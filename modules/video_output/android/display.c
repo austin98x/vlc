@@ -316,11 +316,8 @@ static void SetupPictureYV12(picture_t *p_picture, uint32_t i_in_stride)
     }
 
     if (vlc_fourcc_AreUVPlanesSwapped(p_picture->format.i_chroma,
-                                      VLC_CODEC_YV12)) {
-        uint8_t *p_tmp = p_picture->p[1].p_pixels;
-        p_picture->p[1].p_pixels = p_picture->p[2].p_pixels;
-        p_picture->p[2].p_pixels = p_tmp;
-    }
+                                      VLC_CODEC_YV12))
+        plane_SwapUV( p_picture->p );
 }
 
 static void AndroidWindow_DisconnectSurface(vout_display_sys_t *sys,
@@ -479,7 +476,7 @@ error:
     }
     p_window->b_use_priv = false;
     if (p_window->i_angle != 0)
-        video_format_ApplyRotation(&p_window->fmt, &p_window->fmt);
+        video_format_TransformTo(&p_window->fmt, ORIENT_NORMAL);
     return -1;
 }
 
@@ -729,7 +726,7 @@ static int OpenCommon(vout_display_t *vd)
 
     /* use software rotation if we don't use private anw */
     if (!sys->p_window->b_opaque && !sys->p_window->b_use_priv)
-        video_format_ApplyRotation(&vd->fmt, &vd->fmt);
+        video_format_TransformTo(&vd->fmt, ORIENT_NORMAL);
 
     msg_Dbg(vd, "using %s", sys->p_window->b_opaque ? "opaque" :
             (sys->p_window->b_use_priv ? "ANWP" : "ANW"));
@@ -802,7 +799,9 @@ static void ClearSurface(vout_display_t *vd)
     if (sys->p_window->b_opaque)
     {
         /* Clear the surface to black with OpenGL ES 2 */
-        vlc_gl_t *gl = vlc_gl_Create(sys->embed, VLC_OPENGL_ES2, "$gles2");
+        char *modlist = var_InheritString(sys->embed, "gles2");
+        vlc_gl_t *gl = vlc_gl_Create(sys->embed, VLC_OPENGL_ES2, modlist);
+        free(modlist);
         if (gl == NULL)
             return;
 

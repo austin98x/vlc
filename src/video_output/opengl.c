@@ -23,10 +23,10 @@
 #endif
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 
 #include <vlc_common.h>
-#include <vlc_atomic.h>
 #include <vlc_opengl.h>
 #include "libvlc.h"
 #include <vlc_modules.h>
@@ -135,8 +135,10 @@ vlc_gl_t *vlc_gl_surface_Create(vlc_object_t *obj,
         .sys = sys,
         .resized = vlc_gl_surface_ResizeNotify,
     };
+    char *modlist = var_InheritString(obj, "window");
 
-    vout_window_t *surface = vout_window_New(obj, "$window", cfg, &owner);
+    vout_window_t *surface = vout_window_New(obj, modlist, cfg, &owner);
+    free(modlist);
     if (surface == NULL)
         goto error;
     if (wp != NULL)

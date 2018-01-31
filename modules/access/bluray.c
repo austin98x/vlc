@@ -26,6 +26,7 @@
 #endif
 
 #include <assert.h>
+#include <stdatomic.h>
 
 #if defined (HAVE_MNTENT_H) && defined(HAVE_SYS_STAT_H)
 # include <mntent.h>
@@ -44,7 +45,6 @@
 #include <vlc_plugin.h>
 #include <vlc_demux.h>                      /* demux_t */
 #include <vlc_input.h>                      /* Seekpoints, chapters */
-#include <vlc_atomic.h>
 #include <vlc_dialog.h>                     /* BD+/AACS warnings */
 #include <vlc_vout.h>                       /* vout_PutSubpicture / subpicture_t */
 #include <vlc_url.h>                        /* vlc_path2uri */
@@ -151,6 +151,7 @@ struct  demux_sys_t
     input_title_t       **pp_title;
     unsigned            cur_title;
     unsigned            cur_seekpoint;
+    unsigned            updates;
 
     vlc_mutex_t             pl_info_lock;
     BLURAY_TITLE_INFO      *p_pl_info;
@@ -299,17 +300,19 @@ static void FindMountPoint(char **file)
     struct stat st;
     if (lstat (bd_device, &st) == 0 && S_ISBLK (st.st_mode)) {
         FILE *mtab = setmntent ("/proc/self/mounts", "r");
-        struct mntent *m, mbuf;
-        char buf [8192];
+        if (mtab) {
+            struct mntent *m, mbuf;
+            char buf [8192];
 
-        while ((m = getmntent_r (mtab, &mbuf, buf, sizeof(buf))) != NULL) {
-            if (!strcmp (m->mnt_fsname, bd_device)) {
-                free(device);
-                *file = strdup(m->mnt_dir);
-                break;
+            while ((m = getmntent_r (mtab, &mbuf, buf, sizeof(buf))) != NULL) {
+                if (!strcmp (m->mnt_fsname, bd_device)) {
+                    free(device);
+                    *file = strdup(m->mnt_dir);
+                    break;
+                }
             }
+            endmntent (mtab);
         }
-        endmntent (mtab);
     }
     free(bd_device);
 
@@ -665,7 +668,7 @@ static int blurayOpen(vlc_object_t *object)
     p_sys->i_still_end_time = 0;
 
     /* init demux info fields */
-    p_demux->info.i_update    = 0;
+    p_sys->updates = 0;
 
     TAB_INIT(p_sys->i_title, p_sys->pp_title);
     TAB_INIT(p_sys->i_attachments, p_sys->attachments);
@@ -673,6 +676,11 @@ static int blurayOpen(vlc_object_t *object)
     vlc_mutex_init(&p_sys->pl_info_lock);
     vlc_mutex_init(&p_sys->bdj_overlay_lock);
     vlc_mutex_init(&p_sys->read_block_lock); /* used during bd_open_stream() */
+
+    /* request sub demuxers to skip continuity check as some split
+       file concatenation are just resetting counters... */
+    var_Create( p_demux, "ts-cc-check", VLC_VAR_BOOL );
+    var_SetBool( p_demux, "ts-cc-check", false );
 
     var_AddCallback( p_demux->p_input, "intf-event", onIntfEvent, p_demux );
 
@@ -1837,7 +1845,7 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
         int i_title = va_arg(args, int);
         if (bluraySetTitle(p_demux, i_title) != VLC_SUCCESS) {
             /* make sure GUI restores the old setting in title menu ... */
-            p_demux->info.i_update |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
+            p_sys->updates |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
             return VLC_EGENERIC;
         }
         blurayResetParser( p_demux );
@@ -1849,10 +1857,16 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
         int i_chapter = va_arg(args, int);
         bd_seek_chapter(p_sys->bluray, i_chapter);
         notifyDiscontinuity( p_sys );
-        p_demux->info.i_update |= INPUT_UPDATE_SEEKPOINT;
+        p_sys->updates |= INPUT_UPDATE_SEEKPOINT;
         break;
     }
-
+    case DEMUX_TEST_AND_CLEAR_FLAGS:
+    {
+        unsigned *restrict flags = va_arg(args, unsigned *);
+        *flags &= p_sys->updates;
+        p_sys->updates &= ~*flags;
+        break;
+    }
     case DEMUX_GET_TITLE:
         *va_arg(args, int *) = p_sys->cur_title;
         break;
@@ -2001,7 +2015,7 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
     case DEMUX_NAV_MENU:
         if (p_sys->b_menu) {
             if (bd_menu_call(p_sys->bluray, -1) == 1) {
-                p_demux->info.i_update |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
+                p_sys->updates |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
                 return VLC_SUCCESS;
             }
             msg_Err(p_demux, "Can't select Top Menu title");
@@ -2095,7 +2109,10 @@ static void streamFlush( demux_sys_t *p_sys )
         0x00, 0x00, 0x00, 0x00,                /* TP extra header (ATC) */
         0x47, 0x50, 0x11, 0x30,                /* TP header */
         (192 - (4 + 5) - sizeof(seq_end_pes)), /* adaptation field length */
-        0x80,                                  /* adaptation field: discontinuity indicator */
+        0x82,                                  /* af: discontinuity indicator + priv data */
+        0x0E,                                  /* priv data size */
+         'V',  'L',  'C',  '_',
+         'S',  'T',  'I',  'L',  'L',  'F',  'R',  'A',  'M',  'E',
     };
 
     memset(p_block->p_buffer, 0, 192);
@@ -2202,13 +2219,13 @@ static void blurayUpdatePlaylist(demux_t *p_demux, unsigned i_playlist)
     if (!p_sys->b_menu)
         p_sys->cur_title = bd_get_current_title(p_sys->bluray);
     p_sys->cur_seekpoint = 0;
-    p_demux->info.i_update |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
+    p_sys->updates |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
 
     BLURAY_TITLE_INFO *p_title_info = bd_get_playlist_info(p_sys->bluray, i_playlist, 0);
     if (p_title_info) {
         blurayUpdateTitleInfo(p_sys->pp_title[p_sys->cur_title], p_title_info);
         if (p_sys->b_menu)
-            p_demux->info.i_update |= INPUT_UPDATE_TITLE_LIST;
+            p_sys->updates |= INPUT_UPDATE_TITLE_LIST;
     }
     setTitleInfo(p_sys, p_title_info);
 
@@ -2253,7 +2270,8 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e)
         /* this is feature title, we don't know yet which playlist it will play (if any) */
         setTitleInfo(p_sys, NULL);
         /* reset title infos here ? */
-        p_demux->info.i_update |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT; /* might be BD-J title with no video */
+        p_sys->updates |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
+        /* might be BD-J title with no video */
         break;
     case BD_EVENT_PLAYLIST:
         /* Start of playlist playback (?????.mpls) */
@@ -2274,7 +2292,7 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e)
           p_sys->cur_seekpoint = e->param - 1;
         else
           p_sys->cur_seekpoint = 0;
-        p_demux->info.i_update |= INPUT_UPDATE_SEEKPOINT;
+        p_sys->updates |= INPUT_UPDATE_SEEKPOINT;
         break;
     case BD_EVENT_PLAYMARK:
     case BD_EVENT_ANGLE:

@@ -698,11 +698,20 @@ libvlc_media_subitems( libvlc_media_t * p_md )
 int libvlc_media_get_stats( libvlc_media_t *p_md,
                             libvlc_media_stats_t *p_stats )
 {
+    input_item_t *item = p_md->p_input_item;
+
     if( !p_md->p_input_item )
         return false;
 
+    vlc_mutex_lock( &item->lock );
+
     input_stats_t *p_itm_stats = p_md->p_input_item->p_stats;
-    vlc_mutex_lock( &p_itm_stats->lock );
+    if( p_itm_stats == NULL )
+    {
+        vlc_mutex_unlock( &item->lock );
+        return false;
+    }
+
     p_stats->i_read_bytes = p_itm_stats->i_read_bytes;
     p_stats->f_input_bitrate = p_itm_stats->f_input_bitrate;
 
@@ -720,10 +729,11 @@ int libvlc_media_get_stats( libvlc_media_t *p_md,
     p_stats->i_played_abuffers = p_itm_stats->i_played_abuffers;
     p_stats->i_lost_abuffers = p_itm_stats->i_lost_abuffers;
 
-    p_stats->i_sent_packets = p_itm_stats->i_sent_packets;
-    p_stats->i_sent_bytes = p_itm_stats->i_sent_bytes;
-    p_stats->f_send_bitrate = p_itm_stats->f_send_bitrate;
-    vlc_mutex_unlock( &p_itm_stats->lock );
+    p_stats->i_sent_packets = 0;
+    p_stats->i_sent_bytes = 0;
+    p_stats->f_send_bitrate = 0.;
+
+    vlc_mutex_unlock( &item->lock );
     return true;
 }
 

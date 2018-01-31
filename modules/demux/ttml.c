@@ -36,6 +36,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "../codec/ttml/ttml.h"
 
@@ -276,6 +277,11 @@ static int Control( demux_t* p_demux, int i_query, va_list args )
                 return VLC_SUCCESS;
             }
             break;
+        case DEMUX_CAN_PAUSE:
+        case DEMUX_SET_PAUSE_STATE:
+        case DEMUX_CAN_CONTROL_PACE:
+            return demux_vaControlHelper( p_demux->s, 0, -1, 0, 1, i_query, args );
+
         case DEMUX_GET_PTS_DELAY:
         case DEMUX_GET_FPS:
         case DEMUX_GET_META:
@@ -439,8 +445,9 @@ int tt_OpenDemux( vlc_object_t* p_this )
     }
 
     /* Simplified probing. Valid TTML must have a namespace declaration */
-    const char *psz_tt = strnstr( psz_xml, "tt ", i_xml );
+    const char *psz_tt = strnstr( psz_xml, "tt", i_xml );
     if( !psz_tt || psz_tt == psz_xml ||
+        ((size_t)(&psz_tt[2] - (const char*)p_peek)) == i_xml || isalpha(psz_tt[2]) ||
         (psz_tt[-1] != ':' && psz_tt[-1] != '<') )
     {
         free( psz_alloc );

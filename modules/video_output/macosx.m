@@ -78,7 +78,7 @@ vlc_module_begin ()
     set_capability ("vout display", 300)
     set_callbacks (Open, Close)
     add_shortcut ("macosx", "vout_macosx")
-    add_glconv ()
+    add_glopts ()
 vlc_module_end ()
 
 /**
@@ -410,7 +410,9 @@ static int Control (vout_display_t *vd, int query, va_list ap)
                  This has the positive side effect that we avoid erratic sizing as we animate every resize. */
                 if (query != VOUT_DISPLAY_CHANGE_DISPLAY_SIZE)
                     // x / y are top left corner, but we need the lower left one
-                    glViewport (place.x, cfg_tmp.display.height - (place.y + place.height), place.width, place.height);
+                    vout_display_opengl_Viewport(sys->vgl, place.x,
+                                                 cfg_tmp.display.height - (place.y + place.height),
+                                                 place.width, place.height);
                 vlc_gl_ReleaseCurrent (sys->gl);
 
                 return VLC_SUCCESS;
@@ -496,7 +498,6 @@ static void OpenglSwap (vlc_gl_t *gl)
         NSOpenGLPFAColorSize, 24,
         NSOpenGLPFAAlphaSize, 8,
         NSOpenGLPFADepthSize, 24,
-        NSOpenGLPFAWindow,
         NSOpenGLPFAAllowOfflineRenderers,
         0
     };

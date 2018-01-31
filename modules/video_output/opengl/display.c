@@ -68,7 +68,7 @@ vlc_module_begin ()
     add_module ("gl", "opengl", NULL,
                 GL_TEXT, PROVIDER_LONGTEXT, true)
 #endif
-    add_glconv ()
+    add_glopts ()
 vlc_module_end ()
 
 struct vout_display_sys_t
@@ -104,7 +104,7 @@ static int Open (vlc_object_t *obj)
         goto error;
     }
 
-    const char *gl_name = "$" MODULE_VARNAME;
+    char *gl_name = var_InheritString(surface, MODULE_VARNAME);
 
     /* VDPAU GL interop works only with GLX. Override the "gl" option to force
      * it. */
@@ -118,10 +118,8 @@ static int Open (vlc_object_t *obj)
             case VLC_CODEC_VDPAU_VIDEO_420:
             {
                 /* Force the option only if it was not previously set */
-                char *str = var_InheritString(surface, MODULE_VARNAME);
-                if (str == NULL)
-                    gl_name = "glx";
-                free(str);
+                if (gl_name == NULL)
+                    gl_name = strdup("glx");
                 break;
             }
             default:
@@ -131,6 +129,7 @@ static int Open (vlc_object_t *obj)
 #endif
 
     sys->gl = vlc_gl_Create (surface, API, gl_name);
+    free(gl_name);
     if (sys->gl == NULL)
         goto error;
 
@@ -257,7 +256,7 @@ static int Control (vout_display_t *vd, int query, va_list ap)
         if (vlc_gl_MakeCurrent (sys->gl) != VLC_SUCCESS)
             return VLC_EGENERIC;
         vout_display_opengl_SetWindowAspectRatio(sys->vgl, (float)place.width / place.height);
-        glViewport (place.x, place.y, place.width, place.height);
+        vout_display_opengl_Viewport(sys->vgl, place.x, place.y, place.width, place.height);
         vlc_gl_ReleaseCurrent (sys->gl);
         return VLC_SUCCESS;
       }
@@ -272,7 +271,7 @@ static int Control (vout_display_t *vd, int query, va_list ap)
         if (vlc_gl_MakeCurrent (sys->gl) != VLC_SUCCESS)
             return VLC_EGENERIC;
         vout_display_opengl_SetWindowAspectRatio(sys->vgl, (float)place.width / place.height);
-        glViewport (place.x, place.y, place.width, place.height);
+        vout_display_opengl_Viewport(sys->vgl, place.x, place.y, place.width, place.height);
         vlc_gl_ReleaseCurrent (sys->gl);
         return VLC_SUCCESS;
       }

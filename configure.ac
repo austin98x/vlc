@@ -1,6 +1,6 @@
 dnl Autoconf settings for vlc
 
-AC_COPYRIGHT([Copyright 1999-2017 VLC authors and VideoLAN])
+AC_COPYRIGHT([Copyright 1999-2018 VLC authors and VideoLAN])
 
 AC_INIT(vlc, 4.0.0-dev)
 VERSION_MAJOR=4
@@ -14,7 +14,7 @@ AC_SUBST(PKGDIR)
 
 CONFIGURE_LINE="`echo "$0 $ac_configure_args" | sed -e 's/\\\/\\\\\\\/g'`"
 CODENAME="Otto Chriek"
-COPYRIGHT_YEARS="1996-2017"
+COPYRIGHT_YEARS="1996-2018"
 
 AC_CONFIG_SRCDIR(src/libvlc.c)
 AC_CONFIG_AUX_DIR(autotools)
@@ -290,6 +290,7 @@ case "${host_os}" in
     LDFLAGS="${LDFLAGS} -Zomf -Zbin-files -Zargs-wild -Zhigh-mem"
     AC_LIBOBJ([freeaddrinfo])
     AC_LIBOBJ([gai_strerror])
+    AC_CHECK_FUNCS([if_nametoindex])
     ;;
   *nacl*)
     SYS=nacl
@@ -330,6 +331,7 @@ AM_CONDITIONAL(HAVE_OSX,     test "${HAVE_OSX}" = "1")
 AM_CONDITIONAL(HAVE_TVOS,    test "${HAVE_TVOS}" = "1")
 
 AM_CONDITIONAL(HAVE_NACL,    test "${SYS}" = "nacl")
+AM_CONDITIONAL(HAVE_LIBANL,  test "${HAVE_LIBANL}" = "1")
 
 AM_CONDITIONAL(HAVE_WIN32,   test "${SYS}" = "mingw32")
 AM_CONDITIONAL(HAVE_WIN64,   test "${HAVE_WIN64}" = "1") dnl Only used for the packaging
@@ -758,6 +760,10 @@ AC_COMPILE_IFELSE([AC_LANG_SOURCE([_Thread_local int foo = 0;
 dnl __STDC_NO_THREADS__ can't be trusted on some platforms.
 dnl check for its availability explicitely
 AC_CHECK_HEADERS([threads.h])
+
+AC_CHECK_LIB([anl],[getaddrinfo_a],[
+  AC_DEFINE(HAVE_LIBANL, 1, [Define to 1 if you have the anl library])
+])
 
 dnl Check for dynamic plugins
 LIBDL=""
@@ -3744,9 +3750,10 @@ AS_IF([test "${enable_skins2}" != "no"], [
   ], [
     PKG_CHECK_MODULES([XPM], [xpm],, [have_skins_deps="no"])
     PKG_CHECK_MODULES([XINERAMA], [xinerama],, [have_skins_deps="no"])
+    PKG_CHECK_MODULES([XCURSOR], [xcursor],, [have_skins_deps="no"])
     PKG_CHECK_MODULES([XEXT], [xext],, [have_skins_deps="no"])
     VLC_ADD_CPPFLAGS([skins2],[${X_CFLAGS} ${XEXT_CFLAGS} ${XPM_CFLAGS} -DX11_SKINS])
-    VLC_ADD_LIBS([skins2],[${X_LIBS} ${X_PRE_LIBS} ${XEXT_LIBS} ${XPM_LIBS} ${XINERAMA_LIBS} -lX11])
+    VLC_ADD_LIBS([skins2],[${X_LIBS} ${X_PRE_LIBS} ${XEXT_LIBS} ${XPM_LIBS} ${XINERAMA_LIBS} ${XCURSOR_LIBS} -lX11])
   ])
 
   dnl we need freetype
@@ -3758,7 +3765,7 @@ AS_IF([test "${enable_skins2}" != "no"], [
     AS_IF([test "x${enable_skins2}" = "x"], [
       AC_MSG_WARN([Skins2 interface disabled due to missing dependencies.])
     ], [
-      AC_MSG_ERROR([Skins2 interface requires FreeType, libxpm, libxext and libxinerama])
+      AC_MSG_ERROR([Skins2 interface requires FreeType, libxcursor, libxpm, libxext and libxinerama])
     ])
     enable_skins2="no"
   ], [
@@ -3834,24 +3841,29 @@ AS_IF([test "$with_breakpad" != "no"], [
     AC_MSG_ERROR([You need to supply the CrashDragon Server URL as value for --with-breakpad])
   ])
 
-  AS_IF([test "$HAVE_OSX" != "1"], [
-    AC_MSG_ERROR([Breakpad currently only works on macOS])
+  AS_IF([test "$HAVE_OSX" = "1"], [
+    AC_MSG_CHECKING([for Breakpad framework])
+    AS_IF([test ! -d ${CONTRIB_DIR}/Breakpad.framework -a \
+                ! -d ${CONTRIB_DIR}/Frameworks/Breakpad.framework], [
+      AC_MSG_RESULT([no])
+      with_breakpad="no"
+      AC_MSG_ERROR([Breakpad framework is required and was not found in ${CONTRIB_DIR}])
+    ], [
+      AC_MSG_RESULT([yes])
+    ])
+  ],[
+    PKG_CHECK_MODULES([BREAKPAD], [breakpad-client], [
+      LDFLAGS="${LDFLAGS} -Wl,--build-id"
+    ], [
+      AC_MSG_ERROR(["breakpad not found"])
+    ])
   ])
-
-  AC_MSG_CHECKING([for Breakpad framework])
-  AS_IF([test ! -d ${CONTRIB_DIR}/Breakpad.framework -a \
-              ! -d ${CONTRIB_DIR}/Frameworks/Breakpad.framework], [
-    AC_MSG_RESULT([no])
-    AC_MSG_ERROR([Breakpad framework is required and was not found in ${CONTRIB_DIR}])
-  ], [
-    AC_MSG_RESULT([yes])
-    AC_DEFINE([HAVE_BREAKPAD], [1], [Define to 1 if breakpad is enabled.])
-    AC_SUBST(BREAKPAD_URL, ["${with_breakpad}"])
-  ])
-
 ])
 
 AM_CONDITIONAL(HAVE_BREAKPAD, [test "$with_breakpad" != "no"])
+AS_IF([test "$with_breakpad" != "no"], [
+  AC_SUBST(BREAKPAD_URL, ["${with_breakpad}"])
+])
 
 dnl
 dnl  Minimal Mac OS X module
@@ -4114,7 +4126,7 @@ AS_IF([test "${enable_osx_notifications}" != "no"], [
 dnl
 dnl Libnotify notification plugin
 dnl
-PKG_ENABLE_MODULES_VLC([NOTIFY], [], [libnotify gtk+-2.0], [libnotify notification], [auto])
+PKG_ENABLE_MODULES_VLC([NOTIFY], [], [libnotify gtk+-3.0], [libnotify notification], [auto])
 
 dnl
 dnl  libplacebo support
@@ -4124,7 +4136,7 @@ AC_ARG_ENABLE(libplacebo,
       [disable libplacebo support (default auto)])])
 
 AS_IF([test "$enable_libplacebo" != "no"], [
-  PKG_CHECK_MODULES([LIBPLACEBO], [libplacebo >= 0.1], [
+  PKG_CHECK_MODULES([LIBPLACEBO], [libplacebo >= 0.2], [
     AC_DEFINE([HAVE_LIBPLACEBO], [1], [Define to 1 if libplacebo is enabled.])
   ], [
     AS_IF([test -n "${enable_libplacebo}"], [

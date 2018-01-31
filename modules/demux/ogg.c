@@ -920,8 +920,9 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
                 }
                 *pi_title_offset = 0;
                 *pi_seekpoint_offset = 0;
+                return VLC_SUCCESS;
             }
-            return VLC_SUCCESS;
+            return VLC_EGENERIC;
         }
         case DEMUX_SET_TITLE:
         {
@@ -957,12 +958,19 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
                 Ogg_ResetStreamsHelper( p_sys );
                 es_out_Control( p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
                                 VLC_TS_0 + i64 );
-                p_demux->info.i_update |= INPUT_UPDATE_SEEKPOINT;
+                p_sys->updates |= INPUT_UPDATE_SEEKPOINT;
                 p_sys->cur_seekpoint = i_seekpoint;
                 return VLC_SUCCESS;
             }
             else
                 return VLC_EGENERIC;
+        }
+        case DEMUX_TEST_AND_CLEAR_FLAGS:
+        {
+            unsigned *restrict flags = va_arg( args, unsigned * );
+            *flags &= p_sys->updates;
+            p_sys->updates = ~*flags;
+            return VLC_SUCCESS;
         }
         case DEMUX_GET_TITLE:
             *va_arg( args, int * ) = 0;
@@ -1064,9 +1072,22 @@ static void Ogg_UpdatePCR( demux_t *p_demux, logical_stream_t *p_stream,
         unsigned i_duration;
         /* no granulepos available, try to interpolate the pcr.
          * If we can't then don't touch the old value. */
-        if( p_stream->fmt.i_cat == VIDEO_ES && p_stream->i_pcr > VLC_TS_INVALID )
+        if( p_stream->b_oggds && p_stream->fmt.i_cat == VIDEO_ES )
         {
-            p_stream->i_pcr += (CLOCK_FREQ / p_stream->f_rate);
+            if( p_stream->i_previous_granulepos > 0 )
+            {
+                p_stream->i_pcr = VLC_TS_0 + p_stream->i_previous_granulepos * CLOCK_FREQ / p_stream->f_rate;
+                p_stream->i_pcr += p_ogg->i_nzpcr_offset;
+            }
+            /* First frame in ogm can be -1 (0 0 -1 2 3 -1 5 ...) */
+            else if( p_stream->i_previous_granulepos == 0 )
+            {
+                p_stream->i_pcr = VLC_TS_0 + p_ogg->i_nzpcr_offset;
+            }
+            else
+            {
+                p_stream->i_pcr += (CLOCK_FREQ / p_stream->f_rate);
+            }
         }
 #ifdef HAVE_LIBVORBIS
         else if ( p_stream->fmt.i_codec == VLC_CODEC_VORBIS &&
@@ -1113,6 +1134,10 @@ static void Ogg_UpdatePCR( demux_t *p_demux, logical_stream_t *p_stream,
 
             p_stream->i_pcr = VLC_TS_0 + sample * CLOCK_FREQ / p_stream->f_rate;
             p_stream->i_pcr += p_ogg->i_nzpcr_offset;
+        }
+        else if( p_stream->fmt.i_cat == VIDEO_ES && p_stream->i_pcr > VLC_TS_UNKNOWN )
+        {
+            p_stream->i_pcr += (CLOCK_FREQ / p_stream->f_rate);
         }
         else if( p_stream->fmt.i_bitrate && p_stream->i_pcr > VLC_TS_UNKNOWN )
         {
@@ -1380,7 +1405,6 @@ static void Ogg_DecodePacket( demux_t *p_demux,
     }
 
     if( !( p_block = block_Alloc( p_oggpacket->bytes ) ) ) return;
-    p_block->i_pts = p_stream->i_pcr;
 
     DemuxDebug( msg_Dbg(p_demux, "block set from granule %"PRId64" to pts/pcr %"PRId64" skip %d",
                         p_oggpacket->granulepos, p_stream->i_pcr, p_stream->i_skip_frames); )
@@ -1415,10 +1439,34 @@ static void Ogg_DecodePacket( demux_t *p_demux,
     }
 
     /* Conditional block fixes */
-    if ( p_stream->fmt.i_cat == VIDEO_ES &&
-         Ogg_IsKeyFrame( p_stream, p_oggpacket ) )
+    if ( p_stream->fmt.i_cat == VIDEO_ES )
     {
-         p_block->i_flags |= BLOCK_FLAG_TYPE_I;
+        if( Ogg_IsKeyFrame( p_stream, p_oggpacket ) )
+            p_block->i_flags |= BLOCK_FLAG_TYPE_I;
+
+        if( p_stream->fmt.i_codec == VLC_CODEC_DIRAC )
+        {
+            ogg_int64_t nzdts = Oggseek_GranuleToAbsTimestamp( p_stream, p_oggpacket->granulepos, false );
+            ogg_int64_t nzpts = Oggseek_GranuleToAbsTimestamp( p_stream, p_oggpacket->granulepos, true );
+            p_block->i_dts = ( nzdts > VLC_TS_INVALID ) ? VLC_TS_0 + nzdts : nzdts;
+            p_block->i_pts = ( nzpts > VLC_TS_INVALID ) ? VLC_TS_0 + nzpts : nzpts;
+            /* granulepos for dirac is possibly broken, this value should be ignored */
+            if( 0 >= p_oggpacket->granulepos )
+            {
+                p_block->i_pts = VLC_TS_INVALID;
+                p_block->i_dts = p_stream->i_pcr;
+            }
+        }
+        else if( p_stream->fmt.i_codec == VLC_CODEC_THEORA )
+        {
+            p_block->i_pts =
+            p_block->i_dts = p_stream->i_pcr;
+        }
+        else
+        {
+            p_block->i_pts = VLC_TS_INVALID;
+            p_block->i_dts = p_stream->i_pcr;
+        }
     }
     else if( p_stream->fmt.i_cat == AUDIO_ES )
     {
@@ -1433,26 +1481,22 @@ static void Ogg_DecodePacket( demux_t *p_demux,
             es_out_Del( p_demux->out, p_stream->p_es );
             p_stream->p_es = es_out_Add( p_demux->out, &p_stream->fmt );
         }
+        else if( p_stream->fmt.i_codec == VLC_CODEC_TARKIN )
+        {
+            /* FIXME: the biggest hack I've ever done */
+            msg_Warn( p_demux, "tarkin pts: %"PRId64", granule: %"PRId64,
+                      p_block->i_pts, p_block->i_dts );
+            msleep(10000);
+        }
 
         /* Blatant abuse of the i_length field. */
         p_block->i_length = p_stream->i_end_trim;
+        p_block->i_pts = p_block->i_dts = p_stream->i_pcr;
     }
     else if( p_stream->fmt.i_cat == SPU_ES )
     {
         p_block->i_length = 0;
-    }
-    else if( p_stream->fmt.i_codec == VLC_CODEC_DIRAC )
-    {
-        ogg_int64_t nzdts = Oggseek_GranuleToAbsTimestamp( p_stream, p_oggpacket->granulepos, false );
-        ogg_int64_t nzpts = Oggseek_GranuleToAbsTimestamp( p_stream, p_oggpacket->granulepos, true );
-        p_block->i_dts = ( nzdts > VLC_TS_INVALID ) ? VLC_TS_0 + nzdts : nzdts;
-        p_block->i_pts = ( nzpts > VLC_TS_INVALID ) ? VLC_TS_0 + nzpts : nzpts;
-        /* granulepos for dirac is possibly broken, this value should be ignored */
-        if( 0 >= p_oggpacket->granulepos )
-        {
-            p_block->i_pts = VLC_TS_INVALID;
-            p_block->i_dts = p_stream->i_pcr;
-        }
+        p_block->i_pts = p_block->i_dts = p_stream->i_pcr;
     }
 
     if( p_stream->fmt.i_codec != VLC_CODEC_VORBIS &&
@@ -1513,15 +1557,6 @@ static void Ogg_DecodePacket( demux_t *p_demux,
             p_block->i_buffer -= i_header_len;
         else
             p_block->i_buffer = 0;
-    }
-
-
-    if( p_stream->fmt.i_codec == VLC_CODEC_TARKIN )
-    {
-        /* FIXME: the biggest hack I've ever done */
-        msg_Warn( p_demux, "tarkin pts: %"PRId64", granule: %"PRId64,
-                  p_block->i_pts, p_block->i_dts );
-        msleep(10000);
     }
 
     memcpy( p_block->p_buffer, p_oggpacket->packet + i_header_len,
@@ -2500,7 +2535,7 @@ static void Ogg_ExtractComments( demux_t *p_demux, es_format_t *p_fmt,
 
     if( p_ogg->i_seekpoints > 1 )
     {
-        p_demux->info.i_update |= INPUT_UPDATE_TITLE_LIST;
+        p_ogg->updates |= INPUT_UPDATE_TITLE_LIST;
     }
 }
 
@@ -2583,7 +2618,7 @@ static void Ogg_ExtractMeta( demux_t *p_demux, es_format_t *p_fmt, const uint8_t
         break;
     }
     if( p_ogg->p_meta )
-        p_demux->info.i_update |= INPUT_UPDATE_META;
+        p_ogg->updates |= INPUT_UPDATE_META;
 }
 
 static bool Ogg_ReadTheoraHeader( logical_stream_t *p_stream,

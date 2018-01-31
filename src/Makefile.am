@@ -60,7 +60,6 @@ pluginsinclude_HEADERS = \
 	../include/vlc_input_item.h \
 	../include/vlc_interface.h \
 	../include/vlc_keystore.h \
-	../include/vlc_main.h \
 	../include/vlc_md5.h \
 	../include/vlc_messages.h \
 	../include/vlc_meta.h \
@@ -430,8 +429,11 @@ if HAVE_LINUX
 libvlccore_la_SOURCES += \
 	linux/cpu.c \
 	linux/dirs.c \
-	linux/getaddrinfo.c \
 	linux/thread.c
+endif
+if HAVE_LIBANL
+libvlccore_la_SOURCES += \
+	linux/getaddrinfo.c
 libvlccore_la_LIBADD += -lanl
 else
 libvlccore_la_SOURCES += \

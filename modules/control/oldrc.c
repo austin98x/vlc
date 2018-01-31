@@ -454,7 +454,7 @@ static void RegisterCallbacks( intf_thread_t *p_intf )
     ADD( "achan", STRING, AudioChannel )
 
     /* misc menu commands */
-    ADD( "stats", BOOL, Statistics )
+    ADD( "stats", VOID, Statistics )
 
 #undef ADD
 }
@@ -1715,7 +1715,6 @@ static int updateStatistics( intf_thread_t *p_intf, input_item_t *p_item )
     if( !p_item ) return VLC_EGENERIC;
 
     vlc_mutex_lock( &p_item->lock );
-    vlc_mutex_lock( &p_item->p_stats->lock );
     msg_rc( "+----[ begin of statistical info ]" );
 
     /* Input */
@@ -1751,17 +1750,7 @@ static int updateStatistics( intf_thread_t *p_intf, input_item_t *p_item )
     msg_rc(_("| buffers lost     :    %5"PRIi64),
             p_item->p_stats->i_lost_abuffers );
     msg_rc("|");
-    /* Sout */
-    msg_rc("%s", _("+-[Streaming]"));
-    msg_rc(_("| packets sent     :    %5"PRIi64),
-           p_item->p_stats->i_sent_packets );
-    msg_rc(_("| bytes sent       : %8.0f KiB"),
-            (float)(p_item->p_stats->i_sent_bytes)/1024 );
-    msg_rc(_("| sending bitrate  :   %6.0f kb/s"),
-            (float)(p_item->p_stats->f_send_bitrate*8)*1000 );
-    msg_rc("|");
     msg_rc( "+----[ end of statistical info ]" );
-    vlc_mutex_unlock( &p_item->p_stats->lock );
     vlc_mutex_unlock( &p_item->lock );
 
     return VLC_SUCCESS;

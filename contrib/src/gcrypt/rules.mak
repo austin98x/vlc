@@ -34,8 +34,10 @@ GCRYPT_CONF = \
 	--enable-pubkey-ciphers=dsa,rsa,ecc \
 	--disable-docs
 
-ifdef HAVE_WIN64
+ifdef HAVE_WIN32
+ifeq ($(ARCH),x86_64)
 GCRYPT_CONF += --disable-asm --disable-padlock-support
+endif
 endif
 ifdef HAVE_IOS
 GCRYPT_EXTRA_CFLAGS = -fheinous-gnu-extensions
@@ -67,6 +69,10 @@ endif
 endif
 
 .gcrypt: gcrypt
+	# Reconfiguring this requires a git repo to be available, to
+	# successfully produce a nonempty mym4_revision_dec.
+	cd $< && git init && git config --local user.email "cone@example.com" && git config --local user.name "Cony Cone" && \
+		git commit --allow-empty -m "dummy commit"
 	$(RECONF)
 	cd $< && $(HOSTVARS) CFLAGS="$(CFLAGS) $(GCRYPT_EXTRA_CFLAGS)" ./configure $(HOSTCONF) $(GCRYPT_CONF)
 	cd $< && $(MAKE) install

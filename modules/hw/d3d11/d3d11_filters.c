@@ -24,6 +24,7 @@
 # include "config.h"
 #endif
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -32,7 +33,6 @@
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
-#include <vlc_atomic.h>
 
 #define COBJMACROS
 #include <initguid.h>
@@ -222,6 +222,13 @@ static picture_t *Filter(filter_t *p_filter, picture_t *p_pic)
     picture_t *p_outpic = filter_NewPicture( p_filter );
     if( !p_outpic )
     {
+        picture_Release( p_pic );
+        return NULL;
+    }
+    if (unlikely(!p_outpic->p_sys))
+    {
+        /* the output filter configuration may have changed since the filter
+         * was opened */
         picture_Release( p_pic );
         return NULL;
     }
@@ -610,7 +617,7 @@ static void D3D11CloseAdjust(vlc_object_t *obj)
 }
 
 vlc_module_begin()
-    set_description(N_("Direct3D11 filter"))
+    set_description(N_("Direct3D11 adjust filter"))
     set_capability("video filter", 0)
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
@@ -637,6 +644,7 @@ vlc_module_begin()
         change_safe()
 
     add_submodule()
+    set_description(N_("Direct3D11 deinterlace filter"))
     set_callbacks( D3D11OpenDeinterlace, D3D11CloseDeinterlace )
     add_shortcut ("deinterlace")
 

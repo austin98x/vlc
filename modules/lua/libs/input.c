@@ -191,9 +191,13 @@ static int vlclua_input_item_stats( lua_State *L )
 {
     input_item_t *p_item = vlclua_input_item_get_internal( L );
     lua_newtable( L );
-    if( p_item )
+    if( p_item == NULL )
+        return 1;
+
+    vlc_mutex_lock( &p_item->lock );
+    input_stats_t *p_stats = p_item->p_stats;
+    if( p_stats != NULL )
     {
-        vlc_mutex_lock( &p_item->p_stats->lock );
 #define STATS_INT( n ) lua_pushinteger( L, p_item->p_stats->i_ ## n ); \
                        lua_setfield( L, -2, #n );
 #define STATS_FLOAT( n ) lua_pushnumber( L, p_item->p_stats->f_ ## n ); \
@@ -201,26 +205,21 @@ static int vlclua_input_item_stats( lua_State *L )
         STATS_INT( read_packets )
         STATS_INT( read_bytes )
         STATS_FLOAT( input_bitrate )
-        STATS_FLOAT( average_input_bitrate )
         STATS_INT( demux_read_packets )
         STATS_INT( demux_read_bytes )
         STATS_FLOAT( demux_bitrate )
-        STATS_FLOAT( average_demux_bitrate )
         STATS_INT( demux_corrupted )
         STATS_INT( demux_discontinuity )
         STATS_INT( decoded_audio )
         STATS_INT( decoded_video )
         STATS_INT( displayed_pictures )
         STATS_INT( lost_pictures )
-        STATS_INT( sent_packets )
-        STATS_INT( sent_bytes )
-        STATS_FLOAT( send_bitrate )
         STATS_INT( played_abuffers )
         STATS_INT( lost_abuffers )
 #undef STATS_INT
 #undef STATS_FLOAT
-        vlc_mutex_unlock( &p_item->p_stats->lock );
     }
+    vlc_mutex_unlock( &p_item->lock );
     return 1;
 }
 

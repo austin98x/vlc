@@ -429,6 +429,7 @@ static picture_pool_t *Direct3D9CreatePicturePool(vlc_object_t *o,
         picture_sys_t *picsys = malloc(sizeof(*picsys));
         if (unlikely(picsys == NULL))
             goto error;
+        memset(picsys, 0, sizeof(*picsys));
 
         HRESULT hr = IDirect3DDevice9_CreateOffscreenPlainSurface(p_d3d9_dev->dev,
                                                           fmt->i_width,
@@ -503,17 +504,26 @@ static void Prepare(vout_display_t *vd, picture_t *picture, subpicture_t *subpic
     else if (picture->context)
     {
         const struct va_pic_context *pic_ctx = (struct va_pic_context*)picture->context;
-        if (pic_ctx->picsys.surface != picture->p_sys->surface)
+        if (pic_ctx->picsys.surface != surface)
         {
-            HRESULT hr;
-            RECT visibleSource;
-            visibleSource.left = 0;
-            visibleSource.top = 0;
-            visibleSource.right = picture->format.i_visible_width;
-            visibleSource.bottom = picture->format.i_visible_height;
-            hr = IDirect3DDevice9_StretchRect( p_d3d9_dev->dev, pic_ctx->picsys.surface, &visibleSource, surface, &visibleSource, D3DTEXF_NONE);
-            if (FAILED(hr)) {
-                msg_Err(vd, "Failed to copy the hw surface to the decoder surface (hr=0x%0lx)", hr );
+            D3DSURFACE_DESC srcDesc, dstDesc;
+            IDirect3DSurface9_GetDesc(pic_ctx->picsys.surface, &srcDesc);
+            IDirect3DSurface9_GetDesc(surface, &dstDesc);
+            if ( srcDesc.Width == dstDesc.Width && srcDesc.Height == dstDesc.Height )
+                surface = pic_ctx->picsys.surface;
+            else
+            {
+                HRESULT hr;
+                RECT visibleSource;
+                visibleSource.left = 0;
+                visibleSource.top = 0;
+                visibleSource.right = picture->format.i_visible_width;
+                visibleSource.bottom = picture->format.i_visible_height;
+
+                hr = IDirect3DDevice9_StretchRect( p_d3d9_dev->dev, pic_ctx->picsys.surface, &visibleSource, surface, &visibleSource, D3DTEXF_NONE);
+                if (FAILED(hr)) {
+                    msg_Err(vd, "Failed to copy the hw surface to the decoder surface (hr=0x%0lx)", hr );
+                }
             }
         }
     }
@@ -1812,7 +1822,7 @@ GLConvUpdate(const opengl_tex_converter_t *tc, GLuint *textures,
     HRESULT hr;
 
     picture_sys_t *picsys = ActivePictureSys(pic);
-    if (!picsys)
+    if (unlikely(!picsys || !priv->gl_render))
         return VLC_EGENERIC;
 
     if (!priv->vt.DXUnlockObjectsNV(priv->gl_handle_d3d, 1, &priv->gl_render))
@@ -1838,6 +1848,8 @@ GLConvUpdate(const opengl_tex_converter_t *tc, GLuint *textures,
     if (!priv->vt.DXLockObjectsNV(priv->gl_handle_d3d, 1, &priv->gl_render))
     {
         msg_Warn(tc->gl, "DXLockObjectsNV failed");
+        priv->vt.DXUnregisterObjectNV(priv->gl_handle_d3d, priv->gl_render);
+        priv->gl_render = NULL;
         return VLC_EGENERIC;
     }
 
@@ -1858,14 +1870,6 @@ GLConvAllocateTextures(const opengl_tex_converter_t *tc, GLuint *textures,
 {
     VLC_UNUSED(tex_width); VLC_UNUSED(tex_height);
     struct glpriv *priv = tc->priv;
-    tc->vt->GenTextures(1, textures);
-
-    tc->vt->ActiveTexture(GL_TEXTURE0);
-    tc->vt->BindTexture(tc->tex_target, textures[0]);
-    tc->vt->TexParameteri(tc->tex_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    tc->vt->TexParameteri(tc->tex_target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    tc->vt->TexParameterf(tc->tex_target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    tc->vt->TexParameterf(tc->tex_target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     priv->gl_render =
         priv->vt.DXRegisterObjectNV(priv->gl_handle_d3d, priv->dx_render,

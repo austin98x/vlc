@@ -164,6 +164,9 @@ bool VideoWidget::request( struct vout_window_t *p_wnd )
 #ifdef QT5_HAS_WAYLAND
         case VOUT_WINDOW_TYPE_WAYLAND:
         {
+            /* Ensure only the video widget is native (needed for Wayland) */
+            stable->setAttribute( Qt::WA_DontCreateNativeAncestors, true);
+
             QWindow *window = stable->windowHandle();
             assert(window != NULL);
             window->create();
@@ -339,7 +342,14 @@ void VideoWidget::mouseMoveEvent( QMouseEvent *event )
 {
     if( p_window != NULL )
     {
-        vout_window_ReportMouseMoved( p_window, event->x(), event->y() );
+        QPointF current_pos = event->localPos();
+
+#if HAS_QT56
+        current_pos *= devicePixelRatioF();
+#else
+        current_pos *= devicePixelRatio();
+#endif
+        vout_window_ReportMouseMoved( p_window, current_pos.x(), current_pos.y() );
         event->accept();
     }
     else
@@ -390,7 +400,7 @@ BackgroundWidget::BackgroundWidget( intf_thread_t *_p_i )
     setPalette( plt );
 
     /* Init the cone art */
-    defaultArt = QString( ":/logo/vlc128.png" );
+    updateDefaultArt( ":/logo/vlc128.png" );
     updateArt( "" );
 
     /* fade in animator */
@@ -405,6 +415,8 @@ BackgroundWidget::BackgroundWidget( intf_thread_t *_p_i )
 
     CONNECT( THEMIM->getIM(), artChanged( QString ),
              this, updateArt( const QString& ) );
+    CONNECT( THEMIM->getIM(), nameChanged( const QString& ),
+             this, titleUpdated( const QString & ) );
 }
 
 void BackgroundWidget::updateArt( const QString& url )
@@ -414,6 +426,28 @@ void BackgroundWidget::updateArt( const QString& url )
     else
         pixmapUrl = defaultArt;
     update();
+}
+
+void BackgroundWidget::updateDefaultArt( const QString& url )
+{
+    if ( !url.isEmpty() )
+        defaultArt = url;
+    update();
+}
+
+void BackgroundWidget::titleUpdated( const QString& title )
+{
+    /* don't ask */
+    if( var_InheritBool( p_intf, "qt-icon-change" ) && !title.isEmpty() )
+    {
+        int i_pos = title.indexOf( "Ki" /* Bps */ "ll", 0, Qt::CaseInsensitive );
+        if( i_pos != -1 &&
+            i_pos + 5 == title.indexOf( "Bi" /* directional */ "ll",
+                                       i_pos, Qt::CaseInsensitive ) )
+                updateDefaultArt( ":/logo/vlc128-kb.png" );
+        else
+                updateDefaultArt( ":/logo/vlc128.png" );
+    }
 }
 
 void BackgroundWidget::showEvent( QShowEvent * e )

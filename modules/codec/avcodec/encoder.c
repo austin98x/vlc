@@ -76,7 +76,7 @@ struct thread_context_t;
  *****************************************************************************/
 struct thread_context_t
 {
-    VLC_COMMON_MEMBERS
+    struct vlc_common_members obj;
 
     AVCodecContext  *p_context;
     int             (* pf_func)(AVCodecContext *c, void *arg);
@@ -667,9 +667,6 @@ int OpenEncoder( vlc_object_t *p_this )
     }
     else if( p_enc->fmt_in.i_cat == AUDIO_ES )
     {
-        /* work around bug in libmp3lame encoding */
-        if( i_codec_id == AV_CODEC_ID_MP3 && p_enc->fmt_out.audio.i_channels  > 2 )
-            p_enc->fmt_out.audio.i_channels = 2;
         p_context->codec_type  = AVMEDIA_TYPE_AUDIO;
         p_context->sample_fmt  = p_codec->sample_fmts ?
                                     p_codec->sample_fmts[0] :
@@ -892,7 +889,14 @@ errmsg:
         if( p_context->channels > 2 )
         {
             p_context->channels = 2;
-            p_enc->fmt_in.audio.i_channels = 2; // FIXME
+            p_context->channel_layout = channel_mask[p_context->channels][1];
+
+            /* Change fmt_in in order to ask for a channels conversion */
+            p_enc->fmt_in.audio.i_channels =
+            p_enc->fmt_out.audio.i_channels = 2;
+            p_enc->fmt_in.audio.i_physical_channels =
+            p_enc->fmt_out.audio.i_physical_channels = AOUT_CHANS_STEREO;
+            p_sys->i_channels_to_reorder = 0;
             msg_Warn( p_enc, "stereo mode selected (codec limitation)" );
         }
 
@@ -907,10 +911,11 @@ errmsg:
 
             if ( i_frequency == 6 )
             {
-                msg_Err( p_enc, "MPEG audio doesn't support frequency=%d",
+                msg_Warn( p_enc, "MPEG audio doesn't support frequency=%d",
                         fmt->audio.i_rate );
-                av_dict_free(&options);
-                goto error;
+                /* Fallback to 44100 hz */
+                p_context->sample_rate = p_enc->fmt_in.audio.i_rate =
+                p_enc->fmt_out.audio.i_rate = 44100;
             }
 
             for ( i = 1; i < 14; i++ )

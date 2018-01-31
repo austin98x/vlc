@@ -128,9 +128,6 @@ MainInterface::MainInterface( intf_thread_t *_p_intf ) : QVLCMW( _p_intf )
     setWindowIcon( QApplication::windowIcon() );
     setWindowOpacity( var_InheritFloat( p_intf, "qt-opacity" ) );
 
-    /* Is video in embedded in the UI or not */
-    b_videoEmbedded = var_InheritBool( p_intf, "embedded-video" );
-
     /* Does the interface resize to video size or the opposite */
     b_autoresize = var_InheritBool( p_intf, "qt-video-autoresize" );
 
@@ -151,6 +148,11 @@ MainInterface::MainInterface( intf_thread_t *_p_intf ) : QVLCMW( _p_intf )
 
     /* Should the UI stays on top of other windows */
     b_interfaceOnTop = var_InheritBool( p_intf, "video-on-top" );
+
+#ifdef QT5_HAS_WAYLAND
+    b_hasWayland = QGuiApplication::platformName()
+        .startsWith(QLatin1String("wayland"), Qt::CaseInsensitive);
+#endif
 
     /**************************
      *  UI and Widgets design
@@ -480,7 +482,7 @@ void MainInterface::createMainWidget( QSettings *creationSettings )
             bgWidget->setExpandstoHeight( true );
 
     /* And video Outputs */
-    if( b_videoEmbedded )
+    if( var_InheritBool( p_intf, "embedded-video" ) )
     {
         videoWidget = new VideoWidget( p_intf, stackCentralW );
         stackCentralW->addWidget( videoWidget );
@@ -741,6 +743,11 @@ void MainInterface::getVideoSlot( struct vout_window_t *p_wnd,
         toggleUpdateSystrayMenu();
 
     /* Request the videoWidget */
+    if ( !videoWidget )
+    {
+        videoWidget = new VideoWidget( p_intf, stackCentralW );
+        stackCentralW->addWidget( videoWidget );
+    }
     *res = videoWidget->request( p_wnd );
     if( *res ) /* The videoWidget is available */
     {
@@ -865,23 +872,35 @@ void MainInterface::setVideoFullScreen( bool fs )
         if( numscreen < 0 || numscreen >= QApplication::desktop()->screenCount() )
             numscreen = QApplication::desktop()->screenNumber( p_intf->p_sys->p_mi );
 
-        QRect screenres = QApplication::desktop()->screenGeometry( numscreen );
-        lastWinScreen = windowHandle()->screen();
-        windowHandle()->setScreen(QGuiApplication::screens()[numscreen]);
+        if( fullscreenControls )
+            fullscreenControls->setTargetScreen( numscreen );
 
-        /* To be sure window is on proper-screen in xinerama */
-        if( !screenres.contains( pos() ) )
+        if ( numscreen >= 0 )
         {
-            lastWinPosition = pos();
-            lastWinSize = size();
-            msg_Dbg( p_intf, "Moving video to correct position");
-            move( QPoint( screenres.x(), screenres.y() ) );
-        }
 
-        /* */
-        if( playlistWidget != NULL && playlistWidget->artContainer->currentWidget() == videoWidget )
-        {
-            showTab( videoWidget );
+            QRect screenres = QApplication::desktop()->screenGeometry( numscreen );
+            lastWinScreen = windowHandle()->screen();
+#ifdef QT5_HAS_WAYLAND
+            if( !b_hasWayland )
+                windowHandle()->setScreen(QGuiApplication::screens()[numscreen]);
+#else
+            windowHandle()->setScreen(QGuiApplication::screens()[numscreen]);
+#endif
+
+            /* To be sure window is on proper-screen in xinerama */
+            if( !screenres.contains( pos() ) )
+            {
+                lastWinPosition = pos();
+                lastWinSize = size();
+                msg_Dbg( p_intf, "Moving video to correct position");
+                move( QPoint( screenres.x(), screenres.y() ) );
+            }
+
+            /* */
+            if( playlistWidget != NULL && playlistWidget->artContainer->currentWidget() == videoWidget )
+            {
+                showTab( videoWidget );
+            }
         }
 
         /* */
@@ -892,8 +911,13 @@ void MainInterface::setVideoFullScreen( bool fs )
     {
         setMinimalView( b_minimalView );
         setInterfaceFullScreen( b_interfaceFullScreen );
-        if (lastWinScreen != NULL)
+#ifdef QT5_HAS_WAYLAND
+        if( lastWinScreen != NULL && !b_hasWayland )
             windowHandle()->setScreen(lastWinScreen);
+#else
+        if( lastWinScreen != NULL )
+            windowHandle()->setScreen(lastWinScreen);
+#endif
         if( lastWinPosition.isNull() == false )
         {
             move( lastWinPosition );
@@ -1063,12 +1087,21 @@ void MainInterface::dockPlaylist( bool p_docked )
     if( !p_docked ) /* Previously docked */
     {
         playlistVisible = playlistWidget->isVisible();
-        stackCentralW->removeWidget( playlistWidget );
-        dialog->importPlaylistWidget( playlistWidget );
+
+        /* repositioning the videowidget __before__ exporting the
+           playlistwidget into the playlist dialog avoids two unneeded
+           calls to the server in the qt library to reparent the underlying
+           native window back and forth.
+           For Wayland, this is mandatory since reparenting is not implemented.
+           For X11 or Windows, this is just an optimization. */
         if ( videoWidget && THEMIM->getIM()->hasVideo() )
             showTab(videoWidget);
         else
             showTab(bgWidget);
+
+        /* playlistwidget exported into the playlist dialog */
+        stackCentralW->removeWidget( playlistWidget );
+        dialog->importPlaylistWidget( playlistWidget );
         if ( playlistVisible ) dialog->show();
     }
     else /* Previously undocked */

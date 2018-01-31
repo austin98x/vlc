@@ -61,6 +61,8 @@ static const std::string NAMESPACE_RECEIVER         = "urn:x-cast:com.google.cas
 
 #define PACKET_MAX_LEN 10 * 1024
 
+//#define CHROMECAST_VERBOSE
+
 // Media player Chromecast app id
 #define APP_ID "CC1AD845" // Default media player aka DEFAULT_MEDIA_RECEIVER_APPLICATION_ID
 
@@ -76,12 +78,15 @@ enum States
     Launching,
     // The application is ready, but idle
     Ready,
+    // The chromecast rejected the media
+    LoadFailed,
     // A media session is being initiated
     Loading,
     Buffering,
     Playing,
     Paused,
     Seeking,
+    Stopping,
     // Something went wrong and the connection is dead.
     Dead,
 };
@@ -154,6 +159,7 @@ struct intf_sys_t
 
     void requestPlayerSeek(mtime_t pos);
     void requestPlayerStop();
+    States state() const;
 
 private:
     bool handleMessages();
@@ -213,13 +219,14 @@ private:
     std::string m_appTransportId;
     std::string m_mediaSessionId;
 
-    vlc_mutex_t  m_lock;
+    mutable vlc_mutex_t  m_lock;
     vlc_cond_t   m_stateChangedCond;
     vlc_thread_t m_chromecastThread;
 
     ChromecastCommunication m_communication;
     std::queue<QueueableMessages> m_msgQueue;
     States m_state;
+    bool m_eof;
 
     std::string m_artwork;
     std::string m_title;

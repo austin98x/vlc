@@ -5,13 +5,16 @@
 #USE_FFMPEG ?= 1
 
 ifndef USE_LIBAV
-FFMPEG_HASH=5a93a85fd0ad62c6c9cdf69415959f116c015f0e
+FFMPEG_HASH=eaff5fcb7cde8d1614755269773d471d3a3d1bfc
 FFMPEG_SNAPURL := http://git.videolan.org/?p=ffmpeg.git;a=snapshot;h=$(FFMPEG_HASH);sf=tgz
 FFMPEG_GITURL := http://git.videolan.org/git/ffmpeg.git
+FFMPEG_LAVC_MIN := 57.37.100
+USE_FFMPEG := 1
 else
 FFMPEG_HASH=e171022c24c42b1e88a51bb3b4c27f13c87c85cb
 FFMPEG_SNAPURL := http://git.libav.org/?p=libav.git;a=snapshot;h=$(FFMPEG_HASH);sf=tgz
 FFMPEG_GITURL := git://git.libav.org/libav.git
+FFMPEG_LAVC_MIN := 57.16.0
 endif
 
 FFMPEG_BASENAME := $(subst .,_,$(subst \,_,$(subst /,_,$(FFMPEG_HASH))))
@@ -23,7 +26,6 @@ FFMPEGCONF = \
 	--disable-encoder=vorbis \
 	--disable-decoder=opus \
 	--enable-libgsm \
-	--enable-libopenjpeg \
 	--disable-debug \
 	--disable-avdevice \
 	--disable-devices \
@@ -47,7 +49,13 @@ FFMPEGCONF += \
 endif
 endif
 
-DEPS_ffmpeg = zlib gsm openjpeg
+DEPS_ffmpeg = zlib gsm
+
+ifndef USE_LIBAV
+FFMPEGCONF += \
+	--enable-libopenjpeg
+DEPS_ffmpeg += openjpeg
+endif
 
 # Optional dependencies
 ifndef BUILD_NETWORK
@@ -144,7 +152,7 @@ endif
 
 # Linux
 ifdef HAVE_LINUX
-FFMPEGCONF += --target-os=linux --enable-pic
+FFMPEGCONF += --target-os=linux --enable-pic --extra-libs="-lm"
 
 endif
 
@@ -179,7 +187,7 @@ else
 FFMPEGCONF += --disable-dxva2
 endif
 
-ifdef HAVE_WIN64
+ifeq ($(ARCH),x86_64)
 FFMPEGCONF += --cpu=athlon64 --arch=x86_64
 else
 ifeq ($(ARCH),i386) # 32bits intel
@@ -205,7 +213,7 @@ endif
 
 # Build
 PKGS += ffmpeg
-ifeq ($(call need_pkg,"libavcodec >= 55.0.0 libavformat >= 53.21.0 libswscale"),)
+ifeq ($(call need_pkg,"libavcodec >= $(FFMPEG_LAVC_MIN) libavformat >= 53.21.0 libswscale"),)
 PKGS_FOUND += ffmpeg
 endif
 
@@ -222,6 +230,14 @@ ffmpeg: ffmpeg-$(FFMPEG_BASENAME).tar.xz .sum-ffmpeg
 	rm -Rf $@ $@-$(FFMPEG_BASENAME)
 	mkdir -p $@-$(FFMPEG_BASENAME)
 	tar xvJf "$<" --strip-components=1 -C $@-$(FFMPEG_BASENAME)
+ifdef USE_FFMPEG
+	$(APPLY) $(SRC)/ffmpeg/armv7_fixup.patch
+	$(APPLY) $(SRC)/ffmpeg/dxva_vc1_crash.patch
+	$(APPLY) $(SRC)/ffmpeg/h264_early_SAR.patch
+endif
+ifdef USE_LIBAV
+	$(APPLY) $(SRC)/ffmpeg/libav_gsm.patch
+endif
 	$(MOVE)
 
 .ffmpeg: ffmpeg

@@ -33,6 +33,7 @@
 #include <vlc_es.h>
 #include <vlc_iso_lang.h>
 #include <vlc_bits.h>
+#include <vlc_text_style.h>
 #include <assert.h>
 #include <time.h>
 
@@ -102,8 +103,8 @@ void box_gather (bo_t *box, bo_t *box2)
 {
     if(box2 && box2->b && box && box->b)
     {
-        box_fix(box2, box2->b->i_buffer);
-        size_t i_offset = box->b->i_buffer;
+        box_fix(box2, bo_size( box2 ));
+        size_t i_offset = bo_size( box );
         box->b = block_Realloc(box->b, 0, box->b->i_buffer + box2->b->i_buffer);
         if(likely(box->b))
             memcpy(&box->b->p_buffer[i_offset], box2->b->p_buffer, box2->b->i_buffer);
@@ -621,13 +622,22 @@ static bo_t *GetHvcCTag(es_format_t *p_fmt, bool b_completeness)
                 }
                 break;
             case HEVC_NAL_PREF_SEI:
-                if(params.i_sei_count != HEVC_DCR_SEI_COUNT)
+                if(params.i_seipref_count != HEVC_DCR_SEI_COUNT)
                 {
-                    params.p_sei[params.i_sei_count] = p_nal;
-                    params.rgi_sei[params.i_sei_count] = i_nal;
-                    params.i_sei_count++;
+                    params.p_seipref[params.i_seipref_count] = p_nal;
+                    params.rgi_seipref[params.i_seipref_count] = i_nal;
+                    params.i_seipref_count++;
                 }
                 break;
+            case HEVC_NAL_SUFF_SEI:
+                if(params.i_seisuff_count != HEVC_DCR_SEI_COUNT)
+                {
+                    params.p_seisuff[params.i_seisuff_count] = p_nal;
+                    params.rgi_seisuff[params.i_seisuff_count] = i_nal;
+                    params.i_seisuff_count++;
+                }
+                break;
+
             default:
                 break;
         }
@@ -1011,34 +1021,129 @@ static bo_t *GetVideBox(vlc_object_t *p_obj, mp4mux_trackinfo_t *p_track, bool b
     return vide;
 }
 
-static bo_t *GetTextBox(void)
+static bo_t *GetTextBox(vlc_object_t *p_obj, mp4mux_trackinfo_t *p_track, bool b_mov)
 {
-    bo_t *text = box_new("text");
-    if(!text)
-        return NULL;
+    VLC_UNUSED(p_obj);
+    if(p_track->fmt.i_codec == VLC_CODEC_QTXT)
+    {
+        bo_t *text = box_new("text");
+        if(!text)
+            return NULL;
 
-    for (int i = 0; i < 6; i++)
-        bo_add_8(text, 0);        // reserved;
-    bo_add_16be(text, 1);         // data-reference-index
+        /* Sample Entry Header */
+        for (int i = 0; i < 6; i++)
+            bo_add_8(text, 0);        // reserved;
+        bo_add_16be(text, 1);         // data-reference-index
 
-    bo_add_32be(text, 0);         // display flags
-    bo_add_32be(text, 0);         // justification
-    for (int i = 0; i < 3; i++)
-        bo_add_16be(text, 0);     // back ground color
+        if(p_track->fmt.i_extra >= 44)
+        {
+            /* Copy the original sample description format */
+            bo_add_mem(text, p_track->fmt.i_extra, p_track->fmt.p_extra);
+        }
+        else
+        {
+            for (int i = 0; i < 6; i++)
+                bo_add_8(text, 0);        // reserved;
+            bo_add_16be(text, 1);         // data-reference-index
 
-    bo_add_16be(text, 0);         // box text
-    bo_add_16be(text, 0);         // box text
-    bo_add_16be(text, 0);         // box text
-    bo_add_16be(text, 0);         // box text
+            bo_add_32be(text, 0);         // display flags
+            bo_add_32be(text, 0);         // justification
+            for (int i = 0; i < 3; i++)
+                bo_add_16be(text, 0);     // background color
 
-    bo_add_64be(text, 0);         // reserved
-    for (int i = 0; i < 3; i++)
-        bo_add_16be(text, 0xff);  // foreground color
+            bo_add_64be(text, 0);         // box text
+            bo_add_64be(text, 0);         // reserved
 
-    bo_add_8 (text, 9);
-    bo_add_mem(text, 9, (uint8_t*)"Helvetica");
+            bo_add_16be(text, 0);         // font-number
+            bo_add_16be(text, 0);         // font-face
+            bo_add_8(text, 0);            // reserved
+            bo_add_16be(text, 0);         // reserved
 
-    return text;
+            for (int i = 0; i < 3; i++)
+                bo_add_16be(text, 0xff);  // foreground color
+
+            bo_add_8(text, 5);
+            bo_add_mem(text, 5,  (void*)"Serif");
+        }
+        return text;
+    }
+    else if(p_track->fmt.i_codec == VLC_CODEC_SPU ||
+            p_track->fmt.i_codec == VLC_CODEC_TX3G)
+    {
+        bo_t *tx3g = box_new("tx3g");
+        if(!tx3g)
+            return NULL;
+
+        /* Sample Entry Header */
+        for (int i = 0; i < 6; i++)
+            bo_add_8(tx3g, 0);        // reserved;
+        bo_add_16be(tx3g, 1);         // data-reference-index
+
+        if(p_track->fmt.i_codec == VLC_CODEC_TX3G &&
+           p_track->fmt.i_extra >= 32)
+        {
+            /* Copy the original sample description format */
+            bo_add_mem(tx3g, p_track->fmt.i_extra, p_track->fmt.p_extra);
+        }
+        else /* Build TTXT(tx3g) sample desc */
+        {
+            /* tx3g sample description */
+            bo_add_32be(tx3g, 0);         // display flags
+            bo_add_16be(tx3g, 0);         // justification
+
+            bo_add_32be(tx3g, 0);         // background color
+
+            /* BoxRecord */
+            bo_add_64be(tx3g, 0);
+
+            /* StyleRecord*/
+            bo_add_16be(tx3g, 0);         // startChar
+            bo_add_16be(tx3g, 0);         // endChar
+            bo_add_16be(tx3g, 0);         // default font ID
+            bo_add_8(tx3g, 0);            // face style flags
+            bo_add_8(tx3g, STYLE_DEFAULT_FONT_SIZE);  // font size
+            bo_add_32be(tx3g, 0xFFFFFFFFU);// foreground color
+
+            /* FontTableBox */
+            bo_t *ftab = box_new("ftab");
+            if(ftab)
+            {
+                bo_add_16be(ftab, b_mov ? 2 : 3); // Entry Count
+                /* Font Record */
+                bo_add_8(ftab, 5);
+                bo_add_mem(ftab, 5,  (void*)"Serif");
+                bo_add_8(ftab, 10);
+                bo_add_mem(ftab, 10, (void*) (b_mov ? "Sans-Serif" : "Sans-serif"));
+                if(!b_mov) /* qt only allows "Serif" and "Sans-Serif" */
+                {
+                    bo_add_8(ftab, 9);
+                    bo_add_mem(ftab, 9,  (void*)"Monospace");
+                }
+
+                box_gather(tx3g, ftab);
+            }
+        }
+
+        return tx3g;
+    }
+    else if(p_track->fmt.i_codec == VLC_CODEC_WEBVTT)
+    {
+        bo_t *wvtt = box_new("wvtt");
+        if(!wvtt)
+            return NULL;
+
+        /* Sample Entry Header */
+        for (int i = 0; i < 6; i++)
+            bo_add_8(wvtt, 0);        // reserved;
+        bo_add_16be(wvtt, 1);         // data-reference-index
+
+        bo_t *ftab = box_new("vttc");
+        box_gather(wvtt, ftab);
+
+        return wvtt;
+    }
+
+    return NULL;
 }
 
 static int64_t GetScaledEntryDuration( const mp4mux_entry_t *p_entry, uint32_t i_timescale,
@@ -1067,7 +1172,7 @@ static bo_t *GetStblBox(vlc_object_t *p_obj, mp4mux_trackinfo_t *p_track, bool b
     else if (p_track->fmt.i_cat == VIDEO_ES)
         box_gather(stsd, GetVideBox(p_obj, p_track, b_mov));
     else if (p_track->fmt.i_cat == SPU_ES)
-        box_gather(stsd, GetTextBox());
+        box_gather(stsd, GetTextBox(p_obj, p_track, b_mov));
 
     /* chunk offset table */
     bo_t *stco;
@@ -1273,7 +1378,7 @@ static bo_t *GetStblBox(vlc_object_t *p_obj, mp4mux_trackinfo_t *p_track, bool b
         box_gather(stbl, ctts);
     box_gather(stbl, stsc);
     box_gather(stbl, stsz);
-    p_track->i_stco_pos = stbl->b->i_buffer + 16;
+    p_track->i_stco_pos = bo_size(stbl) + 16;
     box_gather(stbl, stco);
 
     return stbl;
@@ -1529,7 +1634,15 @@ bo_t * mp4mux_GetMoovBox(vlc_object_t *p_obj, mp4mux_trackinfo_t **pp_tracks, un
         else if (p_stream->fmt.i_cat == VIDEO_ES)
             bo_add_fourcc(hdlr, "vide");
         else if (p_stream->fmt.i_cat == SPU_ES)
-            bo_add_fourcc(hdlr, "text");
+        {
+            /* text/tx3g 3GPP */
+            /* sbtl/tx3g Apple subs */
+            /* text/text Apple textmedia */
+            if(p_stream->fmt.i_codec == VLC_CODEC_TX3G)
+                bo_add_fourcc(hdlr, (b_mov) ? "sbtl" : "text");
+            else
+                bo_add_fourcc(hdlr, "text");
+        }
 
         bo_add_32be(hdlr, 0);         // reserved
         bo_add_32be(hdlr, 0);         // reserved
@@ -1579,22 +1692,28 @@ bo_t * mp4mux_GetMoovBox(vlc_object_t *p_obj, mp4mux_trackinfo_t **pp_tracks, un
                 box_gather(minf, vmhd);
             }
         } else if (p_stream->fmt.i_cat == SPU_ES) {
-            bo_t *gmin = box_full_new("gmin", 0, 1);
-            if(gmin)
+            if(b_mov &&
+               (p_stream->fmt.i_codec == VLC_CODEC_SUBT||
+                p_stream->fmt.i_codec == VLC_CODEC_TX3G||
+                p_stream->fmt.i_codec == VLC_CODEC_QTXT))
             {
-                bo_add_16be(gmin, 0);     // graphicsmode
-                for (int i = 0; i < 3; i++)
-                    bo_add_16be(gmin, 0); // opcolor
-                bo_add_16be(gmin, 0);     // balance
-                bo_add_16be(gmin, 0);     // reserved
-
-                bo_t *gmhd = box_new("gmhd");
-                if(gmhd)
+                bo_t *gmin = box_full_new("gmin", 0, 1);
+                if(gmin)
                 {
-                    box_gather(gmhd, gmin);
-                    box_gather(minf, gmhd);
+                    bo_add_16be(gmin, 0);     // graphicsmode
+                    for (int i = 0; i < 3; i++)
+                        bo_add_16be(gmin, 0); // opcolor
+                    bo_add_16be(gmin, 0);     // balance
+                    bo_add_16be(gmin, 0);     // reserved
+
+                    bo_t *gmhd = box_new("gmhd");
+                    if(gmhd)
+                    {
+                        box_gather(gmhd, gmin);
+                        box_gather(minf, gmhd);
+                    }
+                    else bo_free(gmin);
                 }
-                else bo_free(gmin);
             }
         }
 
@@ -1632,19 +1751,19 @@ bo_t * mp4mux_GetMoovBox(vlc_object_t *p_obj, mp4mux_trackinfo_t **pp_tracks, un
             stbl = GetStblBox(p_obj, p_stream, b_mov, b_stco64);
 
         /* append stbl to minf */
-        p_stream->i_stco_pos += minf->b->i_buffer;
+        p_stream->i_stco_pos += bo_size(minf);
         box_gather(minf, stbl);
 
         /* append minf to mdia */
-        p_stream->i_stco_pos += mdia->b->i_buffer;
+        p_stream->i_stco_pos += bo_size(mdia);
         box_gather(mdia, minf);
 
         /* append mdia to trak */
-        p_stream->i_stco_pos += trak->b->i_buffer;
+        p_stream->i_stco_pos += bo_size(trak);
         box_gather(trak, mdia);
 
         /* append trak to moov */
-        p_stream->i_stco_pos += moov->b->i_buffer;
+        p_stream->i_stco_pos += bo_size(moov);
         box_gather(moov, trak);
     }
 
@@ -1694,7 +1813,7 @@ bo_t * mp4mux_GetMoovBox(vlc_object_t *p_obj, mp4mux_trackinfo_t **pp_tracks, un
     }
 
     if(moov->b)
-        box_fix(moov, moov->b->i_buffer);
+        box_fix(moov, bo_size(moov));
     return moov;
 }
 
@@ -1712,13 +1831,15 @@ bo_t *mp4mux_GetFtyp(vlc_fourcc_t major, uint32_t minor, vlc_fourcc_t extra[], s
             free(box);
             return NULL;
         }
-        box_fix(box, box->b->i_buffer);
+        box_fix(box, bo_size(box));
     }
     return box;
 }
 
-bool mp4mux_CanMux(vlc_object_t *p_obj, const es_format_t *p_fmt)
+bool mp4mux_CanMux(vlc_object_t *p_obj, const es_format_t *p_fmt,
+                   bool b_fragmented, bool b_mov)
 {
+    VLC_UNUSED(b_mov);
     switch(p_fmt->i_codec)
     {
     case VLC_CODEC_A52:
@@ -1757,7 +1878,11 @@ bool mp4mux_CanMux(vlc_object_t *p_obj, const es_format_t *p_fmt)
     case VLC_CODEC_SUBT:
         if(p_obj)
             msg_Warn(p_obj, "subtitle track added like in .mov (even when creating .mp4)");
-        break;
+        return !b_fragmented;
+    case VLC_CODEC_QTXT:
+    case VLC_CODEC_TX3G:
+    case VLC_CODEC_WEBVTT:
+        return !b_fragmented;
     default:
         return false;
     }

@@ -52,7 +52,7 @@ vlc_module_begin()
     set_capability("vout display", 275)
     add_shortcut("glwin32", "opengl")
     set_callbacks(Open, Close)
-    add_glconv()
+    add_glopts()
 vlc_module_end()
 
 /*****************************************************************************
@@ -128,7 +128,9 @@ static int Open(vlc_object_t *object)
     if (!surface)
         goto error;
 
-    sys->gl = vlc_gl_Create (surface, VLC_OPENGL, "$gl");
+    char *modlist = var_InheritString(surface, "gl");
+    sys->gl = vlc_gl_Create (surface, VLC_OPENGL, modlist);
+    free(modlist);
     if (!sys->gl)
     {
         vlc_object_release(surface);
@@ -246,8 +248,8 @@ static void Manage (vout_display_t *vd)
     const int height = sys->sys.rect_dest.bottom - sys->sys.rect_dest.top;
     vlc_gl_Resize (sys->gl, width, height);
     if (vlc_gl_MakeCurrent (sys->gl) != VLC_SUCCESS)
-        return VLC_EGENERIC;
+        return;
     vout_display_opengl_SetWindowAspectRatio(sys->vgl, (float)width / height);
-    glViewport(0, 0, width, height);
+    vout_display_opengl_Viewport(sys->vgl, 0, 0, width, height);
     vlc_gl_ReleaseCurrent (sys->gl);
 }

@@ -103,6 +103,7 @@ typedef struct ps_stream_s
 
     /* Language is iso639-2T */
     uint8_t lang[3];
+    int64_t i_dts;
 
 } ps_stream_t;
 
@@ -215,10 +216,13 @@ static void Close( vlc_object_t * p_this )
     msg_Info( p_mux, "Close" );
 
     p_end = block_Alloc( 4 );
-    p_end->p_buffer[0] = 0x00; p_end->p_buffer[1] = 0x00;
-    p_end->p_buffer[2] = 0x01; p_end->p_buffer[3] = 0xb9;
+    if( p_end )
+    {
+        p_end->p_buffer[0] = 0x00; p_end->p_buffer[1] = 0x00;
+        p_end->p_buffer[2] = 0x01; p_end->p_buffer[3] = 0xb9;
 
-    sout_AccessOutWrite( p_mux->p_access, p_end );
+        sout_AccessOutWrite( p_mux->p_access, p_end );
+    }
 
     free( p_sys );
 }
@@ -270,6 +274,7 @@ static int AddStream( sout_mux_t *p_mux, sout_input_t *p_input )
     if( unlikely(p_input->p_sys == NULL) )
         return VLC_ENOMEM;
     p_stream->i_stream_type = 0x81;
+    p_stream->i_dts = -1;
 
     /* Init this new stream */
     switch( p_input->p_fmt->i_codec )
@@ -468,28 +473,43 @@ static int Mux( sout_mux_t *p_mux )
         p_stream = (ps_stream_t*)p_input->p_sys;
         p_ps     = NULL;
 
+        p_stream->i_dts = i_dts;
+
         /* Write regulary PackHeader */
         if( p_sys->i_pes_count % 30 == 0)
         {
-            /* Update the instant bitrate every second or so */
-            if( p_sys->i_instant_size &&
-                i_dts - p_sys->i_instant_dts > 1000000 )
+            int64_t i_mindts = INT64_MAX;
+            for( size_t i=0; i<p_mux->i_nb_inputs; i++ )
             {
-                int64_t i_instant_bitrate = p_sys->i_instant_size * 8000000 /
-                    ( i_dts - p_sys->i_instant_dts );
-
-                p_sys->i_instant_bitrate += i_instant_bitrate;
-                p_sys->i_instant_bitrate /= 2;
-
-                p_sys->i_instant_size = 0;
-                p_sys->i_instant_dts = i_dts;
-            }
-            else if( !p_sys->i_instant_size )
-            {
-                p_sys->i_instant_dts = i_dts;
+                ps_stream_t *p_s = (ps_stream_t*)p_input->p_sys;
+                if( p_input->p_fmt->i_cat == SPU_ES && p_mux->i_nb_inputs > 1 )
+                    continue;
+                if( p_s->i_dts >= 0 && i_mindts > p_s->i_dts )
+                    i_mindts = p_s->i_dts;
             }
 
-            MuxWritePackHeader( p_mux, &p_ps, i_dts );
+            if( i_mindts > p_sys->i_instant_dts )
+            {
+                /* Update the instant bitrate every second or so */
+                if( p_sys->i_instant_size &&
+                    i_dts - p_sys->i_instant_dts > 1000000 )
+                {
+                    int64_t i_instant_bitrate = p_sys->i_instant_size * 8000000 /
+                            ( i_dts - p_sys->i_instant_dts );
+
+                    p_sys->i_instant_bitrate += i_instant_bitrate;
+                    p_sys->i_instant_bitrate /= 2;
+
+                    p_sys->i_instant_size = 0;
+                    p_sys->i_instant_dts = i_dts;
+                }
+                else if( !p_sys->i_instant_size )
+                {
+                    p_sys->i_instant_dts = i_dts;
+                }
+
+                MuxWritePackHeader( p_mux, &p_ps, i_dts );
+            }
         }
 
         /* Write regulary SystemHeader */
@@ -578,6 +598,8 @@ static void MuxWritePackHeader( sout_mux_t *p_mux, block_t **p_buf,
     i_scr = (i_dts - p_sys->i_dts_delay) * 9 / 100;
 
     p_hdr = block_Alloc( 18 );
+    if( !p_hdr )
+        return;
     p_hdr->i_pts = p_hdr->i_dts = i_dts;
     bits_initwrite( &bits, 14, p_hdr->p_buffer );
     bits_write( &bits, 32, 0x01ba );
@@ -652,6 +674,8 @@ static void MuxWriteSystemHeader( sout_mux_t *p_mux, block_t **p_buf,
         ( i_nb_private > 0 ? i_nb_private - 1 : 0 );
 
     p_hdr = block_Alloc(  12 + i_nb_stream * 3 );
+    if( !p_hdr )
+        return;
     p_hdr->i_dts = p_hdr->i_pts = i_dts;
 
     /* The spec specifies that the reported rate_bound must be upper limit */
@@ -742,6 +766,8 @@ static void MuxWritePSM( sout_mux_t *p_mux, block_t **p_buf, mtime_t i_dts )
     i_psm_size += i_es_map_size;
 
     p_hdr = block_Alloc( i_psm_size );
+    if( !p_hdr )
+        return;
     p_hdr->i_dts = p_hdr->i_pts = i_dts;
 
     memset( p_hdr->p_buffer, 0, p_hdr->i_buffer );

@@ -219,11 +219,9 @@ static es_out_t *test_es_out_create(vlc_object_t *parent)
 static unsigned demux_test_and_clear_flags(demux_t *demux, unsigned flags)
 {
     unsigned update;
-    if (demux_Control(demux, DEMUX_TEST_AND_CLEAR_FLAGS, &update) == VLC_SUCCESS)
-        return update;
-    unsigned ret = demux->info.i_update & flags;
-    demux->info.i_update &= ~flags;
-    return ret;
+    if (demux_Control(demux, DEMUX_TEST_AND_CLEAR_FLAGS, &update))
+        return 0;
+    return update;
 }
 
 static void demux_get_title_list(demux_t *demux)
@@ -400,12 +398,10 @@ extern vlc_plugin_cb vlc_static_modules[];
     f(au) \
     f(avi) \
     f(caf) \
-    f(diracsys) \
     f(es) \
     f(flacsys) \
     f(h26x) \
     f(mjpeg) \
-    f(mkv) \
     f(mp4) \
     f(nsc) \
     f(nsv) \
@@ -424,7 +420,6 @@ extern vlc_plugin_cb vlc_static_modules[];
     f(xa) \
     f(a52) \
     f(copy) \
-    f(dirac) \
     f(dts) \
     f(flac) \
     f(h264) \

@@ -217,7 +217,7 @@ static int assert_staging(filter_t *p_filter, picture_sys_t *p_sys)
         /* failed with the this format, try a different one */
         UINT supportFlags = D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
         const d3d_format_t *new_fmt =
-                FindD3D11Format( p_device, 0, 0, false, supportFlags );
+                FindD3D11Format( p_device, 0, false, 0, false, supportFlags );
         if (new_fmt && texDesc.Format != new_fmt->formatTexture)
         {
             DXGI_FORMAT srcFormat = texDesc.Format;
@@ -346,11 +346,8 @@ static void D3D11_YUY2(filter_t *p_filter, picture_t *src, picture_t *dst)
         return;
     }
 
-    if (dst->format.i_chroma == VLC_CODEC_I420) {
-        uint8_t *tmp = dst->p[1].p_pixels;
-        dst->p[1].p_pixels = dst->p[2].p_pixels;
-        dst->p[2].p_pixels = tmp;
-    }
+    if (dst->format.i_chroma == VLC_CODEC_I420)
+        plane_SwapUV( dst->p );
 
     ID3D11Texture2D_GetDesc(sys->staging, &desc);
 
@@ -383,17 +380,15 @@ static void D3D11_YUY2(filter_t *p_filter, picture_t *src, picture_t *dst)
             lock.RowPitch,
         };
         Copy420_SP_to_P(dst, plane, pitch,
-                        src->format.i_visible_height + src->format.i_y_offset, &sys->cache);
+                        __MIN(desc.Height, src->format.i_y_offset + src->format.i_visible_height),
+                        &sys->cache);
         picture_SwapUV(dst);
     } else {
         msg_Err(p_filter, "Unsupported D3D11VA conversion from 0x%08X to YV12", desc.Format);
     }
 
-    if (dst->format.i_chroma == VLC_CODEC_I420) {
-        uint8_t *tmp = dst->p[1].p_pixels;
-        dst->p[1].p_pixels = dst->p[2].p_pixels;
-        dst->p[2].p_pixels = tmp;
-    }
+    if (dst->format.i_chroma == VLC_CODEC_I420)
+        plane_SwapUV( dst->p );
 
     /* */
     ID3D11DeviceContext_Unmap(p_sys->context, sys->staging_resource, 0);
@@ -493,7 +488,8 @@ static void D3D11_NV12(filter_t *p_filter, picture_t *src, picture_t *dst)
             lock.RowPitch,
         };
         Copy420_SP_to_SP(dst, plane, pitch,
-                          src->format.i_visible_height + src->format.i_y_offset, &sys->cache);
+                         __MIN(desc.Height, src->format.i_y_offset + src->format.i_visible_height),
+                         &sys->cache);
     } else {
         msg_Err(p_filter, "Unsupported D3D11VA conversion from 0x%08X to NV12", desc.Format);
     }
@@ -580,6 +576,12 @@ static void NV12_D3D11(filter_t *p_filter, picture_t *src, picture_t *dst)
 {
     filter_sys_t *sys = (filter_sys_t*) p_filter->p_sys;
     picture_sys_t *p_sys = dst->p_sys;
+    if (unlikely(p_sys==NULL))
+    {
+        /* the output filter configuration may have changed since the filter
+         * was opened */
+        return;
+    }
 
     D3D11_TEXTURE2D_DESC texDesc;
     ID3D11Texture2D_GetDesc( sys->staging_pic->p_sys->texture[KNOWN_DXGI_INDEX], &texDesc);

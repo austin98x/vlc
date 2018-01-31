@@ -35,8 +35,9 @@
 
 #include <stdlib.h>                                      /* malloc(), free() */
 #include <string.h>
+#include <stdatomic.h>
+
 #include <vlc_common.h>
-#include <vlc_atomic.h>
 #include <vlc_actions.h>
 #include <vlc_dialog.h>
 #include <vlc_url.h>
@@ -237,6 +238,10 @@ static VLCMain *sharedInstance = nil;
 
         var_AddCallback(p_intf->obj.libvlc, "intf-toggle-fscontrol", ShowController, (__bridge void *)self);
         var_AddCallback(p_intf->obj.libvlc, "intf-show", ShowController, (__bridge void *)self);
+
+        // Load them here already to apply stored profiles
+        _videoEffectsPanel = [[VLCVideoEffectsWindowController alloc] init];
+        _audioEffectsPanel = [[VLCAudioEffectsWindowController alloc] init];
 
         playlist_t *p_playlist = pl_Get(p_intf);
         if ([NSApp currentSystemPresentationOptions] & NSApplicationPresentationFullScreen)
@@ -509,17 +514,11 @@ static VLCMain *sharedInstance = nil;
 
 - (VLCAudioEffectsWindowController *)audioEffectsPanel
 {
-    if (!_audioEffectsPanel)
-        _audioEffectsPanel = [[VLCAudioEffectsWindowController alloc] init];
-
     return _audioEffectsPanel;
 }
 
 - (VLCVideoEffectsWindowController *)videoEffectsPanel
 {
-    if (!_videoEffectsPanel)
-        _videoEffectsPanel = [[VLCVideoEffectsWindowController alloc] init];
-
     return _videoEffectsPanel;
 }
 

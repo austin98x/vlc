@@ -233,6 +233,9 @@ libwebvtt_plugin_la_SOURCES = codec/webvtt/subsvtt.c \
                               codec/webvtt/webvtt.h \
                               demux/webvtt.c \
                               demux/mp4/minibox.h
+if ENABLE_SOUT
+libwebvtt_plugin_la_SOURCES += codec/webvtt/encvtt.c
+endif
 codec_LTLIBRARIES += libwebvtt_plugin.la
 if ENABLE_CSS
 # dependency: we need grammar build first
@@ -350,9 +353,6 @@ libvideotoolbox_plugin_la_SOURCES = \
 	packetizer/h264_slice.c packetizer/h264_slice.h \
 	packetizer/h264_nal.c packetizer/h264_nal.h \
 	packetizer/hevc_nal.c packetizer/hevc_nal.h
-if HAVE_OSX
-libvideotoolbox_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS) -mmacosx-version-min=10.8
-endif
 if HAVE_IOS
 libvideotoolbox_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS) -miphoneos-version-min=8.0
 endif
@@ -504,7 +504,7 @@ libmediacodec_plugin_la_SOURCES = codec/omxil/mediacodec.c codec/omxil/mediacode
 	packetizer/hxxx_nal.h packetizer/hxxx_nal.c \
 	packetizer/h264_nal.c packetizer/h264_nal.h \
 	packetizer/hevc_nal.c packetizer/hevc_nal.h
-libmediacodec_plugin_la_LIBADD = libchroma_copy.la 
+libmediacodec_plugin_la_LIBADD = libchroma_copy.la
 codec_LTLIBRARIES += $(LTLIBomxil) $(LTLIBomxil_vout)
 EXTRA_LTLIBRARIES += libomxil_plugin.la libomxil_vout_plugin.la
 if HAVE_ANDROID

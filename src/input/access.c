@@ -199,14 +199,9 @@ static block_t *AStreamReadBlock(stream_t *s, bool *restrict eof)
 
     if (block != NULL && input != NULL)
     {
-        uint64_t total;
-
-        vlc_mutex_lock(&input_priv(input)->counters.counters_lock);
-        stats_Update(input_priv(input)->counters.p_read_bytes,
-                     block->i_buffer, &total);
-        stats_Update(input_priv(input)->counters.p_input_bitrate, total, NULL);
-        stats_Update(input_priv(input)->counters.p_read_packets, 1, NULL);
-        vlc_mutex_unlock(&input_priv(input)->counters.counters_lock);
+        struct input_stats *stats = input_priv(input)->stats;
+        if (stats != NULL)
+            input_rate_Add(&stats->input_bitrate, block->i_buffer);
     }
 
     return block;
@@ -227,13 +222,9 @@ static ssize_t AStreamReadStream(stream_t *s, void *buf, size_t len)
 
     if (val > 0 && input != NULL)
     {
-        uint64_t total;
-
-        vlc_mutex_lock(&input_priv(input)->counters.counters_lock);
-        stats_Update(input_priv(input)->counters.p_read_bytes, val, &total);
-        stats_Update(input_priv(input)->counters.p_input_bitrate, total, NULL);
-        stats_Update(input_priv(input)->counters.p_read_packets, 1, NULL);
-        vlc_mutex_unlock(&input_priv(input)->counters.counters_lock);
+        struct input_stats *stats = input_priv(input)->stats;
+        if (stats != NULL)
+            input_rate_Add(&stats->input_bitrate, val);
     }
 
     return val;

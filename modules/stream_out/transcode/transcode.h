@@ -61,6 +61,8 @@ struct sout_stream_sys_t
     config_chain_t  *p_spu_cfg;
     spu_t           *p_spu;
     filter_t        *p_spu_blend;
+    unsigned int     i_spu_width; /* render width */
+    unsigned int     i_spu_height;
 
     /* Sync */
     bool            b_master_sync;
@@ -73,6 +75,7 @@ struct aout_filters;
 struct sout_stream_id_sys_t
 {
     bool            b_transcode;
+    bool            b_error;
 
     /* id of the out stream */
     void *id;
@@ -107,11 +110,13 @@ struct sout_stream_id_sys_t
              filter_chain_t  *p_f_chain; /**< Video filters */
              filter_chain_t  *p_uf_chain; /**< User-specified video filters */
              video_format_t  fmt_input_video;
+             video_format_t  video_dec_out; /* only rw from pf_vout_format_update() */
          };
          struct
          {
              struct aout_filters    *p_af_chain; /**< Audio filters */
              audio_format_t  fmt_audio;
+             audio_format_t  audio_dec_out; /* only rw from pf_aout_format_update() */
          };
 
     };

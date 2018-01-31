@@ -1,4 +1,4 @@
-List of vlc plugins (491):
+List of VLC plugins:
 $Id$
 
  * a52: A/52 audio decoder plugin, using liba52
@@ -41,7 +41,7 @@ $Id$
  * android_logger: logger output to native Android logs (adb logcat)
  * android_window: Android direct/undirect rendering video output
  * antiflicker: anti-flicker video filter
- * aom: AOM decoder (AV1)
+ * aom: AOM encoder and decoder (AV1)
  * araw: Pseudo audio decoder for raw PCM
  * archive: libarchive based access and stream filter and stream_extractor
  * aribcam: ARIB STD-B25 decoder/virtual CAM
@@ -53,7 +53,7 @@ $Id$
  * audiobargraph_a: audiobargraph audio plugin
  * audiobargraph_v: audiobargraph video plugin
  * audioscrobbler: AudioScrobbler/Last.fm submission plugin
- * audiotoolbox_midi: AudioToolbox MIDI decoder plugin for macOS
+ * audiotoolboxmidi: AudioToolbox MIDI decoder plugin for macOS
  * audiounit_ios: AudioUnit output plugin for iOS
  * auhal: Audio output for Mac OS X based on the AUHAL API
  * avahi: Zeroconf services discovery
@@ -107,7 +107,6 @@ $Id$
  * demux_chromecast: Internal demux filter to report the playback time on the Chromecast
  * demux_stl: EBU STL subtitles demuxer
  * demuxdump: Pseudo-demuxer that dumps the stream
- * diracsys: BBC Dirac demuxer
  * direct3d11: video output module using the Direct3D11 API
  * direct3d11_filters: adjust|deinterlacer filter for Direct3D11 video decoding
  * direct3d9: video output module using the Direct3D9 API
@@ -291,7 +290,6 @@ $Id$
  * packetizer_a52: A/52 basic parser/packetizer
  * packetizer_avparser: libavcodec packetizer
  * packetizer_copy: Simple copy packetizer
- * packetizer_dirac: Dirac video packetizer
  * packetizer_dts: DTS basic parser/packetizer
  * packetizer_flac: FLAC audio packetizer
  * packetizer_h264: H264 video packetizer
@@ -396,7 +394,7 @@ $Id$
  * stream_out_transcode: audio & video transcoder
  * subsdec: a codec to output textual subtitles
  * subsdelay: subtitles delay filter
- * substx3g: tx3g styled subtitles decoder
+ * substx3g: tx3g styled subtitles encoder and decoder
  * subsusf: a demuxer for USF subtitles
  * subtitle: a demuxer for subtitle files
  * svcdsub: SVCD subtitles decoder
@@ -460,12 +458,13 @@ $Id$
  * wav: Wav demuxer
  * wave: Wave video effect
  * waveout: simple audio output module for Windows
- * webvtt: WEBVTT subtitles decoder and demuxer
+ * webvtt: WEBVTT subtitles decoder, encoder and demuxer
  * wgl: WGL extension for OpenGL
  * win_hotkeys: module to catch hotkeys when application doesn't have the focus
  * win_msg: Windows Messages module
  * windrive: Windows logical disc drives
  * wingdi: WIN 32 / WIN CE GDI video output
+ * winhibit: Win32 screensaver inhibition
  * winstore: Windows Store App audio output
  * wl_screenshooter: Wayland screen capture input
  * wl_shell: Wayland shell surface window provider

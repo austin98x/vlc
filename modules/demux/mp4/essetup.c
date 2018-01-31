@@ -27,6 +27,7 @@
 #include "mp4.h"
 #include "avci.h"
 #include "../xiph.h"
+#include "../../packetizer/dts_header.h"
 
 #include <vlc_demux.h>
 #include <vlc_aout.h>
@@ -50,6 +51,7 @@ static void SetupGlobalExtensions( mp4_track_t *p_track, MP4_Box_t *p_sample )
 static void SetupESDS( demux_t *p_demux, mp4_track_t *p_track, const MP4_descriptor_decoder_config_t *p_decconfig )
 {
     /* First update information based on i_objectTypeIndication */
+    /* See 14496-1 and http://www.mp4ra.org/object.html */
     switch( p_decconfig->i_objectProfileIndication )
     {
     case( 0x20 ): /* MPEG4 VIDEO */
@@ -113,9 +115,11 @@ static void SetupESDS( demux_t *p_demux, mp4_track_t *p_track, const MP4_descrip
     case( 0xa6 ):
         p_track->fmt.i_codec = VLC_CODEC_EAC3;
         break;
-    case( 0xa9 ): /* dts */
     case( 0xaa ): /* DTS-HD HRA */
     case( 0xab ): /* DTS-HD Master Audio */
+        p_track->fmt.i_profile = PROFILE_DTS_HD;
+        /* fallthrough */
+    case( 0xa9 ): /* dts */
         p_track->fmt.i_codec = VLC_CODEC_DTS;
         break;
     case( 0xDD ):
@@ -147,9 +151,10 @@ static void SetupESDS( demux_t *p_demux, mp4_track_t *p_track, const MP4_descrip
                   "unknown objectProfileIndication(0x%x) (Track[ID 0x%x])",
                   p_decconfig->i_objectProfileIndication,
                   p_track->i_track_ID );
-        break;
+        return;
     }
 
+    p_track->fmt.i_original_fourcc = 0; /* so we don't have MP4A as original fourcc */
     p_track->fmt.i_bitrate = p_decconfig->i_avg_bitrate;
 
     p_track->fmt.i_extra = p_decconfig->i_decoder_specific_info_len;
@@ -703,11 +708,14 @@ int SetupVideoES( demux_t *p_demux, mp4_track_t *p_track, MP4_Box_t *p_sample )
         break;
 
         case ATOM_WMV3:
+            p_track->p_asf = MP4_BoxGet( p_sample, "ASF " );
+            /* fallsthrough */
+        case ATOM_H264:
+        case VLC_FOURCC('W','V','C','1'):
         {
             MP4_Box_t *p_strf = MP4_BoxGet(  p_sample, "strf", 0 );
             if ( p_strf && BOXDATA(p_strf) )
             {
-                p_track->fmt.i_codec = VLC_CODEC_WMV3;
                 p_track->fmt.video.i_width = BOXDATA(p_strf)->bmiHeader.biWidth;
                 p_track->fmt.video.i_visible_width = p_track->fmt.video.i_width;
                 p_track->fmt.video.i_height = BOXDATA(p_strf)->bmiHeader.biHeight;
@@ -720,7 +728,6 @@ int SetupVideoES( demux_t *p_demux, mp4_track_t *p_track, MP4_Box_t *p_sample )
                     memcpy( p_track->fmt.p_extra, BOXDATA(p_strf)->p_extra,
                             p_track->fmt.i_extra );
                 }
-                p_track->p_asf = MP4_BoxGet( p_sample, "ASF " );
             }
             break;
         }
@@ -998,6 +1005,15 @@ int SetupAudioES( demux_t *p_demux, mp4_track_t *p_track, MP4_Box_t *p_sample )
             break;
         }
 
+        case ATOM_dtse: /* DTS‐HD Lossless formats */
+        case ATOM_dtsh: /* DTS‐HD audio formats */
+        case ATOM_dtsl: /* DTS‐HD Lossless formats */
+        {
+            p_track->fmt.i_codec = VLC_CODEC_DTS;
+            p_track->fmt.i_profile = PROFILE_DTS_HD;
+            break;
+        }
+
         case( VLC_FOURCC( 'r', 'a', 'w', ' ' ) ):
         case( VLC_FOURCC( 'N', 'O', 'N', 'E' ) ):
         {
@@ -1260,38 +1276,23 @@ int SetupSpuES( demux_t *p_demux, mp4_track_t *p_track, MP4_Box_t *p_sample )
             if(!p_text)
                 return 0;
 
-            p_track->fmt.i_codec = VLC_CODEC_TX3G;
+            if( p_sample->i_type == VLC_FOURCC( 't', 'e', 'x', 't' ) )
+                p_track->fmt.i_codec = VLC_CODEC_QTXT;
+            else
+                p_track->fmt.i_codec = VLC_CODEC_TX3G;
 
-            if( p_text->i_display_flags & 0xC0000000 )
+            if( GetDWBE(p_text->p_data) & 0xC0000000 )
             {
                 p_track->fmt.i_priority = ES_PRIORITY_SELECTABLE_MIN + 1;
                 p_track->b_forced_spu = true;
             }
 
-            text_style_t *p_style = text_style_Create( STYLE_NO_DEFAULTS );
-            if ( p_style )
+            p_track->fmt.p_extra = malloc( p_text->i_data );
+            if( p_track->fmt.p_extra )
             {
-                if ( p_text->i_font_size ) /* !WARN: in % of 5% height */
-                {
-                    p_style->i_font_size = p_text->i_font_size;
-                }
-                if ( p_text->i_font_color )
-                {
-                    p_style->i_font_color = p_text->i_font_color >> 8;
-                    p_style->i_font_alpha = p_text->i_font_color & 0xFF;
-                    p_style->i_features |= (STYLE_HAS_FONT_ALPHA | STYLE_HAS_FONT_COLOR);
-                }
-                if ( p_text->i_background_color[3] >> 8 )
-                {
-                    p_style->i_background_color = p_text->i_background_color[0] >> 8;
-                    p_style->i_background_color |= p_text->i_background_color[1] >> 8;
-                    p_style->i_background_color |= p_text->i_background_color[2] >> 8;
-                    p_style->i_background_alpha = p_text->i_background_color[3] >> 8;
-                    p_style->i_features |= (STYLE_HAS_BACKGROUND_ALPHA | STYLE_HAS_BACKGROUND_COLOR);
-                }
+                memcpy( p_track->fmt.p_extra, p_text->p_data, p_text->i_data );
+                p_track->fmt.i_extra = p_text->i_data;
             }
-            assert(p_track->fmt.i_cat == SPU_ES);
-            p_track->fmt.subs.p_style = p_style;
 
             /* FIXME UTF-8 doesn't work here ? */
             if( p_track->b_mac_encoding )

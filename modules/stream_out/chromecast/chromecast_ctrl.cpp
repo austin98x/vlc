@@ -58,6 +58,8 @@ static const char* StateToStr( States s )
         return "Lauching";
     case Ready:
         return "Ready";
+    case LoadFailed:
+        return "LoadFailed";
     case Loading:
         return "Loading";
     case Buffering:
@@ -68,6 +70,8 @@ static const char* StateToStr( States s )
         return "Paused";
     case Seeking:
         return "Seeking";
+    case Stopping:
+        return "Stopping";
     case Dead:
         return "Dead";
     }
@@ -82,6 +86,7 @@ intf_sys_t::intf_sys_t(vlc_object_t * const p_this, int port, std::string device
  , m_streaming_port(port)
  , m_communication( p_this, device_addr.c_str(), device_port )
  , m_state( Authenticating )
+ , m_eof( false )
  , m_ctl_thread_interrupt(p_interrupt)
  , m_time_playback_started( VLC_TS_INVALID )
  , m_ts_local_start( VLC_TS_INVALID )
@@ -127,6 +132,7 @@ intf_sys_t::~intf_sys_t()
     case Playing:
     case Paused:
     case Seeking:
+    case Stopping:
         // Generate the close messages.
         m_communication.msgReceiverClose( m_appTransportId );
         /* fallthrough */
@@ -156,6 +162,10 @@ void intf_sys_t::setHasInput( const std::string mime_type )
 
     this->m_mime = mime_type;
 
+    /* new input: clear message queue */
+    std::queue<QueueableMessages> empty;
+    std::swap(m_msgQueue, empty);
+
     waitAppStarted();
     if ( m_state == Dead )
     {
@@ -163,10 +173,11 @@ void intf_sys_t::setHasInput( const std::string mime_type )
         return;
     }
     // We should now be in the ready state, and therefor have a valid transportId
-    assert( m_state == Ready && m_appTransportId.empty() == false );
+    assert( m_appTransportId.empty() == false );
     // we cannot start a new load when the last one is still processing
     m_communication.msgPlayerLoad( m_appTransportId, m_streaming_port, m_title, m_artwork, mime_type );
     setState( Loading );
+    m_eof = false;
 }
 
 /**
@@ -229,6 +240,9 @@ void intf_sys_t::mainLoop()
     {
         if ( !handleMessages() )
             break;
+        // Reset the interrupt state to avoid commands not being sent (since
+        // the context is still flagged as interrupted)
+        vlc_interrupt_unregister();
         vlc_mutex_locker lock( &m_lock );
         while ( m_msgQueue.empty() == false )
         {
@@ -237,6 +251,7 @@ void intf_sys_t::mainLoop()
             {
                 case Stop:
                     m_communication.msgPlayerStop( m_appTransportId, m_mediaSessionId );
+                    setState( Stopping );
                     break;
                 case Seek:
                 {
@@ -378,7 +393,12 @@ void intf_sys_t::processReceiverMessage( const castchannel::CastMessage& msg )
                 break;
             // else: fall through and warn
         default:
-            msg_Warn( m_module, "Unexpected RECEIVER_STATUS with state %d", m_state );
+            msg_Warn( m_module, "Unexpected RECEIVER_STATUS with state %s. "
+                      "Checking media status",
+                      StateToStr( m_state ) );
+            // This is likely because the chromecast refused the playback, but
+            // let's check by explicitely probing the media status
+            m_communication.msgPlayerGetStatus( m_appTransportId );
             break;
         }
     }
@@ -416,14 +436,26 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg )
 
         vlc_mutex_locker locker( &m_lock );
 
-        if (newPlayerState == "IDLE")
+        if (newPlayerState == "IDLE" || newPlayerState.empty() == true )
         {
-            if ( m_state != Ready )
+            /* Idle state is expected when the media receiver application is
+             * started. In case the state is still Buffering, it denotes an error.
+             * In most case, we'd receive a RECEIVER_STATUS message, which causes
+             * use to ask for the MEDIA_STATUS before assuming an error occured.
+             * If the chromecast silently gave up on playing our stream, we also
+             * might have an empty status array.
+             * If the media load indeed failed, we need to try another
+             * transcode/remux configuration, or give up.
+             */
+            if ( m_state != Ready && m_state != LoadFailed )
             {
                 // The playback stopped
                 m_mediaSessionId = "";
                 m_time_playback_started = VLC_TS_INVALID;
-                setState( Ready );
+                if ( m_state == Buffering )
+                    setState( LoadFailed );
+                else
+                    setState( Ready );
             }
         }
         else
@@ -448,6 +480,7 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg )
                 {
                     /* TODO reset demux PCR ? */
                     m_time_playback_started = mdate();
+                    m_eof = false;
                     setState( Playing );
                 }
             }
@@ -455,6 +488,13 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg )
             {
                 if ( m_state != Buffering )
                 {
+                    /* EOF when state goes from Playing to Buffering. There can
+                     * be a lot of false positives (when seeking or when the cc
+                     * request more input) but this state is fetched only when
+                     * the input has reached EOF. */
+
+                    if( m_state == Playing )
+                        m_eof = true;
                     m_time_playback_started = VLC_TS_INVALID;
                     setState( Buffering );
                 }
@@ -487,7 +527,7 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg )
                     setState( Loading );
                 }
             }
-            else if (!newPlayerState.empty())
+            else
                 msg_Warn( m_module, "Unknown Chromecast MEDIA_STATUS state %s", newPlayerState.c_str());
         }
     }
@@ -495,11 +535,7 @@ void intf_sys_t::processMediaMessage( const castchannel::CastMessage& msg )
     {
         msg_Err( m_module, "Media load failed");
         vlc_mutex_locker locker(&m_lock);
-        /* close the app to restart it */
-        if ( m_state == Launching )
-            m_communication.msgReceiverClose(m_appTransportId);
-        else
-            m_communication.msgReceiverGetStatus();
+        setState( LoadFailed );
     }
     else if (type == "LOAD_CANCELLED")
     {
@@ -618,6 +654,12 @@ void intf_sys_t::requestPlayerStop()
     queueMessage( Stop );
 }
 
+States intf_sys_t::state() const
+{
+    vlc_mutex_locker locker( &m_lock );
+    return m_state;
+}
+
 void intf_sys_t::requestPlayerSeek(mtime_t pos)
 {
     vlc_mutex_locker locker(&m_lock);
@@ -650,7 +692,9 @@ void intf_sys_t::setPauseState(bool paused)
 
 void intf_sys_t::waitAppStarted()
 {
-    while ( m_state != Ready && m_state != Dead )
+    while ( m_state == Connected || m_state == Launching ||
+            m_state == Authenticating || m_state == Connecting ||
+            m_state == Stopping )
     {
         if ( m_state == Connected )
         {
@@ -683,7 +727,7 @@ void intf_sys_t::waitSeekDone()
 bool intf_sys_t::isFinishedPlaying()
 {
     vlc_mutex_locker locker(&m_lock);
-    return m_state == Ready;
+    return m_state == Ready || m_state == LoadFailed || m_state == Dead || m_eof;
 }
 
 void intf_sys_t::setTitle(const char* psz_title)
@@ -708,6 +752,7 @@ mtime_t intf_sys_t::getPlaybackTimestamp() const
     {
     case Playing:
         return ( mdate() - m_time_playback_started ) + m_ts_local_start;
+#ifdef CHROMECAST_VERBOSE
     case Ready:
         msg_Dbg(m_module, "receiver idle using buffering time %" PRId64, m_ts_local_start);
         break;
@@ -717,6 +762,7 @@ mtime_t intf_sys_t::getPlaybackTimestamp() const
     case Paused:
         msg_Dbg(m_module, "receiver paused using buffering time %" PRId64, m_ts_local_start);
         break;
+#endif
     default:
         break;
     }

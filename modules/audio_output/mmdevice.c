@@ -1084,6 +1084,25 @@ static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
     if (sys->dev == NULL)
         return -1;
 
+    const bool b_spdif = AOUT_FMT_SPDIF(fmt);
+    const bool b_hdmi = AOUT_FMT_HDMI(fmt);
+    if (b_spdif || b_hdmi)
+    {
+        switch (var_InheritInteger(aout, "mmdevice-passthrough"))
+        {
+            case MM_PASSTHROUGH_DISABLED:
+                return -1;
+            case MM_PASSTHROUGH_ENABLED:
+                if (b_hdmi)
+                    return -1;
+                else if (fmt->i_format == VLC_CODEC_DTS)
+                    var_SetBool(aout, "dtshd", false );
+                /* falltrough */
+            case MM_PASSTHROUGH_ENABLED_HD:
+                break;
+        }
+    }
+
     aout_stream_t *s = vlc_object_create(aout, sizeof (*s));
     if (unlikely(s == NULL))
         return -1;
@@ -1094,11 +1113,13 @@ static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
     EnterCriticalSection(&sys->lock);
     for (;;)
     {
+        char *modlist = var_InheritString(aout, "mmdevice-backend");
         HRESULT hr;
         s->owner.device = sys->dev;
 
-        sys->module = vlc_module_load(s, "aout stream", "$mmdevice-backend",
+        sys->module = vlc_module_load(s, "aout stream", modlist,
                                       false, aout_stream_Start, s, fmt, &hr);
+        free(modlist);
 
         int ret = -1;
         if (hr == AUDCLNT_E_ALREADY_INITIALIZED)
@@ -1261,8 +1282,24 @@ static void Close(vlc_object_t *obj)
 
     vlc_join(sys->thread, NULL);
     DeleteCriticalSection(&sys->lock);
+
     free(sys);
 }
+
+#define MM_PASSTHROUGH_TEXT N_( \
+    "HDMI/SPDIF audio passthrough")
+#define MM_PASSTHROUGH_LONGTEXT N_( \
+    "Change this value if you have issue with HD codecs when using a HDMI receiver.")
+static const int pi_mmdevice_passthrough_values[] = {
+    MM_PASSTHROUGH_DISABLED,
+    MM_PASSTHROUGH_ENABLED,
+    MM_PASSTHROUGH_ENABLED_HD,
+};
+static const char *const ppsz_mmdevice_passthrough_texts[] = {
+    N_("Disabled"),
+    N_("Enabled (without HD codecs)"),
+    N_("Enabled"),
+};
 
 vlc_module_begin()
     set_shortname("MMDevice")
@@ -1274,4 +1311,8 @@ vlc_module_begin()
     add_module("mmdevice-backend", "aout stream", "any",
                N_("Output back-end"), N_("Audio output back-end interface."),
                true)
+    add_integer( "mmdevice-passthrough", MM_PASSTHROUGH_DEFAULT,
+                 MM_PASSTHROUGH_TEXT, MM_PASSTHROUGH_LONGTEXT, false )
+        change_integer_list( pi_mmdevice_passthrough_values,
+                             ppsz_mmdevice_passthrough_texts )
 vlc_module_end()

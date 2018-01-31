@@ -25,6 +25,7 @@
 #define LIBVLC_INPUT_INTERNAL_H 1
 
 #include <stddef.h>
+#include <stdatomic.h>
 
 #include <vlc_access.h>
 #include <vlc_demux.h>
@@ -33,6 +34,8 @@
 #include <libvlc.h>
 #include "input_interface.h"
 #include "misc/interrupt.h"
+
+struct input_stats;
 
 /*****************************************************************************
  *  Private input fields
@@ -43,7 +46,7 @@
 /* input_source_t: gathers all information per input source */
 typedef struct
 {
-    VLC_COMMON_MEMBERS
+    struct vlc_common_members obj;
 
     demux_t  *p_demux; /**< Demux object (most downstream) */
 
@@ -147,26 +150,7 @@ typedef struct input_thread_private_t
     input_resource_t *p_resource_private;
 
     /* Stats counters */
-    struct {
-        counter_t *p_read_packets;
-        counter_t *p_read_bytes;
-        counter_t *p_input_bitrate;
-        counter_t *p_demux_read;
-        counter_t *p_demux_bitrate;
-        counter_t *p_demux_corrupted;
-        counter_t *p_demux_discontinuity;
-        counter_t *p_decoded_audio;
-        counter_t *p_decoded_video;
-        counter_t *p_decoded_sub;
-        counter_t *p_sout_sent_packets;
-        counter_t *p_sout_sent_bytes;
-        counter_t *p_sout_send_bitrate;
-        counter_t *p_played_abuffers;
-        counter_t *p_lost_abuffers;
-        counter_t *p_displayed_pictures;
-        counter_t *p_lost_pictures;
-        vlc_mutex_t counters_lock;
-    } counters;
+    struct input_stats *stats;
 
     /* Buffer of pending actions */
     vlc_mutex_t lock_control;
@@ -280,5 +264,36 @@ void vlc_audio_replay_gain_MergeFromMeta( audio_replay_gain_t *p_dst,
 
 /* item.c */
 void input_item_node_PostAndDelete( input_item_node_t *p_node );
+
+/* stats.c */
+typedef struct input_rate_t
+{
+    vlc_mutex_t lock;
+    uintmax_t updates;
+    uintmax_t value;
+    struct
+    {
+        uintmax_t value;
+        mtime_t   date;
+    } samples[2];
+} input_rate_t;
+
+struct input_stats {
+    input_rate_t input_bitrate;
+    input_rate_t demux_bitrate;
+    atomic_uintmax_t demux_corrupted;
+    atomic_uintmax_t demux_discontinuity;
+    atomic_uintmax_t decoded_audio;
+    atomic_uintmax_t decoded_video;
+    atomic_uintmax_t played_abuffers;
+    atomic_uintmax_t lost_abuffers;
+    atomic_uintmax_t displayed_pictures;
+    atomic_uintmax_t lost_pictures;
+};
+
+struct input_stats *input_stats_Create(void);
+void input_stats_Destroy(struct input_stats *);
+void input_rate_Add(input_rate_t *, uintmax_t);
+void input_stats_Compute(struct input_stats *, input_stats_t*);
 
 #endif

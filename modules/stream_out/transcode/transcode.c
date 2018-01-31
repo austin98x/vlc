@@ -409,6 +409,9 @@ static int Open( vlc_object_t *p_this )
     }
 
     p_sys->b_soverlay = var_GetBool( p_stream, SOUT_CFG_PREFIX "soverlay" );
+    /* Set default size for TEXT spu non overlay conversion / updater */
+    p_sys->i_spu_width = (p_sys->i_width) ? p_sys->i_width : 1280;
+    p_sys->i_spu_height = (p_sys->i_height) ? p_sys->i_height : 720;
 
     psz_string = var_GetString( p_stream, SOUT_CFG_PREFIX "sfilter" );
     if( psz_string && *psz_string )
@@ -583,13 +586,15 @@ static int Send( sout_stream_t *p_stream, sout_stream_id_sys_t *id,
 {
     block_t *p_out = NULL;
 
+    if( id->b_error )
+        goto error;
+
     if( !id->b_transcode )
     {
         if( id->id )
             return sout_StreamIdSend( p_stream->p_next, id->id, p_buffer );
-
-        block_Release( p_buffer );
-        return VLC_EGENERIC;
+        else
+            goto error;
     }
 
     switch( id->p_decoder->fmt_in.i_cat )
@@ -619,12 +624,14 @@ static int Send( sout_stream_t *p_stream, sout_stream_id_sys_t *id,
         break;
 
     default:
-        p_out = NULL;
-        block_Release( p_buffer );
-        break;
+        goto error;
     }
 
     if( p_out )
         return sout_StreamIdSend( p_stream->p_next, id->id, p_out );
     return VLC_SUCCESS;
+error:
+    if( p_buffer )
+        block_Release( p_buffer );
+    return VLC_EGENERIC;
 }

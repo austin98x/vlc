@@ -220,12 +220,15 @@ struct hevc_dcr_params
     const uint8_t *p_vps[HEVC_DCR_VPS_COUNT],
                   *p_sps[HEVC_DCR_SPS_COUNT],
                   *p_pps[HEVC_DCR_VPS_COUNT],
-                  *p_sei[HEVC_DCR_SEI_COUNT];
+                  *p_seipref[HEVC_DCR_SEI_COUNT],
+                  *p_seisuff[HEVC_DCR_SEI_COUNT];
     uint8_t rgi_vps[HEVC_DCR_VPS_COUNT],
             rgi_sps[HEVC_DCR_SPS_COUNT],
             rgi_pps[HEVC_DCR_PPS_COUNT],
-            rgi_sei[HEVC_DCR_SEI_COUNT];
-    uint8_t i_vps_count, i_sps_count, i_pps_count, i_sei_count;
+            rgi_seipref[HEVC_DCR_SEI_COUNT],
+            rgi_seisuff[HEVC_DCR_SEI_COUNT];
+    uint8_t i_vps_count, i_sps_count, i_pps_count;
+    uint8_t i_seipref_count, i_seisuff_count;
     struct hevc_dcr_values *p_values;
 };
 
@@ -246,15 +249,16 @@ typedef struct
     {
         int lsb;
         int msb;
-    } prevPicOrderCnt, prevTid0PicOrderCnt;
+    } prevTid0PicOrderCnt;
 
+    bool HandleCraAsBlaFlag;
     bool first_picture; /* Must be set on start or on NAL_EOS */
 } hevc_poc_ctx_t;
 
 static inline void hevc_poc_cxt_init( hevc_poc_ctx_t *p_ctx )
 {
-    p_ctx->prevPicOrderCnt.lsb = 0;
-    p_ctx->prevPicOrderCnt.msb = 0;
+    p_ctx->prevTid0PicOrderCnt.lsb = 0;
+    p_ctx->prevTid0PicOrderCnt.msb = 0;
     p_ctx->first_picture = true;
 }
 

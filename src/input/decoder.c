@@ -30,10 +30,9 @@
 # include "config.h"
 #endif
 #include <assert.h>
+#include <stdatomic.h>
 
 #include <vlc_common.h>
-
-#include <vlc_atomic.h>
 #include <vlc_block.h>
 #include <vlc_vout.h>
 #include <vlc_aout.h>
@@ -176,11 +175,11 @@ static int LoadDecoder( decoder_t *p_dec, bool b_packetizer,
             [AUDIO_ES] = "audio decoder",
             [SPU_ES] = "spu decoder",
         };
-        p_dec->p_module = module_need( p_dec, caps[p_dec->fmt_in.i_cat],
-                                       "$codec", false );
+        p_dec->p_module = module_need_var( p_dec, caps[p_dec->fmt_in.i_cat],
+                                           "codec" );
     }
     else
-        p_dec->p_module = module_need( p_dec, "packetizer", "$packetizer", false );
+        p_dec->p_module = module_need_var( p_dec, "packetizer", "packetizer" );
 
     if( !p_dec->p_module )
     {
@@ -313,7 +312,8 @@ static int aout_update_format( decoder_t *p_dec )
 
     if( p_owner->p_aout &&
        ( !AOUT_FMTS_IDENTICAL(&p_dec->fmt_out.audio, &p_owner->fmt.audio) ||
-         p_dec->fmt_out.i_codec != p_dec->fmt_out.audio.i_format ) )
+         p_dec->fmt_out.i_codec != p_dec->fmt_out.audio.i_format ||
+         p_dec->fmt_out.i_profile != p_owner->fmt.i_profile ) )
     {
         audio_output_t *p_aout = p_owner->p_aout;
 
@@ -364,6 +364,11 @@ static int aout_update_format( decoder_t *p_dec )
         p_aout = input_resource_GetAout( p_owner->p_resource );
         if( p_aout )
         {
+            /* TODO: 3.0 HACK: we need to put i_profile inside audio_format_t
+             * for 4.0 */
+            if( p_dec->fmt_out.i_codec == VLC_CODEC_DTS )
+                var_SetBool( p_aout, "dtshd", p_dec->fmt_out.i_profile > 0 );
+
             if( aout_DecNew( p_aout, &format,
                              &p_dec->fmt_out.audio_replay_gain,
                              &request_vout ) )
@@ -851,7 +856,6 @@ static void DecoderProcessSout( decoder_t *p_dec, block_t *p_block )
         {
             vlc_mutex_lock( &p_owner->lock );
             DecoderUpdateFormatLocked( p_dec );
-            vlc_mutex_unlock( &p_owner->lock );
 
             p_owner->fmt.i_group = p_dec->fmt_in.i_group;
             p_owner->fmt.i_id = p_dec->fmt_in.i_id;
@@ -861,6 +865,7 @@ static void DecoderProcessSout( decoder_t *p_dec, block_t *p_block )
                 p_owner->fmt.psz_language =
                     strdup( p_dec->fmt_in.psz_language );
             }
+            vlc_mutex_unlock( &p_owner->lock );
 
             p_owner->p_sout_input =
                 sout_InputNew( p_owner->p_sout, &p_owner->fmt );
@@ -887,7 +892,8 @@ static void DecoderProcessSout( decoder_t *p_dec, block_t *p_block )
 
             if( DecoderPlaySout( p_dec, p_sout_block ) == VLC_EGENERIC )
             {
-                msg_Err( p_dec, "cannot continue streaming due to errors" );
+                msg_Err( p_dec, "cannot continue streaming due to errors with codec %4.4s",
+                                (char *)&p_owner->fmt.i_codec );
 
                 p_owner->error = true;
 
@@ -1093,11 +1099,17 @@ static void DecoderUpdateStatVideo( decoder_owner_sys_t *p_owner,
         lost += vout_lost;
     }
 
-    vlc_mutex_lock( &input_priv(p_input)->counters.counters_lock );
-    stats_Update( input_priv(p_input)->counters.p_decoded_video, decoded, NULL );
-    stats_Update( input_priv(p_input)->counters.p_lost_pictures, lost , NULL);
-    stats_Update( input_priv(p_input)->counters.p_displayed_pictures, displayed, NULL);
-    vlc_mutex_unlock( &input_priv(p_input)->counters.counters_lock );
+    struct input_stats *stats = input_priv(p_input)->stats;
+
+    if( stats != NULL )
+    {
+        atomic_fetch_add_explicit(&stats->decoded_video, decoded,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats->lost_pictures, lost,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats->displayed_pictures, displayed,
+                                  memory_order_relaxed);
+    }
 }
 
 static int DecoderQueueVideo( decoder_t *p_dec, picture_t *p_pic )
@@ -1213,11 +1225,17 @@ static void DecoderUpdateStatAudio( decoder_owner_sys_t *p_owner,
         lost += aout_lost;
     }
 
-    vlc_mutex_lock( &input_priv(p_input)->counters.counters_lock);
-    stats_Update( input_priv(p_input)->counters.p_lost_abuffers, lost, NULL );
-    stats_Update( input_priv(p_input)->counters.p_played_abuffers, played, NULL );
-    stats_Update( input_priv(p_input)->counters.p_decoded_audio, decoded, NULL );
-    vlc_mutex_unlock( &input_priv(p_input)->counters.counters_lock);
+    struct input_stats *stats = input_priv(p_input)->stats;
+
+    if( stats != NULL )
+    {
+        atomic_fetch_add_explicit(&stats->lost_abuffers, lost,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats->played_abuffers, played,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats->decoded_audio, decoded,
+                                  memory_order_relaxed);
+    }
 }
 
 static int DecoderQueueAudio( decoder_t *p_dec, block_t *p_aout_buf )
@@ -1279,14 +1297,6 @@ static int DecoderQueueSpu( decoder_t *p_dec, subpicture_t *p_spu )
 {
     assert( p_spu );
     decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    input_thread_t *p_input = p_owner->p_input;
-
-    if( p_input != NULL )
-    {
-        vlc_mutex_lock( &input_priv(p_input)->counters.counters_lock );
-        stats_Update( input_priv(p_input)->counters.p_decoded_sub, 1, NULL );
-        vlc_mutex_unlock( &input_priv(p_input)->counters.counters_lock );
-    }
 
     int i_ret = -1;
     vout_thread_t *p_vout = input_resource_HoldVout( p_owner->p_resource );
