@@ -2,7 +2,6 @@
  * pva.c: PVA demuxer
  *****************************************************************************
  * Copyright (C) 2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -33,6 +32,8 @@
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
 
+#include "mpeg/pes.h"
+
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
@@ -46,13 +47,14 @@ vlc_module_begin ()
     set_subcategory( SUBCAT_INPUT_DEMUX )
     set_callbacks( Open, Close )
     add_shortcut( "pva" )
+    add_file_extension("pva")
 vlc_module_end ()
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
 
-struct demux_sys_t
+typedef struct
 {
     es_out_id_t *p_video;
     es_out_id_t *p_audio;
@@ -66,7 +68,7 @@ struct demux_sys_t
     block_t     *p_es;  /* video */
 
     int64_t     b_pcr_audio;
-};
+} demux_sys_t;
 
 static int  Demux   ( demux_t *p_demux );
 static int  Control ( demux_t *p_demux, int i_query, va_list args );
@@ -153,19 +155,19 @@ static int Demux( demux_t *p_demux )
     if( vlc_stream_Peek( p_demux->s, &p_peek, 8 ) < 8 )
     {
         msg_Warn( p_demux, "eof ?" );
-        return 0;
+        return VLC_DEMUXER_EOF;
     }
     if( p_peek[0] != 'A' || p_peek[1] != 'V' || p_peek[4] != 0x55 )
     {
         msg_Warn( p_demux, "lost synchro" );
         if( ReSynch( p_demux ) )
         {
-            return -1;
+            return VLC_DEMUXER_EGENERIC;
         }
         if( vlc_stream_Peek( p_demux->s, &p_peek, 8 ) < 8 )
         {
             msg_Warn( p_demux, "eof ?" );
-            return 0;
+            return VLC_DEMUXER_EOF;
         }
     }
 
@@ -215,15 +217,14 @@ static int Demux( demux_t *p_demux )
                 if( ( p_frame = p_sys->p_es ) )
                 {
 
-                    if( p_frame->i_pts > VLC_TS_INVALID && !p_sys->b_pcr_audio )
+                    if( p_frame->i_pts != VLC_TICK_INVALID && !p_sys->b_pcr_audio )
                     {
                         es_out_SetPCR( p_demux->out, p_frame->i_pts);
                     }
 
                     p_frame = block_ChainGather( p_frame );
-                    if( unlikely(p_frame == NULL) )
-                        abort();
-                    es_out_Send( p_demux->out, p_sys->p_video, p_frame );
+                    if( likely(p_frame) )
+                        es_out_Send( p_demux->out, p_sys->p_video, p_frame );
 
                     p_sys->p_es = NULL;
                 }
@@ -234,7 +235,7 @@ static int Demux( demux_t *p_demux )
                 p_frame->p_buffer += i_skip;
                 p_frame->i_buffer -= i_skip;
                 if( i_pts >= 0 )
-                    p_frame->i_pts = VLC_TS_0 + i_pts * 100 / 9;
+                    p_frame->i_pts = FROM_SCALE(i_pts);
                 block_ChainAppend( &p_sys->p_es, p_frame );
             }
             break;
@@ -279,10 +280,10 @@ static int Demux( demux_t *p_demux )
         default:
             msg_Warn( p_demux, "unknown id=0x%x", p_peek[2] );
             if( vlc_stream_Read( p_demux->s, NULL, i_size + 8 ) < i_size + 8 )
-                return 0;
+                return VLC_DEMUXER_EOF;
             break;
     }
-    return 1;
+    return VLC_DEMUXER_SUCCESS;
 }
 
 /*****************************************************************************
@@ -320,7 +321,7 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
 
 #if 0
         case DEMUX_GET_TIME:
-            pi64 = va_arg( args, int64_t * );
+            pi64 = va_arg( args, vlc_tick_t * );
             if( p_sys->i_time < 0 )
             {
                 *pi64 = 0;
@@ -331,10 +332,10 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
 
 #if 0
         case DEMUX_GET_LENGTH:
-            pi64 = va_arg( args, int64_t * );
+            pi64 = va_arg( args, vlc_tick_t * );
             if( p_sys->i_mux_rate > 0 )
             {
-                *pi64 = (int64_t)1000000 * ( stream_Size( p_demux->s ) / 50 ) / p_sys->i_mux_rate;
+                *pi64 = vlc_tick_from_samples( stream_Size( p_demux->s ) / 50, p_sys->i_mux_rate);
                 return VLC_SUCCESS;
             }
             *pi64 = 0;
@@ -399,8 +400,8 @@ static void ParsePES( demux_t *p_demux )
     uint8_t     hdr[30];
 
     unsigned    i_skip;
-    mtime_t     i_dts = -1;
-    mtime_t     i_pts = -1;
+    stime_t     i_dts = -1;
+    stime_t     i_pts = -1;
 
     p_sys->p_pes = NULL;
 
@@ -422,25 +423,17 @@ static void ParsePES( demux_t *p_demux )
     i_skip = hdr[8] + 9;
     if( hdr[7]&0x80 )    /* has pts */
     {
-        i_pts = ((mtime_t)(hdr[ 9]&0x0e ) << 29)|
-                 (mtime_t)(hdr[10] << 22)|
-                ((mtime_t)(hdr[11]&0xfe) << 14)|
-                 (mtime_t)(hdr[12] << 7)|
-                 (mtime_t)(hdr[12] >> 1);
+        i_pts = GetPESTimestamp( &hdr[9] );
 
         if( hdr[7]&0x40 )    /* has dts */
         {
-             i_dts = ((mtime_t)(hdr[14]&0x0e ) << 29)|
-                     (mtime_t)(hdr[15] << 22)|
-                    ((mtime_t)(hdr[16]&0xfe) << 14)|
-                     (mtime_t)(hdr[17] << 7)|
-                     (mtime_t)(hdr[18] >> 1);
+             i_dts = GetPESTimestamp( &hdr[14] );
         }
     }
 
     p_pes = block_ChainGather( p_pes );
     if( unlikely(p_pes == NULL) )
-        abort();
+        return;
     if( p_pes->i_buffer <= i_skip )
     {
         block_ChainRelease( p_pes );
@@ -451,12 +444,12 @@ static void ParsePES( demux_t *p_demux )
     p_pes->p_buffer += i_skip;
 
     if( i_dts >= 0 )
-        p_pes->i_dts = VLC_TS_0 + i_dts * 100 / 9;
+        p_pes->i_dts = FROM_SCALE(i_dts);
     if( i_pts >= 0 )
-        p_pes->i_pts = VLC_TS_0 + i_pts * 100 / 9;
+        p_pes->i_pts = FROM_SCALE(i_pts);
 
     /* Set PCR */
-    if( p_pes->i_pts > 0 )
+    if( p_pes->i_pts != VLC_TICK_INVALID )
     {
         es_out_SetPCR( p_demux->out, p_pes->i_pts);
         p_sys->b_pcr_audio = true;

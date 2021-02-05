@@ -2,7 +2,6 @@
  * smf.c : Standard MIDI File (.mid) demux module for vlc
  *****************************************************************************
  * Copyright © 2007 Rémi Denis-Courmont
- * $Id$
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -91,20 +90,20 @@ static int ReadDeltaTime (stream_t *s, mtrk_t *track)
     return 0;
 }
 
-struct demux_sys_t
+typedef struct
 {
     es_out_id_t *es;
     date_t       pts; /*< Play timestamp */
     uint64_t     pulse; /*< Pulses counter */
-    mtime_t      tick; /*< Last tick timestamp */
+    vlc_tick_t   tick; /*< Last tick timestamp */
 
-    mtime_t      duration; /*< Total duration */
+    vlc_tick_t   duration; /*< Total duration */
     unsigned     ppqn;   /*< Pulses Per Quarter Note */
     /* by the way, "quarter note" is "noire" in French */
 
     unsigned     trackc; /*< Number of tracks */
     mtrk_t       trackv[]; /*< Track states */
-};
+} demux_sys_t;
 
 /**
  * Non-MIDI Meta events handler
@@ -234,10 +233,8 @@ int HandleMeta (demux_t *p_demux, mtrk_t *tr)
             break;
 
         case 0x59: /* Key signature */
-            if (length == 2)
-                ;
-            else
-                ret = -1;
+            if (length != 2)
+                msg_Warn(p_demux, "invalid key signature");
             break;
 
         case 0x7f: /* Proprietary event */
@@ -261,7 +258,7 @@ int HandleMessage (demux_t *p_demux, mtrk_t *tr, es_out_t *out)
     demux_sys_t *sys = p_demux->p_sys;
     block_t *block;
     uint8_t first, event;
-    unsigned datalen;
+    int datalen;
 
     if (vlc_stream_Seek (s, tr->start + tr->offset)
      || (vlc_stream_Read (s, &first, 1) != 1))
@@ -375,9 +372,9 @@ static int SeekSet0 (demux_t *demux)
 
     /* Default SMF tempo is 120BPM, i.e. half a second per quarter note */
     date_Init (&sys->pts, sys->ppqn * 2, 1);
-    date_Set (&sys->pts, VLC_TS_0);
+    date_Set (&sys->pts, VLC_TICK_0);
     sys->pulse = 0;
-    sys->tick = VLC_TS_0;
+    sys->tick = VLC_TICK_0;
 
     for (unsigned i = 0; i < sys->trackc; i++)
     {
@@ -431,7 +428,7 @@ static int ReadEvents (demux_t *demux, uint64_t *restrict pulse,
     return 0;
 }
 
-#define TICK (CLOCK_FREQ / 100)
+#define TICK VLC_TICK_FROM_MS(10)
 
 /*****************************************************************************
  * Demux: read chunks and send them to the synthesizer
@@ -456,23 +453,23 @@ static int Demux (demux_t *demux)
         es_out_SetPCR (demux->out, sys->tick);
 
         sys->tick += TICK;
-        return 1;
+        return VLC_DEMUXER_SUCCESS;
     }
 
     /* MIDI events in chronological order across all tracks */
     uint64_t pulse = sys->pulse;
 
     if (ReadEvents (demux, &pulse, demux->out))
-        return VLC_EGENERIC;
+        return VLC_DEMUXER_EGENERIC;
 
     if (pulse == UINT64_MAX)
-        return 0; /* all tracks are done */
+        return VLC_DEMUXER_EOF; /* all tracks are done */
 
     sys->pulse = pulse;
-    return 1;
+    return VLC_DEMUXER_SUCCESS;
 }
 
-static int Seek (demux_t *demux, mtime_t pts)
+static int Seek (demux_t *demux, vlc_tick_t pts)
 {
     demux_sys_t *sys = demux->p_sys;
 
@@ -492,7 +489,7 @@ static int Seek (demux_t *demux, mtime_t pts)
     }
 
     sys->pulse = pulse;
-    sys->tick = ((date_Get (&sys->pts) - VLC_TS_0) / TICK) * TICK + VLC_TS_0;
+    sys->tick = ((date_Get (&sys->pts) - VLC_TICK_0) / TICK) * TICK + VLC_TICK_0;
     return VLC_SUCCESS;
 }
 
@@ -511,19 +508,19 @@ static int Control (demux_t *demux, int i_query, va_list args)
         case DEMUX_GET_POSITION:
             if (!sys->duration)
                 return VLC_EGENERIC;
-            *va_arg (args, double *) = (sys->tick - (double)VLC_TS_0)
+            *va_arg (args, double *) = (sys->tick - (double)VLC_TICK_0)
                                      / sys->duration;
             break;
         case DEMUX_SET_POSITION:
             return Seek (demux, va_arg (args, double) * sys->duration);
         case DEMUX_GET_LENGTH:
-            *va_arg (args, int64_t *) = sys->duration;
+            *va_arg (args, vlc_tick_t *) = sys->duration;
             break;
         case DEMUX_GET_TIME:
-            *va_arg (args, int64_t *) = sys->tick - VLC_TS_0;
+            *va_arg (args, vlc_tick_t *) = sys->tick - VLC_TICK_0;
             break;
         case DEMUX_SET_TIME:
-            return Seek (demux, va_arg (args, int64_t));
+            return Seek (demux, va_arg (args, vlc_tick_t));
 
         case DEMUX_CAN_PAUSE:
         case DEMUX_SET_PAUSE_STATE:
@@ -709,6 +706,7 @@ static int Open (vlc_object_t *obj)
     es_format_Init (&fmt, AUDIO_ES, VLC_CODEC_MIDI);
     fmt.audio.i_channels = 2;
     fmt.audio.i_rate = 44100; /* dummy value */
+    fmt.i_id = 0;
     sys->es = es_out_Add (demux->out, &fmt);
 
     demux->pf_demux = Demux;
@@ -737,4 +735,7 @@ vlc_module_begin ()
     set_subcategory (SUBCAT_INPUT_DEMUX)
     set_capability ("demux", 20)
     set_callbacks (Open, Close)
+    add_file_extension("kar")
+    add_file_extension("mid")
+    add_file_extension("rmi")
 vlc_module_end ()

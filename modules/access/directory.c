@@ -2,7 +2,6 @@
  * directory.c: expands a directory (directory: access_browser plug-in)
  *****************************************************************************
  * Copyright (C) 2002-2015 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Derk-Jan Hartman <hartman at videolan dot org>
  *          Rémi Denis-Courmont
@@ -42,11 +41,28 @@
 #include <vlc_fs.h>
 #include <vlc_url.h>
 
-struct access_sys_t
+typedef struct
 {
     char *base_uri;
+    bool need_separator;
     DIR *dir;
-};
+} access_sys_t;
+
+static int DirRead (stream_t *access, input_item_node_t *node);
+
+static int DirControl( stream_t *p_access, int i_query, va_list args )
+{
+    switch ( i_query )
+    {
+        case STREAM_GET_TYPE:
+        {
+            *va_arg( args, int* ) = ITEM_TYPE_DIRECTORY;
+            return VLC_SUCCESS;
+        }
+        default:
+            return access_vaDirectoryControlHelper( p_access, i_query, args );
+    }
+}
 
 /*****************************************************************************
  * DirInit: Init the directory access with a directory stream
@@ -68,11 +84,17 @@ int DirInit (stream_t *access, DIR *dir)
     if (unlikely(sys->base_uri == NULL))
         goto error;
 
+    char last_char = sys->base_uri[strlen(sys->base_uri) - 1];
+    sys->need_separator =
+#ifdef _WIN32
+            last_char != '\\' &&
+#endif
+            last_char != '/';
     sys->dir = dir;
 
     access->p_sys = sys;
     access->pf_readdir = DirRead;
-    access->pf_control = access_vaDirectoryControlHelper;
+    access->pf_control = DirControl;
     return VLC_SUCCESS;
 
 error:
@@ -109,7 +131,7 @@ void DirClose(vlc_object_t *obj)
     closedir(sys->dir);
 }
 
-int DirRead (stream_t *access, input_item_node_t *node)
+static int DirRead (stream_t *access, input_item_node_t *node)
 {
     access_sys_t *sys = access->p_sys;
     const char *entry;
@@ -125,23 +147,25 @@ int DirRead (stream_t *access, input_item_node_t *node)
         struct stat st;
         int type;
 
-#ifdef HAVE_OPENAT
+#ifdef HAVE_FSTATAT
         if (fstatat(dirfd(sys->dir), entry, &st, 0))
             continue;
 #else
-        char path[PATH_MAX];
+        char *path;
 
-        if (snprintf(path, PATH_MAX, "%s"DIR_SEP"%s", access->psz_filepath,
-                     entry) >= PATH_MAX || vlc_stat(path, &st))
+        if (asprintf(&path, "%s"DIR_SEP"%s", access->psz_filepath, entry) == -1
+         || (type = vlc_stat(path, &st), free(path), type))
             continue;
 #endif
         switch (st.st_mode & S_IFMT)
         {
+#ifdef S_IFBLK
             case S_IFBLK:
                 if (!special_files)
                     continue;
                 type = ITEM_TYPE_DISC;
                 break;
+#endif
             case S_IFCHR:
                 if (!special_files)
                     continue;
@@ -173,7 +197,9 @@ int DirRead (stream_t *access, input_item_node_t *node)
         }
 
         char *uri;
-        if (unlikely(asprintf(&uri, "%s/%s", sys->base_uri, encoded) == -1))
+        if (unlikely(asprintf(&uri, "%s%s%s", sys->base_uri,
+                              sys->need_separator ? "/" : "",
+                              encoded) == -1))
             uri = NULL;
         free(encoded);
         if (unlikely(uri == NULL))

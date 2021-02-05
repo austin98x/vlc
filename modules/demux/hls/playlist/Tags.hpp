@@ -96,7 +96,9 @@ namespace hls
                     EXTXKEY = 20,
                     EXTXMAP,
                     EXTXMEDIA,
+                    EXTXSTART,
                     EXTXSTREAMINF,
+                    EXTXSESSIONKEY,
                 };
                 AttributesTag(int, const std::string &);
                 virtual ~AttributesTag();
@@ -119,7 +121,7 @@ namespace hls
                 virtual ~ValuesListTag();
 
             protected:
-                virtual void parseAttributes(const std::string &);
+                virtual void parseAttributes(const std::string &) override;
         };
 
         class TagFactory

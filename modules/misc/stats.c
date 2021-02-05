@@ -55,18 +55,18 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     if( p_block->i_buffer == kBufferSize )
     {
         msg_Dbg( p_dec, "got %"PRIu64" ms",
-                 *(mtime_t *)p_block->p_buffer  / 1000 );
+                 MS_FROM_VLC_TICK(*(vlc_tick_t *)p_block->p_buffer) );
         msg_Dbg( p_dec, "got %"PRIu64" ms offset",
-                 (mdate() - *(mtime_t *)p_block->p_buffer) / 1000 );
-        *(mtime_t *)(p_pic->p->p_pixels) = *(mtime_t *)p_block->p_buffer;
+                 MS_FROM_VLC_TICK(vlc_tick_now() - *(vlc_tick_t *)p_block->p_buffer) );
+        *(vlc_tick_t *)(p_pic->p->p_pixels) = *(vlc_tick_t *)p_block->p_buffer;
     }
     else
     {
         msg_Dbg( p_dec, "got a packet not from stats demuxer" );
-        *(mtime_t *)(p_pic->p->p_pixels) = mdate();
+        *(vlc_tick_t *)(p_pic->p->p_pixels) = vlc_tick_now();
     }
 
-    p_pic->date = p_block->i_pts > VLC_TS_INVALID ?
+    p_pic->date = p_block->i_pts != VLC_TICK_INVALID ?
             p_block->i_pts : p_block->i_dts;
     p_pic->b_force = true;
 
@@ -102,13 +102,13 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
     (void)p_pict;
     block_t * p_block = block_Alloc( kBufferSize );
 
-    *(mtime_t*)p_block->p_buffer = mdate();
+    *(vlc_tick_t*)p_block->p_buffer = vlc_tick_now();
     p_block->i_buffer = kBufferSize;
     p_block->i_length = kBufferSize;
     p_block->i_dts = p_pict->date;
 
     msg_Dbg( p_enc, "putting %"PRIu64"ms",
-             *(mtime_t*)p_block->p_buffer / 1000 );
+             MS_FROM_VLC_TICK(*(vlc_tick_t*)p_block->p_buffer) );
     return p_block;
 }
 
@@ -133,13 +133,13 @@ static int OpenEncoder ( vlc_object_t *p_this )
 #endif
 
 /*** Demuxer ***/
-struct demux_sys_t
+typedef struct
 {
     es_format_t     fmt;
     es_out_id_t     *p_es;
 
     date_t          pts;
-};
+} demux_sys_t;
 
 static int Demux( demux_t *p_demux )
 {
@@ -149,11 +149,10 @@ static int Demux( demux_t *p_demux )
 
     if( !p_block ) return 1;
 
-    p_block->i_dts = p_block->i_pts =
-        date_Increment( &p_sys->pts, kBufferSize );
+    p_block->i_dts = p_block->i_pts = date_Increment( &p_sys->pts, kBufferSize );
 
     msg_Dbg( p_demux, "demux got %"PRId64" ms offset",
-             (mdate() - *(mtime_t *)p_block->p_buffer) / 1000 );
+             MS_FROM_VLC_TICK(vlc_tick_now() - *(vlc_tick_t *)p_block->p_buffer) );
 
     //es_out_SetPCR( p_demux->out, p_block->i_pts );
 
@@ -190,7 +189,7 @@ static int OpenDemux ( vlc_object_t *p_this )
         return VLC_ENOMEM;
 
     date_Init( &p_sys->pts, 1, 1 );
-    date_Set( &p_sys->pts, 1 );
+    date_Set( &p_sys->pts, VLC_TICK_0 );
 
     es_format_Init( &p_sys->fmt, VIDEO_ES, VLC_FOURCC('s','t','a','t') );
     p_sys->fmt.video.i_width = 720;
@@ -216,26 +215,26 @@ vlc_module_begin ()
     set_description( N_("Stats encoder function") )
     set_capability( "encoder", 0 )
     add_shortcut( "stats" )
-    set_callbacks( OpenEncoder, NULL )
+    set_callback( OpenEncoder )
     add_submodule ()
 #endif
         set_section( N_( "Stats decoder" ), NULL )
         set_description( N_("Stats decoder function") )
         set_capability( "video decoder", 0 )
         add_shortcut( "stats" )
-        set_callbacks( OpenDecoder, NULL )
+        set_callback( OpenDecoder )
     add_submodule()
         set_section( N_( "Stats decoder" ), NULL )
         set_description( N_("Stats decoder function") )
         set_capability( "audio decoder", 0 )
         add_shortcut( "stats" )
-        set_callbacks( OpenDecoder, NULL )
+        set_callback( OpenDecoder )
     add_submodule()
         set_section( N_( "Stats decoder" ), NULL )
         set_description( N_("Stats decoder function") )
         set_capability( "spu decoder", 0 )
         add_shortcut( "stats" )
-        set_callbacks( OpenDecoder, NULL )
+        set_callback( OpenDecoder )
     add_submodule ()
         set_section( N_( "Stats demux" ), NULL )
         set_description( N_("Stats demux function") )

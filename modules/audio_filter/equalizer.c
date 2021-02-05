@@ -2,7 +2,6 @@
  * equalizer.c:
  *****************************************************************************
  * Copyright (C) 2004-2012 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -53,7 +52,7 @@
  * Module descriptor
  *****************************************************************************/
 static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
+static void Close( filter_t * );
 
 #define PRESET_TEXT N_( "Equalizer preset" )
 #define PRESET_LONGTEXT N_("Preset to use for the equalizer." )
@@ -94,14 +93,14 @@ vlc_module_begin ()
               VLC_BANDS_LONGTEXT, true )
     add_float( "equalizer-preamp", 12.0f, PREAMP_TEXT,
                PREAMP_LONGTEXT, true )
-    set_callbacks( Open, Close )
+    set_callback( Open )
     add_shortcut( "equalizer" )
 vlc_module_end ()
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     /* Filter static config */
     int i_band;
@@ -123,7 +122,7 @@ struct filter_sys_t
     float y2[32][128][2];
 
     vlc_mutex_t lock;
-};
+} filter_sys_t;
 
 static block_t *DoWork( filter_t *, block_t * );
 
@@ -158,7 +157,6 @@ static int Open( vlc_object_t *p_this )
     vlc_mutex_init( &p_sys->lock );
     if( EqzInit( p_filter, p_filter->fmt_in.audio.i_rate ) != VLC_SUCCESS )
     {
-        vlc_mutex_destroy( &p_sys->lock );
         free( p_sys );
         return VLC_EGENERIC;
     }
@@ -166,7 +164,11 @@ static int Open( vlc_object_t *p_this )
     p_filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
     aout_FormatPrepare(&p_filter->fmt_in.audio);
     p_filter->fmt_out.audio = p_filter->fmt_in.audio;
-    p_filter->pf_audio_filter = DoWork;
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = DoWork, .close = Close,
+    };
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 }
@@ -174,13 +176,11 @@ static int Open( vlc_object_t *p_this )
 /*****************************************************************************
  * Close: close the plugin
  *****************************************************************************/
-static void Close( vlc_object_t *p_this )
+static void Close( filter_t *p_filter )
 {
-    filter_t     *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     EqzClean( p_filter );
-    vlc_mutex_destroy( &p_sys->lock );
     free( p_sys );
 }
 
@@ -283,7 +283,7 @@ static int EqzInit( filter_t *p_filter, int i_rate )
     eqz_config_t cfg;
     int i, ch;
     vlc_value_t val1, val2, val3;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
     int i_ret = VLC_ENOMEM;
 
     bool b_vlcFreqs = var_InheritBool( p_aout, "equalizer-vlcfreqs" );
@@ -452,7 +452,7 @@ static void EqzFilter( filter_t *p_filter, float *out, float *in,
 static void EqzClean( filter_t *p_filter )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
 
     var_DelCallback( p_aout, "equalizer-bands", BandsCallback, p_sys );
     var_DelCallback( p_aout, "equalizer-preset", PresetCallback, p_sys );
@@ -574,4 +574,3 @@ static int TwoPassCallback( vlc_object_t *p_this, char const *psz_cmd,
     vlc_mutex_unlock( &p_sys->lock );
     return VLC_SUCCESS;
 }
-

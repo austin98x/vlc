@@ -2,7 +2,6 @@
  * mux.c: muxer using libavformat
  *****************************************************************************
  * Copyright (C) 2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *
@@ -32,6 +31,7 @@
 #include <vlc_common.h>
 #include <vlc_block.h>
 #include <vlc_sout.h>
+#include <vlc_es.h>
 
 #include <libavformat/avformat.h>
 
@@ -44,13 +44,13 @@
 //#define AVFORMAT_DEBUG 1
 
 static const char *const ppsz_mux_options[] = {
-    "mux", "options", NULL
+    "mux", "options", "reset-ts", NULL
 };
 
 /*****************************************************************************
  * mux_sys_t: mux descriptor
  *****************************************************************************/
-struct sout_mux_sys_t
+typedef struct
 {
     AVIOContext     *io;
     int             io_buffer_size;
@@ -64,7 +64,7 @@ struct sout_mux_sys_t
 #if LIBAVFORMAT_VERSION_CHECK( 57, 7, 0, 40, 100 )
     bool     b_header_done;
 #endif
-};
+} sout_mux_sys_t;
 
 /*****************************************************************************
  * Local prototypes
@@ -90,9 +90,12 @@ int avformat_OpenMux( vlc_object_t *p_this )
     sout_mux_t *p_mux = (sout_mux_t*)p_this;
     bool dummy = !strcmp( p_mux->p_access->psz_access, "dummy");
 
+#if ( (LIBAVFORMAT_VERSION_MICRO >= 100) \
+      && (LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58, 7, 100)) )
     if( dummy && strlen(p_mux->p_access->psz_path)
                               >= sizeof (((AVFormatContext *)NULL)->filename) )
         return VLC_EGENERIC;
+#endif
 
     msg_Dbg( p_mux, "using %s %s", AVPROVIDER(LIBAVFORMAT), LIBAVFORMAT_IDENT );
 
@@ -127,7 +130,12 @@ int avformat_OpenMux( vlc_object_t *p_this )
     p_sys->oc->oformat = file_oformat;
     /* If we use dummy access, let avformat write output */
     if( dummy )
+#if ( (LIBAVFORMAT_VERSION_MICRO >= 100) \
+      && (LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(58, 7, 100)) )
+        p_sys->oc->url = av_strdup(p_mux->p_access->psz_path);
+#else
         strcpy( p_sys->oc->filename, p_mux->p_access->psz_path );
+#endif
 
     /* Create I/O wrapper */
     p_sys->io_buffer_size = 10 * 1024 * 1024;  /* FIXME */
@@ -150,6 +158,8 @@ int avformat_OpenMux( vlc_object_t *p_this )
     p_sys->io->write_data_type = IOWriteTyped;
     p_sys->b_header_done = false;
 #endif
+    if( var_GetBool( p_mux, "sout-avformat-reset-ts" ) )
+        p_sys->oc->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
 
     /* Fill p_mux fields */
     p_mux->pf_control   = Control;
@@ -200,7 +210,7 @@ static int AddStream( sout_mux_t *p_mux, sout_input_t *p_input )
     }
 
     unsigned opus_size[XIPH_MAX_HEADER_COUNT];
-    void     *opus_packet[XIPH_MAX_HEADER_COUNT];
+    const void *opus_packet[XIPH_MAX_HEADER_COUNT];
     if( fmt->i_codec == VLC_CODEC_OPUS )
     {
         unsigned count;
@@ -218,10 +228,16 @@ static int AddStream( sout_mux_t *p_mux, sout_input_t *p_input )
         i_codec_id = AV_CODEC_ID_MP3;
     }
 
-    if( fmt->i_cat != VIDEO_ES && fmt->i_cat != AUDIO_ES)
+    /* Whitelist allowed ES categories */
+    switch( fmt->i_cat )
     {
-        msg_Warn( p_mux, "Unhandled ES category" );
-        return VLC_EGENERIC;
+        case VIDEO_ES:
+        case AUDIO_ES:
+        case SPU_ES:
+            break;
+        default:
+            msg_Warn( p_mux, "Unhandled ES category" );
+            return VLC_EGENERIC;
     }
 
     /* */
@@ -261,6 +277,18 @@ static int AddStream( sout_mux_t *p_mux, sout_input_t *p_input )
         }
         break;
 
+    case SPU_ES:
+        codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        /* psz_description and psz_language are expected to be compliant with
+         * the muxing format. It should be the case when muxing a compliant
+         * source to the same muxing format, but we have no general guarantee
+         * at this point in the code. */
+        if (fmt->psz_description != NULL && *fmt->psz_description != '\0')
+            av_dict_set( &stream->metadata, "title", fmt->psz_description, 0 );
+        if (fmt->psz_language != NULL && *fmt->psz_language != '\0')
+            av_dict_set( &stream->metadata, "language", fmt->psz_language, 0 );
+        break;
+
     case VIDEO_ES:
         if( !fmt->video.i_frame_rate || !fmt->video.i_frame_rate_base ) {
             msg_Warn( p_mux, "Missing frame rate, assuming 25fps" );
@@ -285,6 +313,16 @@ static int AddStream( sout_mux_t *p_mux, sout_input_t *p_input )
         stream->sample_aspect_ratio.num = codecpar->sample_aspect_ratio.num;
         stream->time_base.den = i_frame_rate;
         stream->time_base.num = i_frame_rate_base;
+        if(i_codec_id == AV_CODEC_ID_RAWVIDEO)
+        {
+            video_format_t vfmt;
+            video_format_Copy(&vfmt, &fmt->video);
+            video_format_FixRgb(&vfmt);
+            if(GetFfmpegChroma(&codecpar->format, &vfmt))
+                msg_Warn(p_mux, "can't match format RAW video %4.4s",
+                         (const char *)&vfmt.i_chroma);
+            video_format_Clean(&vfmt);
+        }
         if (fmt->i_bitrate == 0) {
             msg_Warn( p_mux, "Missing video bitrate, assuming 512k" );
             i_bitrate = 512000;
@@ -360,16 +398,20 @@ static int MuxBlock( sout_mux_t *p_mux, sout_input_t *p_input )
         pkt.flags |= AV_PKT_FLAG_KEY;
     }
 
-    if( p_data->i_pts > 0 )
-        pkt.pts = p_data->i_pts * p_stream->time_base.den /
-            CLOCK_FREQ / p_stream->time_base.num;
-    if( p_data->i_dts > 0 )
-        pkt.dts = p_data->i_dts * p_stream->time_base.den /
-            CLOCK_FREQ / p_stream->time_base.num;
+    if( p_data->i_pts >= VLC_TICK_0 )
+        pkt.pts = av_rescale_q( p_data->i_pts - VLC_TICK_0,
+                                VLC_TIME_BASE_Q, p_stream->time_base );
+    if( p_data->i_dts >= VLC_TICK_0 )
+        pkt.dts = av_rescale_q( p_data->i_dts - VLC_TICK_0,
+                                VLC_TIME_BASE_Q, p_stream->time_base );
 
     /* this is another hack to prevent libavformat from triggering the "non monotone timestamps" check in avformat/utils.c */
-    p_stream->cur_dts = ( p_data->i_dts * p_stream->time_base.den /
-            CLOCK_FREQ / p_stream->time_base.num ) - 1;
+    if( p_stream->cur_dts >= pkt.dts )
+    {
+        msg_Warn( p_mux, "Non monotonic stream %d(%4.4s) %"PRId64" >= %"PRId64,
+                  p_input->fmt.i_id, (const char *) &p_input->fmt.i_codec, p_stream->cur_dts, pkt.dts );
+        p_stream->cur_dts = pkt.dts - 1;
+    }
 
     if( av_write_frame( p_sys->oc, &pkt ) < 0 )
     {
@@ -379,6 +421,8 @@ static int MuxBlock( sout_mux_t *p_mux, sout_input_t *p_input )
         block_Release( p_data );
         return VLC_EGENERIC;
     }
+
+    p_stream->cur_dts = pkt.dts;
 
     block_Release( p_data );
     return VLC_SUCCESS;
@@ -440,7 +484,7 @@ static int Mux( sout_mux_t *p_mux )
 
     for( ;; )
     {
-        mtime_t i_dts;
+        vlc_tick_t i_dts;
 
         int i_stream = sout_MuxGetStream( p_mux, 1, &i_dts );
         if( i_stream < 0 )
@@ -466,15 +510,11 @@ static int Control( sout_mux_t *p_mux, int i_query, va_list args )
         *pb_bool = false;
         return VLC_SUCCESS;
 
-    case MUX_GET_ADD_STREAM_WAIT:
-        pb_bool = va_arg( args, bool * );
-        *pb_bool = true;
-        return VLC_SUCCESS;
-
     case MUX_GET_MIME:
     {
         char **ppsz = va_arg( args, char ** );
-        *ppsz = strdup( p_mux->p_sys->oc->oformat->mime_type );
+        sout_mux_sys_t *p_sys = p_mux->p_sys;
+        *ppsz = strdup( p_sys->oc->oformat->mime_type );
         return VLC_SUCCESS;
     }
 

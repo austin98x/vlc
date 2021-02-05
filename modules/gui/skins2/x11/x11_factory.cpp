@@ -2,7 +2,6 @@
  * x11_factory.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -86,12 +85,12 @@ bool X11Factory::init()
                                      ConnectionNumber( pDisplay ) );
 
     // Initialize the resource path
-    char *datadir = config_GetUserDir( VLC_DATA_DIR );
+    char *datadir = config_GetUserDir( VLC_USERDATA_DIR );
     m_resourcePath.push_back( (std::string)datadir + "/skins2" );
     free( datadir );
     m_resourcePath.push_back( (std::string)"share/skins2" );
-    datadir = config_GetDataDir();
-    m_resourcePath.push_back( (std::string)datadir + "/skins2" );
+    datadir = config_GetSysPath(VLC_PKG_DATA_DIR, "skins2");
+    m_resourcePath.push_back( (std::string)datadir );
     free( datadir );
 
     // Determine the monitor geometry
@@ -204,10 +203,11 @@ int X11Factory::getScreenHeight() const
 }
 
 
-void X11Factory::getMonitorInfo( const GenericWindow &rWindow,
+void X11Factory::getMonitorInfo( OSWindow *pWindow,
                                  int* p_x, int* p_y,
                                  int* p_width, int* p_height ) const
 {
+    X11Window *pWin = (X11Window*)pWindow;
     // initialize to default geometry
     *p_x = 0;
     *p_y = 0;
@@ -217,7 +217,7 @@ void X11Factory::getMonitorInfo( const GenericWindow &rWindow,
     // Use Xinerama to determine the monitor where the video
     // mostly resides (biggest surface)
     Display *pDisplay = m_pDisplay->getDisplay();
-    Window wnd = (Window)rWindow.getOSHandle();
+    Window wnd = pWin->getDrawable();
     Window root = DefaultRootWindow( pDisplay );
     Window child_wnd;
 
@@ -343,15 +343,18 @@ SkinsRect X11Factory::getWorkArea() const
                                 &ret, &i_format, &i_items, &i_bytesafter,
                                 (unsigned char **)&values ) == Success )
         {
-            x = values[0];
-            y = values[1];
-            w = values[2];
-            h = values[3];
-            XFree( values );
+            if( values )
+            {
+                x = values[0];
+                y = values[1];
+                w = values[2];
+                h = values[3];
+                XFree( values );
+            }
         }
     }
     msg_Dbg( getIntf(),"WorkArea: %ix%i at +%i+%i", w, h, x, y );
-    return SkinsRect( x, y, w, h );
+    return SkinsRect( x, y, x + w, y + h );
 }
 
 

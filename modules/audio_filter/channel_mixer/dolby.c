@@ -2,23 +2,22 @@
  * dolby.c : simple decoder for dolby surround encoded streams
  *****************************************************************************
  * Copyright (C) 2005-2009 the VideoLAN team
- * $Id$
  *
  * Authors: Boris Dorès <babal@via.ecp.fr>
  *
  * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
+ * under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation; either version 2.1 of the License, or
+ * (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along with
- * this program; if not, write to the Free Software Foundation, Inc., 51
- * Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
 
 /*****************************************************************************
@@ -29,7 +28,6 @@
 # include "config.h"
 #endif
 
-#define VLC_MODULE_LICENSE VLC_LICENSE_GPL_2_PLUS
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_aout.h>
@@ -39,7 +37,6 @@
  * Local prototypes
  *****************************************************************************/
 static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
 
 static block_t *DoWork( filter_t *, block_t * );
 
@@ -52,13 +49,13 @@ vlc_module_begin ()
     set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACODEC )
     set_capability( "audio converter", 5 )
-    set_callbacks( Create, Destroy )
+    set_callback( Create )
 vlc_module_end ()
 
 /*****************************************************************************
  * Internal data structures
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     int i_left;
     int i_center;
@@ -66,7 +63,7 @@ struct filter_sys_t
     int i_rear_left;
     int i_rear_center;
     int i_rear_right;
-};
+} filter_sys_t;
 
 /*****************************************************************************
  * Create: allocate headphone downmixer
@@ -100,8 +97,8 @@ static int Create( vlc_object_t *p_this )
     }
 
     /* Allocate the memory needed to store the module's structure */
-    p_sys = p_filter->p_sys = malloc( sizeof(*p_sys) );
-    if( p_sys == NULL )
+    p_sys = p_filter->p_sys = vlc_obj_malloc( VLC_OBJECT(p_filter), sizeof(*p_sys) );
+    if( unlikely(p_sys == NULL) )
         return VLC_ENOMEM;
     p_sys->i_left = -1;
     p_sys->i_center = -1;
@@ -140,18 +137,13 @@ static int Create( vlc_object_t *p_this )
         ++i;
     }
 
-    p_filter->pf_audio_filter = DoWork;
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = DoWork,
+    };
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
-}
-
-/*****************************************************************************
- * Destroy: deallocate resources associated with headphone downmixer
- *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
-{
-    filter_t * p_filter = (filter_t *)p_this;
-    free( p_filter->p_sys );
 }
 
 /*****************************************************************************

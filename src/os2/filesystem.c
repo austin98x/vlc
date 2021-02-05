@@ -5,7 +5,7 @@
  * Copyright © 2005-2008 Rémi Denis-Courmont
  * Copyright (C) 2012 KO Myung-Hun
  *
- * Authors: Rémi Denis-Courmont <rem # videolan.org>
+ * Authors: Rémi Denis-Courmont
  *          KO Myung-Hun <komh@chollian.net>
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -38,7 +38,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
+#endif
 #include <signal.h>
 
 #include <vlc_common.h>
@@ -261,6 +263,15 @@ int vlc_dup (int oldfd)
     return newfd;
 }
 
+int vlc_dup2 (int oldfd, int newfd)
+{
+    int fd = dup2 (oldfd, newfd);
+    if (fd != -1)
+        setmode (fd, O_BINARY);
+
+    return fd;
+}
+
 int vlc_pipe (int fds[2])
 {
     if (vlc_socketpair (AF_LOCAL, SOCK_STREAM, 0, fds, false))
@@ -347,4 +358,20 @@ int vlc_accept (int lfd, struct sockaddr *addr, socklen_t *alen, bool nonblock)
     while (errno == EINTR);
 
     return -1;
+}
+
+ssize_t vlc_send(int fd, const void *buf, size_t len, int flags)
+{
+    return send(fd, buf, len, flags);
+}
+
+ssize_t vlc_sendto(int fd, const void *buf, size_t len, int flags,
+                   const struct sockaddr *dst, socklen_t dstlen)
+{
+    return sendto(fd, buf, len, flags, dst, dstlen);
+}
+
+ssize_t vlc_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    return sendmsg(fd, msg, flags);
 }

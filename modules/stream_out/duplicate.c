@@ -2,7 +2,6 @@
  * duplicate.c: duplicate stream output module
  *****************************************************************************
  * Copyright (C) 2003-2004 the VideoLAN team
- * $Id$
  *
  * Author: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -42,41 +41,73 @@ static void     Close   ( vlc_object_t * );
 
 vlc_module_begin ()
     set_description( N_("Duplicate stream output") )
-    set_capability( "sout stream", 50 )
+    set_capability( "sout output", 50 )
     add_shortcut( "duplicate", "dup" )
     set_category( CAT_SOUT )
     set_subcategory( SUBCAT_SOUT_STREAM )
     set_callbacks( Open, Close )
+    add_submodule()
+    set_capability("sout filter", 0)
+    add_shortcut("duplicate", "dup")
+    set_callbacks(Open, Close)
 vlc_module_end ()
 
 
 /*****************************************************************************
  * Exported prototypes
  *****************************************************************************/
-static sout_stream_id_sys_t *Add( sout_stream_t *, const es_format_t * );
-static void              Del ( sout_stream_t *, sout_stream_id_sys_t * );
-static int               Send( sout_stream_t *, sout_stream_id_sys_t *,
-                               block_t* );
+static void *Add( sout_stream_t *, const es_format_t * );
+static void  Del( sout_stream_t *, void * );
+static int   Send( sout_stream_t *, void *, block_t * );
 
-struct sout_stream_sys_t
+typedef struct
 {
     int             i_nb_streams;
     sout_stream_t   **pp_streams;
 
-    int             i_nb_last_streams;
-    sout_stream_t   **pp_last_streams;
-
     int             i_nb_select;
     char            **ppsz_select;
-};
+} sout_stream_sys_t;
 
-struct sout_stream_id_sys_t
+typedef struct
 {
     int                 i_nb_ids;
     void                **pp_ids;
-};
+} sout_stream_id_sys_t;
 
-static bool ESSelected( const es_format_t *fmt, char *psz_select );
+static bool ESSelected( struct vlc_logger *, const es_format_t *fmt,
+                        char *psz_select );
+
+/*****************************************************************************
+ * Control
+ *****************************************************************************/
+static int Control( sout_stream_t *p_stream, int i_query, va_list args )
+{
+    sout_stream_sys_t *p_sys = p_stream->p_sys;
+
+    /* Fanout controls */
+    switch( i_query )
+    {
+        case SOUT_STREAM_ID_SPU_HIGHLIGHT:
+        {
+            sout_stream_id_sys_t *id = va_arg(args, void *);
+            void *spu_hl = va_arg(args, void *);
+            for( int i = 0; i < id->i_nb_ids; i++ )
+            {
+                if( id->pp_ids[i] )
+                    sout_StreamControl( p_sys->pp_streams[i], i_query,
+                                        id->pp_ids[i], spu_hl );
+            }
+            return VLC_SUCCESS;
+        }
+    }
+
+    return VLC_EGENERIC;
+}
+
+static const struct sout_stream_operations ops = {
+    Add, Del, Send, Control, NULL,
+};
 
 /*****************************************************************************
  * Open:
@@ -94,43 +125,42 @@ static int Open( vlc_object_t *p_this )
         return VLC_ENOMEM;
 
     TAB_INIT( p_sys->i_nb_streams, p_sys->pp_streams );
-    TAB_INIT( p_sys->i_nb_last_streams, p_sys->pp_last_streams );
     TAB_INIT( p_sys->i_nb_select, p_sys->ppsz_select );
+
+    char **ppsz_select = NULL;
 
     for( p_cfg = p_stream->p_cfg; p_cfg != NULL; p_cfg = p_cfg->p_next )
     {
         if( !strncmp( p_cfg->psz_name, "dst", strlen( "dst" ) ) )
         {
-            sout_stream_t *s, *p_last;
+            sout_stream_t *s;
 
             msg_Dbg( p_stream, " * adding `%s'", p_cfg->psz_value );
-            s = sout_StreamChainNew( p_stream->p_sout, p_cfg->psz_value,
-                p_stream->p_next, &p_last );
+            s = sout_StreamChainNew( VLC_OBJECT(p_stream), p_cfg->psz_value,
+                p_stream->p_next );
 
             if( s )
             {
                 TAB_APPEND( p_sys->i_nb_streams, p_sys->pp_streams, s );
-                TAB_APPEND( p_sys->i_nb_last_streams, p_sys->pp_last_streams,
-                    p_last );
                 TAB_APPEND( p_sys->i_nb_select,  p_sys->ppsz_select, NULL );
+                ppsz_select = &p_sys->ppsz_select[p_sys->i_nb_select - 1];
             }
         }
         else if( !strncmp( p_cfg->psz_name, "select", strlen( "select" ) ) )
         {
             char *psz = p_cfg->psz_value;
-            if( p_sys->i_nb_select > 0 && psz && *psz )
-            {
-                char **ppsz_select = &p_sys->ppsz_select[p_sys->i_nb_select - 1];
 
-                if( *ppsz_select )
+            if( psz && *psz )
+            {
+                if( ppsz_select == NULL )
                 {
-                    msg_Err( p_stream, " * ignore selection `%s' (it already has `%s')",
-                             psz, *ppsz_select );
+                    msg_Err( p_stream, " * ignore selection `%s'", psz );
                 }
                 else
                 {
                     msg_Dbg( p_stream, " * apply selection `%s'", psz );
                     *ppsz_select = strdup( psz );
+                    ppsz_select = NULL;
                 }
             }
         }
@@ -148,12 +178,8 @@ static int Open( vlc_object_t *p_this )
         return VLC_EGENERIC;
     }
 
-    p_stream->pf_add    = Add;
-    p_stream->pf_del    = Del;
-    p_stream->pf_send   = Send;
-
-    p_stream->p_sys     = p_sys;
-
+    p_stream->p_sys = p_sys;
+    p_stream->ops = &ops;
     return VLC_SUCCESS;
 }
 
@@ -168,11 +194,10 @@ static void Close( vlc_object_t * p_this )
     msg_Dbg( p_stream, "closing a duplication" );
     for( int i = 0; i < p_sys->i_nb_streams; i++ )
     {
-        sout_StreamChainDelete(p_sys->pp_streams[i], p_sys->pp_last_streams[i]);
+        sout_StreamChainDelete(p_sys->pp_streams[i], p_stream->p_next);
         free( p_sys->ppsz_select[i] );
     }
     free( p_sys->pp_streams );
-    free( p_sys->pp_last_streams );
     free( p_sys->ppsz_select );
 
     free( p_sys );
@@ -181,7 +206,7 @@ static void Close( vlc_object_t * p_this )
 /*****************************************************************************
  * Add:
  *****************************************************************************/
-static sout_stream_id_sys_t * Add( sout_stream_t *p_stream, const es_format_t *p_fmt )
+static void *Add( sout_stream_t *p_stream, const es_format_t *p_fmt )
 {
     sout_stream_sys_t *p_sys = p_stream->p_sys;
     sout_stream_id_sys_t  *id;
@@ -200,7 +225,8 @@ static sout_stream_id_sys_t * Add( sout_stream_t *p_stream, const es_format_t *p
     {
         void *id_new = NULL;
 
-        if( ESSelected( p_fmt, p_sys->ppsz_select[i_stream] ) )
+        if( ESSelected( p_stream->obj.logger, p_fmt,
+                        p_sys->ppsz_select[i_stream] ) )
         {
             sout_stream_t *out = p_sys->pp_streams[i_stream];
 
@@ -237,9 +263,10 @@ static sout_stream_id_sys_t * Add( sout_stream_t *p_stream, const es_format_t *p
 /*****************************************************************************
  * Del:
  *****************************************************************************/
-static void Del( sout_stream_t *p_stream, sout_stream_id_sys_t *id )
+static void Del( sout_stream_t *p_stream, void *_id )
 {
     sout_stream_sys_t *p_sys = p_stream->p_sys;
+    sout_stream_id_sys_t *id = (sout_stream_id_sys_t *)_id;
     int               i_stream;
 
     for( i_stream = 0; i_stream < p_sys->i_nb_streams; i_stream++ )
@@ -258,10 +285,10 @@ static void Del( sout_stream_t *p_stream, sout_stream_id_sys_t *id )
 /*****************************************************************************
  * Send:
  *****************************************************************************/
-static int Send( sout_stream_t *p_stream, sout_stream_id_sys_t *id,
-                 block_t *p_buffer )
+static int Send( sout_stream_t *p_stream, void *_id, block_t *p_buffer )
 {
     sout_stream_sys_t *p_sys = p_stream->p_sys;
+    sout_stream_id_sys_t *id = (sout_stream_id_sys_t *)_id;
     sout_stream_t     *p_dup_stream;
     int               i_stream;
 
@@ -315,7 +342,8 @@ static bool NumInRange( const char *psz_range, int i_num )
         || (beginRange > endRange && (i_num <= beginRange && i_num >= endRange));
 }
 
-static bool ESSelected( const es_format_t *fmt, char *psz_select )
+static bool ESSelected( struct vlc_logger *logger, const es_format_t *fmt,
+                        char *psz_select )
 {
     char  *psz_dup;
     char  *psz;
@@ -446,7 +474,7 @@ static bool ESSelected( const es_format_t *fmt, char *psz_select )
         }
         else
         {
-            fprintf( stderr, "unknown args (%s)\n", psz );
+            vlc_error( logger, "unknown args (%s)", psz );
         }
         /* Next */
         psz = p;

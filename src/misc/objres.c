@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <string.h>
 
 #include <vlc_common.h>
 
@@ -141,29 +142,32 @@ void *vlc_obj_malloc(vlc_object_t *obj, size_t size)
     return ptr;
 }
 
-static void *vlc_obj_alloc_common(vlc_object_t *obj, size_t nmemb, size_t size,
-                                  bool do_memset)
+void *vlc_obj_calloc(vlc_object_t *obj, size_t nmemb, size_t size)
 {
     size_t tabsize;
-    if (mul_overflow(nmemb, size, &tabsize))
+    if (unlikely(mul_overflow(nmemb, size, &tabsize)))
     {
         errno = ENOMEM;
         return NULL;
     }
 
-    void *ptr = vlc_objres_new(tabsize, dummy_release);
+    void *ptr = vlc_obj_malloc(obj, tabsize);
     if (likely(ptr != NULL))
-    {
-        if (do_memset)
-            memset(ptr, 0, tabsize);
-        vlc_objres_push(obj, ptr);
-    }
+        memset(ptr, 0, tabsize);
     return ptr;
 }
 
-void *vlc_obj_calloc(vlc_object_t *obj, size_t nmemb, size_t size)
+static void *vlc_obj_memdup(vlc_object_t *obj, const void *base, size_t len)
 {
-    return vlc_obj_alloc_common(obj, nmemb, size, true);
+    void *ptr = vlc_obj_malloc(obj, len);
+    if (likely(ptr != NULL))
+        memcpy(ptr, base, len);
+    return ptr;
+}
+
+char *vlc_obj_strdup(vlc_object_t *obj, const char *str)
+{
+    return vlc_obj_memdup(obj, str, strlen(str) + 1);
 }
 
 void vlc_obj_free(vlc_object_t *obj, void *ptr)

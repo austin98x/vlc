@@ -2,7 +2,6 @@
  * mosaic.c : Mosaic video plugin for vlc
  *****************************************************************************
  * Copyright (C) 2004-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan dot org>
  *          Christophe Massiot <massiot@via.ecp.fr>
@@ -40,14 +39,14 @@
 
 #include "mosaic.h"
 
-#define BLANK_DELAY INT64_C(1000000)
+#define BLANK_DELAY  VLC_TICK_FROM_SEC(1)
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  CreateFilter    ( vlc_object_t * );
-static void DestroyFilter   ( vlc_object_t * );
-static subpicture_t *Filter ( filter_t *, mtime_t );
+static int  CreateFilter    ( filter_t * );
+static void DestroyFilter   ( filter_t * );
+static subpicture_t *Filter ( filter_t *, vlc_tick_t );
 
 static int MosaicCallback   ( vlc_object_t *, char const *, vlc_value_t,
                               vlc_value_t, void * );
@@ -55,7 +54,7 @@ static int MosaicCallback   ( vlc_object_t *, char const *, vlc_value_t,
 /*****************************************************************************
  * filter_sys_t : filter descriptor
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     vlc_mutex_t lock;         /* Internal filter lock */
 
@@ -78,8 +77,8 @@ struct filter_sys_t
     int *pi_y_offsets;        /* List of substreams y offsets */
     int i_offsets_length;
 
-    mtime_t i_delay;
-};
+    vlc_tick_t i_delay;
+} filter_sys_t;
 
 /*****************************************************************************
  * Module descriptor
@@ -177,8 +176,7 @@ vlc_module_begin ()
     set_shortname( N_("Mosaic") )
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_SUBPIC)
-    set_capability( "sub source", 0 )
-    set_callbacks( CreateFilter, DestroyFilter )
+    set_callback_sub_source( CreateFilter, 0 )
 
     add_integer_with_range( CFG_PREFIX "alpha", 255, 0, 255,
                             ALPHA_TEXT, ALPHA_LONGTEXT, false )
@@ -272,12 +270,15 @@ static void mosaic_ParseSetOffsets( vlc_object_t *p_this,
 #define mosaic_ParseSetOffsets( a, b, c ) \
             mosaic_ParseSetOffsets( VLC_OBJECT( a ), b, c )
 
+static const struct vlc_filter_operations filter_ops = {
+    .source_sub = Filter, .close = DestroyFilter,
+};
+
 /*****************************************************************************
  * CreateFiler: allocate mosaic video filter
  *****************************************************************************/
-static int CreateFilter( vlc_object_t *p_this )
+static int CreateFilter( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
     char *psz_order, *_psz_order;
     char *psz_offsets;
@@ -289,7 +290,7 @@ static int CreateFilter( vlc_object_t *p_this )
     if( p_sys == NULL )
         return VLC_ENOMEM;
 
-    p_filter->pf_sub_source = Filter;
+    p_filter->ops = &filter_ops;
 
     vlc_mutex_init( &p_sys->lock );
     vlc_mutex_lock( &p_sys->lock );
@@ -317,9 +318,10 @@ static int CreateFilter( vlc_object_t *p_this )
     GET_VAR( cols, 1, INT_MAX );
     GET_VAR( alpha, 0, 255 );
     GET_VAR( position, 0, 2 );
-    GET_VAR( delay, 100, INT_MAX );
 #undef GET_VAR
-    p_sys->i_delay *= 1000;
+    i_command = var_CreateGetIntegerCommand( p_filter, CFG_PREFIX "delay" );
+    p_sys->i_delay = VLC_TICK_FROM_MS(VLC_CLIP( i_command, 0, INT_MAX ));
+    var_AddCallback( p_filter, CFG_PREFIX "delay", MosaicCallback, p_sys );
 
     p_sys->b_ar = var_CreateGetBoolCommand( p_filter,
                                             CFG_PREFIX "keep-aspect-ratio" );
@@ -375,9 +377,8 @@ static int CreateFilter( vlc_object_t *p_this )
 /*****************************************************************************
  * DestroyFilter: destroy mosaic video filter
  *****************************************************************************/
-static void DestroyFilter( vlc_object_t *p_this )
+static void DestroyFilter( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t*)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
 #define DEL_CB( name ) \
@@ -421,14 +422,13 @@ static void DestroyFilter( vlc_object_t *p_this )
         p_sys->i_offsets_length = 0;
     }
 
-    vlc_mutex_destroy( &p_sys->lock );
     free( p_sys );
 }
 
 /*****************************************************************************
  * Filter
  *****************************************************************************/
-static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
+static subpicture_t *Filter( filter_t *p_filter, vlc_tick_t date )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
     bridge_t *p_bridge;
@@ -530,34 +530,39 @@ static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
         if ( p_es->b_empty )
             continue;
 
-        while ( p_es->p_picture != NULL
-                 && p_es->p_picture->date + p_sys->i_delay < date )
+        while ( !vlc_picture_chain_IsEmpty( &p_es->pictures ) )
         {
-            if ( p_es->p_picture->p_next != NULL )
+            picture_t *front = vlc_picture_chain_PeekFront( &p_es->pictures );
+            if ( front->date + p_sys->i_delay >= date )
+                break; // front picture not late
+
+            if ( vlc_picture_chain_HasNext( &p_es->pictures ) )
             {
-                picture_t *p_next = p_es->p_picture->p_next;
-                picture_Release( p_es->p_picture );
-                p_es->p_picture = p_next;
+                // front picture is late and has more pictures chained, skip it
+                front = vlc_picture_chain_PopFront( &p_es->pictures );
+                picture_Release( front );
+                continue;
             }
-            else if ( p_es->p_picture->date + p_sys->i_delay + BLANK_DELAY <
-                        date )
+
+            if ( front->date + p_sys->i_delay + BLANK_DELAY < date )
             {
-                /* Display blank */
-                picture_Release( p_es->p_picture );
-                p_es->p_picture = NULL;
-                p_es->pp_last = &p_es->p_picture;
+                // front picture is late and too old, don't display it
+                front = vlc_picture_chain_PopFront( &p_es->pictures );
+                // the picture chain is empty as the front didn't have chained pics
+                picture_Release( front );
                 break;
             }
             else
             {
+                // front picture is a little late, display it
                 msg_Dbg( p_filter, "too late picture for %s (%"PRId64 ")",
                          p_es->psz_id,
-                         date - p_es->p_picture->date - p_sys->i_delay );
+                         date - front->date - p_sys->i_delay );
                 break;
             }
         }
 
-        if ( p_es->p_picture == NULL )
+        if ( vlc_picture_chain_IsEmpty( &p_es->pictures ) )
             continue;
 
         if ( p_sys->i_order_length == 0 )
@@ -585,12 +590,13 @@ static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
         video_format_Init( &fmt_in, 0 );
         video_format_Init( &fmt_out, 0 );
 
+        p_converted = vlc_picture_chain_PeekFront( &p_es->pictures );
         if ( !p_sys->b_keep )
         {
             /* Convert the images */
-            fmt_in.i_chroma = p_es->p_picture->format.i_chroma;
-            fmt_in.i_height = p_es->p_picture->format.i_height;
-            fmt_in.i_width = p_es->p_picture->format.i_width;
+            fmt_in.i_chroma = p_converted->format.i_chroma;
+            fmt_in.i_height = p_converted->format.i_height;
+            fmt_in.i_width = p_converted->format.i_width;
 
             if( fmt_in.i_chroma == VLC_CODEC_YUVA ||
                 fmt_in.i_chroma == VLC_CODEC_RGBA )
@@ -618,7 +624,7 @@ static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
             fmt_out.i_visible_width = fmt_out.i_width;
             fmt_out.i_visible_height = fmt_out.i_height;
 
-            p_converted = image_Convert( p_sys->p_image, p_es->p_picture,
+            p_converted = image_Convert( p_sys->p_image, p_converted,
                                          &fmt_in, &fmt_out );
             if( !p_converted )
             {
@@ -631,7 +637,6 @@ static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
         }
         else
         {
-            p_converted = p_es->p_picture;
             fmt_in.i_width = fmt_out.i_width = p_converted->format.i_width;
             fmt_in.i_height = fmt_out.i_height = p_converted->format.i_height;
             fmt_in.i_chroma = fmt_out.i_chroma = p_converted->format.i_chroma;

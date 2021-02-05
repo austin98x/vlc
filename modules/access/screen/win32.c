@@ -2,7 +2,6 @@
  * win32.c: Screen capture module.
  *****************************************************************************
  * Copyright (C) 2004-2011 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *
@@ -135,6 +134,8 @@ int screen_InitCapture( demux_t *p_demux )
     p_sys->fmt.video.i_bits_per_pixel = i_bits_per_pixel;
     p_sys->fmt.video.i_sar_num = p_sys->fmt.video.i_sar_den = 1;
     p_sys->fmt.video.i_chroma         = i_chroma;
+    p_sys->fmt.video.transfer         = TRANSFER_FUNC_SRGB;
+    p_sys->fmt.video.color_range      = COLOR_RANGE_FULL;
 
     switch( i_chroma )
     {
@@ -193,6 +194,11 @@ static void CaptureBlockRelease( block_t *p_block )
     free( p_block );
 }
 
+static const struct vlc_block_callbacks CaptureBlockCallbacks =
+{
+    CaptureBlockRelease,
+};
+
 static block_t *CaptureBlockNew( demux_t *p_demux )
 {
     demux_sys_t *p_sys = p_demux->p_sys;
@@ -224,7 +230,7 @@ static block_t *CaptureBlockNew( demux_t *p_demux )
                                             (int)p_sys->fmt.video.i_height :
                                             p_data->i_fragment_size;
         p_sys->f_fps *= (p_sys->fmt.video.i_height/p_data->i_fragment_size);
-        p_sys->i_incr = 1000000 / p_sys->f_fps;
+        p_sys->i_incr = vlc_tick_rate_duration( p_sys->f_fps );
         p_data->i_fragment = 0;
         p_data->p_block = 0;
     }
@@ -252,15 +258,14 @@ static block_t *CaptureBlockNew( demux_t *p_demux )
     }
 
     /* Build block */
-    if( !(p_block = malloc( sizeof( block_t ) + sizeof( struct block_sys_t ) )) )
+    if( !(p_block = malloc( sizeof( struct block_sys_t ) )) )
         goto error;
 
     /* Fill all fields */
     int i_stride =
         ( ( ( ( p_sys->fmt.video.i_width * p_sys->fmt.video.i_bits_per_pixel ) + 31 ) & ~31 ) >> 3 );
     i_buffer = i_stride * p_sys->fmt.video.i_height;
-    block_Init( &p_block->self, p_buffer, i_buffer );
-    p_block->self.pf_release = CaptureBlockRelease;
+    block_Init( &p_block->self, &CaptureBlockCallbacks, p_buffer, i_buffer );
     p_block->hbmp            = hbmp;
 
     return &p_block->self;

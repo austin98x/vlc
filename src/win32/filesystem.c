@@ -4,7 +4,7 @@
  * Copyright (C) 2005-2006 VLC authors and VideoLAN
  * Copyright © 2005-2008 Rémi Denis-Courmont
  *
- * Authors: Rémi Denis-Courmont <rem # videolan.org>
+ * Authors: Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -63,11 +63,6 @@ static wchar_t *widen_path (const char *path)
     }
     return wpath;
 }
-
-#define CONVERT_PATH(path, wpath, err) \
-    wchar_t *wpath = wide_path(path); \
-    if (wpath == NULL) return (err)
-
 
 int vlc_open (const char *filename, int flags, ...)
 {
@@ -309,6 +304,14 @@ int vlc_dup (int oldfd)
     return fd;
 }
 
+int vlc_dup2(int oldfd, int newfd)
+{
+    int fd = dup2(oldfd, newfd);
+    if (fd != -1)
+        setmode(fd, O_BINARY);
+    return fd;
+}
+
 int vlc_pipe (int fds[2])
 {
 #if VLC_WINSTORE_APP
@@ -326,6 +329,7 @@ ssize_t vlc_write(int fd, const void *buf, size_t len)
 
 ssize_t vlc_writev(int fd, const struct iovec *iov, int count)
 {
+    (void) fd; (void) iov; (void) count;
     vlc_assert_unreachable();
 }
 
@@ -357,42 +361,26 @@ int vlc_accept (int lfd, struct sockaddr *addr, socklen_t *alen, bool nonblock)
     return fd;
 }
 
-#if !VLC_WINSTORE_APP
-FILE *vlc_win32_tmpfile(void)
+ssize_t vlc_send(int fd, const void *buf, size_t len, int flags)
 {
-    TCHAR tmp_path[MAX_PATH-14];
-    int i_ret = GetTempPath (MAX_PATH-14, tmp_path);
-    if (i_ret == 0)
-        return NULL;
+    WSABUF wsabuf = { .buf = (char *)buf, .len = len };
+    DWORD sent;
 
-    TCHAR tmp_name[MAX_PATH];
-    i_ret = GetTempFileName(tmp_path, TEXT("VLC"), 0, tmp_name);
-    if (i_ret == 0)
-        return NULL;
-
-    HANDLE hFile = CreateFile(tmp_name,
-            GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-    if (hFile == INVALID_HANDLE_VALUE)
-        return NULL;
-
-    int fd = _open_osfhandle((intptr_t)hFile, 0);
-    if (fd == -1) {
-        CloseHandle(hFile);
-        return NULL;
-    }
-
-    FILE *stream = _fdopen(fd, "w+b");
-    if (stream == NULL) {
-        _close(fd);
-        return NULL;
-    }
-    return stream;
+    return WSASend(fd, &wsabuf, 1, &sent, flags,
+                   NULL, NULL) ? -1 : (ssize_t)sent;
 }
-#else
-FILE *vlc_win32_tmpfile(void)
+
+ssize_t vlc_sendto(int fd, const void *buf, size_t len, int flags,
+                   const struct sockaddr *dst, socklen_t dstlen)
 {
-    return NULL;
-}
-#endif
+    WSABUF wsabuf = { .buf = (char *)buf, .len = len };
+    DWORD sent;
 
+    return WSASendTo(fd, &wsabuf, 1, &sent, flags, dst, dstlen,
+                     NULL, NULL) ? -1 : (ssize_t)sent;
+}
+
+ssize_t vlc_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    return sendmsg(fd, msg, flags);
+}

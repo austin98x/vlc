@@ -3,10 +3,9 @@
  *****************************************************************************
  * Copyright (C) 2001-2006 VLC authors and VideoLAN
  * Copyright © 2006 Rémi Denis-Courmont
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr> - original code
- *          Rémi Denis-Courmont <rem # videolan.org> - EPSV support
+ *          Rémi Denis-Courmont - EPSV support
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -39,6 +38,7 @@
 #include <vlc_access.h>
 #include <vlc_dialog.h>
 #include <vlc_input_item.h>
+#include <vlc_memstream.h>
 #include <vlc_network.h>
 #include <vlc_url.h>
 #include <vlc_tls.h>
@@ -86,7 +86,7 @@ vlc_module_begin ()
     set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACCESS )
     add_string( "ftp-user", NULL, USER_TEXT, USER_LONGTEXT, false )
-    add_string( "ftp-pwd", NULL, PASS_TEXT, PASS_LONGTEXT, false )
+    add_password( "ftp-pwd", NULL, PASS_TEXT, PASS_LONGTEXT )
     add_string( "ftp-account", "anonymous", ACCOUNT_TEXT,
                 ACCOUNT_LONGTEXT, false )
     add_shortcut( "ftp", "ftps", "ftpes" )
@@ -107,6 +107,9 @@ vlc_module_end ()
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
+
+typedef struct access_sys_t access_sys_t;
+
 static ssize_t Read( stream_t *, void *, size_t );
 static int Seek( stream_t *, uint64_t );
 static int Control( stream_t *, int, va_list );
@@ -139,7 +142,7 @@ struct access_sys_t
     vlc_url_t  url;
 
     ftp_features_t   features;
-    vlc_tls_creds_t *p_creds;
+    vlc_tls_client_t *p_creds;
     enum tls_mode_e  tlsmode;
     vlc_tls_t *cmd;
     vlc_tls_t *data;
@@ -152,6 +155,7 @@ struct access_sys_t
 #define GET_OUT_SYS( p_this ) \
     ((access_sys_t *)(((sout_access_out_t *)(p_this))->p_sys))
 
+VLC_FORMAT(3, 4)
 static int ftp_SendCommand( vlc_object_t *obj, access_sys_t *sys,
                             const char *fmt, ... )
 {
@@ -356,7 +360,7 @@ static void clearCmd( access_sys_t *p_sys )
     }
 }
 
-static int Login( vlc_object_t *p_access, access_sys_t *p_sys )
+static int Login( vlc_object_t *p_access, access_sys_t *p_sys, const char *path )
 {
     int i_answer;
 
@@ -443,7 +447,7 @@ static int Login( vlc_object_t *p_access, access_sys_t *p_sys )
 
     vlc_url_t url;
     vlc_credential credential;
-    if( vlc_UrlParseFixup( &url, ((stream_t *)p_access)->psz_url ) != 0 )
+    if( vlc_UrlParseFixup( &url, path ) != 0 )
     {
         vlc_UrlClean( &url );
         goto error;
@@ -456,19 +460,15 @@ static int Login( vlc_object_t *p_access, access_sys_t *p_sys )
                         NULL, NULL );
     do
     {
-        if( credential.psz_username != NULL )
-        {
-            if( LoginUserPwd( p_access, p_sys, credential.psz_username,
-                              credential.psz_password, &b_logged ) != 0
-             || b_logged )
-                break;
-        }
-        else
-        {
-            /* No crendential specified: show the dialog with a "anonymous"
-             * user pre-filled */
-            credential.psz_username = "anonymous";
-        }
+        const char *psz_username = credential.psz_username;
+
+        if( psz_username == NULL ) /* use anonymous by default */
+            psz_username = "anonymous";
+
+        if( LoginUserPwd( p_access, p_sys, psz_username,
+                          credential.psz_password, &b_logged ) != 0
+         || b_logged )
+            break;
     }
     while( vlc_credential_get( &credential, p_access, "ftp-user", "ftp-pwd",
                                LOGIN_DIALOG_TITLE, LOGIN_DIALOG_TEXT,
@@ -576,18 +576,9 @@ static void FeaturesCheck( void *opaque, const char *feature )
         features->b_mlst = true;
 }
 
-static const char *IsASCII( const char *str )
+static int Connect( vlc_object_t *p_access, access_sys_t *p_sys, const char *path )
 {
-    int8_t c;
-    for( const char *p = str; (c = *p) != '\0'; p++ )
-        if( c < 0 )
-            return NULL;
-    return str;
-}
-
-static int Connect( vlc_object_t *p_access, access_sys_t *p_sys )
-{
-    if( Login( p_access, p_sys ) < 0 )
+    if( Login( p_access, p_sys, path ) < 0 )
         return -1;
 
     /* Extended passive mode */
@@ -613,7 +604,7 @@ static int Connect( vlc_object_t *p_access, access_sys_t *p_sys )
         msg_Info( p_access, "FTP Extended passive mode disabled" );
         clearCmd( p_sys );
 
-        if( Login( p_access, p_sys ) )
+        if( Login( p_access, p_sys, path ) )
             goto error;
     }
 
@@ -710,7 +701,7 @@ static int InOpen( vlc_object_t *p_this )
     if( parseURL( &p_sys->url, p_access->psz_url, p_sys->tlsmode ) )
         goto exit_error;
 
-    if( Connect( p_this, p_sys ) )
+    if( Connect( p_this, p_sys, p_access->psz_url ) )
         goto exit_error;
 
     do {
@@ -772,7 +763,7 @@ error:
 
 exit_error:
     vlc_UrlClean( &p_sys->url );
-    vlc_tls_Delete( p_sys->p_creds );
+    vlc_tls_ClientDelete( p_sys->p_creds );
     return VLC_EGENERIC;
 }
 
@@ -801,7 +792,7 @@ static int OutOpen( vlc_object_t *p_this )
         goto exit_error;
     }
 
-    if( Connect( p_this, p_sys ) )
+    if( Connect( p_this, p_sys, p_access->psz_path ) )
         goto exit_error;
 
     /* Start the 'stream' */
@@ -820,7 +811,7 @@ static int OutOpen( vlc_object_t *p_this )
 
 exit_error:
     vlc_UrlClean( &p_sys->url );
-    vlc_tls_Delete( p_sys->p_creds );
+    vlc_tls_ClientDelete( p_sys->p_creds );
     return VLC_EGENERIC;
 }
 #endif
@@ -846,7 +837,7 @@ static void Close( vlc_object_t *p_access, access_sys_t *p_sys )
 
     /* free memory */
     vlc_UrlClean( &p_sys->url );
-    vlc_tls_Delete( p_sys->p_creds );
+    vlc_tls_ClientDelete( p_sys->p_creds );
 }
 
 static void InClose( vlc_object_t *p_this )
@@ -904,7 +895,8 @@ static ssize_t Read( stream_t *p_access, void *p_buffer, size_t i_len )
 {
     access_sys_t *p_sys = p_access->p_sys;
 
-    assert( p_sys->data != NULL );
+    if( p_sys->data == NULL )
+        return 0;
     assert( !p_sys->out );
 
     ssize_t i_read = vlc_tls_Read( p_sys->data, p_buffer, i_len, false );
@@ -964,22 +956,52 @@ static int DirRead (stream_t *p_access, input_item_node_t *p_current_node)
         else
             psz_file = psz_line;
 
-        char *psz_uri;
-        char *psz_filename = vlc_uri_encode( psz_file );
-        if( psz_filename != NULL &&
-            asprintf( &psz_uri, "%s://%s:%d%s%s/%s",
-                      ( p_sys->tlsmode == NONE ) ? "ftp" :
-                      ( ( p_sys->tlsmode == IMPLICIT ) ? "ftps" : "ftpes" ),
-                      p_sys->url.psz_host, p_sys->url.i_port,
-                      p_sys->url.psz_path ? "/" : "",
-                      p_sys->url.psz_path ? p_sys->url.psz_path : "",
-                      psz_filename ) != -1 )
+        /* Exclude this and parent directory */
+        if (strcmp(psz_file, ".") == 0 || strcmp(psz_file, "..") == 0)
         {
-            i_ret = vlc_readdir_helper_additem( &rdh, psz_uri, NULL, psz_file,
-                                                type, ITEM_NET );
-            free( psz_uri );
+            free(psz_line);
+            continue;
         }
-        free( psz_filename );
+
+        char *psz_filename = vlc_uri_encode( psz_file );
+
+        if (unlikely(psz_filename == NULL))
+            continue;
+
+        struct vlc_memstream ms;
+
+        vlc_memstream_open(&ms);
+        vlc_memstream_puts(&ms, "ftp");
+        if (p_sys->tlsmode != NONE)
+        {
+            if (p_sys->tlsmode != IMPLICIT)
+                vlc_memstream_putc(&ms, 'e');
+            vlc_memstream_putc(&ms, 's');
+        }
+        vlc_memstream_puts(&ms, "://");
+
+        if (strchr(p_sys->url.psz_host, ':') != NULL)
+            vlc_memstream_printf(&ms, "[%s]", p_sys->url.psz_host);
+        else
+            vlc_memstream_puts(&ms, p_sys->url.psz_host);
+
+        if (p_sys->url.i_port != ((p_sys->tlsmode != IMPLICIT) ? IPPORT_FTP
+                                                               : IPPORT_FTPS))
+            vlc_memstream_printf(&ms, ":%d", p_sys->url.i_port);
+
+        if (p_sys->url.psz_path != NULL)
+            vlc_memstream_printf(&ms, "/%s", p_sys->url.psz_path);
+        vlc_memstream_puts(&ms, psz_filename);
+        free(psz_filename);
+
+        if (likely(vlc_memstream_close(&ms) == 0))
+        {
+            msg_Err(p_access, "%s -> %s", p_sys->url.psz_path, ms.ptr);
+
+            i_ret = vlc_readdir_helper_additem( &rdh, ms.ptr, NULL, psz_file,
+                                                type, ITEM_NET );
+            free(ms.ptr);
+        }
         free( psz_line );
     }
 
@@ -1020,7 +1042,6 @@ static int Control( stream_t *p_access, int i_query, va_list args )
 {
     access_sys_t *sys = p_access->p_sys;
     bool    *pb_bool;
-    int64_t *pi_64;
 
     switch( i_query )
     {
@@ -1047,9 +1068,8 @@ static int Control( stream_t *p_access, int i_query, va_list args )
             break;
 
         case STREAM_GET_PTS_DELAY:
-            pi_64 = va_arg( args, int64_t * );
-            *pi_64 = INT64_C(1000)
-                   * var_InheritInteger( p_access, "network-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS(var_InheritInteger( p_access, "network-caching" ));
             break;
 
         case STREAM_SET_PAUSE_STATE:
@@ -1157,7 +1177,7 @@ static int ftp_StartStream( vlc_object_t *p_access, access_sys_t *p_sys,
         }
         else
         if( ftp_SendCommand( p_access, p_sys, "NLST" ) < 0 ||
-            ftp_RecvCommandInit( p_access, p_sys ) == 1 )
+            ftp_RecvCommandInit( p_access, p_sys ) != 1 )
         {
             msg_Err( p_access, "cannot list directory contents" );
             return VLC_EGENERIC;

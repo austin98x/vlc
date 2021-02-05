@@ -50,11 +50,11 @@ static void Close( vlc_object_t * );
 vlc_module_begin()
     set_shortname( N_("DC1394") )
     set_description( N_("IIDC Digital Camera (FireWire) input") )
-    set_capability( "access_demux", 10 )
+    set_capability( "access", 0 )
     set_callbacks( Open, Close )
 vlc_module_end()
 
-struct demux_sys_t
+typedef struct
 {
     /* camera info */
     dc1394_t            *p_dccontext;
@@ -77,7 +77,7 @@ struct demux_sys_t
     unsigned int        focus;
     es_out_id_t         *p_es_video;
     dc1394video_frame_t *frame;
-};
+} demux_sys_t;
 
 /*****************************************************************************
  * Local prototypes
@@ -165,6 +165,9 @@ static int Open( vlc_object_t *p_this )
     demux_sys_t  *p_sys;
     es_format_t   fmt;
     dc1394error_t res;
+
+    if (p_demux->out == NULL)
+        return VLC_EGENERIC;
 
     /* Set up p_demux */
     p_demux->pf_demux = Demux;
@@ -449,7 +452,7 @@ static block_t *GrabVideo( demux_t *p_demux )
     memcpy( p_block->p_buffer, (const char *)p_sys->frame->image,
             p_sys->width * p_sys->height * 2 );
 
-    p_block->i_pts = p_block->i_dts = mdate();
+    p_block->i_pts = p_block->i_dts = vlc_tick_now();
     dc1394_capture_enqueue( p_sys->camera, p_sys->frame );
     return p_block;
 }
@@ -467,7 +470,7 @@ static int Demux( demux_t *p_demux )
         /* Sleep so we do not consume all the cpu, 10ms seems
          * like a good value (100fps)
          */
-        msleep( 10000 );
+        vlc_tick_sleep( VLC_HARD_MIN_SLEEP );
         return 1;
     }
 
@@ -495,11 +498,11 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
-            *va_arg( args, int64_t * ) = (int64_t)DEFAULT_PTS_DELAY;
+            *va_arg( args, vlc_tick_t * ) = DEFAULT_PTS_DELAY;
             return VLC_SUCCESS;
 
         case DEMUX_GET_TIME:
-            *va_arg( args, int64_t * ) = mdate();
+            *va_arg( args, vlc_tick_t * ) = vlc_tick_now();
             return VLC_SUCCESS;
 
         /* TODO implement others */

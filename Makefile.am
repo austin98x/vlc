@@ -10,6 +10,8 @@ SUBDIRS = compat doc po share src modules lib bin test
 DIST_SUBDIRS = m4 $(SUBDIRS)
 
 EXTRA_DIST = \
+	extras/include/x86/x86inc.asm \
+	extras/include/x86/x86util.asm \
 	extras/package/macosx/package.mak \
 	extras/package/win32/package.mak \
 	extras/package/npapi.am
@@ -61,10 +63,14 @@ EXTRA_DIST += \
 	extras/tools/packages.mak \
 	extras/tools/tools.mak \
 	extras/tools/SHA512SUMS \
+	extras/tools/automake-clang.patch \
 	extras/tools/bison-macOS-7df04f9.patch \
 	extras/tools/bison-macOS-c41f233c.patch \
-	extras/tools/libtool-2.4.2-bitcode.patch \
-	extras/tools/libtool-2.4.2-san.patch \
+	extras/tools/cmake-enable-ALPN-support-on-macOS-10.14.patch \
+	extras/tools/libtool-2.4.6-bitcode.patch \
+	extras/tools/libtool-2.4.6-clang-libs.patch \
+	extras/tools/libtool-2.4.6-response-files.patch \
+	extras/tools/libtool-2.4.6-san.patch \
 	extras/tools/ragel-6.8-javacodegen.patch
 
 ###############################################################################
@@ -120,7 +126,9 @@ doc:
 ###############################################################################
 
 ALL_ALIASES = cvlc rvlc svlc qvlc nvlc
+if BUILD_VLC
 bin_SCRIPTS = $(ALIASES)
+endif
 CLEANFILES += $(ALIASES) $(noinst_SCRIPTS)
 EXTRA_SCRIPTS = $(ALL_ALIASES)
 
@@ -165,15 +173,15 @@ install-exec-hook:
 	if test "$(build)" = "$(host)"; then \
 		PATH="$(DESTDIR)$(bindir):$$PATH" \
 		LD_LIBRARY_PATH="$(DESTDIR)$(libdir):$$LD_LIBRARY_PATH" \
-		"$(DESTDIR)$(vlclibdir)/vlc-cache-gen$(EXEEXT)" \
-			 "$(DESTDIR)$(vlclibdir)/plugins" ; \
+		"$(DESTDIR)$(pkglibexecdir)/vlc-cache-gen$(EXEEXT)" \
+			 "$(DESTDIR)$(pkglibdir)/plugins" ; \
 	else \
 		echo "Cross-compilation: cache generation skipped!" ; \
 	fi
 endif
 
 uninstall-hook:
-	rm -f -- "$(DESTDIR)$(vlclibdir)/plugins/plugins.dat"
+	rm -f -- "$(DESTDIR)$(pkglibdir)/plugins/plugins.dat"
 
 ###############################################################################
 # Test coverage
@@ -187,7 +195,7 @@ lcov-raw.out:
 
 lcov.out: lcov-raw.out
 	lcov -r lcov-raw.out -o lcov.out \
-		'*test*' 'contrib/*' '/usr/include/*'
+		'*test*' 'contrib/*' '/usr/include/*' '*mock*'
 
 lcov: lcov.out
 	rm -Rf lcov lcov.tmp

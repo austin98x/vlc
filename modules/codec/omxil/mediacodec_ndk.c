@@ -38,8 +38,15 @@
 
 #include "mediacodec.h"
 
+static_assert(MC_API_NO_QUIRKS == OMXCODEC_NO_QUIRKS
+    && MC_API_QUIRKS_NEED_CSD == OMXCODEC_QUIRKS_NEED_CSD
+    && MC_API_VIDEO_QUIRKS_IGNORE_PADDING == OMXCODEC_VIDEO_QUIRKS_IGNORE_PADDING
+    && MC_API_VIDEO_QUIRKS_SUPPORT_INTERLACED == OMXCODEC_VIDEO_QUIRKS_SUPPORT_INTERLACED
+    && MC_API_AUDIO_QUIRKS_NEED_CHANNELS == OMXCODEC_AUDIO_QUIRKS_NEED_CHANNELS,
+    "mediacodec.h/omx_utils.h mismatch");
+
 char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
-                         int hxxx_profile, bool *p_adaptive);
+                         int hxxx_profile, int *p_quirks);
 
 #define THREAD_NAME "mediacodec_ndk"
 
@@ -77,6 +84,13 @@ typedef enum {
 /*****************************************************************************
  * NdkMediaCodec.h
  *****************************************************************************/
+
+/* cf. https://github.com/android-ndk/ndk/issues/459 */
+#if defined(__USE_FILE_OFFSET64) && !defined(__LP64__)
+#define off_t_compat int32_t
+#else
+#define off_t_compat off_t
+#endif
 
 struct AMediaCodec;
 typedef struct AMediaCodec AMediaCodec;
@@ -132,7 +146,7 @@ typedef uint8_t* (*pf_AMediaCodec_getInputBuffer)(AMediaCodec*,
         size_t idx, size_t *out_size);
 
 typedef media_status_t (*pf_AMediaCodec_queueInputBuffer)(AMediaCodec*,
-        size_t idx, off_t offset, size_t size, uint64_t time, uint32_t flags);
+        size_t idx, off_t_compat offset, size_t size, uint64_t time, uint32_t flags);
 
 typedef ssize_t (*pf_AMediaCodec_dequeueOutputBuffer)(AMediaCodec*,
         AMediaCodecBufferInfo *info, int64_t timeoutUs);
@@ -279,41 +293,11 @@ struct mc_api_sys
 };
 
 /*****************************************************************************
- * Stop
+ * ConfigureDecoder
  *****************************************************************************/
-static int Stop(mc_api *api)
+static int ConfigureDecoder(mc_api *api, union mc_api_args *p_args)
 {
     mc_api_sys *p_sys = api->p_sys;
-
-    api->b_direct_rendering = false;
-
-    if (p_sys->p_codec)
-    {
-        if (api->b_started)
-        {
-            syms.AMediaCodec.stop(p_sys->p_codec);
-            api->b_started = false;
-        }
-        syms.AMediaCodec.delete(p_sys->p_codec);
-        p_sys->p_codec = NULL;
-    }
-    if (p_sys->p_format)
-    {
-        syms.AMediaFormat.delete(p_sys->p_format);
-        p_sys->p_format = NULL;
-    }
-
-    msg_Dbg(api->p_obj, "MediaCodec via NDK closed");
-    return 0;
-}
-
-/*****************************************************************************
- * Start
- *****************************************************************************/
-static int Start(mc_api *api, union mc_api_args *p_args)
-{
-    mc_api_sys *p_sys = api->p_sys;
-    int i_ret = MC_API_ERROR;
     ANativeWindow *p_anw = NULL;
 
     assert(api->psz_mime && api->psz_name);
@@ -323,14 +307,14 @@ static int Start(mc_api *api, union mc_api_args *p_args)
     {
         msg_Err(api->p_obj, "AMediaCodec.createCodecByName for %s failed",
                 api->psz_name);
-        goto error;
+        return MC_API_ERROR;
     }
 
     p_sys->p_format = syms.AMediaFormat.new();
     if (!p_sys->p_format)
     {
         msg_Err(api->p_obj, "AMediaFormat.new failed");
-        goto error;
+        return MC_API_ERROR;
     }
 
     syms.AMediaFormat.setInt32(p_sys->p_format, "encoder", 0);
@@ -363,8 +347,51 @@ static int Start(mc_api *api, union mc_api_args *p_args)
                                    p_anw, NULL, 0) != AMEDIA_OK)
     {
         msg_Err(api->p_obj, "AMediaCodec.configure failed");
-        goto error;
+        return MC_API_ERROR;
     }
+
+    api->b_direct_rendering = !!p_anw;
+
+    return 0;
+}
+
+/*****************************************************************************
+ * Stop
+ *****************************************************************************/
+static int Stop(mc_api *api)
+{
+    mc_api_sys *p_sys = api->p_sys;
+
+    api->b_direct_rendering = false;
+
+    if (p_sys->p_codec)
+    {
+        if (api->b_started)
+        {
+            syms.AMediaCodec.stop(p_sys->p_codec);
+            api->b_started = false;
+        }
+        syms.AMediaCodec.delete(p_sys->p_codec);
+        p_sys->p_codec = NULL;
+    }
+    if (p_sys->p_format)
+    {
+        syms.AMediaFormat.delete(p_sys->p_format);
+        p_sys->p_format = NULL;
+    }
+
+    msg_Dbg(api->p_obj, "MediaCodec via NDK closed");
+    return 0;
+}
+
+/*****************************************************************************
+ * Start
+ *****************************************************************************/
+static int Start(mc_api *api)
+{
+    mc_api_sys *p_sys = api->p_sys;
+    int i_ret = MC_API_ERROR;
+
     if (syms.AMediaCodec.start(p_sys->p_codec) != AMEDIA_OK)
     {
         msg_Err(api->p_obj, "AMediaCodec.start failed");
@@ -372,7 +399,6 @@ static int Start(mc_api *api, union mc_api_args *p_args)
     }
 
     api->b_started = true;
-    api->b_direct_rendering = !!p_anw;
     i_ret = 0;
 
     msg_Dbg(api->p_obj, "MediaCodec via NDK opened");
@@ -398,7 +424,7 @@ static int Flush(mc_api *api)
 /*****************************************************************************
  * DequeueInput
  *****************************************************************************/
-static int DequeueInput(mc_api *api, mtime_t i_timeout)
+static int DequeueInput(mc_api *api, vlc_tick_t i_timeout)
 {
     mc_api_sys *p_sys = api->p_sys;
     ssize_t i_index;
@@ -419,7 +445,7 @@ static int DequeueInput(mc_api *api, mtime_t i_timeout)
  * QueueInput
  *****************************************************************************/
 static int QueueInput(mc_api *api, int i_index, const void *p_buf,
-                      size_t i_size, mtime_t i_ts, bool b_config)
+                      size_t i_size, vlc_tick_t i_ts, bool b_config)
 {
     mc_api_sys *p_sys = api->p_sys;
     uint8_t *p_mc_buf;
@@ -458,7 +484,7 @@ static int32_t GetFormatInteger(AMediaFormat *p_format, const char *psz_name)
 /*****************************************************************************
  * DequeueOutput
  *****************************************************************************/
-static int DequeueOutput(mc_api *api, mtime_t i_timeout)
+static int DequeueOutput(mc_api *api, vlc_tick_t i_timeout)
 {
     mc_api_sys *p_sys = api->p_sys;
     ssize_t i_index;
@@ -601,22 +627,21 @@ static void Clean(mc_api *api)
 }
 
 /*****************************************************************************
- * Configure
+ * Prepare
  *****************************************************************************/
-static int Configure(mc_api * api, int i_profile)
+static int Prepare(mc_api * api, int i_profile)
 {
     free(api->psz_name);
-    bool b_adaptive;
+
+    api->i_quirks = 0;
     api->psz_name = MediaCodec_GetName(api->p_obj, api->psz_mime,
-                                       i_profile, &b_adaptive);
+                                       i_profile, &api->i_quirks);
     if (!api->psz_name)
         return MC_API_ERROR;
-    api->i_quirks = OMXCodec_GetQuirks(api->i_cat, api->i_codec, api->psz_name,
-                                       strlen(api->psz_name));
+    api->i_quirks |= OMXCodec_GetQuirks(api->i_cat, api->i_codec, api->psz_name,
+                                        strlen(api->psz_name));
     /* Allow interlaced picture after API 21 */
     api->i_quirks |= MC_API_VIDEO_QUIRKS_SUPPORT_INTERLACED;
-    if (b_adaptive)
-        api->i_quirks |= MC_API_VIDEO_QUIRKS_ADAPTIVE;
     return 0;
 }
 
@@ -633,7 +658,8 @@ int MediaCodecNdk_Init(mc_api *api)
         return MC_API_ERROR;
 
     api->clean = Clean;
-    api->configure = Configure;
+    api->prepare = Prepare;
+    api->configure_decoder = ConfigureDecoder;
     api->start = Start;
     api->stop = Stop;
     api->flush = Flush;

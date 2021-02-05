@@ -34,11 +34,11 @@
 #include <vlc_common.h>
 
 typedef struct AWindowHandler AWindowHandler;
+typedef struct ASurfaceTexture ASurfaceTexture;
 
 enum AWindow_ID {
     AWindow_Video,
     AWindow_Subtitles,
-    AWindow_SurfaceTexture,
     AWindow_Max,
 };
 
@@ -51,29 +51,6 @@ typedef struct
     void (*unlockAndPost)(ANativeWindow*);
     int32_t (*setBuffersGeometry)(ANativeWindow*, int32_t, int32_t, int32_t); /* can be NULL */
 } native_window_api_t;
-
-/**
- * native_window_priv_api_t. See system/core/include/system/window.h in AOSP.
- */
-typedef struct native_window_priv native_window_priv;
-typedef struct
-{
-    native_window_priv *(*connect)(ANativeWindow *);
-    int (*disconnect) (native_window_priv *);
-    int (*setUsage) (native_window_priv *, bool, int );
-    int (*setBuffersGeometry) (native_window_priv *, int, int, int );
-    int (*getMinUndequeued) (native_window_priv *, unsigned int *);
-    int (*getMaxBufferCount) (native_window_priv *, unsigned int *);
-    int (*setBufferCount) (native_window_priv *, unsigned int );
-    int (*setCrop) (native_window_priv *, int, int, int, int);
-    int (*dequeue) (native_window_priv *, void **);
-    int (*lock) (native_window_priv *, void *);
-    int (*queue) (native_window_priv *, void *);
-    int (*cancel) (native_window_priv *, void *);
-    int (*lockData) (native_window_priv *, void **, ANativeWindow_Buffer *);
-    int (*unlockData) (native_window_priv *, void *, bool b_render);
-    int (*setOrientation) (native_window_priv *, int);
-} native_window_priv_api_t;
 
 struct awh_mouse_coords
 {
@@ -91,14 +68,51 @@ typedef struct
                                 const struct awh_mouse_coords *coords);
 } awh_events_t;
 
+typedef struct android_video_context_t android_video_context_t;
+
+struct android_video_context_t
+{
+    struct vlc_asurfacetexture *texture;
+    void *dec_opaque;
+    bool (*render)(struct picture_context_t *ctx);
+    bool (*render_ts)(struct picture_context_t *ctx, vlc_tick_t ts);
+
+    struct vlc_asurfacetexture *
+        (*get_texture)(struct picture_context_t *ctx);
+};
+
+struct vlc_asurfacetexture
+{
+    struct ANativeWindow *window;
+    jobject              *jsurface;
+
+    const struct vlc_asurfacetexture_operations *ops;
+};
+
 /**
- * Load a private native window API
+ * Wrapper structure for Android SurfaceTexture object.
  *
- * This can be used to access the private ANativeWindow API.
- * \param api doesn't need to be released
- * \return 0 on success, -1 on error.
+ * It can use either the NDK API or JNI API.
  */
-int android_loadNativeWindowPrivApi(native_window_priv_api_t *api);
+struct vlc_asurfacetexture_operations
+{
+    int (*attach_to_gl_context)(
+            struct vlc_asurfacetexture *surface,
+            uint32_t tex_name);
+
+    void (*detach_from_gl_context)(
+            struct vlc_asurfacetexture *surface);
+
+    int (*update_tex_image)(
+            struct vlc_asurfacetexture *surface,
+            const float **pp_transform_mtx);
+
+    void (*release_tex_image)(
+            struct vlc_asurfacetexture *st);
+
+    void (*destroy)(
+            struct vlc_asurfacetexture *surface);
+};
 
 /**
  * Attach or get a JNIEnv*
@@ -117,7 +131,7 @@ JNIEnv *android_getEnv(vlc_object_t *p_obj, const char *psz_thread_name);
  * \return a valid AWindowHandler * or NULL. It must be released with
  * AWindowHandler_destroy.
  */
-AWindowHandler *AWindowHandler_new(vout_window_t *wnd, awh_events_t *p_events);
+AWindowHandler *AWindowHandler_new(vlc_object_t *obj, vout_window_t *wnd, awh_events_t *p_events);
 void AWindowHandler_destroy(AWindowHandler *p_awh);
 
 /**
@@ -150,16 +164,6 @@ ANativeWindow *AWindowHandler_getANativeWindow(AWindowHandler *p_awh,
  */
 void AWindowHandler_releaseANativeWindow(AWindowHandler *p_awh,
                                          enum AWindow_ID id);
-/**
- * Pre-ICS hack of ANativeWindow_setBuffersGeometry
- *
- * This function is a fix up of ANativeWindow_setBuffersGeometry that doesn't
- * work before Android ICS. It configures the Surface from the Android
- * MainThread via a SurfaceHolder. It returns VLC_SUCCESS if the Surface was
- * configured (it returns VLC_EGENERIC after Android ICS).
- */
-int AWindowHandler_setBuffersGeometry(AWindowHandler *p_awh, enum AWindow_ID id,
-                                      int i_width, int i_height, int i_format);
 
 /**
  * Returns true if the video layout can be changed
@@ -184,44 +188,35 @@ int AWindowHandler_setVideoLayout(AWindowHandler *p_awh,
  * \return 0 on success, -1 on error.
  */
 int
-SurfaceTexture_attachToGLContext(AWindowHandler *p_awh, int tex_name);
+SurfaceTexture_attachToGLContext(struct vlc_asurfacetexture *st, uint32_t tex_name);
 
 /**
  * Detach a SurfaceTexture from the OpenGL ES context that owns the OpenGL ES
  * texture object.
  */
 void
-SurfaceTexture_detachFromGLContext(AWindowHandler *p_awh);
+SurfaceTexture_detachFromGLContext(struct vlc_asurfacetexture *st);
 
 /**
- * Get a Java Surface from the attached SurfaceTexture
+ * Create a new SurfaceTexture object.
  *
- * This object can be used with mediacodec_jni.
+ * See Android SurfaceTexture
  */
-static inline jobject
-SurfaceTexture_getSurface(AWindowHandler *p_awh)
+struct vlc_asurfacetexture *
+vlc_asurfacetexture_New(AWindowHandler *p_awh, bool single_buffer);
+
+/**
+ * Delete a SurfaceTexture object created with SurfaceTexture_New.
+ */
+static inline void
+vlc_asurfacetexture_Delete(struct vlc_asurfacetexture *st)
 {
-    return AWindowHandler_getSurface(p_awh, AWindow_SurfaceTexture);
+    if (st->ops->destroy)
+        st->ops->destroy(st);
 }
 
 /**
- * Get a ANativeWindow from the attached SurfaceTexture
- *
- * This pointer can be used with mediacodec_ndk.
- */
-static inline ANativeWindow *
-SurfaceTexture_getANativeWindow(AWindowHandler *p_awh)
-{
-    return AWindowHandler_getANativeWindow(p_awh, AWindow_SurfaceTexture);
-}
-
-/**
- * Wait for a new frame and update it
- *
- * This function must be called from the OpenGL thread. This is an helper that
- * waits for a new frame via the Java SurfaceTexture.OnFrameAvailableListener
- * listener and update the frame via the SurfaceTexture.updateTexImage()
- * method.
+ * Update the SurfaceTexture to the most recent frame.
  *
  * \param pp_transform_mtx the transform matrix fetched from
  * SurfaceTexture.getTransformMatrix() after the
@@ -229,5 +224,7 @@ SurfaceTexture_getANativeWindow(AWindowHandler *p_awh)
  * \return VLC_SUCCESS or a VLC error
  */
 int
-SurfaceTexture_waitAndUpdateTexImage(AWindowHandler *p_awh,
-                                     const float **pp_transform_mtx);
+SurfaceTexture_updateTexImage(struct vlc_asurfacetexture *st, const float **pp_transform_mtx);
+
+void
+SurfaceTexture_releaseTexImage(struct vlc_asurfacetexture *st);

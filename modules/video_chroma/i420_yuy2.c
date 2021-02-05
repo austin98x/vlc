@@ -2,7 +2,6 @@
  * i420_yuy2.c : YUV to YUV conversion module for vlc
  *****************************************************************************
  * Copyright (C) 2000, 2001 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Samuel Hocevar <sam@zoy.org>
  *          Damien Fouilleul <damien@videolan.org>
@@ -61,22 +60,7 @@
 /*****************************************************************************
  * Local and extern prototypes.
  *****************************************************************************/
-static int  Activate ( vlc_object_t * );
-
-static void I420_YUY2           ( filter_t *, picture_t *, picture_t * );
-static void I420_YVYU           ( filter_t *, picture_t *, picture_t * );
-static void I420_UYVY           ( filter_t *, picture_t *, picture_t * );
-static picture_t *I420_YUY2_Filter    ( filter_t *, picture_t * );
-static picture_t *I420_YVYU_Filter    ( filter_t *, picture_t * );
-static picture_t *I420_UYVY_Filter    ( filter_t *, picture_t * );
-#if !defined (MODULE_NAME_IS_i420_yuy2_altivec)
-static void I420_IUYV           ( filter_t *, picture_t *, picture_t * );
-static picture_t *I420_IUYV_Filter    ( filter_t *, picture_t * );
-#endif
-#if defined (MODULE_NAME_IS_i420_yuy2)
-static void I420_Y211           ( filter_t *, picture_t *, picture_t * );
-static picture_t *I420_Y211_Filter    ( filter_t *, picture_t * );
-#endif
+static int  Activate ( filter_t * );
 
 /*****************************************************************************
  * Module descriptor.
@@ -84,86 +68,93 @@ static picture_t *I420_Y211_Filter    ( filter_t *, picture_t * );
 vlc_module_begin ()
 #if defined (MODULE_NAME_IS_i420_yuy2)
     set_description( N_("Conversions from " SRC_FOURCC " to " DEST_FOURCC) )
-    set_capability( "video converter", 80 )
+    set_callback_video_converter( Activate, 80 )
 # define vlc_CPU_capable() (true)
 #elif defined (MODULE_NAME_IS_i420_yuy2_mmx)
     set_description( N_("MMX conversions from " SRC_FOURCC " to " DEST_FOURCC) )
-    set_capability( "video converter", 160 )
+    set_callback_video_converter( Activate, 160 )
 # define vlc_CPU_capable() vlc_CPU_MMX()
 #elif defined (MODULE_NAME_IS_i420_yuy2_sse2)
     set_description( N_("SSE2 conversions from " SRC_FOURCC " to " DEST_FOURCC) )
-    set_capability( "video converter", 250 )
+    set_callback_video_converter( Activate, 250 )
 # define vlc_CPU_capable() vlc_CPU_SSE2()
 #elif defined (MODULE_NAME_IS_i420_yuy2_altivec)
     set_description(
             _("AltiVec conversions from " SRC_FOURCC " to " DEST_FOURCC) );
-    set_capability( "video converter", 250 )
+    set_callback_video_converter( Activate, 250 )
 # define vlc_CPU_capable() vlc_CPU_ALTIVEC()
 #endif
-    set_callbacks( Activate, NULL )
 vlc_module_end ()
+
+VIDEO_FILTER_WRAPPER( I420_YUY2 )
+VIDEO_FILTER_WRAPPER( I420_YVYU )
+VIDEO_FILTER_WRAPPER( I420_UYVY )
+#if !defined (MODULE_NAME_IS_i420_yuy2_altivec)
+VIDEO_FILTER_WRAPPER( I420_IUYV )
+#endif
+#if defined (MODULE_NAME_IS_i420_yuy2)
+VIDEO_FILTER_WRAPPER( I420_Y211 )
+#endif
+
+static const struct vlc_filter_operations *
+GetFilterOperations( filter_t *p_filter )
+{
+    switch( p_filter->fmt_out.video.i_chroma )
+    {
+        case VLC_CODEC_YUYV:
+            return &I420_YUY2_ops;
+
+        case VLC_CODEC_YVYU:
+            return &I420_YVYU_ops;
+
+        case VLC_CODEC_UYVY:
+            return &I420_UYVY_ops;
+
+#if !defined (MODULE_NAME_IS_i420_yuy2_altivec)
+        case VLC_FOURCC('I','U','Y','V'):
+            return &I420_IUYV_ops;
+#endif
+
+#if defined (MODULE_NAME_IS_i420_yuy2)
+        case VLC_CODEC_Y211:
+            return &I420_Y211_ops;
+#endif
+        default:
+            return NULL;
+    }
+}
 
 /*****************************************************************************
  * Activate: allocate a chroma function
  *****************************************************************************
  * This function allocates and initializes a chroma function
  *****************************************************************************/
-static int Activate( vlc_object_t *p_this )
+static int Activate( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     if( !vlc_CPU_capable() )
         return VLC_EGENERIC;
+
     if( (p_filter->fmt_in.video.i_x_offset + p_filter->fmt_in.video.i_visible_width) & 1
      || (p_filter->fmt_in.video.i_y_offset + p_filter->fmt_in.video.i_visible_height) & 1 )
     {
-        return -1;
+        return VLC_EGENERIC;
     }
 
     if( p_filter->fmt_in.video.i_width != p_filter->fmt_out.video.i_width
        || p_filter->fmt_in.video.i_height != p_filter->fmt_out.video.i_height
        || p_filter->fmt_in.video.orientation != p_filter->fmt_out.video.orientation )
-        return -1;
+        return VLC_EGENERIC;
 
-    switch( p_filter->fmt_in.video.i_chroma )
-    {
-//        case VLC_CODEC_YV12: FIXME invert U and V in the filters :)
-        case VLC_CODEC_I420:
-            switch( p_filter->fmt_out.video.i_chroma )
-            {
-                case VLC_CODEC_YUYV:
-                    p_filter->pf_video_filter = I420_YUY2_Filter;
-                    break;
+    // VLC_CODEC_YV12: FIXME invert U and V in the filters :)
+    if( p_filter->fmt_in.video.i_chroma != VLC_CODEC_I420)
+        return VLC_EGENERIC;
 
-                case VLC_CODEC_YVYU:
-                    p_filter->pf_video_filter = I420_YVYU_Filter;
-                    break;
+    /* Find the adequate filter function depending on the output format. */
+    p_filter->ops = GetFilterOperations( p_filter );
+    if( p_filter->ops == NULL )
+        return VLC_EGENERIC;
 
-                case VLC_CODEC_UYVY:
-                    p_filter->pf_video_filter = I420_UYVY_Filter;
-                    break;
-#if !defined (MODULE_NAME_IS_i420_yuy2_altivec)
-                case VLC_FOURCC('I','U','Y','V'):
-                    p_filter->pf_video_filter = I420_IUYV_Filter;
-                    break;
-#endif
-
-#if defined (MODULE_NAME_IS_i420_yuy2)
-                case VLC_CODEC_Y211:
-                    p_filter->pf_video_filter = I420_Y211_Filter;
-                    break;
-#endif
-
-                default:
-                    return -1;
-            }
-            break;
-
-        default:
-            return -1;
-    }
-
-    return 0;
+    return VLC_SUCCESS;
 }
 
 #if 0
@@ -177,16 +168,6 @@ static inline unsigned long long read_cycles(void)
 #endif
 
 /* Following functions are local */
-
-VIDEO_FILTER_WRAPPER( I420_YUY2 )
-VIDEO_FILTER_WRAPPER( I420_YVYU )
-VIDEO_FILTER_WRAPPER( I420_UYVY )
-#if !defined (MODULE_NAME_IS_i420_yuy2_altivec)
-VIDEO_FILTER_WRAPPER( I420_IUYV )
-#endif
-#if defined (MODULE_NAME_IS_i420_yuy2)
-VIDEO_FILTER_WRAPPER( I420_Y211 )
-#endif
 
 /*****************************************************************************
  * I420_YUY2: planar YUV 4:2:0 to packed YUYV 4:2:2
@@ -304,20 +285,17 @@ static void I420_YUY2( filter_t *p_filter, picture_t *p_source,
         p_y1 = p_y2;
         p_y2 += p_source->p[Y_PLANE].i_pitch;
 
-#if !defined (MODULE_NAME_IS_i420_yuy2_mmx)
         for( i_x = (p_filter->fmt_in.video.i_x_offset + p_filter->fmt_in.video.i_visible_width) / 8; i_x-- ; )
         {
+#if !defined (MODULE_NAME_IS_i420_yuy2_mmx)
             C_YUV420_YUYV( );
             C_YUV420_YUYV( );
             C_YUV420_YUYV( );
             C_YUV420_YUYV( );
-        }
 #else
-        for( i_x = (p_filter->fmt_in.video.i_x_offset + p_filter->fmt_in.video.i_visible_width) / 8 ; i_x-- ; )
-        {
             MMX_CALL( MMX_YUV420_YUYV );
-        }
 #endif
+        }
         for( i_x = ( (p_filter->fmt_in.video.i_x_offset + p_filter->fmt_in.video.i_visible_width) % 8 ) / 2; i_x-- ; )
         {
             C_YUV420_YUYV( );
@@ -532,11 +510,9 @@ static void I420_YVYU( filter_t *p_filter, picture_t *p_source,
             C_YUV420_YVYU( );
         }
 
-        p_y1 += i_source_margin;
         p_y2 += i_source_margin;
         p_u += i_source_margin_c;
         p_v += i_source_margin_c;
-        p_line1 += i_dest_margin;
         p_line2 += i_dest_margin;
     }
 
@@ -575,11 +551,9 @@ static void I420_YVYU( filter_t *p_filter, picture_t *p_source,
                 C_YUV420_YVYU( );
             }
 
-            p_y1 += i_source_margin;
             p_y2 += i_source_margin;
             p_u += i_source_margin_c;
             p_v += i_source_margin_c;
-            p_line1 += i_dest_margin;
             p_line2 += i_dest_margin;
         }
     }
@@ -603,11 +577,9 @@ static void I420_YVYU( filter_t *p_filter, picture_t *p_source,
                 C_YUV420_YVYU( );
             }
 
-            p_y1 += i_source_margin;
             p_y2 += i_source_margin;
             p_u += i_source_margin_c;
             p_v += i_source_margin_c;
-            p_line1 += i_dest_margin;
             p_line2 += i_dest_margin;
         }
     }
@@ -745,11 +717,9 @@ static void I420_UYVY( filter_t *p_filter, picture_t *p_source,
             C_YUV420_UYVY( );
         }
 
-        p_y1 += i_source_margin;
         p_y2 += i_source_margin;
         p_u += i_source_margin_c;
         p_v += i_source_margin_c;
-        p_line1 += i_dest_margin;
         p_line2 += i_dest_margin;
     }
 
@@ -788,11 +758,9 @@ static void I420_UYVY( filter_t *p_filter, picture_t *p_source,
                 C_YUV420_UYVY( );
             }
 
-            p_y1 += i_source_margin;
             p_y2 += i_source_margin;
             p_u += i_source_margin_c;
             p_v += i_source_margin_c;
-            p_line1 += i_dest_margin;
             p_line2 += i_dest_margin;
         }
     }
@@ -816,11 +784,9 @@ static void I420_UYVY( filter_t *p_filter, picture_t *p_source,
                 C_YUV420_UYVY( );
             }
 
-            p_y1 += i_source_margin;
             p_y2 += i_source_margin;
             p_u += i_source_margin_c;
             p_v += i_source_margin_c;
-            p_line1 += i_dest_margin;
             p_line2 += i_dest_margin;
         }
     }
@@ -880,11 +846,9 @@ static void I420_Y211( filter_t *p_filter, picture_t *p_source,
             C_YUV420_Y211( );
         }
 
-        p_y1 += i_source_margin;
         p_y2 += i_source_margin;
         p_u += i_source_margin_c;
         p_v += i_source_margin_c;
-        p_line1 += i_dest_margin;
         p_line2 += i_dest_margin;
     }
 }

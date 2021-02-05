@@ -10,7 +10,6 @@ OPTIONS="
       --enable-sftp
       --enable-vcd
       --enable-libcddb
-      --enable-realrtsp
       --enable-dvbpsi
       --enable-ogg
       --enable-mad
@@ -27,7 +26,6 @@ OPTIONS="
       --enable-x264
       --enable-libass
       --disable-xcb
-      --disable-xvideo
       --enable-freetype
       --enable-fribidi
       --enable-fontconfig

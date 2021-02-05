@@ -2,7 +2,6 @@
  * helpers.c : Generic helper functions for the VLC deinterlacer
  *****************************************************************************
  * Copyright (C) 2011 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Juha Jeronen <juha.jeronen@jyu.fi>
  *
@@ -268,6 +267,8 @@ void ComposeFrame( filter_t *p_filter,
             i_output_chroma == CC_SOURCE_TOP    ||
             i_output_chroma == CC_SOURCE_BOTTOM ||
             i_output_chroma == CC_MERGE );
+
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     const bool b_upconvert_chroma = i_output_chroma == CC_UPCONVERT;
 

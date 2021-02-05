@@ -2,7 +2,6 @@
  * playlist.h:  Playlist import module common functions
  *****************************************************************************
  * Copyright (C) 2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Sigmund Augdal Helberg <dnumgis@videolan.org>
  *
@@ -24,6 +23,8 @@
 #include <vlc_input.h>
 
 char *ProcessMRL( const char *, const char * );
+
+int PlaylistControl( stream_t *p_access, int i_query, va_list args );
 
 int Import_M3U ( vlc_object_t * );
 
@@ -52,17 +53,15 @@ int Import_QTL ( vlc_object_t * );
 int Import_IFO ( vlc_object_t * );
 void Close_IFO ( vlc_object_t * );
 
+int Import_BDMV ( vlc_object_t * );
+void Close_BDMV ( vlc_object_t * );
+
 int Import_iTML ( vlc_object_t * );
+
+int Import_WMS(vlc_object_t *);
 
 int Import_WPL ( vlc_object_t * );
 void Close_WPL ( vlc_object_t * );
 
-#define GetCurrentItem(obj) input_GetItem((obj)->p_input)
+#define GetCurrentItem(obj) ((obj)->p_input_item)
 #define GetSource(obj) ((obj)->s)
-
-#define CHECK_FILE(obj) \
-do { \
-    if( vlc_stream_Control( GetSource(obj), \
-                            STREAM_IS_DIRECTORY ) == VLC_SUCCESS ) \
-        return VLC_EGENERIC; \
-} while(0)

@@ -39,20 +39,20 @@ namespace smooth
     class SmoothManager : public PlaylistManager
     {
         public:
-            SmoothManager( demux_t *, AuthStorage *, playlist::Manifest *,
+            SmoothManager( demux_t *, SharedResources *, playlist::Manifest *,
                         AbstractStreamFactory *,
                         logic::AbstractAdaptationLogic::LogicType type );
             virtual ~SmoothManager();
 
-            virtual bool needsUpdate() const; /* reimpl */
-            virtual void scheduleNextUpdate(); /* reimpl */
-            virtual bool updatePlaylist(); /* reimpl */
+            virtual bool needsUpdate() const override;
+            virtual void scheduleNextUpdate() override;
+            virtual bool updatePlaylist() override;
 
             static bool isSmoothStreaming(xml::Node *);
             static bool mimeMatched(const std::string &);
 
         protected:
-            virtual bool reactivateStream(AbstractStream *); /* reimpl */
+            virtual bool reactivateStream(AbstractStream *) override;
 
         private:
             bool updatePlaylist(bool);

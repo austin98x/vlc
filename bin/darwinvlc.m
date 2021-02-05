@@ -2,7 +2,6 @@
  * darwinvlc.m: OS X specific main executable for VLC media player
  *****************************************************************************
  * Copyright (C) 2013-2015 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Felix Paul Kühne <fkuehne at videolan dot org>
  *          David Fuhrmann <dfuhrmann at videolan dot org>
@@ -27,6 +26,9 @@
 #endif
 
 #include <vlc/vlc.h>
+#include <vlc_common.h>
+#include <vlc_charset.h>
+
 #include <stdlib.h>
 #include <locale.h>
 #include <signal.h>
@@ -114,6 +116,13 @@ BreakpadRef initBreakpad()
  *****************************************************************************/
 int main(int i_argc, const char *ppsz_argv[])
 {
+#ifdef HAVE_BREAKPAD
+    BreakpadRef breakpad = NULL;
+
+    if (!getenv("VLC_DISABLE_BREAKPAD"))
+        breakpad = initBreakpad();
+#endif
+
     /* The so-called POSIX-compliant MacOS X reportedly processes SIGPIPE even
      * if it is blocked in all thread.
      * Note: this is NOT an excuse for not protecting against SIGPIPE. If
@@ -130,6 +139,7 @@ int main(int i_argc, const char *ppsz_argv[])
 #ifdef TOP_BUILDDIR
     setenv("VLC_PLUGIN_PATH", TOP_BUILDDIR"/modules", 1);
     setenv("VLC_DATA_PATH", TOP_SRCDIR"/share", 1);
+    setenv("VLC_LIB_PATH", TOP_BUILDDIR"/modules", 1);
 #endif
 
 #ifndef ALLOW_RUN_AS_ROOT
@@ -223,44 +233,21 @@ int main(int i_argc, const char *ppsz_argv[])
     argv[argc++] = "--no-ignore-config";
     argv[argc++] = "--media-library";
 
-    /* overwrite system language on Mac */
-    char *lang = NULL;
+    /* Overwrite system language */
+    CFPropertyListRef lang_pref = CFPreferencesCopyAppValue(CFSTR("language"),
+        kCFPreferencesCurrentApplication);
 
-    for (int i = 0; i < i_argc; i++) {
-        if (!strncmp(ppsz_argv[i], "--language", 10)) {
-            lang = strstr(ppsz_argv[i], "=");
-            ppsz_argv++, i_argc--;
-            continue;
-        }
-    }
-    if (lang && strncmp( lang, "auto", 4 )) {
-        char tmp[11];
-        snprintf(tmp, 11, "LANG%s", lang);
-        putenv(tmp);
-    }
-
-    if (!lang) {
-        CFStringRef language;
-        language = (CFStringRef)CFPreferencesCopyAppValue(CFSTR("language"),
-                                                          kCFPreferencesCurrentApplication);
-        if (language) {
-            CFIndex length = CFStringGetLength(language) + 1;
-            if (length > 0) {
-                CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8);
-                lang = (char *)malloc(maxSize);
-                if(lang) {
-                    CFStringGetCString(language, lang, maxSize - 1, kCFStringEncodingUTF8);
-                    if (strncmp( lang, "auto", 4 )) {
-                        char tmp[11];
-                        snprintf(tmp, 11, "LANG=%s", lang);
-                        putenv(tmp);
-
-                    }
-                }
-                free(lang);
+    if (lang_pref) {
+        if (CFGetTypeID(lang_pref) == CFStringGetTypeID()) {
+            char *lang = FromCFString(lang_pref, kCFStringEncodingUTF8);
+            if (strncmp(lang, "auto", 4)) {
+                char tmp[11];
+                snprintf(tmp, 11, "LANG=%s", lang);
+                putenv(tmp);
             }
-            CFRelease(language);
+            free(lang);
         }
+        CFRelease(lang_pref);
     }
 
     ppsz_argv++; i_argc--; /* skip executable path */
@@ -286,21 +273,17 @@ int main(int i_argc, const char *ppsz_argv[])
     libvlc_set_app_id(vlc, "org.VideoLAN.VLC", PACKAGE_VERSION, PACKAGE_NAME);
     libvlc_set_user_agent(vlc, "VLC media player", "VLC/"PACKAGE_VERSION);
 
-    libvlc_add_intf(vlc, "hotkeys,none");
-
-    if (libvlc_add_intf(vlc, NULL))
+    if (libvlc_add_intf(vlc, NULL)) {
+        fprintf(stderr, "VLC cannot start any interface. Exiting.\n");
         goto out;
-    libvlc_playlist_play(vlc, -1, 0, NULL);
+    }
+    libvlc_playlist_play(vlc);
 
     /*
      * Run the main loop. If the mac interface is not initialized, only the CoreFoundation
      * runloop is used. Otherwise, [NSApp run] needs to be called, which setups more stuff
      * before actually starting the loop.
      */
-#ifdef HAVE_BREAKPAD
-    BreakpadRef breakpad;
-    breakpad = initBreakpad();
-#endif
     @autoreleasepool {
         if(NSApp == nil) {
             CFRunLoopRun();
@@ -320,7 +303,8 @@ out:
     libvlc_release(vlc);
 
 #ifdef HAVE_BREAKPAD
-    BreakpadRelease(breakpad);
+    if (breakpad)
+        BreakpadRelease(breakpad);
 #endif
 
     return ret;

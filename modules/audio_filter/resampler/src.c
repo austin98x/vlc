@@ -52,7 +52,7 @@ static const char *const conv_type_texts[] = {
 
 static int Open (vlc_object_t *);
 static int OpenResampler (vlc_object_t *);
-static void Close (vlc_object_t *);
+static void Close (filter_t *);
 
 vlc_module_begin ()
     set_shortname (N_("SRC resampler"))
@@ -63,11 +63,11 @@ vlc_module_begin ()
                  SRC_CONV_TYPE_TEXT, SRC_CONV_TYPE_LONGTEXT, true)
         change_integer_list (conv_type_values, conv_type_texts)
     set_capability ("audio converter", 50)
-    set_callbacks (Open, Close)
+    set_callback (Open)
 
     add_submodule ()
     set_capability ("audio resampler", 50)
-    set_callbacks (OpenResampler, Close)
+    set_callback (OpenResampler)
 vlc_module_end ()
 
 static block_t *Resample (filter_t *, block_t *);
@@ -103,14 +103,18 @@ static int OpenResampler (vlc_object_t *obj)
         return VLC_EGENERIC;
     }
 
-    filter->p_sys = (filter_sys_t *)s;
-    filter->pf_audio_filter = Resample;
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = Resample, .close = Close,
+    };
+    filter->ops = &filter_ops;
+    filter->p_sys = s;
+
     return VLC_SUCCESS;
 }
 
-static void Close (vlc_object_t *obj)
+static void Close (filter_t *filter)
 {
-    filter_t *filter = (filter_t *)obj;
     SRC_STATE *s = (SRC_STATE *)filter->p_sys;
 
     src_delete (s);
@@ -162,8 +166,7 @@ static block_t *Resample (filter_t *filter, block_t *in)
     out->i_buffer = src.output_frames_gen * framesize;
     out->i_nb_samples = src.output_frames_gen;
     out->i_pts = in->i_pts;
-    out->i_length = src.output_frames_gen * CLOCK_FREQ
-                  / filter->fmt_out.audio.i_rate;
+    out->i_length = vlc_tick_from_samples(src.output_frames_gen, filter->fmt_out.audio.i_rate);
 error:
     block_Release (in);
     return out;

@@ -89,8 +89,6 @@ int Import_xspf(vlc_object_t *p_this)
 {
     stream_t *p_stream = (stream_t *)p_this;
 
-    CHECK_FILE(p_stream);
-
     if( !stream_HasExtension( p_stream, ".xspf" )
      && !stream_IsMimeType( p_stream->s, "application/xspf+xml" ) )
         return VLC_EGENERIC;
@@ -102,7 +100,7 @@ int Import_xspf(vlc_object_t *p_this)
     msg_Dbg(p_stream, "using XSPF playlist reader");
     p_stream->p_sys = sys;
     p_stream->pf_readdir = ReadDir;
-    p_stream->pf_control = access_vaDirectoryControlHelper;
+    p_stream->pf_control = PlaylistControl;
 
     return VLC_SUCCESS;
 }
@@ -314,24 +312,30 @@ static bool parse_playlist_node COMPLEX_INTERFACE
     if(b_empty_node)
         return false;
 
+    bool b_version_found = false;
     /* read all playlist attributes */
-    const char *psz_version = get_node_attribute(p_xml_reader, "version");
-    if(!psz_version || (strcmp(psz_version, "0") && strcmp(psz_version, "1")))
+    const char *psz_name, *psz_value;
+    while ((psz_name = xml_ReaderNextAttr(p_xml_reader, &psz_value)) != NULL)
     {
-        /* attribute version is mandatory !!! */
-        if(!psz_version)
-            msg_Warn(p_stream, "<playlist> requires \"version\" attribute");
+        if (!strcmp(psz_name, "version"))
+        {
+            b_version_found = true;
+            if (strcmp(psz_value, "0") && strcmp(psz_value, "1"))
+                msg_Warn(p_stream, "unsupported XSPF version %s", psz_value);
+        }
+        else if (!strcmp(psz_name, "xmlns") || !strcmp(psz_name, "xmlns:vlc"))
+            ;
+        else if (!strcmp(psz_name, "xml:base"))
+        {
+            free(sys->psz_base);
+            sys->psz_base = strdup(psz_value);
+        }
         else
-            msg_Warn(p_stream, "unsupported XSPF version %s", psz_version);
-        return false;
+            msg_Warn(p_stream, "invalid <playlist> attribute: \"%s\"", psz_name);
     }
-
-    const char *psz_base = get_node_attribute(p_xml_reader, "xml:base");
-    if(psz_base)
-    {
-        free(sys->psz_base);
-        sys->psz_base = strdup(psz_base);
-    }
+    /* attribute version is mandatory !!! */
+    if (!b_version_found)
+        msg_Warn(p_stream, "<playlist> requires \"version\" attribute");
 
     static const xml_elem_hnd_t pl_elements[] =
         { {"title",        {.smpl = set_item_info}, false },
@@ -438,12 +442,10 @@ static bool parse_track_node COMPLEX_INTERFACE
                             track_elements, ARRAY_SIZE(track_elements));
     if(b_ret)
     {
-        input_item_CopyOptions(p_new_input, p_input_node->p_item);
-
         /* Make sure we have a URI */
         char *psz_uri = input_item_GetURI(p_new_input);
         if (!psz_uri)
-            input_item_SetURI(p_new_input, "vlc://nop");
+            input_item_SetURI(p_new_input, INPUT_ITEM_URI_NOP);
         else
             free(psz_uri);
 
@@ -502,7 +504,8 @@ static bool parse_track_node COMPLEX_INTERFACE
  */
 static bool set_item_info SIMPLE_INTERFACE
 {
-    VLC_UNUSED(opaque);
+    xspf_sys_t *p_sys = (xspf_sys_t *) opaque;
+
     /* exit if setting is impossible */
     if (!psz_name || !psz_value || !p_input)
         return false;
@@ -519,13 +522,23 @@ static bool set_item_info SIMPLE_INTERFACE
     else if (!strcmp(psz_name, "trackNum"))
         input_item_SetTrackNum(p_input, psz_value);
     else if (!strcmp(psz_name, "duration"))
-        p_input->i_duration = atol(psz_value) * INT64_C(1000);
+        p_input->i_duration = VLC_TICK_FROM_MS(atol(psz_value));
     else if (!strcmp(psz_name, "annotation"))
         input_item_SetDescription(p_input, psz_value);
     else if (!strcmp(psz_name, "info"))
-        input_item_SetURL(p_input, psz_value);
+    {
+        char *psz_mrl = ProcessMRL( psz_value, p_sys->psz_base );
+        if( psz_mrl )
+            input_item_SetURL(p_input, psz_mrl);
+        free( psz_mrl );
+    }
     else if (!strcmp(psz_name, "image") && *psz_value)
-        input_item_SetArtURL(p_input, psz_value);
+    {
+        char *psz_mrl = ProcessMRL( psz_value, p_sys->psz_base );
+        if( psz_mrl )
+            input_item_SetArtURL(p_input, psz_mrl);
+        free( psz_mrl );
+    }
     return true;
 }
 
@@ -585,7 +598,7 @@ static bool parse_vlcnode_node COMPLEX_INTERFACE
         return false;
     }
     input_item_t *p_new_input =
-        input_item_NewDirectory("vlc://nop", psz_title, ITEM_NET_UNKNOWN);
+        input_item_NewDirectory(INPUT_ITEM_URI_NOP, psz_title, ITEM_NET_UNKNOWN);
     free(psz_title);
     if (p_new_input)
     {
@@ -620,6 +633,7 @@ static bool parse_extension_node COMPLEX_INTERFACE
     if(b_empty_node)
         return false;
 
+    /* read all extension node attributes */
     const char *psz_application = get_node_attribute(p_xml_reader, "application");
     if (!psz_application)
     {
@@ -661,6 +675,7 @@ static bool parse_extitem_node COMPLEX_INTERFACE
     if(!b_empty_node)
         return false;
 
+    /* read all extension node attributes */
     const char *psz_tid = get_node_attribute(p_xml_reader, "tid");
     if(psz_tid)
         i_tid = atoi(psz_tid);

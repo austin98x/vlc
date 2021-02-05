@@ -5,6 +5,10 @@ GPGERROR_URL := ftp://ftp.gnupg.org/gcrypt/libgpg-error/libgpg-error-$(GPGERROR_
 $(TARBALLS)/libgpg-error-$(GPGERROR_VERSION).tar.bz2:
 	$(call download_pkg,$(GPGERROR_URL),gpg-error)
 
+ifeq ($(call need_pkg,"gpg-error >= 1.27"),)
+PKGS_FOUND += gpg-error
+endif
+
 .sum-gpg-error: libgpg-error-$(GPGERROR_VERSION).tar.bz2
 
 libgpg-error: libgpg-error-$(GPGERROR_VERSION).tar.bz2 .sum-gpg-error
@@ -18,6 +22,9 @@ endif
 	$(APPLY) $(SRC)/gpg-error/missing-unistd-include.patch
 	$(APPLY) $(SRC)/gpg-error/no-executable.patch
 	$(APPLY) $(SRC)/gpg-error/win32-unicode.patch
+	$(APPLY) $(SRC)/gpg-error/version-bump-gawk-5.patch
+	$(APPLY) $(SRC)/gpg-error/win32-extern-struct.patch
+	$(APPLY) $(SRC)/gpg-error/darwin-triplet.patch
 	$(MOVE)
 ifdef HAVE_ANDROID
 ifeq ($(ARCH),aarch64)
@@ -27,21 +34,24 @@ else
 	cp $@/src/syscfg/lock-obj-pub.arm-unknown-linux-androideabi.h $@/src/syscfg/lock-obj-pub.linux-android.h
 endif
 endif
-ifdef HAVE_TIZEN
-ifeq ($(TIZEN_ABI), x86)
-	cp $@/src/syscfg/lock-obj-pub.i686-pc-linux-gnu.h $@/src/syscfg/lock-obj-pub.linux-gnueabi.h
-endif
-endif
-ifdef HAVE_IOS
-ifdef HAVE_ARMV7A
-	cp $@/src/syscfg/lock-obj-pub.arm-apple-darwin.h $@/src/syscfg/lock-obj-pub.$(HOST).h
+ifdef HAVE_NACL
+ifeq ($(ARCH),i386) # 32bits intel
+	cp $@/src/syscfg/lock-obj-pub.i686-pc-linux-gnu.h $@/src/syscfg/lock-obj-pub.nacl.h
 else
-	cp $@/src/syscfg/lock-obj-pub.aarch64-apple-darwin.h $@/src/syscfg/lock-obj-pub.$(HOST).h
+ifeq ($(ARCH),x86_64)
+	cp $@/src/syscfg/lock-obj-pub.x86_64-pc-linux-gnu.h $@/src/syscfg/lock-obj-pub.nacl.h
+endif
 endif
 endif
 
+GPGERROR_CONF := $(HOSTCONF) \
+	--disable-nls \
+	--disable-shared \
+	--disable-languages \
+	--disable-tests
+
 .gpg-error: libgpg-error
 	$(RECONF)
-	cd $< && $(HOSTVARS) ./configure $(HOSTCONF) --disable-nls --disable-shared --disable-languages --disable-tests
+	cd $< && $(HOSTVARS) ./configure $(GPGERROR_CONF)
 	cd $< && $(MAKE) install
 	touch $@

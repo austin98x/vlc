@@ -2,7 +2,6 @@
  * directsound.c: DirectSound audio output plugin for VLC
  *****************************************************************************
  * Copyright (C) 2001-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *
@@ -36,7 +35,6 @@
 #include <vlc_plugin.h>
 #include <vlc_aout.h>
 #include <vlc_charset.h>
-#include <vlc_memory.h>
 
 #include "audio_output/windows_audio_common.h"
 #include "audio_output/mmdevice.h"
@@ -48,9 +46,6 @@ static int  Open( vlc_object_t * );
 static void Close( vlc_object_t * );
 static HRESULT StreamStart( aout_stream_t *, audio_sample_format_t *,
                             const GUID * );
-static HRESULT StreamStop( aout_stream_t * );
-static int ReloadDirectXDevices( vlc_object_t *, const char *,
-                                 char ***, char *** );
 static void * PlayedDataEraser( void * );
 /* Speaker setup override options list */
 static const char *const speaker_list[] = { "Windows default", "Mono", "Stereo",
@@ -79,7 +74,6 @@ vlc_module_begin ()
 
     add_string( "directx-audio-device", NULL,
              DEVICE_TEXT, DEVICE_LONGTEXT, false )
-        change_string_cb( ReloadDirectXDevices )
     add_obsolete_string( "directx-audio-device-name")
     add_bool( "directx-audio-float32", true, FLOAT_TEXT,
               FLOAT_LONGTEXT, true )
@@ -94,7 +88,7 @@ vlc_module_begin ()
 
     add_submodule()
         set_capability( "aout stream", 30 )
-        set_callbacks( StreamStart, StreamStop )
+        set_callback( StreamStart )
 vlc_module_end ()
 
 typedef struct aout_stream_sys
@@ -129,7 +123,7 @@ typedef struct aout_stream_sys
  * This structure is part of the audio output thread descriptor.
  * It describes the direct sound specific properties of an audio device.
  */
-struct aout_sys_t
+typedef struct
 {
     aout_stream_sys_t s;
     struct
@@ -138,14 +132,14 @@ struct aout_sys_t
         LONG          mb;
         bool          mute;
     } volume;
-};
+} aout_sys_t;
 
-static HRESULT Flush( aout_stream_sys_t *sys, bool drain);
-static HRESULT TimeGet( aout_stream_sys_t *sys, mtime_t *delay )
+static HRESULT Flush( aout_stream_sys_t *sys );
+static HRESULT TimeGet( aout_stream_sys_t *sys, vlc_tick_t *delay )
 {
     DWORD read, status;
     HRESULT hr;
-    mtime_t size;
+    ssize_t size;
 
     hr = IDirectSoundBuffer_GetStatus( sys->p_dsbuffer, &status );
     if( hr != DS_OK )
@@ -157,7 +151,7 @@ static HRESULT TimeGet( aout_stream_sys_t *sys, mtime_t *delay )
     if( hr != DS_OK )
         return hr;
 
-    size = (mtime_t)read - sys->i_last_read;
+    size = (ssize_t)read - sys->i_last_read;
 
     /* GetCurrentPosition cannot be trusted if the return doesn't change
      * Just return an error */
@@ -171,21 +165,22 @@ static HRESULT TimeGet( aout_stream_sys_t *sys, mtime_t *delay )
 
     if( sys->i_data < 0 )
         /* underrun */
-        Flush(sys, false);
+        Flush(sys);
 
-    *delay = ( sys->i_data / sys->i_bytes_per_sample ) * CLOCK_FREQ / sys->i_rate;
+    *delay = vlc_tick_from_samples( sys->i_data / sys->i_bytes_per_sample, sys->i_rate );
 
     return DS_OK;
 }
 
-static HRESULT StreamTimeGet( aout_stream_t *s, mtime_t *delay )
+static HRESULT StreamTimeGet( aout_stream_t *s, vlc_tick_t *delay )
 {
     return TimeGet( s->sys, delay );
 }
 
-static int OutputTimeGet( audio_output_t *aout, mtime_t *delay )
+static int OutputTimeGet( audio_output_t *aout, vlc_tick_t *delay )
 {
-    return (TimeGet( &aout->sys->s, delay ) == DS_OK) ? 0 : -1;
+    aout_sys_t *sys = aout->sys;
+    return (TimeGet( &sys->s, delay ) == DS_OK) ? 0 : -1;
 }
 
 /**
@@ -287,7 +282,7 @@ static HRESULT Play( vlc_object_t *obj, aout_stream_sys_t *sys,
                                             0, 0, DSBPLAY_LOOPING );
     }
     if( dsresult != DS_OK )
-        msg_Err( obj, "cannot start playing buffer: (hr=0x%0lx)", dsresult );
+        msg_Err( obj, "cannot start playing buffer: (hr=0x%lX)", dsresult );
     else
     {
         vlc_mutex_lock( &sys->lock );
@@ -299,14 +294,17 @@ static HRESULT Play( vlc_object_t *obj, aout_stream_sys_t *sys,
     return dsresult;
 }
 
-static HRESULT StreamPlay( aout_stream_t *s, block_t *block )
+static HRESULT StreamPlay( aout_stream_t *s, block_t *block, vlc_tick_t date )
 {
+    (void) date;
     return Play( VLC_OBJECT(s), s->sys, block );
 }
 
-static void OutputPlay( audio_output_t *aout, block_t *block )
+static void OutputPlay( audio_output_t *aout, block_t *block, vlc_tick_t date )
 {
-    Play( VLC_OBJECT(aout), &aout->sys->s, block );
+    aout_sys_t *sys = aout->sys;
+    Play( VLC_OBJECT(aout), &sys->s, block );
+    (void) date;
 }
 
 static HRESULT Pause( aout_stream_sys_t *sys, bool pause )
@@ -333,16 +331,17 @@ static HRESULT StreamPause( aout_stream_t *s, bool pause )
     return Pause( s->sys, pause );
 }
 
-static void OutputPause( audio_output_t *aout, bool pause, mtime_t date )
+static void OutputPause( audio_output_t *aout, bool pause, vlc_tick_t date )
 {
-    Pause( &aout->sys->s, pause );
+    aout_sys_t *sys = aout->sys;
+    Pause( &sys->s, pause );
     (void) date;
 }
 
-static HRESULT Flush( aout_stream_sys_t *sys, bool drain)
+static HRESULT Flush( aout_stream_sys_t *sys )
 {
     HRESULT ret = IDirectSoundBuffer_Stop( sys->p_dsbuffer );
-    if( ret == DS_OK && !drain )
+    if( ret == DS_OK )
     {
         vlc_mutex_lock(&sys->lock);
         sys->i_data = 0;
@@ -356,13 +355,13 @@ static HRESULT Flush( aout_stream_sys_t *sys, bool drain)
 
 static HRESULT StreamFlush( aout_stream_t *s )
 {
-    return Flush( s->sys, false );
+    return Flush( s->sys );
 }
 
-static void OutputFlush( audio_output_t *aout, bool drain )
+static void OutputFlush( audio_output_t *aout )
 {
-    aout_stream_sys_t *sys = &aout->sys->s;
-    Flush( sys, drain );
+    aout_sys_t *sys = aout->sys;
+    Flush( &sys->s );
 }
 
 /**
@@ -518,7 +517,7 @@ static HRESULT CreateDSBufferPCM( vlc_object_t *obj, aout_stream_sys_t *sys,
                                   int i_rate, bool b_probe )
 {
     HRESULT hr;
-    unsigned i_nb_channels = popcount( i_channels );
+    unsigned i_nb_channels = vlc_popcount( i_channels );
 
     if( var_GetBool( obj, "directx-audio-float32" ) )
     {
@@ -553,8 +552,6 @@ static HRESULT Stop( aout_stream_sys_t *p_sys )
     vlc_mutex_unlock( &p_sys->lock );
     vlc_cancel( p_sys->eraser_thread );
     vlc_join( p_sys->eraser_thread, NULL );
-    vlc_cond_destroy( &p_sys->cond );
-    vlc_mutex_destroy( &p_sys->lock );
 
     if( p_sys->p_notify != NULL )
     {
@@ -575,19 +572,17 @@ static HRESULT Stop( aout_stream_sys_t *p_sys )
     return DS_OK;
 }
 
-static HRESULT StreamStop( aout_stream_t *s )
+static void StreamStop( aout_stream_t *s )
 {
-    HRESULT hr;
-
-    hr = Stop( s->sys );
+    Stop( s->sys );
     free( s->sys );
-    return hr;
 }
 
 static void OutputStop( audio_output_t *aout )
 {
     msg_Dbg( aout, "closing audio device" );
-    Stop( &aout->sys->s );
+    aout_sys_t *sys = aout->sys;
+    Stop( &sys->s );
 }
 
 static HRESULT Start( vlc_object_t *obj, aout_stream_sys_t *sys,
@@ -663,11 +658,7 @@ static HRESULT Start( vlc_object_t *obj, aout_stream_sys_t *sys,
             fmt.i_frame_length = A52_FRAME_NB;
         }
         else
-        {
-            vlc_mutex_destroy(&sys->lock);
-            vlc_cond_destroy(&sys->cond);
             return E_FAIL;
-        }
     }
 
     if( hr != DS_OK )
@@ -795,19 +786,8 @@ static HRESULT Start( vlc_object_t *obj, aout_stream_sys_t *sys,
         if( ret != ENOMEM )
             msg_Err( obj, "Couldn't start eraser thread" );
 
-        vlc_cond_destroy(&sys->cond);
-        vlc_mutex_destroy(&sys->lock);
-
-        if( sys->p_notify != NULL )
-        {
-            IDirectSoundNotify_Release( sys->p_notify );
-            sys->p_notify = NULL;
-        }
-        IDirectSoundBuffer_Release( sys->p_dsbuffer );
-        sys->p_dsbuffer = NULL;
-        IDirectSound_Release( sys->p_dsobject );
-        sys->p_dsobject = NULL;
-        return ret;
+        hr = E_FAIL;
+        goto error;
     }
 
     fmt.channel_type = AUDIO_CHANNEL_TYPE_BITMAP;
@@ -821,7 +801,18 @@ static HRESULT Start( vlc_object_t *obj, aout_stream_sys_t *sys,
     return DS_OK;
 
 error:
-    Stop( sys );
+    if( sys->p_notify != NULL )
+    {
+        IDirectSoundNotify_Release( sys->p_notify );
+        sys->p_notify = NULL;
+    }
+    if( sys->p_dsbuffer != NULL )
+    {
+        IDirectSoundBuffer_Release( sys->p_dsbuffer );
+        sys->p_dsbuffer = NULL;
+    }
+    IDirectSound_Release( sys->p_dsobject );
+    sys->p_dsobject = NULL;
     return hr;
 }
 
@@ -833,20 +824,26 @@ static HRESULT StreamStart( aout_stream_t *s,
     if( unlikely(sys == NULL) )
         return E_OUTOFMEMORY;
 
-    DIRECTX_AUDIO_ACTIVATION_PARAMS params = {
-        .cbDirectXAudioActivationParams = sizeof( params ),
-        .guidAudioSession = *sid,
-        .dwAudioStreamFlags = 0,
-    };
-    PROPVARIANT prop;
-
-    PropVariantInit( &prop );
-    prop.vt = VT_BLOB;
-    prop.blob.cbSize = sizeof( params );
-    prop.blob.pBlobData = (BYTE *)&params;
-
     void *pv;
-    HRESULT hr = aout_stream_Activate( s, &IID_IDirectSound, &prop, &pv );
+    HRESULT hr;
+    if( sid )
+    {
+        DIRECTX_AUDIO_ACTIVATION_PARAMS params = {
+            .cbDirectXAudioActivationParams = sizeof( params ),
+            .guidAudioSession = *sid,
+            .dwAudioStreamFlags = 0,
+        };
+        PROPVARIANT prop;
+
+        PropVariantInit( &prop );
+        prop.vt = VT_BLOB;
+        prop.blob.cbSize = sizeof( params );
+        prop.blob.pBlobData = (BYTE *)&params;
+
+        hr = aout_stream_Activate( s, &IID_IDirectSound, &prop, &pv );
+    }
+    else
+        hr = aout_stream_Activate( s, &IID_IDirectSound, NULL, &pv );
     if( FAILED(hr) )
         goto error;
 
@@ -861,6 +858,7 @@ static HRESULT StreamStart( aout_stream_t *s,
     s->play = StreamPlay;
     s->pause = StreamPause;
     s->flush = StreamFlush;
+    s->stop = StreamStop;
     return S_OK;
 error:
     free( sys );
@@ -935,7 +933,7 @@ static int VolumeSet( audio_output_t *p_aout, float volume )
     aout_VolumeReport( p_aout, volume );
 
     if( var_InheritBool( p_aout, "volume-save" ) )
-        config_PutFloat( p_aout, "directx-volume", volume );
+        config_PutFloat( "directx-volume", volume );
     return ret;
 }
 
@@ -966,13 +964,14 @@ static int OutputStart( audio_output_t *p_aout,
         return -1;
     }
 
-    HRESULT hr = Start( VLC_OBJECT(p_aout), &p_aout->sys->s, fmt );
+    aout_sys_t *sys = p_aout->sys;
+    HRESULT hr = Start( VLC_OBJECT(p_aout), &sys->s, fmt );
     if( FAILED(hr) )
         return -1;
 
     /* Force volume update */
-    VolumeSet( p_aout, p_aout->sys->volume.volume );
-    MuteSet( p_aout, p_aout->sys->volume.mute );
+    VolumeSet( p_aout, sys->volume.volume );
+    MuteSet( p_aout, sys->volume.mute );
 
     /* then launch the notification thread */
     p_aout->time_get = OutputTimeGet;
@@ -1019,7 +1018,7 @@ static int CALLBACK DeviceEnumCallback( LPGUID guid, LPCWSTR desc,
 /**
  * Stores the list of devices in preferences
  */
-static int ReloadDirectXDevices( vlc_object_t *p_this, char const *psz_name,
+static int ReloadDirectXDevices( char const *psz_name,
                                  char ***values, char ***descs )
 {
     ds_list_t list = {
@@ -1033,12 +1032,13 @@ static int ReloadDirectXDevices( vlc_object_t *p_this, char const *psz_name,
     (void) psz_name;
 
     DirectSoundEnumerate( DeviceEnumCallback, &list );
-    msg_Dbg( p_this, "found %u devices", list.count );
 
     *values = list.ids;
     *descs = list.names;
     return list.count;
 }
+
+VLC_CONFIG_STRING_ENUM(ReloadDirectXDevices)
 
 static int DeviceSelect (audio_output_t *aout, const char *id)
 {
@@ -1069,7 +1069,8 @@ static int Open(vlc_object_t *obj)
 
     /* DirectSound does not support hot-plug events (unless with WASAPI) */
     char **ids, **names;
-    int count = ReloadDirectXDevices(obj, NULL, &ids, &names);
+    int count = ReloadDirectXDevices(NULL, &ids, &names);
+    msg_Dbg(obj, "found %d devices", count);
     if (count >= 0)
     {
         for (int i = 0; i < count; i++)
@@ -1101,11 +1102,13 @@ static void Close(vlc_object_t *obj)
 static void * PlayedDataEraser( void * data )
 {
     const audio_output_t *aout = (audio_output_t *) data;
-    aout_stream_sys_t *p_sys = &aout->sys->s;
+    aout_sys_t *aout_sys = aout->sys;
+    aout_stream_sys_t *p_sys = &aout_sys->s;
     void *p_write_position, *p_wrap_around;
     unsigned long l_bytes1, l_bytes2;
     DWORD i_read;
     int64_t toerase, tosleep;
+    vlc_tick_t ticksleep;
     HRESULT dsresult;
 
     for(;;)
@@ -1118,6 +1121,7 @@ static void * PlayedDataEraser( void * data )
 
         toerase = 0;
         tosleep = 0;
+        ticksleep = VLC_TICK_FROM_MS(20);
 
         dsresult = IDirectSoundBuffer_GetCurrentPosition( p_sys->p_dsbuffer,
                                                           &i_read, NULL );
@@ -1130,10 +1134,10 @@ static void * PlayedDataEraser( void * data )
             else
                 tosleep += DS_BUF_SIZE;
             toerase = max;
-            tosleep = ( tosleep / p_sys->i_bytes_per_sample ) * CLOCK_FREQ / p_sys->i_rate;
+            ticksleep = vlc_tick_from_sec( tosleep / p_sys->i_bytes_per_sample ) / p_sys->i_rate;
         }
 
-        tosleep = __MAX( tosleep, 20000 );
+        ticksleep = __MAX( ticksleep, VLC_TICK_FROM_MS(20) );
         dsresult = IDirectSoundBuffer_Lock( p_sys->p_dsbuffer,
                                             p_sys->i_write,
                                             toerase,
@@ -1165,7 +1169,7 @@ static void * PlayedDataEraser( void * data )
 wait:
         vlc_mutex_unlock(&p_sys->lock);
         vlc_restorecancel(canc);
-        msleep(tosleep);
+        vlc_tick_sleep(ticksleep);
     }
     return NULL;
 }

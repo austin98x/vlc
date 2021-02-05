@@ -2,7 +2,6 @@
  * cache_read.c
  *****************************************************************************
  * Copyright (C) 1999-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -74,7 +73,7 @@
 
 typedef struct
 {
-    mtime_t date;
+    vlc_tick_t date;
 
     uint64_t i_start;
     uint64_t i_end;
@@ -83,7 +82,7 @@ typedef struct
 
 } stream_track_t;
 
-struct stream_sys_t
+typedef struct
 {
     uint64_t     i_pos;      /* Current reading offset */
 
@@ -103,9 +102,9 @@ struct stream_sys_t
         /* Stat about reading data */
         uint64_t i_read_count;
         uint64_t i_bytes;
-        uint64_t i_read_time;
+        vlc_tick_t i_read_time;
     } stat;
-};
+} stream_sys_t;
 
 static int AStreamRefillStream(stream_t *s)
 {
@@ -124,7 +123,7 @@ static int AStreamRefillStream(stream_t *s)
                  sys->i_used, i_toread);
 #endif
 
-    mtime_t start = mdate();
+    vlc_tick_t start = vlc_tick_now();
     while (i_toread > 0)
     {
         int i_off = tk->i_end % STREAM_CACHE_TRACK_SIZE;
@@ -163,21 +162,21 @@ static int AStreamRefillStream(stream_t *s)
         sys->stat.i_read_count++;
     }
 
-    sys->stat.i_read_time += mdate() - start;
+    sys->stat.i_read_time += vlc_tick_now() - start;
     return VLC_SUCCESS;
 }
 
 static void AStreamPrebufferStream(stream_t *s)
 {
     stream_sys_t *sys = s->p_sys;
-    mtime_t start = mdate();
+    vlc_tick_t start = vlc_tick_now();
     bool first = true;
 
     msg_Dbg(s, "starting pre-buffering");
     for (;;)
     {
         stream_track_t *tk = &sys->tk[sys->i_tk];
-        mtime_t now = mdate();
+        vlc_tick_t now = vlc_tick_now();
 
         int i_read;
         int i_buffered = tk->i_end - tk->i_start;
@@ -194,7 +193,7 @@ static void AStreamPrebufferStream(stream_t *s)
 
             msg_Dbg(s, "pre-buffering done %"PRId64" bytes in %"PRId64"s - "
                     "%"PRId64" KiB/s", sys->stat.i_bytes,
-                    sys->stat.i_read_time / CLOCK_FREQ, i_byterate / 1024);
+                    SEC_FROM_VLC_TICK(sys->stat.i_read_time), i_byterate / 1024);
             break;
         }
 
@@ -209,7 +208,7 @@ static void AStreamPrebufferStream(stream_t *s)
         if (first)
         {
             msg_Dbg(s, "received first data after %"PRId64" ms",
-                    (mdate() - start) / 1000);
+                    MS_FROM_VLC_TICK(vlc_tick_now() - start));
             first = false;
         }
 
@@ -324,7 +323,7 @@ static int AStreamSeekStream(stream_t *s, uint64_t i_pos)
         i_skip_threshold = INT64_MAX;
 
     /* Date the current track */
-    p_current->date = mdate();
+    p_current->date = vlc_tick_now();
 
     /* Search a new track slot */
     stream_track_t *tk = NULL;
@@ -455,7 +454,6 @@ static int AStreamControl(stream_t *s, int i_query, va_list args)
         case STREAM_CAN_FASTSEEK:
         case STREAM_CAN_PAUSE:
         case STREAM_CAN_CONTROL_PACE:
-        case STREAM_IS_DIRECTORY:
         case STREAM_GET_SIZE:
         case STREAM_GET_PTS_DELAY:
         case STREAM_GET_TITLE_INFO:
@@ -465,6 +463,7 @@ static int AStreamControl(stream_t *s, int i_query, va_list args)
         case STREAM_GET_CONTENT_TYPE:
         case STREAM_GET_SIGNAL:
         case STREAM_GET_TAGS:
+        case STREAM_GET_TYPE:
         case STREAM_SET_PAUSE_STATE:
         case STREAM_SET_PRIVATE_ID_STATE:
         case STREAM_SET_PRIVATE_ID_CA:
@@ -491,6 +490,9 @@ static int AStreamControl(stream_t *s, int i_query, va_list args)
 static int Open(vlc_object_t *obj)
 {
     stream_t *s = (stream_t *)obj;
+
+    if (s->s->pf_read == NULL)
+        return VLC_EGENERIC;
 
     stream_sys_t *sys = malloc(sizeof (*sys));
     if (unlikely(sys == NULL))
@@ -565,6 +567,7 @@ vlc_module_begin()
     set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_STREAM_FILTER)
     set_capability("stream_filter", 0)
+    add_shortcut("cache")
 
     set_description(N_("Byte stream cache"))
     set_callbacks(Open, Close)

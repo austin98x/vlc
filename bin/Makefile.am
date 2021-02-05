@@ -23,7 +23,7 @@ endif
 #
 # Main VLC executable
 #
-vlc_LDADD = ../lib/libvlc.la $(LIBPTHREAD)
+vlc_LDADD = ../lib/libvlc.la
 vlc_CPPFLAGS = $(AM_CPPFLAGS)
 if !HAVE_WIN32
 vlc_SOURCES = vlc.c override.c
@@ -31,7 +31,7 @@ vlc_LDADD += $(LIBDL)
 else
 vlc_SOURCES = winvlc.c
 vlc_DEPENDENCIES = vlc_win32_rc.$(OBJEXT)
-vlc_LDFLAGS = -mwindows
+vlc_LDFLAGS = -mwindows -Wc,-static
 vlc_LDADD += vlc_win32_rc.$(OBJEXT)
 libbreakpad_wrapper_la_SOURCES = breakpad.cpp
 libbreakpad_wrapper_la_LIBADD = $(BREAKPAD_LIBS)
@@ -47,8 +47,7 @@ endif
 
 vlc_osx_SOURCES = darwinvlc.m
 vlc_osx_LDFLAGS = $(LDFLAGS_vlc) -Wl,-framework,CoreFoundation,-framework,Cocoa
-vlc_osx_LDFLAGS += -Xlinker -rpath -Xlinker "@executable_path/lib/"
-vlc_osx_LDFLAGS += -Xlinker -rpath -Xlinker "@executable_path/plugins/"
+vlc_osx_LDFLAGS += -Xlinker -rpath -Xlinker "$(libdir)"
 if HAVE_BREAKPAD
 vlc_osx_LDFLAGS += -Wl,-framework,Breakpad
 vlc_osx_OBJCFLAGS = -F$(CONTRIB_DIR)/Frameworks
@@ -109,7 +108,7 @@ vlc_win32_rc.$(OBJEXT): vlc_win32_rc.rc $(top_srcdir)/extras/package/win32/vlc.e
 # Plug-ins cache generator
 #
 if HAVE_DYNAMIC_PLUGINS
-vlclib_PROGRAMS = vlc-cache-gen
+pkglibexec_PROGRAMS = vlc-cache-gen
 endif
 vlc_cache_gen_SOURCES = cachegen.c
 vlc_cache_gen_LDADD = \
@@ -118,6 +117,7 @@ vlc_cache_gen_LDADD = \
 	../lib/libvlc.la
 if HAVE_WIN32
 vlc_cache_gen_LDADD += vlc_win32_rc.$(OBJEXT)
+vlc_cache_gen_LDFLAGS = -Wc,-static
 vlc_cache_gen_DEPENDENCIES = vlc_win32_rc.$(OBJEXT)
 endif
 
@@ -130,9 +130,11 @@ endif
 MOSTLYCLEANFILES = $(noinst_DATA)
 
 if HAVE_OSX
+if BUILD_VLC
 install-data-local:
-	cd $(bindir); mv vlc-osx vlc
+	cd "$(DESTDIR)$(bindir)"; mv vlc-osx vlc
 
+endif
 endif
 
 .PHONY: ../modules/plugins.dat

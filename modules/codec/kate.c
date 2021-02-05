@@ -2,7 +2,6 @@
  * kate.c : a decoder for the kate bitstream format
  *****************************************************************************
  * Copyright (C) 2000-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Vincent Penquerc'h <ogg.k.ogg.k@googlemail.com>
  *
@@ -30,7 +29,7 @@
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
-#include <vlc_input.h>
+#include <vlc_input_item.h>
 #include <vlc_codec.h>
 #include "../demux/xiph.h"
 
@@ -43,8 +42,8 @@
 /* #define ENABLE_PROFILE */
 
 #ifdef ENABLE_PROFILE
-# define PROFILE_START(name) int64_t profile_start_##name = mdate()
-# define PROFILE_STOP(name) fprintf( stderr, #name ": %f ms\n", (mdate() - profile_start_##name)/1000.0f )
+# define PROFILE_START(name) int64_t profile_start_##name = vlc_tick_now()
+# define PROFILE_STOP(name) fprintf( stderr, #name ": %f ms\n", (vlc_tick_now() - profile_start_##name)/1000.0f )
 #else
 # define PROFILE_START(name) ((void)0)
 # define PROFILE_STOP(name) ((void)0)
@@ -53,17 +52,18 @@
 #define CHECK_TIGER_RET( statement )                                   \
     do                                                                 \
     {                                                                  \
-        int i_ret = (statement);                                       \
-        if( i_ret < 0 )                                                \
+        int i_ret_check = (statement);                                 \
+        if( i_ret_check < 0 )                                          \
         {                                                              \
-            msg_Dbg( p_dec, "Error in " #statement ": %d", i_ret );    \
+            msg_Dbg( p_dec, "Error in " #statement ": %d",             \
+                     i_ret_check );                                    \
         }                                                              \
     } while( 0 )
 
 /*****************************************************************************
  * decoder_sys_t : decoder descriptor
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
 #ifdef ENABLE_PACKETIZER
     /* Module mode */
@@ -86,8 +86,8 @@ struct decoder_sys_t
     /*
      * Common properties
      */
-    mtime_t i_pts;
-    mtime_t i_max_stop;
+    vlc_tick_t i_pts;
+    vlc_tick_t i_max_stop;
 
     /* decoder_sys_t is shared between decoder and spu units */
     vlc_mutex_t lock;
@@ -113,13 +113,13 @@ struct decoder_sys_t
      */
     bool   b_formatted;
     bool   b_use_tiger;
-};
+} decoder_sys_t;
 
-struct subpicture_updater_sys_t
+typedef struct
 {
     decoder_sys_t *p_dec_sys;
-    mtime_t        i_start;
-};
+    vlc_tick_t     i_start;
+} kate_spu_updater_sys_t;
 
 
 /*
@@ -328,13 +328,7 @@ vlc_module_begin ()
 
 vlc_module_end ()
 
-/*****************************************************************************
- * OpenDecoder: probe the decoder and return score
- *****************************************************************************
- * Tries to launch a decoder and return score so that the interface is able
- * to chose.
- *****************************************************************************/
-static int OpenDecoder( vlc_object_t *p_this )
+static int OpenCommon( vlc_object_t *p_this, bool b_packetizer )
 {
     decoder_t     *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
@@ -346,14 +340,15 @@ static int OpenDecoder( vlc_object_t *p_this )
 
     msg_Dbg( p_dec, "kate: OpenDecoder");
 
-    /* Set callbacks */
-    p_dec->pf_decode    = DecodeSub;
-    p_dec->pf_packetize = Packetize;
-    p_dec->pf_flush     = Flush;
-
     /* Allocate the memory needed to store the decoder's structure */
     if( ( p_dec->p_sys = p_sys = malloc(sizeof(*p_sys)) ) == NULL )
         return VLC_ENOMEM;
+
+    if( b_packetizer )
+        p_dec->pf_packetize = Packetize;
+    else
+        p_dec->pf_decode    = DecodeSub;
+    p_dec->pf_flush = Flush;
 
     vlc_mutex_init( &p_sys->lock );
     p_sys->i_refcount = 0;
@@ -361,11 +356,11 @@ static int OpenDecoder( vlc_object_t *p_this )
 
     /* init of p_sys */
 #ifdef ENABLE_PACKETIZER
-    p_sys->b_packetizer = false;
+    p_sys->b_packetizer = b_packetizer;
 #endif
     p_sys->b_ready = false;
     p_sys->i_pts =
-    p_sys->i_max_stop = VLC_TS_INVALID;
+    p_sys->i_max_stop = VLC_TICK_INVALID;
 
     kate_comment_init( &p_sys->kc );
     kate_info_init( &p_sys->ki );
@@ -417,7 +412,10 @@ static int OpenDecoder( vlc_object_t *p_this )
 
 #endif
 
-    p_dec->fmt_out.i_codec = 0; // may vary during the stream
+    if( b_packetizer )
+        p_dec->fmt_out.i_codec = VLC_CODEC_KATE;
+    else
+        p_dec->fmt_out.i_codec = 0; // may vary during the stream
 
     /* add the decoder to the global list */
     decoder_t **list = realloc( kate_decoder_list, (kate_decoder_list_size+1) * sizeof( *list ));
@@ -432,20 +430,15 @@ static int OpenDecoder( vlc_object_t *p_this )
     return VLC_SUCCESS;
 }
 
+static int OpenDecoder( vlc_object_t *p_this )
+{
+    return OpenCommon( p_this, false );
+}
+
 #ifdef ENABLE_PACKETIZER
 static int OpenPacketizer( vlc_object_t *p_this )
 {
-    decoder_t *p_dec = (decoder_t*)p_this;
-
-    int i_ret = OpenDecoder( p_this );
-
-    if( i_ret == VLC_SUCCESS )
-    {
-        p_dec->p_sys->b_packetizer = true;
-        p_dec->fmt_out.i_codec = VLC_CODEC_KATE;
-    }
-
-    return i_ret;
+    return OpenCommon( p_this, true );
 }
 #endif
 
@@ -462,7 +455,7 @@ static void Flush( decoder_t *p_dec )
     tiger_renderer_seek( p_sys->p_tr, 0 );
     vlc_mutex_unlock( &p_sys->lock );
 #endif
-    p_sys->i_max_stop = VLC_TS_INVALID;
+    p_sys->i_max_stop = VLC_TICK_INVALID;
 }
 
 /****************************************************************************
@@ -488,7 +481,7 @@ static void *DecodeBlock( decoder_t *p_dec, block_t *p_block )
 #endif
         if( p_block->i_flags & BLOCK_FLAG_CORRUPTED )
         {
-            p_sys->i_max_stop = VLC_TS_INVALID;
+            p_sys->i_max_stop = VLC_TICK_INVALID;
             block_Release( p_block );
             return NULL;
         }
@@ -540,7 +533,7 @@ static int ProcessHeaders( decoder_t *p_dec )
     kate_packet kp;
 
     unsigned pi_size[XIPH_MAX_HEADER_COUNT];
-    void     *pp_data[XIPH_MAX_HEADER_COUNT];
+    const void *pp_data[XIPH_MAX_HEADER_COUNT];
     unsigned i_count;
     if( xiph_SplitHeaders( pi_size, pp_data, &i_count,
                            p_dec->fmt_in.i_extra, p_dec->fmt_in.p_extra) )
@@ -551,7 +544,7 @@ static int ProcessHeaders( decoder_t *p_dec )
 
     /* Take care of the initial Kate header */
     kp.nbytes = pi_size[0];
-    kp.data   = pp_data[0];
+    kp.data   = (void *)pp_data[0];
     int i_ret = kate_decode_headerin( &p_sys->ki, &p_sys->kc, &kp );
     if( i_ret < 0 )
     {
@@ -568,7 +561,7 @@ static int ProcessHeaders( decoder_t *p_dec )
     for( unsigned i_headeridx = 1; i_headeridx < i_count; i_headeridx++ )
     {
         kp.nbytes = pi_size[i_headeridx];
-        kp.data   = pp_data[i_headeridx];
+        kp.data   = (void *)pp_data[i_headeridx];
         i_ret = kate_decode_headerin( &p_sys->ki, &p_sys->kc, &kp );
         if( i_ret < 0 )
         {
@@ -625,7 +618,7 @@ static void *ProcessPacket( decoder_t *p_dec, kate_packet *p_kp,
     decoder_sys_t *p_sys = p_dec->p_sys;
 
     /* Date management */
-    if( p_block->i_pts > VLC_TS_INVALID && p_block->i_pts != p_sys->i_pts )
+    if( p_block->i_pts != VLC_TICK_INVALID && p_block->i_pts != p_sys->i_pts )
     {
         p_sys->i_pts = p_block->i_pts;
     }
@@ -754,8 +747,9 @@ static void SetupText( decoder_t *p_dec, subpicture_t *p_spu, const kate_event *
 
 static void TigerDestroySubpicture( subpicture_t *p_subpic )
 {
-    DecSysRelease( p_subpic->updater.p_sys->p_dec_sys );
-    free( p_subpic->updater.p_sys );
+    kate_spu_updater_sys_t *p_spusys = p_subpic->updater.p_sys;
+    DecSysRelease( p_spusys->p_dec_sys );
+    free( p_spusys );
 }
 /*
  * We get premultiplied alpha, but VLC doesn't expect this, so we demultiply
@@ -811,11 +805,12 @@ static void PostprocessTigerImage( plane_t *p_plane, unsigned int i_width )
 static int TigerValidateSubpicture( subpicture_t *p_subpic,
                                     bool b_fmt_src, const video_format_t *p_fmt_src,
                                     bool b_fmt_dst, const video_format_t *p_fmt_dst,
-                                    mtime_t ts )
+                                    vlc_tick_t ts )
 {
     VLC_UNUSED(p_fmt_src); VLC_UNUSED(p_fmt_dst);
 
-    decoder_sys_t *p_sys = p_subpic->updater.p_sys->p_dec_sys;
+    kate_spu_updater_sys_t *p_spusys = p_subpic->updater.p_sys;
+    decoder_sys_t *p_sys = p_spusys->p_dec_sys;
 
     if( b_fmt_src || b_fmt_dst )
         return VLC_EGENERIC;
@@ -823,7 +818,7 @@ static int TigerValidateSubpicture( subpicture_t *p_subpic,
     PROFILE_START( TigerValidateSubpicture );
 
     /* time in seconds from the start of the stream */
-    kate_float t = (p_subpic->updater.p_sys->i_start + ts - p_subpic->i_start ) / 1000000.0f;
+    kate_float t = (p_spusys->i_start + ts - p_subpic->i_start ) / 1000000.0f;
 
     /* it is likely that the current region (if any) can be kept as is; test for this */
     vlc_mutex_lock( &p_sys->lock );
@@ -854,16 +849,17 @@ exit:
 static void TigerUpdateSubpicture( subpicture_t *p_subpic,
                                    const video_format_t *p_fmt_src,
                                    const video_format_t *p_fmt_dst,
-                                   mtime_t ts )
+                                   vlc_tick_t ts )
 {
-    decoder_sys_t *p_sys = p_subpic->updater.p_sys->p_dec_sys;
+    kate_spu_updater_sys_t *p_spusys = p_subpic->updater.p_sys;
+    decoder_sys_t *p_sys = p_spusys->p_dec_sys;
     plane_t *p_plane;
     kate_float t;
     int i_ret;
 
 
     /* time in seconds from the start of the stream */
-    t = (p_subpic->updater.p_sys->i_start + ts - p_subpic->i_start ) / 1000000.0f;
+    t = (p_spusys->i_start + ts - p_subpic->i_start ) / 1000000.0f;
 
     PROFILE_START( TigerUpdateSubpicture );
 
@@ -1059,7 +1055,7 @@ static subpicture_t *DecodePacket( decoder_t *p_dec, kate_packet *p_kp, block_t 
     /* we have an event */
 
     /* Get a new spu */
-    subpicture_updater_sys_t *p_spu_sys = NULL;
+    kate_spu_updater_sys_t *p_spu_sys = NULL;
     if( p_sys->b_use_tiger)
     {
         p_spu_sys = malloc( sizeof(*p_spu_sys) );
@@ -1084,8 +1080,7 @@ static subpicture_t *DecodePacket( decoder_t *p_dec, kate_packet *p_kp, block_t 
     }
 
     p_spu->i_start = p_block->i_pts;
-    p_spu->i_stop = p_block->i_pts + CLOCK_FREQ *
-        ev->duration * p_sys->ki.gps_denominator / p_sys->ki.gps_numerator;
+    p_spu->i_stop = p_block->i_pts + vlc_tick_from_samples(ev->duration * p_sys->ki.gps_denominator, p_sys->ki.gps_numerator);
     p_spu->b_ephemer = false;
     p_spu->b_absolute = false;
 
@@ -1247,9 +1242,11 @@ static void ParseKateComments( decoder_t *p_dec )
     char *psz_name, *psz_value, *psz_comment;
     int i = 0;
 
-    while ( i < p_dec->p_sys->kc.comments )
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    while ( i < p_sys->kc.comments )
     {
-        psz_comment = strdup( p_dec->p_sys->kc.user_comments[i] );
+        psz_comment = strdup( p_sys->kc.user_comments[i] );
         if( !psz_comment )
             break;
         psz_name = psz_comment;
@@ -1311,7 +1308,6 @@ static void DecSysRelease( decoder_sys_t *p_sys )
     }
 
     vlc_mutex_unlock( &p_sys->lock );
-    vlc_mutex_destroy( &p_sys->lock );
 
 #ifdef HAVE_TIGER
     if( p_sys->p_tr )
@@ -1326,4 +1322,3 @@ static void DecSysRelease( decoder_sys_t *p_sys )
 
     free( p_sys );
 }
-

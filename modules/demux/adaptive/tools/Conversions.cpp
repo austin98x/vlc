@@ -30,18 +30,18 @@
 /*
   Decodes a duration as defined by ISO 8601
   http://en.wikipedia.org/wiki/ISO_8601#Durations
-  @param str A null-terminated string to convert
+  @param str A nullptr-terminated string to convert
   @return: The duration in seconds. -1 if an error occurred.
 
   Exemple input string: "PT0H9M56.46S"
  */
-static time_t str_duration( const char *psz_duration )
+static vlc_tick_t str_duration( const char *psz_duration )
 {
     bool        timeDesignatorReached = false;
-    time_t      res = 0;
+    vlc_tick_t  res = 0;
     char*       end_ptr;
 
-    if ( psz_duration == NULL )
+    if ( psz_duration == nullptr )
         return -1;
     if ( ( *(psz_duration++) ) != 'P' )
         return -1;
@@ -79,7 +79,7 @@ static time_t str_duration( const char *psz_duration )
             default:
                 break ;
         }
-        res += (time_t)(mul * number);
+        res += vlc_tick_from_sec(mul * number);
         if ( *psz_duration )
             psz_duration++;
     } while ( *psz_duration );
@@ -91,7 +91,7 @@ IsoTime::IsoTime(const std::string &str)
     time = str_duration(str.c_str());
 }
 
-IsoTime::operator time_t () const
+IsoTime::operator vlc_tick_t () const
 {
     return time;
 }
@@ -133,48 +133,57 @@ UTCTime::UTCTime(const std::string &str)
         }
         else if (!in.eof() && (in.peek() == '+' || in.peek() == '-'))
         {
-            int i, tz = (in.peek() == '+') ? -60 : +60;
+            int sign = (in.peek() == '+') ? 1 : -1;
+            int tz = 0;
             in.ignore(1);
+
             if(!in.eof())
             {
-                in >> i;
-                tz *= i;
-                in.ignore(1);
-                if(!in.eof())
+                std::string tzspec;
+                in >> tzspec;
+
+                if(tzspec.length() >= 4)
                 {
-                    in >> i;
-                    tz += i;
+                    tz = sign * std::stoul(tzspec.substr(0, 2)) * 60;
+                    if(tzspec.length() == 5 && tzspec.find(':') == 2)
+                        tz += sign * std::stoul(tzspec.substr(3, 2));
+                    else
+                        tz += sign * std::stoul(tzspec.substr(2, 2));
+                }
+                else
+                {
+                    tz = sign * std::stoul(tzspec) * 60;
                 }
                 values[UTCTIME_TZ] = tz;
             }
         }
 
-        struct tm tm;
+        if (!in.fail() && !in.bad()) {
+            struct tm tm;
 
-        tm.tm_year = values[UTCTIME_YEAR] - 1900;
-        tm.tm_mon = values[UTCTIME_MON] - 1;
-        tm.tm_mday = values[UTCTIME_DAY];
-        tm.tm_hour = values[UTCTIME_HOUR];
-        tm.tm_min = values[UTCTIME_MIN];
-        tm.tm_sec = values[UTCTIME_SEC];
-        tm.tm_isdst = 0;
+            tm.tm_year = values[UTCTIME_YEAR] - 1900;
+            tm.tm_mon = values[UTCTIME_MON] - 1;
+            tm.tm_mday = values[UTCTIME_DAY];
+            tm.tm_hour = values[UTCTIME_HOUR];
+            tm.tm_min = values[UTCTIME_MIN];
+            tm.tm_sec = values[UTCTIME_SEC];
+            tm.tm_isdst = 0;
 
-        t = timegm( &tm );
-        t += values[UTCTIME_TZ] * 60;
-        t *= 1000;
-        t += values[UTCTIME_MSEC];
-        t *= CLOCK_FREQ / 1000;
-    } catch(int) {
+            int64_t mst = timegm( &tm );
+            mst += values[UTCTIME_TZ] * -60;
+            mst *= 1000;
+            mst += values[UTCTIME_MSEC];
+            t = VLC_TICK_FROM_MS(mst);
+        } else {
+            // Failure parsing time string
+            t = 0;
+        }
+    } catch(...) {
         t = 0;
     }
 }
 
-time_t UTCTime::time() const
-{
-    return t / CLOCK_FREQ;
-}
-
-mtime_t UTCTime::mtime() const
+vlc_tick_t UTCTime::mtime() const
 {
     return t;
 }

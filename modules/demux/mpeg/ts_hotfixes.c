@@ -82,13 +82,14 @@ void ProbePES( demux_t *p_demux, ts_pid_t *pid, const uint8_t *p_pesstart, size_
         return;
 
     size_t i_pesextoffset = 8;
-    mtime_t i_dts = -1;
+    stime_t i_dts = -1;
     if( p_pes[7] & 0x80 ) // PTS
     {
         i_pesextoffset += 5;
         if ( i_data < i_pesextoffset ||
             !ExtractPESTimestamp( &p_pes[9], p_pes[7] >> 6, &i_dts ) )
             return;
+        pid->probed.i_dts_count++;
     }
     if( p_pes[7] & 0x40 ) // DTS
     {
@@ -107,6 +108,9 @@ void ProbePES( demux_t *p_demux, ts_pid_t *pid, const uint8_t *p_pesstart, size_
         i_pesextoffset += 1;
     if( p_pes[7] & 0x02 ) // PESCRC
         i_pesextoffset += 2;
+
+    if( pid->probed.i_fourcc != 0 )
+        goto codecprobingend;
 
     if ( i_data < i_pesextoffset )
         return;
@@ -166,24 +170,15 @@ void ProbePES( demux_t *p_demux, ts_pid_t *pid, const uint8_t *p_pesstart, size_
     else if(i_stream_id >= 0xC0 && i_stream_id <= 0xDF)
     {
         pid->probed.i_cat = AUDIO_ES;
-        if( p_data[0] == 0xFF && (p_data[1] & 0xE0) == 0xE0 )
+        if( p_data[0] == 0xFF && (p_data[1] & 0xE0) == 0xE0 &&
+           (p_data[1] & 0x0C) != 0x04 && (p_data[1] & 0x03) == 0x00 )
         {
-            switch(p_data[1] & 6)
-            {
-            /* 01 - Layer III
-               10 - Layer II
-               11 - Layer I */
-                case 0x06:
-                    pid->probed.i_fourcc = VLC_CODEC_MPGA;
-                    break;
-                case 0x04:
-                    pid->probed.i_fourcc = VLC_CODEC_MP2;
-                    break;
-                case 0x02:
-                    pid->probed.i_fourcc = VLC_CODEC_MP3;
-                default:
-                    break;
-            }
+            pid->probed.i_fourcc = VLC_CODEC_MPGA;
+        }
+        else if( p_data[0] == 0xFF && (p_data[1] & 0xF2) == 0xF0 )
+        {
+            pid->probed.i_fourcc = VLC_CODEC_MP4A; /* ADTS */
+            pid->probed.i_original_fourcc = VLC_FOURCC('A','D','T','S');
         }
     }
     /* VIDEO STREAM */
@@ -200,6 +195,7 @@ void ProbePES( demux_t *p_demux, ts_pid_t *pid, const uint8_t *p_pesstart, size_
         }
     }
 
+codecprobingend:
     /* Track timestamps and flag missing PAT */
     if( !p_sys->patfix.i_timesourcepid && i_dts > -1 )
     {
@@ -256,6 +252,7 @@ void MissingPATPMTFixup( demux_t *p_demux )
         }
     }
 
+    const ts_pid_t * candidates[4] = { NULL };
     const ts_pid_t *p_pid = NULL;
     ts_pid_next_context_t pidnextctx = ts_pid_NextContextInitValue;
     while( (p_pid = ts_pid_Next( &p_sys->pids, &pidnextctx )) )
@@ -263,11 +260,31 @@ void MissingPATPMTFixup( demux_t *p_demux )
         if( !SEEN(p_pid) || p_pid->probed.i_fourcc == 0 )
             continue;
 
-        if( i_pcr_pid == 0x1FFF && ( p_pid->probed.i_cat == AUDIO_ES ||
-                                     p_pid->probed.i_pcr_count ) )
-            i_pcr_pid = p_pid->i_pid;
+        if( p_pid->probed.i_pcr_count && candidates[0] == NULL && false )
+            candidates[0] = p_pid;
+
+        if( p_pid->probed.i_cat == AUDIO_ES &&
+            (candidates[1] == NULL ||
+             candidates[1]->probed.i_dts_count > p_pid->probed.i_dts_count) )
+            candidates[1] = p_pid;
+
+        if( candidates[2] == NULL && p_pid != candidates[1] &&
+            p_pid->probed.i_dts_count > 0 )
+            candidates[2] = p_pid;
+
+        if( candidates[3] == NULL )
+            candidates[3] = p_pid;
 
         i_num_pes++;
+    }
+
+    for(int i=0; i<4; i++)
+    {
+        if(!candidates[i])
+            continue;
+        i_pcr_pid = candidates[i]->i_pid;
+        p_sys->patfix.b_pcrhasnopcrfield = (candidates[i]->probed.i_pcr_count < 1);
+        break;
     }
 
     if( i_num_pes == 0 )
@@ -323,6 +340,7 @@ void MissingPATPMTFixup( demux_t *p_demux )
                 continue;
 
             es_format_Init(&esstreams[j].fmt, p_pid->probed.i_cat, p_pid->probed.i_fourcc);
+            esstreams[j].fmt.i_original_fourcc = p_pid->probed.i_original_fourcc;
 
             if( VLC_SUCCESS !=
                 FillPMTESParams(mux_standard, &esstreams[j].fmt, &esstreams[j].ts, &esstreams[j].pes ) )

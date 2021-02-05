@@ -4,7 +4,7 @@
  * Copyright (C) 2005-2006 VLC authors and VideoLAN
  * Copyright © 2005-2008 Rémi Denis-Courmont
  *
- * Authors: Rémi Denis-Courmont <rem # videolan.org>
+ * Authors: Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -37,23 +37,22 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#ifndef HAVE_LSTAT
-# define lstat(a, b) stat(a, b)
-#endif
 #include <dirent.h>
+#ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
-#ifndef O_TMPFILE
-# define O_TMPFILE 0
 #endif
 
 #include <vlc_common.h>
 #include <vlc_fs.h>
 
-#if !defined(HAVE_ACCEPT4) || !defined HAVE_MKOSTEMP
+#if !defined(HAVE_ACCEPT4)
 static inline void vlc_cloexec(int fd)
 {
     fcntl(fd, F_SETFD, FD_CLOEXEC | fcntl(fd, F_GETFD));
 }
+#endif
+#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+# define MSG_NOSIGNAL 0
 #endif
 
 int vlc_open (const char *filename, int flags, ...)
@@ -62,18 +61,11 @@ int vlc_open (const char *filename, int flags, ...)
     va_list ap;
 
     va_start (ap, flags);
-    if (flags & (O_CREAT|O_TMPFILE))
+    if (flags & O_CREAT)
         mode = va_arg (ap, unsigned int);
     va_end (ap);
 
-#ifdef O_CLOEXEC
-    return open(filename, flags, mode | O_CLOEXEC);
-#else
-    int fd = open(filename, flags, mode);
-    if (fd != -1)
-        vlc_cloexec(fd);
-    return -1;
-#endif
+    return open(filename, flags | O_CLOEXEC, mode);
 }
 
 int vlc_openat (int dir, const char *filename, int flags, ...)
@@ -82,49 +74,24 @@ int vlc_openat (int dir, const char *filename, int flags, ...)
     va_list ap;
 
     va_start (ap, flags);
-    if (flags & (O_CREAT|O_TMPFILE))
+    if (flags & O_CREAT)
         mode = va_arg (ap, unsigned int);
     va_end (ap);
 
-#ifdef HAVE_OPENAT
-    return openat(dir, filename, flags, mode | O_CLOEXEC);
-#else
-    VLC_UNUSED (dir);
-    VLC_UNUSED (filename);
-    VLC_UNUSED (mode);
-    errno = ENOSYS;
-    return -1;
-#endif
+    return openat(dir, filename, flags | O_CLOEXEC, mode);
 }
 
+#ifdef HAVE_MKOSTEMP
 int vlc_mkstemp (char *template)
 {
-#if defined (HAVE_MKOSTEMP) && defined (O_CLOEXEC)
     return mkostemp(template, O_CLOEXEC);
-#else
-    int fd = mkstemp(template);
-    if (fd != -1)
-        vlc_cloexec(fd);
-    return fd;
-#endif
 }
-
-int vlc_memfd (void)
-{
-    int fd;
-#ifdef O_TMPFILE
-    fd = vlc_open ("/tmp", O_RDWR|O_TMPFILE, S_IRUSR|S_IWUSR);
-    if (fd != -1)
-        return fd;
-    /* ENOENT means either /tmp is missing (!) or the kernel does not support
-     * O_TMPFILE. EISDIR means /tmp exists but the kernel does not support
-     * O_TMPFILE. EOPNOTSUPP means the kernel supports O_TMPFILE but the /tmp
-     * filesystem does not. Do not fallback on other errors. */
-    if (errno != ENOENT && errno != EISDIR && errno != EOPNOTSUPP)
-        return -1;
 #endif
 
+VLC_WEAK int vlc_memfd(void)
+{
     char bufpath[] = "/tmp/"PACKAGE_NAME"XXXXXX";
+    int fd;
 
     fd = vlc_mkstemp (bufpath);
     if (fd != -1)
@@ -208,13 +175,18 @@ char *vlc_getcwd (void)
 
 int vlc_dup (int oldfd)
 {
-#ifdef F_DUPFD_CLOEXEC
     return fcntl (oldfd, F_DUPFD_CLOEXEC, 0);
+}
+
+int vlc_dup2(int oldfd, int newfd)
+{
+#ifdef HAVE_DUP3
+    return dup3(oldfd, newfd, O_CLOEXEC);
 #else
-    int newfd = dup (oldfd);
-    if (newfd != -1)
-        vlc_cloexec(oldfd);
-    return newfd;
+    int ret = dup2(oldfd, newfd);
+    if (ret >= 0)
+        vlc_cloexec(newfd);
+    return ret;
 #endif
 }
 
@@ -357,4 +329,31 @@ int vlc_accept (int lfd, struct sockaddr *addr, socklen_t *alen, bool nonblock)
         vlc_socket_setup(fd, nonblock);
 #endif
     return fd;
+}
+
+ssize_t vlc_send(int fd, const void *buf, size_t len, int flags)
+{
+    return vlc_sendto(fd, buf, len, flags, NULL, 0);
+}
+
+ssize_t vlc_sendto(int fd, const void *buf, size_t len, int flags,
+                   const struct sockaddr *dst, socklen_t dstlen)
+{
+    struct iovec iov = {
+        .iov_base = (void *)buf,
+        .iov_len = len,
+    };
+    struct msghdr msg = {
+        .msg_name = (struct sockaddr *)dst,
+        .msg_namelen = dstlen,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+
+    return vlc_sendmsg(fd, &msg, flags);
+}
+
+ssize_t vlc_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    return sendmsg(fd, msg, flags | MSG_NOSIGNAL);
 }

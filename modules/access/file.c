@@ -3,10 +3,9 @@
  *****************************************************************************
  * Copyright (C) 2001-2006 VLC authors and VideoLAN
  * Copyright © 2006-2007 Rémi Denis-Courmont
- * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
- *          Rémi Denis-Courmont <rem # videolan # org>
+ *          Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -29,6 +28,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -55,7 +55,6 @@
 
 #include <vlc_common.h>
 #include "fs.h"
-#include <vlc_input.h>
 #include <vlc_access.h>
 #ifdef _WIN32
 # include <vlc_charset.h>
@@ -64,12 +63,12 @@
 #include <vlc_url.h>
 #include <vlc_interrupt.h>
 
-struct access_sys_t
+typedef struct
 {
     int fd;
 
     bool b_pace_control;
-};
+} access_sys_t;
 
 #if !defined (_WIN32) && !defined (__OS2__)
 static bool IsRemote (int fd)
@@ -129,7 +128,6 @@ static bool IsRemote (const char *path)
 
 static ssize_t Read (stream_t *, void *, size_t);
 static int FileSeek (stream_t *, uint64_t);
-static int NoSeek (stream_t *, uint64_t);
 static int FileControl (stream_t *, int, va_list);
 
 /*****************************************************************************
@@ -145,9 +143,11 @@ int FileOpen( vlc_object_t *p_this )
     if (!strcasecmp (p_access->psz_name, "fd"))
     {
         char *end;
-        int oldfd = strtol (p_access->psz_location, &end, 10);
+        unsigned long oldfd = strtoul(p_access->psz_location, &end, 10);
 
-        if (*end == '\0')
+        if (oldfd > INT_MAX)
+            errno = EBADF;
+        else if (*end == '\0')
             fd = vlc_dup (oldfd);
         else if (*end == '/' && end > p_access->psz_location)
         {
@@ -235,7 +235,7 @@ int FileOpen( vlc_object_t *p_this )
     }
     else
     {
-        p_access->pf_seek = NoSeek;
+        p_access->pf_seek = NULL;
         p_sys->b_pace_control = strcasecmp (p_access->psz_name, "stream");
     }
 
@@ -299,13 +299,6 @@ static int FileSeek (stream_t *p_access, uint64_t i_pos)
     return VLC_SUCCESS;
 }
 
-static int NoSeek (stream_t *p_access, uint64_t i_pos)
-{
-    /* vlc_assert_unreachable(); ?? */
-    (void) p_access; (void) i_pos;
-    return VLC_EGENERIC;
-}
-
 /*****************************************************************************
  * Control:
  *****************************************************************************/
@@ -313,14 +306,14 @@ static int FileControl( stream_t *p_access, int i_query, va_list args )
 {
     access_sys_t *p_sys = p_access->p_sys;
     bool    *pb_bool;
-    int64_t *pi_64;
+    vlc_tick_t *pi_64;
 
     switch( i_query )
     {
         case STREAM_CAN_SEEK:
         case STREAM_CAN_FASTSEEK:
             pb_bool = va_arg( args, bool * );
-            *pb_bool = (p_access->pf_seek != NoSeek);
+            *pb_bool = (p_access->pf_seek != NULL);
             break;
 
         case STREAM_CAN_PAUSE:
@@ -340,12 +333,13 @@ static int FileControl( stream_t *p_access, int i_query, va_list args )
         }
 
         case STREAM_GET_PTS_DELAY:
-            pi_64 = va_arg( args, int64_t * );
+            pi_64 = va_arg( args, vlc_tick_t * );
             if (IsRemote (p_sys->fd, p_access->psz_filepath))
-                *pi_64 = var_InheritInteger (p_access, "network-caching");
+                *pi_64 = VLC_TICK_FROM_MS(
+                        var_InheritInteger (p_access, "network-caching") );
             else
-                *pi_64 = var_InheritInteger (p_access, "file-caching");
-            *pi_64 *= 1000;
+                *pi_64 = VLC_TICK_FROM_MS(
+                        var_InheritInteger (p_access, "file-caching") );
             break;
 
         case STREAM_SET_PAUSE_STATE:

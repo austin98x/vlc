@@ -2,7 +2,6 @@
  * compressor.c: dynamic range compressor, ported from plugins from LADSPA SWH
  *****************************************************************************
  * Copyright (C) 2010 Ronald Wright
- * $Id$
  *
  * Author: Ronald Wright <logiconcepts819@gmail.com>
  * Original author: Steve Harris <steve@plugin.org.uk>
@@ -80,7 +79,7 @@ typedef struct
 
 } lookahead;
 
-struct filter_sys_t
+typedef struct
 {
     float f_amp;
     float pf_as[A_TBL];
@@ -106,7 +105,7 @@ struct filter_sys_t
     float f_ratio;
     float f_knee;
     float f_makeup_gain;
-};
+} filter_sys_t;
 
 typedef union
 {
@@ -116,7 +115,7 @@ typedef union
 } ls_pcast32;
 
 static int      Open            ( vlc_object_t * );
-static void     Close           ( vlc_object_t * );
+static void     Close           ( filter_t * );
 static block_t *DoWork          ( filter_t *, block_t * );
 
 static void     DbInit          ( filter_sys_t * );
@@ -174,8 +173,8 @@ static int MakeupGainCallback   ( vlc_object_t *, char const *, vlc_value_t,
 #define MAKEUP_GAIN_LONGTEXT N_( "Set the makeup gain in dB (0 ... 24)." )
 
 vlc_module_begin()
-    set_shortname( _("Compressor") )
-    set_description( _("Dynamic range compressor") )
+    set_shortname( N_("Compressor") )
+    set_description( N_("Dynamic range compressor") )
     set_capability( "audio filter", 0 )
     set_category( CAT_AUDIO )
     set_subcategory( SUBCAT_AUDIO_AFILTER )
@@ -194,7 +193,7 @@ vlc_module_begin()
                KNEE_TEXT, KNEE_LONGTEXT, false )
     add_float_with_range( "compressor-makeup-gain", 7.0, 0.0, 24.0,
                MAKEUP_GAIN_TEXT, MAKEUP_GAIN_LONGTEXT, false )
-    set_callbacks( Open, Close )
+    set_callback( Open )
     add_shortcut( "compressor" )
 vlc_module_end ()
 
@@ -205,7 +204,7 @@ vlc_module_end ()
 static int Open( vlc_object_t *p_this )
 {
     filter_t *p_filter = (filter_t*)p_this;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
     float f_sample_rate = p_filter->fmt_in.audio.i_rate;
     float f_num;
 
@@ -257,7 +256,12 @@ static int Open( vlc_object_t *p_this )
     p_filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
     aout_FormatPrepare(&p_filter->fmt_in.audio);
     p_filter->fmt_out.audio = p_filter->fmt_in.audio;
-    p_filter->pf_audio_filter = DoWork;
+
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = DoWork, .close = Close,
+    };
+    p_filter->ops = &filter_ops;
 
     /* At this stage, we are ready! */
     msg_Dbg( p_filter, "compressor successfully initialized" );
@@ -268,10 +272,9 @@ static int Open( vlc_object_t *p_this )
  * Close: destroy interface
  *****************************************************************************/
 
-static void Close( vlc_object_t *p_this )
+static void Close( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t*)p_this;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
     filter_sys_t *p_sys = p_filter->p_sys;
 
     /* Remove our callbacks */
@@ -282,9 +285,6 @@ static void Close( vlc_object_t *p_this )
     var_DelCallback( p_aout, "compressor-ratio", RatioCallback, p_sys );
     var_DelCallback( p_aout, "compressor-knee", KneeCallback, p_sys );
     var_DelCallback( p_aout, "compressor-makeup-gain", MakeupGainCallback, p_sys );
-
-    /* Destroy the mutex */
-    vlc_mutex_destroy( &p_sys->lock );
 
     /* Destroy the filter parameter structure */
     free( p_sys );

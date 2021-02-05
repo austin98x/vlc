@@ -2,7 +2,6 @@
  * avformat.c: demuxer and muxer using libavformat library
  *****************************************************************************
  * Copyright (C) 1999-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -29,6 +28,7 @@
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
+#include <vlc_demux.h>
 
 #include "avformat.h"
 #include "../../codec/avcodec/avcommon.h"
@@ -36,6 +36,7 @@
 vlc_module_begin ()
 #endif /* MERGE_FFMPEG */
     add_shortcut( "ffmpeg", "avformat" )
+    add_file_extension("rm")
     set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_DEMUX )
     set_description( N_("Avformat demuxer" ) )
@@ -57,6 +58,7 @@ vlc_module_begin ()
     add_string( "sout-avformat-mux", NULL, MUX_TEXT, MUX_LONGTEXT, true )
     add_obsolete_string("ffmpeg-mux") /* removed since 2.1.0 */
     add_string( "sout-avformat-options", NULL, AV_OPTIONS_TEXT, AV_OPTIONS_LONGTEXT, true )
+    add_bool( "sout-avformat-reset-ts", false, AV_RESET_TS_TEXT, AV_RESET_TS_LONGTEXT, true )
     set_callbacks( avformat_OpenMux, avformat_CloseMux )
 #endif
 #ifndef MERGE_FFMPEG

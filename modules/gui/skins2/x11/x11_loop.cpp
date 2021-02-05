@@ -2,7 +2,6 @@
  * x11_loop.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -179,7 +178,7 @@ void X11Loop::handleX11Event()
                 (Atom)event.xclient.data.l[0] == wm_delete )
             {
                 msg_Dbg( getIntf(), "Received WM_DELETE_WINDOW message" );
-                libvlc_Quit( getIntf()->obj.libvlc );
+                libvlc_Quit( vlc_object_instance(getIntf()) );
             }
         }
         return;
@@ -254,7 +253,7 @@ void X11Loop::handleX11Event()
             if( event.type == ButtonPress &&
                 event.xbutton.button == 1 )
             {
-                mtime_t time = mdate();
+                vlc_tick_t time = vlc_tick_now();
                 int x, y;
                 pFactory->getMousePos( x, y );
                 if( time - m_lastClickTime < m_dblClickDelay &&

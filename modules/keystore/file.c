@@ -34,7 +34,6 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_fs.h>
-#include <vlc_memory.h>
 #include <vlc_keystore.h>
 #include <vlc_strings.h>
 
@@ -56,7 +55,7 @@ vlc_module_begin()
     set_category(CAT_ADVANCED)
     set_subcategory(SUBCAT_ADVANCED_MISC)
     set_callbacks(Open, Close)
-    add_savefile("keystore-file", NULL, NULL, NULL, true)
+    add_savefile("keystore-file", NULL, NULL, NULL)
         change_private()
     set_capability("keystore", 0)
     add_shortcut("file_plaintext")
@@ -266,7 +265,7 @@ end:
     }
     return VLC_SUCCESS;
 }
- 
+
 #if (!defined(HAVE_FLOCK) && defined (HAVE_FCNTL) && defined (F_SETLKW))
 static int
 posix_lock_fd(int fd)

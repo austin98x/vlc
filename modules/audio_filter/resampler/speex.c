@@ -36,7 +36,7 @@
 
 static int Open (vlc_object_t *);
 static int OpenResampler (vlc_object_t *);
-static void Close (vlc_object_t *);
+static void Close (filter_t *);
 
 vlc_module_begin ()
     set_shortname (N_("Speex resampler"))
@@ -47,11 +47,11 @@ vlc_module_begin ()
                  QUALITY_TEXT, QUALITY_LONGTEXT, true)
         change_integer_range (0, 10)
     set_capability ("audio converter", 0)
-    set_callbacks (Open, Close)
+    set_callback (Open)
 
     add_submodule ()
     set_capability ("audio resampler", 0)
-    set_callbacks (OpenResampler, Close)
+    set_callback (OpenResampler)
     add_shortcut ("speex")
 vlc_module_end ()
 
@@ -92,8 +92,12 @@ static int OpenResampler (vlc_object_t *obj)
         return VLC_ENOMEM;
     }
 
-    filter->p_sys = (filter_sys_t *)st;
-    filter->pf_audio_filter = Resample;
+    static const struct vlc_filter_operations filter_ops =
+        { .filter_audio = Resample, .close = Close };
+
+    filter->p_sys = st;
+    filter->ops = &filter_ops;
+
     return VLC_SUCCESS;
 }
 
@@ -107,9 +111,8 @@ static int Open (vlc_object_t *obj)
     return OpenResampler (obj);
 }
 
-static void Close (vlc_object_t *obj)
+static void Close (filter_t *filter)
 {
-    filter_t *filter = (filter_t *)obj;
     SpeexResamplerState *st = (SpeexResamplerState *)filter->p_sys;
 
     speex_resampler_destroy (st);
@@ -156,7 +159,7 @@ static block_t *Resample (filter_t *filter, block_t *in)
     out->i_buffer = olen * framesize;
     out->i_nb_samples = olen;
     out->i_pts = in->i_pts;
-    out->i_length = olen * CLOCK_FREQ / filter->fmt_out.audio.i_rate;
+    out->i_length = vlc_tick_from_samples(olen, filter->fmt_out.audio.i_rate);
 error:
     block_Release (in);
     return out;

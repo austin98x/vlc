@@ -2,7 +2,6 @@
  * wave.c : Wave video effect plugin for vlc
  *****************************************************************************
  * Copyright (C) 2000-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Samuel Hocevar <sam@zoy.org>
  *          Antoine Cellerier <dionoea -at- videolan -dot- org>
@@ -41,10 +40,7 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
-
-static picture_t *Filter( filter_t *, picture_t * );
+static int  Create    ( filter_t * );
 
 /*****************************************************************************
  * Module descriptor
@@ -52,13 +48,14 @@ static picture_t *Filter( filter_t *, picture_t * );
 vlc_module_begin ()
     set_description( N_("Wave video filter") )
     set_shortname( N_( "Wave" ))
-    set_capability( "video filter", 0 )
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
     add_shortcut( "wave" )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
+
+VIDEO_FILTER_WRAPPER(Filter)
 
 /*****************************************************************************
  * filter_sys_t: Distort video output method descriptor
@@ -66,48 +63,36 @@ vlc_module_end ()
  * This structure is part of the video output thread descriptor.
  * It describes the Distort specific properties of an output thread.
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     double  f_angle;
-    mtime_t last_date;
-};
+    vlc_tick_t last_date;
+} filter_sys_t;
 
 /*****************************************************************************
  * Create: allocates Distort video thread output method
  *****************************************************************************
  * This function allocates and initializes a Distort vout method.
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     const vlc_chroma_description_t *p_chroma =
         vlc_fourcc_GetChromaDescription( p_filter->fmt_in.video.i_chroma );
     if( p_chroma == NULL || p_chroma->plane_count == 0 )
         return VLC_EGENERIC;
 
     /* Allocate structure */
-    p_filter->p_sys = malloc( sizeof( filter_sys_t ) );
-    if( p_filter->p_sys == NULL )
+    filter_sys_t *p_sys = p_filter->p_sys =
+        vlc_obj_malloc( VLC_OBJECT(p_filter), sizeof(*p_sys) );
+    if( !p_sys )
         return VLC_ENOMEM;
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
 
-    p_filter->p_sys->f_angle = 0.0;
-    p_filter->p_sys->last_date = 0;
+    p_sys->f_angle = 0.0;
+    p_sys->last_date = 0;
 
     return VLC_SUCCESS;
-}
-
-/*****************************************************************************
- * Destroy: destroy Distort video thread output method
- *****************************************************************************
- * Terminate an output method created by DistortCreateOutputMethod
- *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
-{
-    filter_t *p_filter = (filter_t *)p_this;
-    free( p_filter->p_sys );
 }
 
 /*****************************************************************************
@@ -117,30 +102,22 @@ static void Destroy( vlc_object_t *p_this )
  * until it is displayed and switch the two rendering buffers, preparing next
  * frame.
  *****************************************************************************/
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
 {
-    picture_t *p_outpic;
     double f_angle;
-    mtime_t new_date = mdate();
+    vlc_tick_t new_date = vlc_tick_now();
 
-    if( !p_pic ) return NULL;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
-    p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        picture_Release( p_pic );
-        return NULL;
-    }
-
-    p_filter->p_sys->f_angle += (new_date - p_filter->p_sys->last_date) / 200000.0;
-    p_filter->p_sys->last_date = new_date;
-    f_angle = p_filter->p_sys->f_angle;
+    p_sys->f_angle += 5.0f * secf_from_vlc_tick(new_date - p_sys->last_date);
+    p_sys->last_date = new_date;
+    f_angle = p_sys->f_angle;
 
     for( int i_index = 0 ; i_index < p_pic->i_planes ; i_index++ )
     {
         int i_num_lines, i_visible_pitch, i_pixel_pitch, i_offset,
             i_visible_pixels;
-        uint8_t black_pixel;
+        uint16_t black_pixel;
         uint8_t *p_in, *p_out;
 
         p_in = p_pic->p[i_index].p_pixels;
@@ -149,17 +126,26 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
         i_num_lines = p_pic->p[i_index].i_visible_lines;
         i_visible_pitch = p_pic->p[i_index].i_visible_pitch;
         i_pixel_pitch = p_pic->p[i_index].i_pixel_pitch;
+
         switch( p_filter->fmt_in.video.i_chroma )
         {
+            CASE_PLANAR_YUV10
+                black_pixel = ( p_pic->i_planes > 1 && i_index == Y_PLANE ) ? 0x00
+                                                                            : 0x200;
+                break;
             CASE_PACKED_YUV_422
                 // Quick hack to fix u/v inversion occuring with 2 byte pixel pitch
                 i_pixel_pitch *= 2;
+                /* fallthrough */
+            CASE_PLANAR_YUV
+                black_pixel = ( p_pic->i_planes > 1 && i_index == Y_PLANE ) ? 0x00
+                                                                            : 0x80;
                 break;
+            default:
+                black_pixel = 0x00;
         }
-        i_visible_pixels = i_visible_pitch/i_pixel_pitch;
 
-        black_pixel = ( p_pic->i_planes > 1 && i_index == Y_PLANE ) ? 0x00
-                                                                    : 0x80;
+        i_visible_pixels = i_visible_pitch/i_pixel_pitch;
 
         /* Ok, we do 3 times the sin() calculation for each line. So what ? */
         for( int i_line = 0 ; i_line < i_num_lines ; i_line++ )
@@ -172,32 +158,35 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 
             if( i_offset )
             {
+                void *p_black_out;
                 if( i_offset < 0 )
                 {
                     memcpy( p_out, p_in - i_offset,
                                 i_visible_pitch + i_offset );
-                    p_in += p_pic->p[i_index].i_pitch;
-                    p_out += p_outpic->p[i_index].i_pitch;
-                    memset( p_out + i_offset, black_pixel, -i_offset );
+                    p_black_out = &p_out[i_visible_pitch + i_offset];
+                    i_offset = -i_offset;
                 }
                 else
                 {
                     memcpy( p_out + i_offset, p_in,
                                 i_visible_pitch - i_offset );
-                    memset( p_out, black_pixel, i_offset );
-                    p_in += p_pic->p[i_index].i_pitch;
-                    p_out += p_outpic->p[i_index].i_pitch;
+                    p_black_out = p_out;
                 }
+                if (black_pixel > 0xFF)
+                {
+                    uint16_t *p_out16 = p_black_out;
+                    for (int x = 0; x < i_offset; x += 2)
+                        *p_out16++ = black_pixel;
+                }
+                else
+                    memset( p_black_out, black_pixel, i_offset );
             }
             else
             {
                 memcpy( p_out, p_in, i_visible_pitch );
-                p_in += p_pic->p[i_index].i_pitch;
-                p_out += p_outpic->p[i_index].i_pitch;
             }
-
+            p_in += p_pic->p[i_index].i_pitch;
+            p_out += p_outpic->p[i_index].i_pitch;
         }
     }
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }

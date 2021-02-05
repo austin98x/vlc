@@ -65,17 +65,16 @@ static const char *const ppsz_pos_descriptions[] =
 { N_("Center"), N_("Left"), N_("Right"), N_("Top"), N_("Bottom"),
   N_("Top-Left"), N_("Top-Right"), N_("Bottom-Left"), N_("Bottom-Right") };
 
-static int  OpenSub  (vlc_object_t *);
-static int  OpenVideo(vlc_object_t *);
-static void Close    (vlc_object_t *);
+static int  OpenSub  (filter_t *);
+static int  OpenVideo(filter_t *);
+static void Close    (filter_t *);
 
 vlc_module_begin ()
 
     set_category(CAT_VIDEO)
     set_subcategory(SUBCAT_VIDEO_SUBPIC)
 
-    set_capability("sub source", 0)
-    set_callbacks(OpenSub, Close)
+    set_callback_sub_source(OpenSub, 0)
     set_description(N_("Audio Bar Graph Video sub source"))
     set_shortname(N_("Audio Bar Graph Video"))
     add_shortcut("audiobargraph_v")
@@ -93,8 +92,7 @@ vlc_module_begin ()
 
     /* video output filter submodule */
     add_submodule ()
-    set_capability("video filter", 0)
-    set_callbacks(OpenVideo, Close)
+    set_callback_video_filter(OpenVideo)
     set_description(N_("Audio Bar Graph Video sub source"))
     add_shortcut("audiobargraph_v")
 vlc_module_end ()
@@ -113,7 +111,7 @@ typedef struct
     int nbChannels;
     int *i_values;
     picture_t *p_pic;
-    mtime_t date;
+    vlc_tick_t date;
     int scale;
     bool alarm;
     int barWidth;
@@ -123,9 +121,9 @@ typedef struct
 /**
  * Private data holder
  */
-struct filter_sys_t
+typedef struct
 {
-    filter_t *p_blend;
+    vlc_blender_t *p_blend;
 
     vlc_mutex_t lock;
 
@@ -138,7 +136,7 @@ struct filter_sys_t
 
     /* On the fly control variable */
     bool b_spu_update;
-};
+} filter_sys_t;
 
 static const char *const ppsz_filter_options[] = {
     "x", "y", "transparency", "position", "barWidth", "barHeight", NULL
@@ -357,7 +355,7 @@ static int BarGraphCallback(vlc_object_t *p_this, char const *psz_var,
 /**
  * Sub source
  */
-static subpicture_t *FilterSub(filter_t *p_filter, mtime_t date)
+static subpicture_t *FilterSub(filter_t *p_filter, vlc_tick_t date)
 {
     filter_sys_t *p_sys = p_filter->p_sys;
     BarGraph_t *p_BarGraph = &(p_sys->p_BarGraph);
@@ -391,8 +389,7 @@ static subpicture_t *FilterSub(filter_t *p_filter, mtime_t date)
         goto exit;
 
     /* Create new SPU region */
-    memset(&fmt, 0, sizeof(video_format_t));
-    fmt.i_chroma = VLC_CODEC_YUVA;
+    video_format_Init(&fmt, VLC_CODEC_YUVA);
     fmt.i_sar_num = fmt.i_sar_den = 1;
     fmt.i_width = fmt.i_visible_width = p_pic->p[Y_PLANE].i_visible_pitch;
     fmt.i_height = fmt.i_visible_height = p_pic->p[Y_PLANE].i_visible_lines;
@@ -488,12 +485,19 @@ out:
     return p_dst;
 }
 
+static const struct vlc_filter_operations filter_sub_ops = {
+    .source_sub = FilterSub, .close = Close
+};
+
+static const struct vlc_filter_operations filter_video_ops = {
+    .filter_video = FilterVideo, .close = Close,
+};
+
 /**
  * Common open function
  */
-static int OpenCommon(vlc_object_t *p_this, bool b_sub)
+static int OpenCommon(filter_t *p_filter, bool b_sub)
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     /* */
@@ -542,26 +546,26 @@ static int OpenCommon(vlc_object_t *p_this, bool b_sub)
     if (!b_sub && p_sys->i_pos_x >= 0 && p_sys->i_pos_y >= 0)
         p_sys->i_pos = 0;
 
+    vlc_object_t *vlc = VLC_OBJECT(vlc_object_instance(p_filter));
+
     vlc_mutex_init(&p_sys->lock);
-    var_Create(p_filter->obj.libvlc, CFG_PREFIX "alarm", VLC_VAR_BOOL);
-    var_Create(p_filter->obj.libvlc, CFG_PREFIX "i_values", VLC_VAR_STRING);
+    var_Create(vlc, CFG_PREFIX "alarm", VLC_VAR_BOOL);
+    var_Create(vlc, CFG_PREFIX "i_values", VLC_VAR_STRING);
 
-    var_AddCallback(p_filter->obj.libvlc, CFG_PREFIX "alarm",
-                    BarGraphCallback, p_sys);
-    var_AddCallback(p_filter->obj.libvlc, CFG_PREFIX "i_values",
-                    BarGraphCallback, p_sys);
+    var_AddCallback(vlc, CFG_PREFIX "alarm", BarGraphCallback, p_sys);
+    var_AddCallback(vlc, CFG_PREFIX "i_values", BarGraphCallback, p_sys);
 
-    var_TriggerCallback(p_filter->obj.libvlc, CFG_PREFIX "alarm");
-    var_TriggerCallback(p_filter->obj.libvlc, CFG_PREFIX "i_values");
+    var_TriggerCallback(vlc, CFG_PREFIX "alarm");
+    var_TriggerCallback(vlc, CFG_PREFIX "i_values");
 
     for (int i = 0; ppsz_filter_callbacks[i]; i++)
         var_AddCallback(p_filter, ppsz_filter_callbacks[i],
                          BarGraphCallback, p_sys);
 
     if (b_sub)
-        p_filter->pf_sub_source = FilterSub;
+        p_filter->ops = &filter_sub_ops;
     else
-        p_filter->pf_video_filter = FilterVideo;
+        p_filter->ops = &filter_video_ops;
 
     return VLC_SUCCESS;
 }
@@ -569,42 +573,38 @@ static int OpenCommon(vlc_object_t *p_this, bool b_sub)
 /**
  * Open the sub source
  */
-static int OpenSub(vlc_object_t *p_this)
+static int OpenSub(filter_t *p_filter)
 {
-    return OpenCommon(p_this, true);
+    return OpenCommon(p_filter, true);
 }
 
 /**
  * Open the video filter
  */
-static int OpenVideo(vlc_object_t *p_this)
+static int OpenVideo(filter_t *p_filter)
 {
-    return OpenCommon(p_this, false);
+    return OpenCommon(p_filter, false);
 }
 
 /**
  * Common close function
  */
-static void Close(vlc_object_t *p_this)
+static void Close(filter_t *p_filter)
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
+    vlc_object_t *vlc = VLC_OBJECT(vlc_object_instance(p_filter));
 
     for (int i = 0; ppsz_filter_callbacks[i]; i++)
         var_DelCallback(p_filter, ppsz_filter_callbacks[i],
                          BarGraphCallback, p_sys);
 
-    var_DelCallback(p_filter->obj.libvlc, CFG_PREFIX "i_values",
-                    BarGraphCallback, p_sys);
-    var_DelCallback(p_filter->obj.libvlc, CFG_PREFIX "alarm",
-                    BarGraphCallback, p_sys);
-    var_Destroy(p_filter->obj.libvlc, CFG_PREFIX "i_values");
-    var_Destroy(p_filter->obj.libvlc, CFG_PREFIX "alarm");
+    var_DelCallback(vlc, CFG_PREFIX "i_values", BarGraphCallback, p_sys);
+    var_DelCallback(vlc, CFG_PREFIX "alarm", BarGraphCallback, p_sys);
+    var_Destroy(vlc, CFG_PREFIX "i_values");
+    var_Destroy(vlc, CFG_PREFIX "alarm");
 
     if (p_sys->p_blend)
         filter_DeleteBlend(p_sys->p_blend);
-
-    vlc_mutex_destroy(&p_sys->lock);
 
     if (p_sys->p_BarGraph.p_pic)
         picture_Release(p_sys->p_BarGraph.p_pic);

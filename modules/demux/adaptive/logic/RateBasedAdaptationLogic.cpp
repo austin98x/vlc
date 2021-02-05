@@ -36,31 +36,29 @@
 using namespace adaptive::logic;
 using namespace adaptive;
 
-RateBasedAdaptationLogic::RateBasedAdaptationLogic  (vlc_object_t *p_obj_) :
-                          AbstractAdaptationLogic   (),
+RateBasedAdaptationLogic::RateBasedAdaptationLogic  (vlc_object_t *obj) :
+                          AbstractAdaptationLogic   (obj),
                           bpsAvg(0),
                           currentBps(0)
 {
     usedBps = 0;
     dllength = 0;
-    p_obj = p_obj_;
     dlsize = 0;
     vlc_mutex_init(&lock);
 }
 
 RateBasedAdaptationLogic::~RateBasedAdaptationLogic()
 {
-    vlc_mutex_destroy(&lock);
 }
 
 BaseRepresentation *RateBasedAdaptationLogic::getNextRepresentation(BaseAdaptationSet *adaptSet, BaseRepresentation *currep)
 {
-    if(adaptSet == NULL)
-        return NULL;
+    if(adaptSet == nullptr)
+        return nullptr;
 
-    vlc_mutex_lock(const_cast<vlc_mutex_t *>(&lock));
+    vlc_mutex_lock(&lock);
     size_t availBps = currentBps + ((currep) ? currep->getBandwidth() : 0);
-    vlc_mutex_unlock(const_cast<vlc_mutex_t *>(&lock));
+    vlc_mutex_unlock(&lock);
     if(availBps > usedBps)
         availBps -= usedBps;
     else
@@ -68,17 +66,17 @@ BaseRepresentation *RateBasedAdaptationLogic::getNextRepresentation(BaseAdaptati
 
     RepresentationSelector selector(maxwidth, maxheight);
     BaseRepresentation *rep = selector.select(adaptSet, availBps);
-    if ( rep == NULL )
+    if ( rep == nullptr )
     {
         rep = selector.select(adaptSet);
-        if ( rep == NULL )
-            return NULL;
+        if ( rep == nullptr )
+            return nullptr;
     }
 
     return rep;
 }
 
-void RateBasedAdaptationLogic::updateDownloadRate(const ID &, size_t size, mtime_t time)
+void RateBasedAdaptationLogic::updateDownloadRate(const ID &, size_t size, vlc_tick_t time)
 {
     if(unlikely(time == 0))
         return;
@@ -86,7 +84,7 @@ void RateBasedAdaptationLogic::updateDownloadRate(const ID &, size_t size, mtime
     dllength += time;
     dlsize += size;
 
-    if(dllength < CLOCK_FREQ / 4)
+    if(dllength < VLC_TICK_FROM_MS(250))
         return;
 
     const size_t bps = CLOCK_FREQ * dlsize * 8 / dllength;
@@ -107,15 +105,17 @@ void RateBasedAdaptationLogic::updateDownloadRate(const ID &, size_t size, mtime
     vlc_mutex_unlock(&lock);
 }
 
-void RateBasedAdaptationLogic::trackerEvent(const SegmentTrackerEvent &event)
+void RateBasedAdaptationLogic::trackerEvent(const TrackerEvent &ev)
 {
-    if(event.type == SegmentTrackerEvent::SWITCHING)
+    if(ev.getType() == TrackerEvent::Type::RepresentationSwitch)
     {
+        const RepresentationSwitchEvent &event =
+                static_cast<const RepresentationSwitchEvent &>(ev);
         vlc_mutex_lock(&lock);
-        if(event.u.switching.prev)
-            usedBps -= event.u.switching.prev->getBandwidth();
-        if(event.u.switching.next)
-            usedBps += event.u.switching.next->getBandwidth();
+        if(event.prev)
+            usedBps -= event.prev->getBandwidth();
+        if(event.next)
+            usedBps += event.next->getBandwidth();
 
         BwDebug(msg_Info(p_obj, "New bandwidth usage %zu KiB/s %u%%",
                         (usedBps / 8000), (bpsAvg) ? (unsigned)(usedBps * 100.0 / bpsAvg) : 0 ));
@@ -123,24 +123,24 @@ void RateBasedAdaptationLogic::trackerEvent(const SegmentTrackerEvent &event)
     }
 }
 
-FixedRateAdaptationLogic::FixedRateAdaptationLogic(size_t bps) :
-    AbstractAdaptationLogic()
+FixedRateAdaptationLogic::FixedRateAdaptationLogic(vlc_object_t *obj, size_t bps) :
+    AbstractAdaptationLogic(obj)
 {
     currentBps = bps;
 }
 
 BaseRepresentation *FixedRateAdaptationLogic::getNextRepresentation(BaseAdaptationSet *adaptSet, BaseRepresentation *)
 {
-    if(adaptSet == NULL)
-        return NULL;
+    if(adaptSet == nullptr)
+        return nullptr;
 
     RepresentationSelector selector(maxwidth, maxheight);
     BaseRepresentation *rep = selector.select(adaptSet, currentBps);
-    if ( rep == NULL )
+    if ( rep == nullptr )
     {
         rep = selector.select(adaptSet);
-        if ( rep == NULL )
-            return NULL;
+        if ( rep == nullptr )
+            return nullptr;
     }
     return rep;
 }

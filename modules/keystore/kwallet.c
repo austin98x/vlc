@@ -205,8 +205,6 @@ values2key( const char* const* ppsz_values, bool b_search )
 end:
     free( psz_b64_realm );
     free( psz_b64_auth );
-    if ( vlc_memstream_flush( &ms ) != 0 )
-        b_state = false;
     char *psz_key = vlc_memstream_close( &ms ) == 0 ? ms.ptr : NULL;
     if ( !b_state )
     {
@@ -1181,7 +1179,8 @@ kwallet_read_password_list( vlc_keystore* p_keystore, char* psz_entry_name,
 error:
     free( p_secret_decoded );
     *pi_count = 0;
-    vlc_keystore_release_entries( p_entries, i );
+    if ( p_entries )
+        vlc_keystore_release_entries( p_entries, i );
     if ( msg )
         dbus_message_unref( msg );
     if ( repmsg )

@@ -4,6 +4,79 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>English</string>
+	<key>CFBundleAllowMixedLocalizations</key>
+	<true/>
+	<key>NSRequiresAquaSystemAppearance</key>
+	<false/>
+	<key>CFBundleExecutable</key>
+	<string>VLC</string>
+	<key>CFBundleIconFile</key>
+	<string>VLC.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.videolan.vlc</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>VLC media player</string>
+	<key>CFBundleDisplayName</key>
+	<string>VLC</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>VLC#</string>
+	<key>BreakpadProduct</key>
+	<string>VLC</string>
+	<key>BreakpadVendor</key>
+	<string>VideoLAN</string>
+	<key>BreakpadRequestComments</key>
+	<string>1</string>
+	<key>BreakpadURL</key>
+	<string>@BREAKPAD_URL@/reports</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.11.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>NSAppleScriptEnabled</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMainNibFile</key>
+	<string>MainMenu</string>
+	<key>NSPrincipalClass</key>
+	<string>VLCApplication</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://update.videolan.org/vlc/sparkle/vlc-intel64.xml</string>
+	<key>SUPublicDSAKeyFile</key>
+	<string>dsa_pub.pem</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) @COPYRIGHT_YEARS@ VLC authors and VideoLAN</string>
+	<key>NSCameraUsageDescription</key>
+	<string>VLC wants to access the camera as requested by the user.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>VLC wants to access the microphone as requested by the user.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>VLC wants to pause and resume external media players.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>VLC wants to access the desktop folder as requested by the user.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>VLC wants to access the documents folder as requested by the user.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>VLC wants to access the downloads folder as requested by the user.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>VLC wants to access a network volume as requested by the user.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>VLC wants to access a removable volume as requested by the user.</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -351,6 +424,42 @@
 			<string>DTS Encoded Audio File</string>
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeIconFile</key>
+			<string>audio.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>DSD Stream File</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.sony.dsf</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeIconFile</key>
+			<string>movie.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>DAV Video File</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.videolan.dav</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeIconFile</key>
+			<string>audio.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>DSD Interchange File</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.philips.dsdiff</string>
+			</array>
 		</dict>
 		<dict>
 			<key>CFBundleTypeExtensions</key>
@@ -928,6 +1037,7 @@
 			<array>
 				<string>tp</string>
 				<string>ts</string>
+				<string>m2t</string>
 				<string>m2ts</string>
 				<string>mts</string>
 				<string>mt2s</string>
@@ -1042,16 +1152,16 @@
 			</array>
 		</dict>
 		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>mkv</string>
+			</array>
 			<key>CFBundleTypeIconFile</key>
 			<string>mkv.icns</string>
 			<key>CFBundleTypeName</key>
 			<string>Matroska Video File</string>
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
-			<key>LSItemContentTypes</key>
-			<array>
-				<string>org.matroska.mkv</string>
-			</array>
 		</dict>
 		<dict>
 			<key>CFBundleTypeExtensions</key>
@@ -1368,34 +1478,6 @@
 			<string>Binary</string>
 		</dict>
 	</array>
-	<key>CFBundleExecutable</key>
-	<string>VLC</string>
-	<key>CFBundleGetInfoString</key>
-	<string>@COPYRIGHT_MESSAGE@</string>
-	<key>CFBundleIconFile</key>
-	<string>VLC.icns</string>
-	<key>CFBundleIdentifier</key>
-	<string>org.videolan.vlc</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
-	<key>CFBundleName</key>
-	<string>VLC media player</string>
-	<key>CFBundleDisplayName</key>
-	<string>VLC</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>CFBundleShortVersionString</key>
-	<string>@VERSION@</string>
-	<key>CFBundleSignature</key>
-	<string>VLC#</string>
-	<key>BreakpadProduct</key>
-	<string>VLC</string>
-	<key>BreakpadVendor</key>
-	<string>VideoLAN</string>
-	<key>BreakpadRequestComments</key>
-	<string>1</string>
-	<key>BreakpadURL</key>
-	<string>@BREAKPAD_URL@/reports</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -1496,31 +1578,6 @@
 			</array>
 		</dict>
 	</array>
-	<key>CFBundleVersion</key>
-	<string>@VERSION@</string>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.video</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>10.10.0</string>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-	</dict>
-	<key>NSAppleScriptEnabled</key>
-	<true/>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-	<key>NSMainNibFile</key>
-	<string>MainMenu</string>
-	<key>NSPrincipalClass</key>
-	<string>VLCApplication</string>
-	<key>NSSupportsAutomaticGraphicsSwitching</key>
-	<true/>
-	<key>SUFeedURL</key>
-	<string>http://update.videolan.org/vlc/sparkle/vlc-intel64.xml</string>
-	<key>SUPublicDSAKeyFile</key>
-	<string>dsa_pub.pem</string>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
@@ -2152,6 +2209,7 @@
 					<string>ps</string>
 					<string>tp</string>
 					<string>ts</string>
+					<string>m2t</string>
 					<string>m2ts</string>
 					<string>mts</string>
 					<string>mt2s</string>
@@ -2349,13 +2407,28 @@
 		<dict>
 			<key>UTTypeConformsTo</key>
 			<array>
+				<string>public.video</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>DAV Video File</string>
+			<key>UTTypeIdentifier</key>
+			<string>org.videolan.dav</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>dav</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
 				<string>public.data</string>
 				<string>public.archive</string>
 			</array>
 			<key>UTTypeDescription</key>
 			<string>RAR Archive</string>
-			<key>UTTypeIconFile</key>
-			<string>rar</string>
 			<key>UTTypeIdentifier</key>
 			<string>com.rarlab.rar-archive</string>
 			<key>UTTypeTagSpecification</key>
@@ -2368,6 +2441,48 @@
 				<array>
 					<string>application/x-rar</string>
 					<string>application/x-rar-compressed</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.audio</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>DSD Interchange File</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.philips.dsdiff</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>dff</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>audio/x-dff</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.audio</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>DSD Stream File</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.sony.dsf</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>dsf</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>audio/x-dsf</string>
 				</array>
 			</dict>
 		</dict>

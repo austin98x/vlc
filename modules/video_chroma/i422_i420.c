@@ -2,7 +2,6 @@
  * i422_i420.c : Planar YUV 4:2:2 to Planar YUV 4:2:0 conversion module for vlc
  *****************************************************************************
  * Copyright (C) 2000, 2001 - 2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Samuel Hocevar <sam@zoy.org>
  *          Damien Fouilleul <damienf@videolan.org>
@@ -41,33 +40,27 @@
 /*****************************************************************************
  * Local and extern prototypes.
  *****************************************************************************/
-static int  Activate ( vlc_object_t * );
-
-static void I422_I420( filter_t *, picture_t *, picture_t * );
-static void I422_YV12( filter_t *, picture_t *, picture_t * );
-static void I422_YUVA( filter_t *, picture_t *, picture_t * );
-static picture_t *I422_I420_Filter( filter_t *, picture_t * );
-static picture_t *I422_YV12_Filter( filter_t *, picture_t * );
-static picture_t *I422_YUVA_Filter( filter_t *, picture_t * );
+static int  Activate ( filter_t * );
 
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
 vlc_module_begin ()
     set_description( N_("Conversions from " SRC_FOURCC " to " DEST_FOURCC) )
-    set_capability( "video converter", 60 )
-    set_callbacks( Activate, NULL )
+    set_callback_video_converter( Activate, 60 )
 vlc_module_end ()
+
+VIDEO_FILTER_WRAPPER( I422_I420 )
+VIDEO_FILTER_WRAPPER( I422_YV12 )
+VIDEO_FILTER_WRAPPER( I422_YUVA )
 
 /*****************************************************************************
  * Activate: allocate a chroma function
  *****************************************************************************
  * This function allocates and initializes a chroma function
  *****************************************************************************/
-static int Activate( vlc_object_t *p_this )
+static int Activate( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     if( p_filter->fmt_in.video.i_width & 1
      || p_filter->fmt_in.video.i_height & 1 )
     {
@@ -87,15 +80,15 @@ static int Activate( vlc_object_t *p_this )
             {
                 case VLC_CODEC_I420:
                 case VLC_CODEC_J420:
-                    p_filter->pf_video_filter = I422_I420_Filter;
+                    p_filter->ops = &I422_I420_ops;
                     break;
 
                 case VLC_CODEC_YV12:
-                    p_filter->pf_video_filter = I422_YV12_Filter;
+                    p_filter->ops = &I422_YV12_ops;
                     break;
 
                 case VLC_CODEC_YUV420A:
-                    p_filter->pf_video_filter = I422_YUVA_Filter;
+                    p_filter->ops = &I422_YUVA_ops;
                     break;
 
                 default:
@@ -110,9 +103,6 @@ static int Activate( vlc_object_t *p_this )
 }
 
 /* Following functions are local */
-VIDEO_FILTER_WRAPPER( I422_I420 )
-VIDEO_FILTER_WRAPPER( I422_YV12 )
-VIDEO_FILTER_WRAPPER( I422_YUVA )
 
 /*****************************************************************************
  * I422_I420: planar YUV 4:2:2 to planar I420 4:2:0 Y:U:V

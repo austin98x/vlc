@@ -45,20 +45,20 @@ namespace dash
     {
         public:
             DASHManager( demux_t *,
-                         AuthStorage *,
+                         SharedResources *,
                          mpd::MPD *mpd,
                          AbstractStreamFactory *,
                          logic::AbstractAdaptationLogic::LogicType type);
             virtual ~DASHManager    ();
 
-            virtual bool needsUpdate() const; /* reimpl */
-            virtual bool updatePlaylist(); /* reimpl */
-            virtual void scheduleNextUpdate();/* reimpl */
+            virtual bool needsUpdate() const override;
+            virtual bool updatePlaylist() override;
+            virtual void scheduleNextUpdate() override;
             static bool isDASH(xml::Node *);
             static bool mimeMatched(const std::string &);
 
         protected:
-            virtual int doControl(int, va_list); /* reimpl */
+            virtual int doControl(int, va_list) override;
     };
 
 }

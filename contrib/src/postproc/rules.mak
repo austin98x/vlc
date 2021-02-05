@@ -6,6 +6,8 @@ POSTPROC_VERSION := $(POSTPROC_HASH)
 
 POSTPROCCONF = \
 	--cc="$(CC)" \
+	--ar="$(AR)" \
+	--ranlib="$(RANLIB)" \
 	--disable-debug \
 	--enable-gpl \
 	--enable-postproc
@@ -101,6 +103,10 @@ ifdef HAVE_SOLARIS
 POSTPROCCONF += --enable-pic
 endif
 
+ifdef HAVE_NACL
+POSTPROCCONF += --target-os=linux
+endif
+
 # Build
 
 ifdef GPL
@@ -119,6 +125,8 @@ $(TARBALLS)/postproc-$(POSTPROC_VERSION).tar.xz:
 
 postproc: postproc-$(POSTPROC_VERSION).tar.xz .sum-postproc
 	$(UNPACK)
+	$(APPLY) $(SRC)/postproc/win-pic.patch
+	$(APPLY) $(SRC)/postproc/postproc-ranlib.patch
 	$(MOVE)
 
 .postproc: postproc

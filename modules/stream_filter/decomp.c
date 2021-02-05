@@ -27,17 +27,10 @@
 #include <vlc_stream.h>
 #include <vlc_network.h>
 #include <vlc_fs.h>
-#include <assert.h>
+#include <vlc_spawn.h>
 #include <unistd.h>
 #include <errno.h>
-#ifndef _POSIX_SPAWN
-# define _POSIX_SPAWN (-1)
-#endif
 #include <fcntl.h>
-#if (_POSIX_SPAWN >= 0)
-# include <spawn.h>
-#endif
-#include <sys/wait.h>
 #include <sys/ioctl.h>
 #if defined (__linux__) && defined (HAVE_VMSPLICE)
 # include <sys/uio.h>
@@ -57,7 +50,7 @@ static void Close (vlc_object_t *);
 vlc_module_begin ()
     set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_STREAM_FILTER)
-    set_capability ("stream_filter", 20)
+    set_capability ("stream_filter", 320)
 
     set_description (N_("LZMA decompression"))
     set_callbacks (OpenXZ, Close)
@@ -72,7 +65,7 @@ vlc_module_begin ()
     set_callbacks (OpenGzip, Close)
 vlc_module_end ()
 
-struct stream_sys_t
+typedef struct
 {
     /* Thread data */
     int          write_fd;
@@ -89,8 +82,8 @@ struct stream_sys_t
     int          read_fd;
     bool         can_pace;
     bool         can_pause;
-    int64_t      pts_delay;
-};
+    vlc_tick_t   pts_delay;
+} stream_sys_t;
 
 extern char **environ;
 
@@ -222,7 +215,7 @@ static int Control (stream_t *stream, int query, va_list args)
             *(va_arg (args, uint64_t *)) = 0;
             break;
         case STREAM_GET_PTS_DELAY:
-            *va_arg (args, int64_t *) = p_sys->pts_delay;
+            *va_arg (args, vlc_tick_t *) = p_sys->pts_delay;
             break;
         case STREAM_SET_PAUSE_STATE:
         {
@@ -274,47 +267,23 @@ static int Open (stream_t *stream, const char *path)
         int uncomp[2];
         if (vlc_pipe (uncomp) == 0)
         {
+            int fdv[] = { comp[0], uncomp[1], 2, -1 };
+            const char *argv[] = { path, NULL };
+
             p_sys->read_fd = uncomp[0];
 
-#if (_POSIX_SPAWN >= 0)
-            posix_spawn_file_actions_t actions;
-            if (posix_spawn_file_actions_init (&actions) == 0)
+            if (vlc_spawnp(&p_sys->pid, path, fdv, argv) == 0)
             {
-                char *const argv[] = { (char *)path, NULL };
+                if (vlc_clone(&p_sys->thread, Thread, stream,
+                              VLC_THREAD_PRIORITY_INPUT) == 0)
+                    ret = VLC_SUCCESS;
+            }
+            else
+            {
+                msg_Err (stream, "cannot execute %s", path);
+                p_sys->pid = -1;
+            }
 
-                if (!posix_spawn_file_actions_adddup2 (&actions, comp[0], 0)
-                 && !posix_spawn_file_actions_adddup2 (&actions, uncomp[1], 1)
-                 && !posix_spawnp (&p_sys->pid, path, &actions, NULL, argv,
-                                   environ))
-                {
-                    if (vlc_clone (&p_sys->thread, Thread, stream,
-                                   VLC_THREAD_PRIORITY_INPUT) == 0)
-                        ret = VLC_SUCCESS;
-                }
-                else
-                {
-                    msg_Err (stream, "cannot execute %s", path);
-                    p_sys->pid = -1;
-                }
-                posix_spawn_file_actions_destroy (&actions);
-            }
-#else /* _POSIX_SPAWN */
-            switch (p_sys->pid = fork ())
-            {
-                case -1:
-                    msg_Err (stream, "cannot fork: %s", vlc_strerror_c(errno));
-                    break;
-                case 0:
-                    dup2 (comp[0], 0);
-                    dup2 (uncomp[1], 1);
-                    execlp (path, path, (const char *)NULL);
-                    exit (1); /* if we get, execlp() failed! */
-                default:
-                    if (vlc_clone (&p_sys->thread, Thread, stream,
-                                   VLC_THREAD_PRIORITY_INPUT) == 0)
-                        ret = VLC_SUCCESS;
-            }
-#endif /* _POSIX_SPAWN < 0 */
             vlc_close (uncomp[1]);
             if (ret != VLC_SUCCESS)
                 vlc_close (uncomp[0]);
@@ -327,9 +296,7 @@ static int Open (stream_t *stream, const char *path)
     if (ret != VLC_SUCCESS)
     {
         if (p_sys->pid != -1)
-            while (waitpid (p_sys->pid, &(int){ 0 }, 0) == -1);
-        vlc_mutex_destroy (&p_sys->lock);
-        vlc_cond_destroy (&p_sys->wait);
+            vlc_waitpid(p_sys->pid);
         free (p_sys);
         return ret;
     }
@@ -348,7 +315,6 @@ static void Close (vlc_object_t *obj)
 {
     stream_t *stream = (stream_t *)obj;
     stream_sys_t *p_sys = stream->p_sys;
-    int status;
 
     vlc_cancel (p_sys->thread);
     vlc_close (p_sys->read_fd);
@@ -358,11 +324,7 @@ static void Close (vlc_object_t *obj)
         vlc_close (p_sys->write_fd);
 
     msg_Dbg (obj, "waiting for PID %u", (unsigned)p_sys->pid);
-    while (waitpid (p_sys->pid, &status, 0) == -1);
-    msg_Dbg (obj, "exit status %d", status);
-
-    vlc_mutex_destroy (&p_sys->lock);
-    vlc_cond_destroy (&p_sys->wait);
+    msg_Dbg (obj, "exit status %d", vlc_waitpid(p_sys->pid));
     free (p_sys);
 }
 

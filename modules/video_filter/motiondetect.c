@@ -2,7 +2,6 @@
  * motiondetect.c : Second version of a motion detection plugin.
  *****************************************************************************
  * Copyright (C) 2000-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea -at- videolan -dot- org>
  *
@@ -39,8 +38,8 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
+static int  Create    ( filter_t * );
+static void Destroy   ( filter_t * );
 
 #define FILTER_PREFIX "motiondetect-"
 
@@ -49,10 +48,9 @@ vlc_module_begin ()
     set_shortname( N_( "Motion Detect" ))
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
-    set_capability( "video filter", 0 )
 
     add_shortcut( "motion" )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 
@@ -66,10 +64,9 @@ static int FindShapes( uint32_t *, uint32_t *, int, int, int,
 static void Draw( filter_t *p_filter, uint8_t *p_pix, int i_pix_pitch, int i_pix_size );
 #define NUM_COLORS (5000)
 
-struct filter_sys_t
+typedef struct
 {
     bool is_yuv_planar;
-    bool b_old;
     picture_t *p_old;
     uint32_t *p_buf;
     uint32_t *p_buf2;
@@ -81,14 +78,23 @@ struct filter_sys_t
     int color_x_max[NUM_COLORS];
     int color_y_min[NUM_COLORS];
     int color_y_max[NUM_COLORS];
-};
+} filter_sys_t;
+
+static void Flush(filter_t *p_filter)
+{
+    filter_sys_t *p_sys = p_filter->p_sys;
+    if (p_sys->p_old != NULL)
+    {
+        picture_Release(p_sys->p_old);
+        p_sys->p_old = NULL;
+    }
+}
 
 /*****************************************************************************
  * Create
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     const video_format_t *p_fmt = &p_filter->fmt_in.video;
     filter_sys_t *p_sys;
     bool is_yuv_planar;
@@ -108,7 +114,11 @@ static int Create( vlc_object_t *p_this )
                      (char*)&(p_fmt->i_chroma) );
             return VLC_EGENERIC;
     }
-    p_filter->pf_video_filter = Filter;
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_video = Filter, .flush = Flush, .close = Destroy,
+    };
+    p_filter->ops = &filter_ops;
 
     /* Allocate structure */
     p_filter->p_sys = p_sys = malloc( sizeof( filter_sys_t ) );
@@ -116,17 +126,14 @@ static int Create( vlc_object_t *p_this )
         return VLC_ENOMEM;
 
     p_sys->is_yuv_planar = is_yuv_planar;
-    p_sys->b_old = false;
-    p_sys->p_old = picture_NewFromFormat( p_fmt );
+    p_sys->p_old = NULL;
     p_sys->p_buf  = calloc( p_fmt->i_width * p_fmt->i_height, sizeof(*p_sys->p_buf) );
     p_sys->p_buf2 = calloc( p_fmt->i_width * p_fmt->i_height, sizeof(*p_sys->p_buf) );
 
-    if( !p_sys->p_old || !p_sys->p_buf || !p_sys->p_buf2 )
+    if( !p_sys->p_buf || !p_sys->p_buf2 )
     {
         free( p_sys->p_buf2 );
         free( p_sys->p_buf );
-        if( p_sys->p_old )
-            picture_Release( p_sys->p_old );
         return VLC_ENOMEM;
     }
 
@@ -136,14 +143,14 @@ static int Create( vlc_object_t *p_this )
 /*****************************************************************************
  * Destroy
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     free( p_sys->p_buf2 );
     free( p_sys->p_buf );
-    picture_Release( p_sys->p_old );
+    if( p_sys->p_old )
+        picture_Release( p_sys->p_old );
     free( p_sys );
 }
 
@@ -272,10 +279,9 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_inpic )
     }
     picture_Copy( p_outpic, p_inpic );
 
-    if( !p_sys->b_old )
+    if( !p_sys->p_old )
     {
-        picture_Copy( p_sys->p_old, p_inpic );
-        p_sys->b_old = true;
+        p_sys->p_old = picture_Hold( p_inpic );
         goto exit;
     }
 
@@ -307,13 +313,12 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_inpic )
      */
     Draw( p_filter, &p_outpic->p[Y_PLANE].p_pixels[i_pix_offset], p_outpic->p[Y_PLANE].i_pitch, i_pix_size );
 
-    /**
-     * We're done. Lets keep a copy of the picture
-     * TODO we may just picture_Release with a latency of 1 if the filters/vout
-     * handle it correctly */
-    picture_Copy( p_sys->p_old, p_inpic );
+    /* We're done. Lets keep a copy of the picture */
+    picture_Release( p_sys->p_old );
+    p_sys->p_old = picture_Hold( p_inpic );
 
 exit:
+    picture_CopyProperties(p_outpic, p_inpic);
     picture_Release( p_inpic );
     return p_outpic;
 }

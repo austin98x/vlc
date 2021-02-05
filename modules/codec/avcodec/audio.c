@@ -2,7 +2,6 @@
  * audio.c: audio decoder using libavcodec library
  *****************************************************************************
  * Copyright (C) 1999-2003 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -47,7 +46,7 @@
 /*****************************************************************************
  * decoder_sys_t : decoder descriptor
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
     AVCodecContext *p_context;
     const AVCodec  *p_codec;
@@ -66,7 +65,7 @@ struct decoder_sys_t
     int     pi_extraction[AOUT_CHAN_MAX];
     int     i_previous_channels;
     uint64_t i_previous_layout;
-};
+} decoder_sys_t;
 
 #define BLOCK_FLAG_PRIVATE_REALLOCATED (1 << BLOCK_FLAG_PRIVATE_SHIFT)
 
@@ -169,6 +168,11 @@ static void vlc_av_frame_Release(block_t *block)
     free(b);
 }
 
+static const struct vlc_block_callbacks vlc_av_frame_cbs =
+{
+    vlc_av_frame_Release,
+};
+
 static block_t *vlc_av_frame_Wrap(AVFrame *frame)
 {
     for (unsigned i = 1; i < AV_NUM_DATA_POINTERS; i++)
@@ -183,9 +187,9 @@ static block_t *vlc_av_frame_Wrap(AVFrame *frame)
 
     block_t *block = &b->self;
 
-    block_Init(block, frame->extended_data[0], frame->linesize[0]);
+    block_Init(block, &vlc_av_frame_cbs,
+               frame->extended_data[0], frame->linesize[0]);
     block->i_nb_samples = frame->nb_samples;
-    block->pf_release = vlc_av_frame_Release;
     b->frame = frame;
     return block;
 }
@@ -251,7 +255,6 @@ int InitAudioDec( vlc_object_t *obj )
     /* Try to set as much information as possible but do not trust it */
     SetupOutputFormat( p_dec, false );
 
-    date_Set( &p_sys->end_date, VLC_TS_INVALID );
     if( !p_dec->fmt_out.audio.i_rate )
         p_dec->fmt_out.audio.i_rate = p_dec->fmt_in.audio.i_rate;
     if( p_dec->fmt_out.audio.i_rate )
@@ -280,7 +283,7 @@ static void Flush( decoder_t *p_dec )
 
     if( avcodec_is_open( ctx ) )
         avcodec_flush_buffers( ctx );
-    date_Set( &p_sys->end_date, VLC_TS_INVALID );
+    date_Set( &p_sys->end_date, VLC_TICK_INVALID );
 
     if( ctx->codec_id == AV_CODEC_ID_MP2 ||
         ctx->codec_id == AV_CODEC_ID_MP3 )
@@ -332,11 +335,12 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
 
         if( p_block->i_flags & BLOCK_FLAG_DISCONTINUITY )
         {
-            date_Set( &p_sys->end_date, VLC_TS_INVALID );
+            date_Set( &p_sys->end_date, VLC_TICK_INVALID );
         }
 
         /* We've just started the stream, wait for the first PTS. */
-        if( !date_Get( &p_sys->end_date ) && p_block->i_pts <= VLC_TS_INVALID )
+        if( p_block->i_pts == VLC_TICK_INVALID &&
+            date_Get( &p_sys->end_date ) == VLC_TICK_INVALID )
             goto drop;
 
         if( p_block->i_buffer <= 0 )
@@ -385,7 +389,12 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
                 if( ret == AVERROR(ENOMEM) || ret == AVERROR(EINVAL) )
                     goto end;
                 else
+                {
+                    char errorstring[AV_ERROR_MAX_STRING_SIZE];
+                    if( !av_strerror( ret, errorstring, AV_ERROR_MAX_STRING_SIZE ) )
+                        msg_Err( p_dec, "%s", errorstring );
                     goto drop;
+                }
             }
         }
 
@@ -591,9 +600,9 @@ static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
     uint32_t pi_order_src[i_order_max];
 
     int i_channels_src = 0;
-    int64_t channel_layout =
+    uint64_t channel_layout =
         p_sys->p_context->channel_layout ? p_sys->p_context->channel_layout :
-        av_get_default_channel_layout( p_sys->p_context->channels );
+        (uint64_t)av_get_default_channel_layout( p_sys->p_context->channels );
 
     if( channel_layout )
     {
@@ -624,19 +633,11 @@ static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
         if( i_channels_dst != i_channels_src && b_trust )
             msg_Warn( p_dec, "%d channels are dropped", i_channels_src - i_channels_dst );
 
-        /* Restore the right order of Ambisonic order 1 channels encoded in AAC... */
+        /* No reordering for Ambisonic order 1 channels encoded in AAC... */
         if (p_dec->fmt_out.audio.channel_type == AUDIO_CHANNEL_TYPE_AMBISONICS
             && p_dec->fmt_in.i_codec == VLC_CODEC_MP4A
             && i_channels_src == 4)
-        {
-            p_sys->pi_extraction[0] = 2;
-            p_sys->pi_extraction[1] = 0;
-            p_sys->pi_extraction[2] = 1;
-            p_sys->pi_extraction[3] = 3;
-            i_layout_dst = AOUT_CHAN_CENTER | AOUT_CHAN_LEFT
-                    | AOUT_CHAN_RIGHT | AOUT_CHAN_REARCENTER;
-            p_sys->b_extract = true;
-        }
+            p_sys->b_extract = false;
 
         p_dec->fmt_out.audio.i_physical_channels = i_layout_dst;
     }

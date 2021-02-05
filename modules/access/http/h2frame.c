@@ -41,7 +41,7 @@ vlc_h2_frame_alloc(uint_fast8_t type, uint_fast8_t flags,
 {
     assert((stream_id >> 31) == 0);
 
-    if (unlikely(length >= (1u << 24)))
+    if (unlikely(length > VLC_H2_MAX_MAX_FRAME))
     {
         errno = EINVAL;
         return NULL;
@@ -854,16 +854,35 @@ static int vlc_h2_parse_frame_window_update(struct vlc_h2_parser *p,
                                             struct vlc_h2_frame *f, size_t len,
                                             uint_fast32_t id)
 {
-    free(f);
-
     if (len != 4)
     {
+        free(f);
+
         if (id == 0)
             return vlc_h2_parse_error(p, VLC_H2_FRAME_SIZE_ERROR);
         return vlc_h2_stream_error(p, id, VLC_H2_FRAME_SIZE_ERROR);
     }
 
-    /* Nothing to do as we do not send data for the time being. */
+    uint_fast32_t credit = GetDWBE(vlc_h2_frame_payload(f)) & 0x7fffffffu;
+
+    free(f);
+
+    if (credit == 0)
+    {
+        if (id == 0)
+            return vlc_h2_parse_error(p, VLC_H2_PROTOCOL_ERROR);
+        return vlc_h2_stream_error(p, id, VLC_H2_PROTOCOL_ERROR);
+    }
+
+    if (id == 0)
+        p->cbs->window_update(p->opaque, credit);
+    else
+    {
+        void *s = vlc_h2_stream_lookup(p, id);
+
+        if (s != NULL)
+            p->cbs->stream_window_update(s, credit);
+    }
     return 0;
 }
 

@@ -279,7 +279,6 @@ int Import_WPL( vlc_object_t* p_this )
 {
     stream_t* p_demux = (stream_t*)p_this;
 
-    CHECK_FILE(p_demux);
     if( !stream_HasExtension( p_demux, ".wpl" ) &&
         !stream_HasExtension( p_demux, ".zpl" ) )
         return VLC_EGENERIC;
@@ -302,11 +301,11 @@ int Import_WPL( vlc_object_t* p_this )
     }
     p_demux->p_sys = p_reader;
 
-    const int i_flags = p_reader->obj.flags;
-    p_reader->obj.flags |= OBJECT_FLAGS_QUIET;
+    struct vlc_logger *const logger = p_reader->obj.logger;
+    p_reader->obj.logger = NULL;
     const char* psz_name;
     int type = xml_ReaderNextNode( p_reader, &psz_name );
-    p_reader->obj.flags = i_flags;
+    p_reader->obj.logger = logger;
     if ( type != XML_READER_STARTELEM || strcasecmp( psz_name, "smil" ) )
     {
         msg_Err( p_demux, "Invalid WPL playlist. Root element should have been <smil>" );
@@ -315,14 +314,16 @@ int Import_WPL( vlc_object_t* p_this )
         return VLC_EGENERIC;
     }
 
-    p_demux->p_sys = xml_ReaderReset( p_reader, p_demux->s );
+    xml_ReaderDelete( p_demux->p_sys );
+
+    p_demux->p_sys = xml_ReaderCreate( p_demux, p_demux->s );
     vlc_stream_Delete( p_probestream );
     if( unlikely( p_demux->p_sys == NULL ) )
         return VLC_EGENERIC;
 
     msg_Dbg( p_demux, "Found valid WPL playlist" );
     p_demux->pf_readdir = Demux;
-    p_demux->pf_control = access_vaDirectoryControlHelper;
+    p_demux->pf_control = PlaylistControl;
 
     return VLC_SUCCESS;
 }

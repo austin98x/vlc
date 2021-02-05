@@ -25,9 +25,9 @@
 #endif
 
 #include <assert.h>
+#include <stdatomic.h>
 
 #include <vlc_common.h>
-#include <vlc_atomic.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
 #include <vlc_plugin.h>
@@ -40,9 +40,6 @@
 #include <CoreImage/CIImage.h>
 #include <CoreImage/CIFilter.h>
 #include <CoreImage/CIVector.h>
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wpartial-availability"
 
 enum    filter_type
 {
@@ -66,7 +63,7 @@ struct  filter_chain
 {
     enum filter_type            filter;
     CIFilter *                  ci_filter;
-    vlc_atomic_float            ci_params[NUM_FILTER_PARAM_MAX];
+    _Atomic float               ci_params[NUM_FILTER_PARAM_MAX];
     struct filter_chain *       next;
     union {
         struct
@@ -84,20 +81,25 @@ struct  ci_filters_ctx
 {
     CVPixelBufferPoolRef        cvpx_pool;
     video_format_t              cvpx_pool_fmt;
-    CVPixelBufferPoolRef        outconv_cvpx_pool;
     CIContext *                 ci_ctx;
     struct filter_chain *       fchain;
+    filter_t *                  src_converter;
     filter_t *                  dst_converter;
+#if !TARGET_OS_IPHONE
+    CGLContextObj               cgl_context;
+#else
+    CVEAGLContext               eagl_context;
+#endif
 };
 
-struct filter_sys_t
+typedef struct filter_sys_t
 {
     char const *                psz_filter;
     bool                        mouse_moved;
     vlc_mouse_t                 old_mouse;
     vlc_mouse_t                 mouse;
     struct ci_filters_ctx *     ctx;
-};
+} filter_sys_t;
 
 struct  range
 {
@@ -308,9 +310,8 @@ ParamsCallback(vlc_object_t *obj,
     else
         vlc_assert_unreachable();
 
-    vlc_atomic_store_float(filter->ci_params + i,
-                           filter_ConvertParam(new_vlc_val,
-                                               filter_param_descs + i));
+    atomic_store(filter->ci_params + i,
+                 filter_ConvertParam(new_vlc_val, filter_param_descs + i));
 
     return VLC_SUCCESS;
 }
@@ -355,10 +356,11 @@ static void filter_PsychedelicControl(filter_t *filter, struct filter_chain *fch
 static picture_t *
 Filter(filter_t *filter, picture_t *src)
 {
-    struct ci_filters_ctx *ctx = filter->p_sys->ctx;
+    filter_sys_t *p_sys = filter->p_sys;
+    struct ci_filters_ctx *ctx = p_sys->ctx;
     enum filter_type filter_types[NUM_MAX_EQUIVALENT_VLC_FILTERS];
 
-    filter_desc_table_GetFilterTypes(filter->p_sys->psz_filter, filter_types);
+    filter_desc_table_GetFilterTypes(p_sys->psz_filter, filter_types);
     if (ctx->fchain->filter != filter_types[0])
         return src;
 
@@ -370,12 +372,21 @@ Filter(filter_t *filter, picture_t *src)
     if (!cvpx)
         goto error;
 
-    if (cvpxpic_attach(dst, cvpx))
+    if (cvpxpic_attach(dst, cvpx, filter->vctx_out, NULL))
     {
         CFRelease(cvpx);
         goto error;
     }
     CFRelease(cvpx);
+
+    if (ctx->src_converter)
+    {
+        // TODO
+        src = ctx->src_converter->ops->filter_video(ctx->src_converter, src);
+        if (!src)
+            return NULL;
+        assert(!picture_HasChainedPics(src)); // no chaining
+    }
 
     @autoreleasepool {
         CIImage *ci_img = [CIImage imageWithCVImageBuffer: cvpxpic_get_ref(src)];
@@ -393,7 +404,7 @@ Filter(filter_t *filter, picture_t *src)
             {
                 NSString *ci_param_name =
                     filter_desc_table[fchain->filter].param_descs[i].ci;
-                float ci_value = vlc_atomic_load_float(fchain->ci_params + i);
+                float ci_value = atomic_load(fchain->ci_params + i);
 
                 [fchain->ci_filter setValue: [NSNumber numberWithFloat: ci_value]
                                      forKey: ci_param_name];
@@ -412,32 +423,31 @@ Filter(filter_t *filter, picture_t *src)
 
     if (ctx->dst_converter)
     {
-        dst = ctx->dst_converter->pf_video_filter(ctx->dst_converter, dst);
+        dst = ctx->dst_converter->ops->filter_video(ctx->dst_converter, dst);
         if (!dst)
             return NULL;
+        assert(!picture_HasChainedPics(dst)); // no chaining
     }
 
-    filter->p_sys->mouse_moved = false;
+    p_sys->mouse_moved = false;
     return dst;
 
 error:
     if (dst)
         picture_Release(dst);
     picture_Release(src);
-    filter->p_sys->mouse_moved = false;
+    p_sys->mouse_moved = false;
     return NULL;
 }
 
 static int
-Mouse(filter_t *filter, struct vlc_mouse_t *mouse,
-      const struct vlc_mouse_t *old, const struct vlc_mouse_t *new)
+Mouse(filter_t *filter, struct vlc_mouse_t *new,
+      const struct vlc_mouse_t *old)
 {
-    VLC_UNUSED(mouse);
     filter_sys_t *sys = filter->p_sys;
     sys->old_mouse = *old;
     sys->mouse = *new;
     sys->mouse_moved = true;
-    *mouse = *new;
     return VLC_SUCCESS;
 }
 
@@ -477,9 +487,9 @@ Open_FilterInit(filter_t *filter, struct filter_chain *fchain)
         else
             vlc_assert_unreachable();
 
-        vlc_atomic_init_float(fchain->ci_params + i,
-                              filter_ConvertParam(vlc_param_val,
-                                                  filter_param_descs + i));
+        atomic_init(fchain->ci_params + i,
+                    filter_ConvertParam(vlc_param_val,
+                                        filter_param_descs + i));
 
         var_AddCallback(filter, filter_param_descs[i].vlc,
                         ParamsCallback, fchain);
@@ -515,246 +525,253 @@ Open_CreateFilters(filter_t *filter, struct filter_chain **p_last_filter,
     return VLC_SUCCESS;
 }
 
-static picture_t *
-CVPX_buffer_new(filter_t *converter)
+static void
+cvpx_video_context_Destroy(void *priv)
 {
-    CVPixelBufferPoolRef pool = converter->owner.sys;
-    CVPixelBufferRef cvpx = cvpxpool_new_cvpx(pool);
-    if (!cvpx)
+    struct ci_filters_ctx *ctx = priv;
+
+    if (ctx->src_converter)
+    {
+        filter_Close( ctx->src_converter );
+        module_unneed(ctx->src_converter, ctx->src_converter->p_module);
+        vlc_object_delete(ctx->src_converter);
+    }
+    if (ctx->dst_converter)
+    {
+        filter_Close( ctx->dst_converter );
+        module_unneed(ctx->dst_converter, ctx->dst_converter->p_module);
+        vlc_object_delete(ctx->dst_converter);
+    }
+
+    if (ctx->cvpx_pool)
+        CVPixelBufferPoolRelease(ctx->cvpx_pool);
+}
+
+static filter_t *
+CVPX_to_CVPX_converter_Create(filter_t *filter, bool to_rgba)
+{
+    filter_t *converter = vlc_object_create(filter, sizeof(filter_t));
+    if (!converter)
         return NULL;
 
-    picture_t *pic = picture_NewFromFormat(&converter->fmt_out.video);
-    if (!pic || cvpxpic_attach(pic, cvpx))
+    converter->fmt_in = filter->fmt_out;
+    converter->fmt_out = filter->fmt_out;
+
+    if (to_rgba)
     {
-        CFRelease(cvpx);
+        converter->fmt_out.video.i_chroma =
+        converter->fmt_out.i_codec = VLC_CODEC_CVPX_BGRA;
+    }
+    else
+    {
+        converter->fmt_in.video.i_chroma =
+        converter->fmt_in.i_codec = VLC_CODEC_CVPX_BGRA;
+    }
+
+    converter->p_module = module_need(converter, "video converter", NULL, false);
+    if (!converter->p_module)
+    {
+        vlc_object_delete(converter);
         return NULL;
     }
-    CFRelease(cvpx);
+    assert( converter->ops != NULL );
 
-    return pic;
+    return converter;
 }
 
 static void
-Close_RemoveConverters(filter_t *filter, struct ci_filters_ctx *ctx)
+Close(filter_t *filter)
 {
-    VLC_UNUSED(filter);
-    if (ctx->dst_converter)
-    {
-        module_unneed(ctx->dst_converter, ctx->dst_converter->p_module);
-        vlc_object_release(ctx->dst_converter);
-        CVPixelBufferPoolRelease(ctx->outconv_cvpx_pool);
-    }
+    filter_sys_t *p_sys = filter->p_sys;
+    struct ci_filters_ctx *ctx = p_sys->ctx;
+    enum filter_type filter_types[NUM_MAX_EQUIVALENT_VLC_FILTERS];
+
+    filter_desc_table_GetFilterTypes(p_sys->psz_filter, filter_types);
+    for (unsigned int i = 0;
+         i < NUM_MAX_EQUIVALENT_VLC_FILTERS && filter_types[i] != FILTER_NONE;
+         ++i)
+        filter_chain_RemoveFilter(&ctx->fchain, filter_types[i]);
+
+    vlc_video_context_Release(filter->vctx_out);
+    free(p_sys);
 }
 
-static int
-Open_AddConverter(filter_t *filter, struct ci_filters_ctx *ctx)
+static const struct vlc_filter_operations filter_ops =
 {
-    ctx->cvpx_pool_fmt = filter->fmt_in.video;
-    ctx->cvpx_pool_fmt.i_chroma = VLC_CODEC_CVPX_BGRA;
-    ctx->cvpx_pool = cvpxpool_create(&ctx->cvpx_pool_fmt, 3);
-    if (!ctx->cvpx_pool)
-        goto error;
-
-    ctx->dst_converter = vlc_object_create(filter, sizeof(filter_t));
-    if (!ctx->dst_converter)
-        goto error;
-
-    ctx->dst_converter->fmt_in = filter->fmt_out;
-    ctx->dst_converter->fmt_out = filter->fmt_out;
-    ctx->dst_converter->fmt_in.video.i_chroma =
-    ctx->dst_converter->fmt_in.i_codec = VLC_CODEC_CVPX_BGRA;
-
-    ctx->outconv_cvpx_pool =
-        cvpxpool_create(&filter->fmt_out.video, 2);
-    if (!ctx->outconv_cvpx_pool)
-        goto error;
-
-    ctx->dst_converter->owner.sys = ctx->outconv_cvpx_pool;
-    ctx->dst_converter->owner.video.buffer_new = CVPX_buffer_new;
-
-    ctx->dst_converter->p_module =
-        module_need(ctx->dst_converter, "video converter", NULL, false);
-    if (!ctx->dst_converter->p_module)
-        goto error;
-
-    return VLC_SUCCESS;
-
-error:
-    if (ctx->dst_converter)
-    {
-        if (ctx->dst_converter->p_module)
-            module_unneed(ctx->dst_converter, ctx->dst_converter->p_module);
-        vlc_object_release(ctx->dst_converter);
-        if (ctx->outconv_cvpx_pool)
-            CVPixelBufferPoolRelease(ctx->outconv_cvpx_pool);
-    }
-    return VLC_EGENERIC;
-}
+    .filter_video = Filter,
+    .video_mouse = Mouse,
+    .close = Close,
+};
 
 static int
-Open(vlc_object_t *obj, char const *psz_filter)
+Open(filter_t *filter, char const *psz_filter)
 {
-    filter_t *filter = (filter_t *)obj;
-
     switch (filter->fmt_in.video.i_chroma)
     {
         case VLC_CODEC_CVPX_NV12:
         case VLC_CODEC_CVPX_UYVY:
         case VLC_CODEC_CVPX_I420:
         case VLC_CODEC_CVPX_BGRA:
-            if (&kCGColorSpaceITUR_709 == nil)
-            {
-                msg_Warn(obj, "iOS/macOS version is too old, aborting...");
-                return VLC_EGENERIC;
-            }
             break;
         default:
             return VLC_EGENERIC;
     }
 
-    filter->p_sys = calloc(1, sizeof(filter_sys_t));
+    if (filter->vctx_in == NULL ||
+        vlc_video_context_GetType(filter->vctx_in) != VLC_VIDEO_CONTEXT_CVPX)
+        return VLC_EGENERIC;
+
+    filter_sys_t *p_sys = filter->p_sys = calloc(1, sizeof(filter_sys_t));
     if (!filter->p_sys)
         return VLC_ENOMEM;
 
     enum filter_type filter_types[NUM_MAX_EQUIVALENT_VLC_FILTERS];
     filter_desc_table_GetFilterTypes(psz_filter, filter_types);
 
-    struct ci_filters_ctx *ctx = var_InheritAddress(filter, "ci-filters-ctx");
-    if (!ctx)
+    struct ci_filters_ctx *ctx =
+        vlc_video_context_GetCVPXPrivate(filter->vctx_in, CVPX_VIDEO_CONTEXT_CIFILTERS);
+
+    if (ctx)
+        filter->vctx_out = vlc_video_context_Hold(filter->vctx_in);
+    else
     {
-        ctx = calloc(1, sizeof(*ctx));
-        if (!ctx)
+        static const struct vlc_video_context_operations ops = {
+            cvpx_video_context_Destroy,
+        };
+        vlc_decoder_device *dec_dev =
+            filter_HoldDecoderDeviceType(filter,
+                                         VLC_DECODER_DEVICE_VIDEOTOOLBOX);
+        if (!dec_dev)
+        {
+            msg_Err(filter, "Missing decoder device");
             goto error;
+        }
+        filter->vctx_out =
+            vlc_video_context_CreateCVPX(dec_dev, CVPX_VIDEO_CONTEXT_CIFILTERS,
+                                         sizeof(struct ci_filters_ctx), &ops);
+        vlc_decoder_device_Release(dec_dev);
+        if (!filter->vctx_out)
+            goto error;
+
+        ctx = vlc_video_context_GetCVPXPrivate(filter->vctx_out,
+                                               CVPX_VIDEO_CONTEXT_CIFILTERS);
+        assert(ctx);
+
+        ctx->src_converter = ctx->dst_converter = NULL;
+        ctx->fchain = NULL;
+        ctx->cvpx_pool = nil;
+        ctx->cvpx_pool_fmt = filter->fmt_out.video;
 
         if (filter->fmt_in.video.i_chroma != VLC_CODEC_CVPX_NV12
-         && filter->fmt_in.video.i_chroma != VLC_CODEC_CVPX_BGRA
-         && Open_AddConverter(filter, ctx))
-            goto error;
+         && filter->fmt_in.video.i_chroma != VLC_CODEC_CVPX_BGRA)
+        {
+            ctx->src_converter =
+                    CVPX_to_CVPX_converter_Create(filter, true);
+            ctx->dst_converter = ctx->src_converter ?
+                    CVPX_to_CVPX_converter_Create(filter, false) : NULL;
+            if (!ctx->src_converter || !ctx->dst_converter)
+                goto error;
+            ctx->cvpx_pool_fmt.i_chroma = VLC_CODEC_CVPX_BGRA;
+        }
 
 #if !TARGET_OS_IPHONE
-        CGLContextObj glctx = var_InheritAddress(filter, "macosx-glcontext");
-        if (!glctx)
-        {
-            msg_Err(filter, "can't find 'macosx-glcontext' var");
-            goto error;
-        }
-        ctx->ci_ctx = [CIContext contextWithCGLContext: glctx
+        CGLPixelFormatAttribute pixel_attr[] = {
+            kCGLPFAAccelerated,
+            kCGLPFAAllowOfflineRenderers,
+            0,
+        };
+
+        CGLPixelFormatObj pixelFormat;
+        GLint numPixelFormats = 0;
+
+        CGLChoosePixelFormat (pixel_attr, &pixelFormat, &numPixelFormats);
+
+        CGLCreateContext( pixelFormat, NULL, &ctx->cgl_context) ;
+        CGLDestroyPixelFormat( pixelFormat ) ;
+
+        ctx->ci_ctx = [CIContext contextWithCGLContext: ctx->cgl_context
                                            pixelFormat: nil
                                             colorSpace: nil
-                                               options: nil];
+                                               options: @{
+                                                kCIContextWorkingColorSpace : [NSNull null],
+                                                kCIContextOutputColorSpace : [NSNull null],
+                                               }];
 #else
-        CVEAGLContext eaglctx = var_InheritAddress(filter, "ios-eaglcontext");
-        if (!eaglctx)
-        {
-            msg_Err(filter, "can't find 'ios-eaglcontext' var");
-            goto error;
-        }
-        ctx->ci_ctx = [CIContext contextWithEAGLContext: eaglctx];
+        ctx->eagl_context = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+        ctx->ci_ctx = [CIContext contextWithEAGLContext: ctx->eagl_context];
 #endif
         if (!ctx->ci_ctx)
             goto error;
 
+        ctx->cvpx_pool = cvpxpool_create(&ctx->cvpx_pool_fmt, 2);
         if (!ctx->cvpx_pool)
-        {
-            ctx->cvpx_pool_fmt = filter->fmt_out.video;
-            ctx->cvpx_pool = cvpxpool_create(&ctx->cvpx_pool_fmt, 2);
-            if (!ctx->cvpx_pool)
-                goto error;
-        }
-
-        if (Open_CreateFilters(filter, &ctx->fchain, filter_types))
             goto error;
-
-        var_Create(filter->obj.parent, "ci-filters-ctx", VLC_VAR_ADDRESS);
-        var_SetAddress(filter->obj.parent, "ci-filters-ctx", ctx);
     }
-    else if (Open_CreateFilters(filter, &ctx->fchain, filter_types))
+    if (Open_CreateFilters(filter, &ctx->fchain, filter_types))
         goto error;
 
-    filter->p_sys->psz_filter = psz_filter;
-    filter->p_sys->ctx = ctx;
+    p_sys->psz_filter = psz_filter;
+    p_sys->ctx = ctx;
 
-    filter->pf_video_filter = Filter;
-    filter->pf_video_mouse = Mouse;
+    filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 
 error:
-    if (ctx)
-    {
-        Close_RemoveConverters(filter, ctx);
-        if (ctx->cvpx_pool)
-            CVPixelBufferPoolRelease(ctx->cvpx_pool);
-        free(ctx);
-    }
-    free(filter->p_sys);
+#if !TARGET_OS_IPHONE
+    if (ctx->cgl_context)
+        CGLDestroyContext(ctx->cgl_context);
+#else
+    if (ctx->eagl_context)
+        [ctx->eagl_context release];
+#endif
+
+    if (filter->vctx_out)
+        vlc_video_context_Release(filter->vctx_out);
+    free(p_sys);
     return VLC_EGENERIC;
 }
 
 static int
-OpenAdjust(vlc_object_t *obj)
+OpenAdjust(filter_t *filter)
 {
-    return Open(obj, "adjust");
+    return Open(filter, "adjust");
 }
 
 static int
-OpenInvert(vlc_object_t *obj)
+OpenInvert(filter_t *filter)
 {
-    return Open(obj, "invert");
+    return Open(filter, "invert");
 }
 
 static int
-OpenPosterize(vlc_object_t *obj)
+OpenPosterize(filter_t *filter)
 {
-    return Open(obj, "posterize");
+    return Open(filter, "posterize");
 }
 
 static int
-OpenSepia(vlc_object_t *obj)
+OpenSepia(filter_t *filter)
 {
-    return Open(obj, "sepia");
+    return Open(filter, "sepia");
 }
 
 static int
-OpenSharpen(vlc_object_t *obj)
+OpenSharpen(filter_t *filter)
 {
-    return Open(obj, "sharpen");
+    return Open(filter, "sharpen");
 }
 
 static int
-OpenPsychedelic(vlc_object_t *obj)
+OpenPsychedelic(filter_t *filter)
 {
-    return Open(obj, "psychedelic");
+    return Open(filter, "psychedelic");
 }
 
 static int
-OpenCustom(vlc_object_t *obj)
+OpenCustom(filter_t *filter)
 {
-    return Open(obj, "custom");
-}
-
-static void
-Close(vlc_object_t *obj)
-{
-    filter_t *filter = (filter_t *)obj;
-    struct ci_filters_ctx *ctx = filter->p_sys->ctx;
-    enum filter_type filter_types[NUM_MAX_EQUIVALENT_VLC_FILTERS];
-
-    filter_desc_table_GetFilterTypes(filter->p_sys->psz_filter, filter_types);
-    for (unsigned int i = 0;
-         i < NUM_MAX_EQUIVALENT_VLC_FILTERS && filter_types[i] != FILTER_NONE;
-         ++i)
-        filter_chain_RemoveFilter(&ctx->fchain, filter_types[i]);
-
-    if (!ctx->fchain)
-    {
-        Close_RemoveConverters(filter, ctx);
-        if (ctx->cvpx_pool)
-            CVPixelBufferPoolRelease(ctx->cvpx_pool);
-        free(ctx);
-        var_Destroy(filter->obj.parent, "ci-filters-ctx");
-    }
-    free(filter->p_sys);
+    return Open(filter, "custom");
 }
 
 #define CI_CUSTOM_FILTER_TEXT N_("Use a specific Core Image Filter")
@@ -762,39 +779,36 @@ Close(vlc_object_t *obj)
     "Example: 'CICrystallize', 'CIBumpDistortion', 'CIThermal', 'CIComicEffect'")
 
 vlc_module_begin()
-    set_capability("video filter", 0)
     set_category(CAT_VIDEO)
     set_subcategory(SUBCAT_VIDEO_VFILTER)
     set_description(N_("Mac OS X hardware video filters"))
 
     add_submodule()
-    set_callbacks(OpenAdjust, Close)
+    set_callback_video_filter(OpenAdjust)
     add_shortcut("adjust")
 
     add_submodule()
-    set_callbacks(OpenInvert, Close)
+    set_callback_video_filter(OpenInvert)
     add_shortcut("invert")
 
     add_submodule()
-    set_callbacks(OpenPosterize, Close)
+    set_callback_video_filter(OpenPosterize)
     add_shortcut("posterize")
 
     add_submodule()
-    set_callbacks(OpenSepia, Close)
+    set_callback_video_filter(OpenSepia)
     add_shortcut("sepia")
 
     add_submodule()
-    set_callbacks(OpenSharpen, Close)
+    set_callback_video_filter(OpenSharpen)
     add_shortcut("sharpen")
 
     add_submodule()
-    set_callbacks(OpenPsychedelic, Close)
+    set_callback_video_filter(OpenPsychedelic)
     add_shortcut("psychedelic")
 
     add_submodule()
-    set_callbacks(OpenCustom, Close)
+    set_callback_video_filter(OpenCustom)
     add_shortcut("ci")
     add_string("ci-filter", "CIComicEffect", CI_CUSTOM_FILTER_TEXT, CI_CUSTOM_FILTER_LONGTEXT, true);
 vlc_module_end()
-
-#pragma clang diagnostic pop

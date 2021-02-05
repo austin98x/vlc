@@ -18,10 +18,6 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
 
-#ifdef __cplusplus
-# error Not implemented in C++.
-#endif
-
 #ifndef VLC_ATOMIC_H
 # define VLC_ATOMIC_H
 
@@ -30,31 +26,51 @@
  * Atomic operations do not require locking, but they are not very powerful.
  */
 
+# include <assert.h>
+#ifndef __cplusplus
 # include <stdatomic.h>
+#else
+# include <atomic>
+using std::atomic_uintptr_t;
+using std::memory_order_relaxed;
+using std::memory_order_acq_rel;
+#endif
+# include <vlc_common.h>
 
-typedef atomic_uint_least32_t vlc_atomic_float;
+typedef struct vlc_atomic_rc_t {
+    atomic_uintptr_t refs;
+} vlc_atomic_rc_t;
 
-static inline void vlc_atomic_init_float(vlc_atomic_float *var, float f)
+/** Init the RC to 1 */
+static inline void vlc_atomic_rc_init(vlc_atomic_rc_t *rc)
 {
-    union { float f; uint32_t i; } u;
-    u.f = f;
-    atomic_init(var, u.i);
+    atomic_init(&rc->refs, (uintptr_t)1);
 }
 
-/** Helper to retrieve a single precision from an atom. */
-static inline float vlc_atomic_load_float(vlc_atomic_float *atom)
+/** Increment the RC */
+static inline void vlc_atomic_rc_inc(vlc_atomic_rc_t *rc)
 {
-    union { float f; uint32_t i; } u;
-    u.i = atomic_load(atom);
-    return u.f;
+    uintptr_t prev = atomic_fetch_add_explicit(&rc->refs, (uintptr_t)1,
+                                               memory_order_relaxed);
+    vlc_assert(prev);
+    VLC_UNUSED(prev);
 }
 
-/** Helper to store a single precision into an atom. */
-static inline void vlc_atomic_store_float(vlc_atomic_float *atom, float f)
+/** Decrement the RC and return true if it reaches 0 */
+static inline bool vlc_atomic_rc_dec(vlc_atomic_rc_t *rc)
 {
-    union { float f; uint32_t i; } u;
-    u.f = f;
-    atomic_store(atom, u.i);
+    uintptr_t prev = atomic_fetch_sub_explicit(&rc->refs, (uintptr_t)1,
+                                               memory_order_acq_rel);
+    vlc_assert(prev);
+    return prev == 1;
+}
+
+/** Returns the current reference count.
+ *  This is not safe to use for logic and must only be used for debugging or
+ *  assertion purposes */
+static inline uintptr_t vlc_atomic_rc_get(const vlc_atomic_rc_t* rc)
+{
+    return atomic_load_explicit(&rc->refs, memory_order_relaxed);
 }
 
 #endif

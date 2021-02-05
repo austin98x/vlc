@@ -26,12 +26,13 @@
 
 #include <vlc_common.h>
 #include <vlc_access.h>
-#include <vlc_input.h>
 #include <vlc_plugin.h>
 #include <vlc_dialog.h>
+#ifdef HAVE_SEARCH_H
 #include <search.h>
+#endif
 
-#include "dtv/dtv.h"
+#include "dtv.h"
 
 #define ADAPTER_TEXT N_("DVB adapter")
 #define ADAPTER_LONGTEXT N_( \
@@ -424,12 +425,12 @@ vlc_module_begin ()
 #endif
 vlc_module_end ()
 
-struct access_sys_t
+typedef struct
 {
     dvb_device_t *dev;
     uint8_t signal_poll;
     tuner_setup_t pf_setup;
-};
+} access_sys_t;
 
 static block_t *Read (stream_t *, bool *);
 static int Control (stream_t *, int, va_list);
@@ -538,8 +539,8 @@ static int Control (stream_t *access, int query, va_list args)
 
         case STREAM_GET_PTS_DELAY:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = var_InheritInteger (access, "live-caching") * INT64_C(1000);
+            *va_arg (args, vlc_tick_t *) =
+                VLC_TICK_FROM_MS( var_InheritInteger (access, "live-caching") );
             break;
         }
 
@@ -576,7 +577,7 @@ static int Control (stream_t *access, int query, va_list args)
 
         case STREAM_SET_PRIVATE_ID_CA:
         {
-            en50221_capmt_info_t *pmt = va_arg (args, en50221_capmt_info_t *);
+            en50221_capmt_info_t *pmt = va_arg(args, void *);
 
             if( !dvb_set_ca_pmt (dev, pmt) )
                 return VLC_EGENERIC;
@@ -868,7 +869,7 @@ static int isdbt_setup (vlc_object_t *obj, dvb_device_t *dev, uint64_t freq)
     for (unsigned i = 0; i < 3; i++)
     {
         char varname[sizeof ("dvb-X-interleaving")];
-        memcpy (varname, "dvb-X-", 4);
+        memcpy (varname, "dvb-X-", 6);
         varname[4] = 'a' + i;
 
         strcpy (varname + 6, "modulation");

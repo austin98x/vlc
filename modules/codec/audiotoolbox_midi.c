@@ -2,7 +2,6 @@
  * audiotoolbox_midi.c: Software MIDI synthesizer using AudioToolbox
  *****************************************************************************
  * Copyright (C) 2017 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Marvin Scholz <epirat07 at gmail dot com>
  *
@@ -60,18 +59,18 @@ vlc_module_begin()
     set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_ACODEC)
     set_callbacks(Open, Close)
-    add_loadfile("soundfont", "",
-                 SOUNDFONT_TEXT, SOUNDFONT_LONGTEXT, false)
+    add_loadfile(CFG_PREFIX "soundfont", "",
+                 SOUNDFONT_TEXT, SOUNDFONT_LONGTEXT)
 vlc_module_end()
 
 
-struct decoder_sys_t
+typedef struct
 {
     AUGraph     graph;
     AudioUnit   synthUnit;
     AudioUnit   outputUnit;
     date_t       end_date;
-};
+} decoder_sys_t;
 
 static int  DecodeBlock (decoder_t *p_dec, block_t *p_block);
 static void Flush (decoder_t *);
@@ -278,7 +277,6 @@ static int Open(vlc_object_t *p_this)
 
     // Initialize date (for PTS)
     date_Init(&p_sys->end_date, p_dec->fmt_out.audio.i_rate, 1);
-    date_Set(&p_sys->end_date, 0);
 
     p_dec->p_sys = p_sys;
     p_dec->pf_decode = DecodeBlock;
@@ -310,7 +308,7 @@ static void Flush (decoder_t *p_dec)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    date_Set(&p_sys->end_date, VLC_TS_INVALID);
+    date_Set(&p_sys->end_date, VLC_TICK_INVALID);
 
     // Turn all sound on all channels off
     // else 'old' notes could still be playing
@@ -336,7 +334,8 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
         }
     }
 
-    if (p_block->i_pts > VLC_TS_INVALID && !date_Get(&p_sys->end_date)) {
+    if ( p_block->i_pts != VLC_TICK_INVALID &&
+         date_Get(&p_sys->end_date) == VLC_TICK_INVALID ) {
         date_Set(&p_sys->end_date, p_block->i_pts);
     } else if (p_block->i_pts < date_Get(&p_sys->end_date)) {
         msg_Warn(p_dec, "MIDI message in the past?");

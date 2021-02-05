@@ -4,43 +4,828 @@ Changes between 3.0.x and 4.0.0-dev:
 Platform support changes:
  * 4.0.x requires:
      - Windows 7/2008 R2 or later (with KB2533623 installed)
-     - macOS 10.10 or later
+     - macOS 10.11 or later
      - iOS 9 or later
      - Android 4.1.x or later (API-16)
      - GCC 5.0 or Clang 3.4 (or equivalent)
+ * Windows on ARM is now supported
+ * Universal Windows is only supported for Windows 10 (not Windows 8 anymore)
+
+Core:
+ * New output clock (internal):
+     - The input clock (PCR) or the audio output can drive the output clock
+     - By default, the audio output will drive the output clock: no more audio
+       resampling or flush when the audio is late or early
+ * New medialibrary (vlc_media_library.h)
+ * New player (vlc_player.h):
+     - Replace the input_thread_t API that is now internal
+     - One instance is used to play subsequent medias
+     - Allow multiple track selection
+     - Fix TOCTOU issues (the player lock is exposed)
+ * New mediatree and mediasource (vlc_media_source.h)
+     - Browse local network and service discoveries
+ * New playlist (vlc_playlist.h)
+     - Replace the previous one
+     - Flat, new random implementation
+     - Can't browse anymore (cf. mediatree)
+ * Add support for dual subtitles selection (via the player)
+
+Audio output:
+ * ALSA: HDMI passthrough support.
+   Use --alsa-passthrough to configure S/PDIF or HDMI passthrough.
+
+Demuxer:
+ * Support for HEIF image and grid image formats
+ * Support for DASH WebM
+ * Support for DVBSUB in mkv
+ * Support for DAV video files
+ * Improved Bluray menus, clips and stream selection
+ * Support chapters in mp3 files
+ * Support for DMX audio music (MUS) files
 
 Codecs:
  * Support for experimental AV1 video encoding
  * WebVTT encoder
+ * Remove iomx support for Android
+ * WebP image decoding
+ * Support for SMPTE-TT image profile
+ * Support for 16-bit greyscale
+ * Support IMM4 decoder
+ * Improve 708 decoder
+ * Support AGM decoder
+ * Support VP4 decoder
+ * Add NVDEC hardware decoder
+ * Remove SDL_image support
+
+Access:
+ * Enable SMB2 / SMB3 support on mobile ports with libsmb2
+ * Added support for the RIST (Reliable Internet Stream Transport) Protocol
+ * Added support for the AMT (Automatic Multicast Tunneling) Protocol
+ * Added support for the Gopher Protocol
+ * Added avaudiocapture module as a replacement for qtsound, which is removed now
+ * Audio CD data tracks are now correctly detected and skipped
+ * Deprecates Audio CD CDDB lookups in favor of more accurate Musicbrainz
+ * Improved CD-TEXT and added Shift-JIS encoding support
+ * Support for YoutubeDL (where available).
+
+Access output:
+ * Added support for the RIST (Reliable Internet Stream Transport) Protocol
+ * Added support for HTTP PUT (HTTP upload)
+
+Video output:
+ * Added X11 RENDER video output plugin
+ * Remove aa plugin
+ * Remove evas plugin
+ * Remove omxil_vout plugin
+ * Remove RealRTSP plugin
+ * Remove Real demuxer plugin
+ * Fix washed out black on NVIDIA cards with Direct3D9
+
+Audio filter:
+ * Add RNNoise recurrent neural network denoiser
+
+Video filter:
+ * Update yadif
+ * Remove remote OSD plugin
+
+Stream output:
+ * New SDI output with improved audio and ancillary support.
+   Candidate for deprecation of decklink vout/aout modules.
+ * Support for DLNA/UPNP renderers
+
+Muxers:
+ * MP4 files are no longer faststart by default
+
+Service discovery:
+ * Support Renderer discovery with avahi
+
+macOS:
+ * Remove Growl notification support
+ * Improved AppleScript API with support for playback modes, recording, rate
+
+appleOS:
+ * Improved proxy configuration handling
 
 
-Changes between 2.2.x and 3.0.0-git:
+Changes between 3.0.12 and 3.0.12.1:
+----------------------------------
+
+macOS:
+ * 3.0.12.1 is the first release for Apple Silicon macs
+ * Version bump to allow an automatic upgrade path
+
+Changes between 3.0.11.1 and 3.0.12:
+----------------------------------
+
+Access:
+ * Add new RIST access module compliant with simple profile (VSF_TR-06-1)
+
+Access Output:
+ * Add new RIST access output module compliant with simple profile (VSF_TR-06-1)
+
+Demux:
+ * Fixed adaptive's handling of resolution settings
+ * Improve Bluray tracks support
+ * Improve WMV seeking and DASH support
+ * Fix crashes in AVI, MKV modules
+
+Audio output:
+ * Fix audio distortion on macOS during start of playback
+
+Video Output:
+ * Direct3D11: Fix some potential crashes when using video filters
+
+macOS:
+ * Add native support for Apple Silicon / ARM-64
+ * Visual UI adaptations for macOS Big Sur
+ * Fix displaying EQ bands in the UI depending on which frequency
+   presets are set for the EQ in advanced preferences
+ * Fix UI issues in bookmarks window
+
+Misc:
+ * Several fixes in the web interface, including privacy and security
+   improvements
+ * Update YouTube and Vocaroo scripts
+ * Fix rotation filter mouse handling
+ * Update translations
+
+
+Changes between 3.0.11 and 3.0.11.1:
+----------------------------------
+
+Demux:
+ * Fixed HLS playlist update mechanism, unable to start
+   in some cases.
+ * Because of broken HLS servers, adaptive no longer
+   considers Content-Type as authoritative.
+ * Fixed handling of WEBM WebVTT subtitles
+ * Workaround invalid ADTS in TS from Makito encoders
+ * Fixed Opus when using avformat demuxer
+
+Decoders:
+ * Fixed inverted explicit start/end positioning
+
+Service Discovery:
+ * Fix listing of media on certain Panasonic recorders discovered via UPnP
+
+macOS:
+ * Fix automatic playback resume with "Music" app
+ * Fix possible freeze after pause, seek, unpause
+
+Contribs:
+ * Updated gnutls to 3.6.14
+ * Updated libebml to 1.4.0
+ * Updated libmatroska to 1.6.0
+ * Updated mpg123 to 1.26.2
+
+Changes between 3.0.10 and 3.0.11:
+----------------------------------
+
+Access:
+ * rtp descriptor leak on error fix
+
+Demux:
+ * Fixed regression with some encrypted HLS streams
+ * Live HLS delay until first update fix
+ * HLS rendition switch regression fix
+ * Fix imprecise m4a seek
+
+Decoder:
+ * Fixed missing captions with some capture cards
+
+Audio filters:
+ * soxr resampling fixes
+
+Contribs:
+ * Updated libfaad to 2.9.2 (Parametric Stereo regression)
+ * Updated libarchive to 3.4.2
+
+macOS:
+ * Fixed moving video window with mouse
+ * Fixed UI issue showing "permissions warning" unnecessarily often
+ * Fixed stack buffer overflow listing bluray mount points
+ * Fixed potential crashes at startup
+
+Audio Output:
+ * Fix sound not coming back after a pause with CoreAudio (macOS/iOS)
+
+Misc:
+ * Update Youtube script
+
+
+Changes between 3.0.9.2 and 3.0.10:
+----------------------------------
+
+Misc:
+ * Update Twitch & VLSub scripts
+
+
+Changes between 3.0.9.1 and 3.0.9.2:
+----------------------------------
+
+Misc:
+ * Properly bump the version in configure.ac
+
+
+Changes between 3.0.9 and 3.0.9.1:
+----------------------------------
+
+Misc:
+ * Fix VLSub returning 401 for earch request
+
+
+Changes between 3.0.8 and 3.0.9:
+----------------------------------
+
+Core:
+ * Work around busy looping when playing an invalid item through VLM
+
+Access:
+ * Multiple dvdread and dvdnav crashs fixes
+ * Fixed DVD glitches on clip change
+ * Fixed dvdread commands/data sequence inversion in some cases causing
+   unwanted glitches
+ * Better handling of authored as corrupted DVD
+ * Added libsmb2 support for SMB2/3 shares
+
+Demux:
+ * Fix TTML entities not passed to decoder
+ * Fixed some WebVTT styling tags being not applied
+ * Misc raw H264/HEVC frame rate fixes
+ * Fix adaptive regression on TS format change (mostly HLS)
+ * Fixed MP4 regression with twos/sowt PCM audio
+ * Fixed some MP4 raw quicktime and ms-PCM audio
+ * Fixed MP4 interlacing handling
+ * Multiple adaptive stack (DASH/HLS/Smooth) fixes
+ * Enabled Live seeking for HLS
+ * Fixed seeking in some cases for HLS
+ * Improved Live playback for Smooth and DASH
+ * Fixed adaptive unwanted end of stream in some cases
+ * Faster adaptive start and new buffering control options
+
+Packetizers:
+ * Fixes H264/HEVC incomplete draining in some cases
+ * packetizer_helper: Fix potential trailing junk on last packet
+ * Added missing drain in packetizers that was causing missing
+   last frame or audio
+ * Improved check to prevent fLAC synchronization drops
+
+Decoder:
+ * avcodec: revector video decoder to fix incomplete drain
+ * spudec: implemented palette updates, fixing missing subtitles
+   on some DVD
+ * Fixed WebVTT CSS styling not being applied on Windows/macOS
+ * Fixed Hebrew teletext pages support in zvbi
+ * Fixed Dav1d aborting decoding on corrupted picture
+ * Extract and display of all CEA708 subtitles
+ * Update libfaad to 2.9.1
+ * Add DXVA support for VP9 Profile 2 (10 bits)
+ * Mediacodec aspect ratio with Amazon devices
+
+Audio output:
+ * Added support for iOS audiounit audio above 48KHz
+ * Added support for amem audio up to 384KHz
+
+Video output:
+ * Fix for opengl glitches in some drivers
+ * Fix GMA950 opengl support on macOS
+ * YUV to RGB StretchRect fixes with NVIDIA drivers
+ * Use libpacebo new tone mapping desaturation algorithm
+
+Text renderer:
+ * Fix crashes on macOS with SSA/ASS subtitles containing emoji
+ * Fixed unwanted growing background in Freetype rendering and Y padding
+
+Mux:
+ * Fixed some YUV mappings
+
+macOS:
+ * Use a layer based video output on 10.14 and higher, which should
+   fix various rendering issues where the vout would glitch between
+   a wrong size and the correct size.
+   Additionally this works around OpenGL issues with Macs that have a
+   dedicated NVIDIA GPU, which caused rendering artifacts in the whole
+   OS, especially when the "Reduce transparency" accessibility option
+   is used
+ * Remove qtsound module and add avaudiocapture module as replacement
+ * Fix audio capture on macOS Catalina by using avaudiocapture
+ * Inform the user in case OS permissions are missing for certain actions
+ * Fix Apple Remote support on macOS Catalina
+ * Add support for pausing Apple Music on macOS Catalina
+ * Fix UPnP discovery crash without an active network interface
+ * Fix rare placement issues with fullscreen panel
+ * Fix problem in audio output remembering the last device configuration
+   in digital mode
+
+Service Discovery:
+ * Update libmicrodns to 0.1.2
+
+Misc:
+ * Update YouTube, SoundCloud and Vocaroo scripts: this restores
+   playback of YouTube URLs.
+ * Add missing .wpl & .zpl file associations on Windows
+ * Improved chromecast audio quality
+
+
+Changes between 3.0.7.1 and 3.0.8:
+----------------------------------
+
+Core:
+ * Fix stuttering for low framerate videos
+
+Demux:
+ * Fix channel ordering in some MP4 files
+ * Fix glitches in TS over HLS
+ * Add real probing of HLS streams
+ * Fix HLS MIME type fallback
+
+Decoder:
+ * Fix WebVTT subtitles rendering
+
+Stream filter:
+ * Improve network buffering
+
+Misc:
+ * Update Youtube script
+
+Audio Output:
+ * macOS/iOS: Fix stuttering or blank audio when starting or seeking when using
+   external audio devices (bluetooth for example)
+ * macOS: Fix AV synchronization when using external audio devices
+
+Video Output:
+ * Direct3D11: Fix hardware acceleration for some AMD drivers
+
+Stream output:
+ * Fix transcoding when the decoder does not set the chroma
+
+Security:
+ * Fix a buffer overflow in the MKV demuxer (CVE-2019-14970)
+ * Fix a read buffer overflow in the avcodec decoder (CVE-2019-13962)
+ * Fix a read buffer overflow in the FAAD decoder
+ * Fix a read buffer overflow in the OGG demuxer (CVE-2019-14437, CVE-2019-14438)
+ * Fix a read buffer overflow in the ASF demuxer (CVE-2019-14776)
+ * Fix a use after free in the MKV demuxer (CVE-2019-14777, CVE-2019-14778)
+ * Fix a use after free in the ASF demuxer (CVE-2019-14533)
+ * Fix a couple of integer underflows in the MP4 demuxer (CVE-2019-13602)
+ * Fix a null dereference in the dvdnav demuxer
+ * Fix a null dereference in the ASF demuxer (CVE-2019-14534)
+ * Fix a null dereference in the AVI demuxer
+ * Fix a division by zero in the CAF demuxer (CVE-2019-14498)
+ * Fix a division by zero in the ASF demuxer (CVE-2019-14535)
+
+Contribs:
+ * Update to a newer libmodplug version (0.8.9.0)
+
+
+Changes between 3.0.7 and 3.0.7.1:
+----------------------------------
+
+Access:
+ * Update libbluray to 1.1.2
+
+macOS:
+ * Fix bluray java menu playback regression in 3.0.7
+
+Video Output:
+ * Fix hardware acceleration with some AMD drivers
+ * Improve direct3d11 HDR support
+
+
+Changes between 3.0.6 and 3.0.7:
+--------------------------------
+
+Access:
+ * Improve Blu-ray support
+ * Fix sftp module build with libssh >= 1.8.1
+
+Audio output:
+ * Fix pass-through on Android-23
+ * Fix DirectSound drain
+
+Demux:
+ * Improve MP4 support
+
+Video Output:
+ * Fix 12 bits sources playback with Direct3D11
+ * Fix crash on iOS
+ * Fix midstream aspect-ratio changes when Windows hardware decoding is on
+ * Fix HLG display with Direct3D11
+
+Stream Output:
+ * Improve Chromecast support with new ChromeCast apps
+
+macOS:
+ * Fix UPNP service discovery, services are discovered on the highest priority
+   active network interface now
+ * Fix video distortion on macOS Mojave
+
+Misc:
+ * Update Youtube, Dailymotion, Vimeo, Soundcloud scripts
+ * Work around busy looping when playing an invalid item with loop enabled
+
+Translations:
+ * Update of most translations
+
+Security:
+ * Fix multiple buffer overflows in the ps demuxer
+ * Fix a buffer overflow when copying a biplanar YUV image
+ * Fix multiple buffer overflows in the faad decoder
+ * Fix buffer overflow in the svcdsub decoder
+ * Fix buffer overflows in the ogg muxer & demuxer
+ * Fix buffer overflows in libavformat demuxer
+ * Fix multiple buffer overflows in the MKV demuxer
+ * Fix a buffer overflow in the MP4 demuxer
+ * Fix a buffer overflow in the textst decoder
+ * Fix a buffer overflow in the webvtt decoder
+ * Fix a buffer overflow in the ASF demux
+ * Fix a buffer overflow in the UPNP SD
+ * Fix use after free in the ogg demuxer
+ * Fix multiple use after free in the MKV demuxer
+ * Fix multiple use after free in the DMO decoder
+ * Fix integer underflow in the MKV demuxer
+ * Fix an updater NULL pointer dereference on invalid signing keys
+ * Fix NULL pointer dereference in the MKV demuxer
+ * Fix an integer overflow in the spudec decoder
+ * Fix an integer overflow in the nsc demuxer
+ * Fix an integer overflow in the avi demuxer
+ * Fix reads of uninitialized pointers in the MKV demuxer
+ * Fix a floating point exception in the MKV demuxer
+ * Fix an infinite loop in the flac packetizer
+
+
+Changes between 3.0.5 and 3.0.6:
+--------------------------------
+
+Core:
+ * Fix potential subtitle picture allocation failures
+
+Codec:
+ * Add support for 12 bits decoding of AV1
+ * Fix HDR support in AV1 when the container provides the metadata
+
+
+Changes between 3.0.4 and 3.0.5:
+--------------------------------
+
+Access:
+ * Improve RTSP playback
+ * BluRay fixes and improvements, notably for menus and seeking
+ * Improve the UDP/RTP truncated issue
+
+Codec:
+ * Add a new AV1 decoder based on dav1d library
+ * Enable libaom decoder by default
+ * Fix decoding of some HEVC streams with macOS hardware decoding
+
+Demux:
+ * MP4: Fix reading of some HDR metadata
+ * Miscellaneous AV1 demuxing improvements
+ * Fix CAF integer-underflow
+ * Fix an MKV crash on iOS 12.0, on iPhone XS phones
+
+Packetizer:
+ * Add an AV1 packetizer
+
+macOS:
+ * Starting with VLC 3.0.5, VLC will be distributed with runtime hardening
+   enabled on macOS Mojave.
+   All external VLC plugins need to be signed by a DeveloperID certificate in order
+   to continue working with the official VLC package.
+ * Update the VLC dark UI to better match the dark mode of macOS Mojave
+ * Fix convert & save panel stream option
+
+Audio output:
+ * Fix corking when the playback state is paused
+ * Improve corking on Android
+
+Video Output:
+ * Fix Direct3D11 tone-mapping when HDR is displayed on an SDR screen
+ * More accurate colors for SD sources in Direct3D11
+ * Disable hardware decoding on some old Intel GPUs
+ * Fix zero-copy GPU acceleration on AMD RX Vega
+ * Misc Direct3D11 fixes
+
+Miscellaneaous:
+ * Improve ChromeCast
+ * Update numerous 3rd party libraries, including for minor security issues
+ * Update Youtube support
+ * Fix subtitles rendering with specific fonts with negative horizontal advance
+
+
+Changes between 3.0.3 and 3.0.4:
+--------------------------------
+
+Decoder:
+ * Blacklist some intel GPU when decoding HEVC
+ * Decode AV1 streams
+ * Fix playback of low-fps files
+ * Fix hardware decoding of low-latency sliced H.264 streams on macOS
+ * Fix seeking with streams containing WebVTT subtitles
+ * Fix decoding some CC-608 streams with roll-up
+ * Fix crashes with LPCM streams
+ * Fix colorspace of JPEG, PNG and screen inputs
+ * Fix MediaCodec rotation handling
+
+Demux:
+ * Improve FLV fps detection
+ * Fix some ogg/flac
+ * Improve support for broken HEVC inside MKV
+ * Fix some AVI regression for broken files and for DVAudio
+ * Support files splitted in the .mts%d pattern
+ * Fixes for MKV seeking
+ * Fix for MP4 disabled track selection
+ * Fix playback of incomplete RAR files (downloading)
+
+Audio Output:
+ * Improve iOS session management and resume-from-pause
+ * Improve macOS audio performance
+ * Support 44.1kHz DTS passthrough
+ * Fix crashes on DirectSound output
+
+Video Output:
+ * Fix some crash in Direct3D11/Direct3D9 because of sensors
+ * Fix some broken DVD subtitles rendering (OpenGL, notably)
+ * Fix crashes on old mac machines, after some time
+ * Fix memleaks on the EGL output (Android notably)
+ * Fix misc display in Direct3D11 due to broken drivers
+ * Fix potential green screen on Windows XP
+
+Text renderer:
+ * Fix rendering of arabic fonts fallback on macOS
+ * Fix head buffer overflow on macOS with some fonts
+ * Fix rendering of fonts with specific fonts
+ * Fix some RTL rendering
+
+Misc:
+ * Fix live555, macOS-UI, screen capture crashes
+ * Change the extension registration names on Windows
+ * Fix VLM 'now' date
+ * Fixes on the HTTPD server
+ * Fix on the NTservice registration
+ * Fix --stop-time option
+ * Fix ChromeCast compatibility with web interface
+ * Fix subtitles alignment
+ * Fix infinite recursion on directory playback
+ * Fix detection SAT>IP servers
+
+Qt:
+ * Fix tooltip display when using Wayland
+
+macOS:
+ * macOS 10.7.5 is required now, VLC will no longer launch on earlier releases
+ * Fix delay and fps setting in subtitle dialog
+ * Modernized and improved support for media keys
+ * Fix issues with drag and drop of playlist items
+ * Fix support for audio capturing with qtsound module
+ * Fix layout issues in the Convert and Save panel
+
+Translations:
+ * Update of most translations
+
+
+Changes between 3.0.2 and 3.0.3:
+--------------------------------
+
+Core:
+ * Update subtitles display while paused
+
+Access:
+ * Enable srt support on binary builds
+
+Decoders:
+ * Allow videotoolbox hardware decoding to be disabled
+ * Disable VideoToolbox for 10bits H.264
+ * Fix VideoToolbox with some invalid HEVC streams
+ * Fix subsdec wide character support
+ * Fix 1st order Ambisonics in AAC
+
+Demux:
+ * Miscellaneous ogg improvements & bugfixes, including oggds
+ * Fix forced tracks selection
+ * Fix Topfield files
+ * Probe AAC/ADTS inside TS
+ * Fix tracks detection issues with DolbyVision and Bluray streams
+
+macOS:
+ * Fix "Open Network Stream" URL box focus
+ * Add option to disable hardware acceleration for video decoding
+ * Remove option to force dolby mode from simple preferences
+
+Video Output:
+ * Fix crashes on Direct3D11
+
+Qt:
+ * Fix tooltip display on some desktop environments
+ * Fix spurious movement of the main Window
+ * Fix playlist being displayed in fullscreen
+
+Misc:
+ * Fix amem output
+ * Fix numerous issues on fonts fallback and font shaping
+ * Fix subtitles toggle through hotkeys
+ * Fix audioscrobbling
+ * Fix buffer over-read in avcodec audio encoding with non-default layouts
+ * Numerous 3rd party libraries updated, fixing security issues
+
+Translations:
+ * Update of most languages
+
+
+Changes between 3.0.1 and 3.0.2:
+--------------------------------
+
+Core:
+ * Fix snapshotting with subtitles when using hardware acceleration
+ * Fix green/missing line/column when the picture dimensions are odd
+
+Decoders:
+ * Important improvements in hardware decoding for macOS, notably faster,
+   supporting more samples and removing crashes/deadlocks
+ * Improve compatibility for DxVA2 and D3D11 decoding, fix crashes when seeking
+   and fix blacklisting of broken drivers
+ * Fix SSA subtitles forced alignment
+ * Fix E-AC-3 stuttering
+ * Fix MIDI playback on macOS
+ * Add playback support for ProRes 4444 XQ
+
+Demux:
+ * Fix wrong colors in some AVI files
+ * Fix IFO files playback to start DVDs
+ * Fix a crash with missing/invalid MPEG SDT
+ * Update VP8/9/10 ISOBMFF bindings and improve HDR for those cases
+ * Fix TTML inside MP4
+ * Improve MP4 read of color information
+ * Fix flac seeking and improve flac parsing
+ * Improve mkv opening & seeking speed
+ * Fix display of chapters with no name defined
+ * Miscellaneous MKV crash fixes
+ * Fix crash with multi-region DVDs
+ * Fix audio being muted on DVD chapter change
+ * Fix audio being muted when seeking in a BluRay disc
+
+Access:
+ * Avoid a crash/assert in FTP after seeking
+
+Audio output:
+ * Fix mmdevice default audio device handling
+ * Fix "reset audio volume" being forcefully deactivated
+ * Allow a default device to be used by VLC
+ * Only warn once about misconfiguration for AUhal devices on macOS
+ * Improve resampling and latency computation for CoreAudio
+ * Passthrough is now disabled by default
+
+Audio filters:
+ * Fix audio stutter after unpausing with headphones
+ * Fix silence when dolby-surround was mis-selected in preferences
+
+Video output:
+ * Fix OpenGL crashes or bad display with semi-planar chromas
+ * Fix OpenGL interop (zero-copy) disabled for tvOS
+ * Major rewrite of the iOS video output to fix numerous crashes
+ * Important improvements of the D3D11 video output to use less memory
+   and less GPU for HDR tone-mapping
+ * Fix crop on vertical videos with Direct3D11
+ * Fix Direct3D9 filters settings not being applied properly
+ * Fix transform filters with hardware decoding
+ * Fix snapshot and filters with HEVC hardware decoding
+ * Fix a buffer overrun during GPU/CPU image copy
+ * Fix glitches on DVD menus with Direct3D11
+ * Fix non-HDR content playback on HDR screens with Direct3D11
+ * Fix YUV full range displayed incorrectly in Direct3D11
+ * Fix miscellaneous crashes in Direct3D11
+ * Fix potential black screen with 10bits videos on Direct3D11
+
+macOS:
+ * Fix Growl notifications on recent macOS versions
+ * Fix conversion output file name encoding
+ * Fix crash reporting on macOS 10.7 and 10.8
+ * Fix crash on exit
+ * Fix remember playback position
+ * Fix Blu-ray disc Java menu
+ * Fix swiping on time slider to change position
+ * Fix problems with restoring user name from keychain
+ * Fix localization issues
+
+Qt:
+ * Fix last folder used in open dialogs
+ * Allow to customize the seek jump when using the mousewheel
+ * Fix fullscreen controller positionment on multiscreen setups
+ * Fix pasted URLs not being trimmed
+ * Fix jump size not being configurable
+ * Fix missing time labels updates
+ * Fix playback speed slider not accepting 1.0x value
+ * Fix raw input dump
+ * Fix window size after a fullscreen playback
+
+Misc:
+ * Fix lua rc & oldrc interfaces host specification
+ * Fix crashes when searching for renderers
+ * Relocate localedir for Linux (improves snap i18n support)
+ * Fix VDPAU GLX usage on Linux
+ * Improve support for NetBSD
+ * Fix MSI script for Windows
+ * Fix libvlc_media_list not going to next media
+ * Fix character encoding on win32 consoles
+ * Miscellaneous chromecast improvements
+ * Fix missing OSD navigation feedback
+ * Various VLSub improvements
+ * lua: Fix scripts not being loaded on some filesystems
+ * lua: Add vlc.io APIs to handle UTF-8 paths
+
+
+Changes between 3.0.0 and 3.0.1:
+--------------------------------
+
+Core:
+ * Fix use-after-free when cleaning playlists
+ * Fix crash on exit on Windows
+
+Video output:
+ * Fix HLG tone mapping on some systems like macOS.
+ * Fix screensaver inhibition on Windows XP
+ * Fix various Direct3D11 crashes
+ * Fix HDR tone mapping in Direct3d11
+ * Fix pink screen on Windows
+
+Decoder:
+ * Fix potential stack buffer overflow with faad
+ * Enable Cineform HD in avcodec
+
+Hardware Decoder:
+ * macOS: Improve HEVC 10bit performance with Videotoolbox
+ * android: Add MPEG2 support via MediaCodec
+ * Fix HEVC decoding with some files on Android/macOS/iOS
+ * Improve Direct3D11 memory usage
+
+Demux:
+ * Improve MKV seeking speed
+ * Fix xspf base URL handling
+ * Fix reading mp4 trun with moof based offsets
+ * Fix adaptive http redirections
+ * Replace old API, fixing adaptive TLS leak
+ * Use mime type as fallback for HLS segment type
+ * Fix subtitle (srt,ssa..) seek when having a single entry
+ * Flag non default HDMV subset video streams
+ * Increase TS probing amount for 4K streams
+ * Miscellaneous MKV, MP4 & AVI crash fixes
+
+Packetizer:
+ * Fix out of bounds read in mpeg4video
+
+Stream Output:
+ * Improve chromecast loading speed
+ * Improve local/chromecast transition during playback
+ * Fix chromecast loading with some versions of Windows
+ * Fix chromecast loading with some chromecast devices (TVs and Android boxes)
+ * Fix wrong first cover art when casting
+ * Fix casting to VP9
+
+macOS Interface:
+ * Re-add option to disable the fullscreen controller panel
+ * Auto-layout improvements
+ * Remove misleading playback warning indicator
+ * Fix crash with the interface for lua extensions (like VLSub)
+ * Fix show sidebar setting being ignored on restart
+ * Fix MKV files association
+ * Fix chromecast audio detection
+
+Qt Interface:
+ * Improve scaling on HiDPI displays
+
+Snap:
+ * Improve interface look and feel.
+
+
+Changes between 2.2.8 and 3.0.0:
 --------------------------------
 
 Platform support changes:
- * 3.0.x will be LTS (on a best-effort basis) that will be the last
-   working version for a lot of systems.
-   Indeed 3.0.x will be the last releases running on:
-     - Windows XP, Vista, and the servers equivalent of those releases
-     - macOS 10.7, 10,8 & 10.9, iOS 7 & 8
-     - Android 2.x, 3.x & 4.0.x
-     - Compilers before gcc 5.0 and clang 3.4
+ * 3.0.x will be maintained as a LTS (best-effort basis, mostly for security)
+   that will be the last working version for quite a few systems.
 
- * For 3.0, please note:
-     * The Windows XP/2003/2003R2 support for VLC is now on a best-efforts basis:
-       it should work, but not without limitations.
-       libVLC support for Windows XP is deprecated.
-       You _really_ should upgrade.
-     * Windows Vista (all versions) without Platform Upgrade is not supported.
-     * Linux support requires now a kernel newer than 2.6.26
-     * Mac OS X 10.6 support is now removed. You need OS X 10.7.
+   Indeed the 3.0.x branch will contain the last releases running on:
+     - Windows XP, Vista, and the servers equivalent of those Windows versions
+     - macOS 10.7, 10.8 & 10.9, iOS 7 & 8
+     - Android 2.x, 3.x, 4.0.x & 4.1.x
+     - Compilers before gcc 5.0 and clang 3.4, or equivalent
+
+ * For the 3.0 branch, please note:
+   * The Windows XP/2003/2003R2 support for VLC is now on a best-effort basis:
+     it should work, but not without limitations.
+     libVLC support for Windows XP is deprecated.
+     You _really_ should upgrade to a more modern Windows version!
+   * Windows Vista (all versions) without Platform Upgrade is not supported.
+   * 64bit version of VLC for Windows is recommended.
+   * Linux support requires now a kernel newer than 2.6.26.
+   * Mac OS X 10.6 support is now removed. You need OS X 10.7.
 
 Core:
- * Support network browsing for distant file system (SMB, FTP, SFTP, NFS...)
-   and rewrite the parsing of the media files
+ * Support network browsing for distant filesystems (SMB, FTP, SFTP, NFS...)
+   and rewrite the parsing of the media files and inputs
  * Support keystores: fetch and store passwords securely (sic!) for common
    protocols (HTTP, SMB, SFTP, FTP, RTSP ...)
- * Autodetect external audio tracks (ac3, m4a, aac, dts...), similar to subtitles
+ * Autodetect external audio tracks (ac3, m4a, aac, dts...) similar to subtitles
  * Support HDMI passthrough for Audio HD codecs, like E-AC3, TrueHD or DTS-HD
  * Support for 12bits codec and extended colorspaces (HDR)
  * Support output renderers, like ChromeCast
@@ -49,12 +834,12 @@ Core:
  * Support wayland surface type
  * Allow to start the video paused on the first frame
  * Refactor preparsing input
- * EPG reworked: table and single event updates, now using network time
- * Refactored and fixed subtitles es selection. Demuxers can now override
+ * EPG rework: table and single event updates, now using network time
+ * Refactor and fix subtitles es selection. Demuxers can now override
    es category single only or multiple es behavior
- * Support for 360 video and audio, including viewpoint setting
+ * Support for 360 video and audio, including viewpoint modification
  * Support for ambisonic audio and more than 8 audio channels
- * Support subtitles size live changing
+ * Support subtitles size live adjustments
 
 Access:
  * New NFS access module using libnfs
@@ -111,7 +896,7 @@ Decoders:
  * Support for experimental Daala video
  * New MPEG-1 & 2 audio layer I, II, III + MPEG 2.5 decoder based on libmpg123
  * New BPG decoder based on libbpg
- * Fixed uncompressed DVD-Audio (AOB) LPCM decoding
+ * Fix uncompressed DVD-Audio (AOB) LPCM decoding
  * Rewrite WPL playlists and add ZPL playlists support (Zune)
  * Support TDSC, Canopus HQX, Cineform, SpeedHQ, Pixlet, QDMC and FMVC codecs
  * TTML subtitles support, including EBU-TT-D variant
@@ -127,7 +912,7 @@ Decoders:
  * Support VPX high bit depth support
  * Extend MicroDVD support with color, fontname, size, position extensions
  * BluRay text subtitles (HDMV) are now decoded
- * Improved Closed Captions detection, notably inside the video streams
+ * Improve Closed Captions detection, notably inside the video streams
  * CEA-708 decoder
  * New MIDI decoder for macOS and iOS using the AudioToolbox framework, works
    without a soundfont or with SoundFont2 and DLS soundfonts
@@ -146,18 +931,18 @@ Demuxers:
     * Add new metadata fields
  * Important rework of the TS demuxer, including:
     * Support Opus in MPEG Transport Stream
-    * Fixed program selection with recorded TS (TopField, DreamBox and others)
-    * Fixed TS playback with PAT/PMT less recordings
+    * Fix program selection with recorded TS (TopField, DreamBox and others)
+    * Fix TS playback with PAT/PMT less recordings
     * Basic support for MPEG4-SL in TS and T-DMB
     * Support SCTE-18 / EAS inside TS
     * Support for new descriptors and ETT tables
     * Support for ARIB channel logos, as attachements, ARIB TR-B21/TR-B14-1
-    * Improved broken-PCR probing and fixing
+    * Improve broken-PCR probing and fixing
     * Improvements for scrambled state detection
  * Support HD-DVD .evo (H.264, VC-1, MPEG-2, PCM, AC-3, E-AC3, MLP, DTS)
  * Important rework of the PS demuxer, including:
     * HEVC support
-    * Fixed a large number of samples, notably with PSM-less H264
+    * Fix large number of samples, notably with PSM-less H264
     * Partial support of PSMF
     * Fix broken SCR samples
     * Fix CDXA mpeg-1 support
@@ -181,8 +966,8 @@ Demuxers:
  * Support for Scenarist Closed Caption
  * Fix Quicktime Mp4 inside MKV and unpacketized VC1
  * Support for isofLaC
- * Improved fLaC seeking
- * Replaced --demux dvb-open option with --stream-filter dvb to parse
+ * Improve fLaC seeking
+ * Replace --demux dvb-open option with --stream-filter dvb to parse
    channels.conf digital TV channel list files
 
 Stream filter:
@@ -190,7 +975,7 @@ Stream filter:
  * Add a ARIB STD-B25 TS streams decoder
  * Add a stream prebuffering plugin
  * Rewrite libarchive module as a stream_extractor
- * Removed HTTP Live streaming stream filter
+ * Remove HTTP Live streaming stream filter
  * Add a zlib (a.k.a. deflate) decompression filter
  * Add a skiptags module to help demuxers skip ID3/APE tags
 
@@ -219,7 +1004,7 @@ Audio filters:
    headphones effects
  * Add a pitch shifting module
 
-Video ouput:
+Video output:
  * Linux/BSD default video output is now OpenGL, instead of Xvideo
  * OpenGL:
     * New OpenGL provider for Windows
@@ -235,7 +1020,7 @@ Video ouput:
  * Large rework of the Android video outputs: there is now Surface (2.1, 2.2)
    NativeWindow (2.3+, supports hw rotation, subpicture blending, opaque)
  * Support rotation in Android NativeWindow output and hardware decoders
- * Renamed the Direct3D output module to Direct3D9
+ * Rename the Direct3D output module to Direct3D9
  * Add a Direct3D11 video output supporting both Windows desktop and WinRT modes,
    supporting subpicture blending and hardware acceleration
  * Support HDR10 in Direct3D11 with Windows 10 Fall Creator Update
@@ -244,7 +1029,7 @@ Video ouput:
 Video filter:
  * Hardware deinterlacing on the rPI, using MMAL
  * New video filter to convert between fps rates
- * Added 9-bit and 10-bit support to image adjust filter
+ * Add 9-bit and 10-bit support to image adjust filter
  * New edge detection filter uses the Sobel operator to detect edges
  * Hardware accelerated deinterlacing/adjust/sharpen/chroma with VA-API
  * Hardware accelerated adjust/invert/posterize/sepia/sharpen with CoreImage
@@ -265,8 +1050,8 @@ Encoder:
  * VP8 and VP9 encoder using libvpx
 
 Muxers:
- * Added fragmented/streamable MP4 muxer
- * Added support for muxing VC1 and WMAPro in MP4
+ * Add fragmented/streamable MP4 muxer
+ * Add support for muxing VC1 and WMAPro in MP4
  * Opus in MPEG Transport Stream
  * Daala in Ogg
 
@@ -277,20 +1062,20 @@ Service Discovery:
  * Rewrite of the UPnP service discovery
 
 Mac OS X Interface
- * Dropped support for Mac OS X 10.6 Snow Leopard
+ * Drop support for Mac OS X 10.6 Snow Leopard
  * Support right-to-left user interface layout for right-to-left languages
  * New resizable fullscreen controller with improved design
  * Add status bar icon which displays metadata and play controls
  * Add support for keyboard blacklight dimming during fullscreen video playback
- * Improved and simplified preferences window
+ * Improve and simplify preferences window
  * Huge performance improvements in playlist handling and other areas
  * New AppleScript API giving access to audio desynchronization
- * Expanded AppleScript API for menu detection and navigation
+ * Expand AppleScript API for menu detection and navigation
  * Support for building with disabled sparkle update mechanism
  * Remove deprecated transcoding wizard, use convert and save dialog instead
 
 iOS:
- * Dropped support for iOS 6.x
+ * Drop support for iOS 6.x
 
 Qt interface:
  * Batch convert support
@@ -319,7 +1104,6 @@ libVLC:
  * Deprecate libvlc_video_get_title_description, libvlc_video_get_chapter_description,
    libvlc_media_player_get_agl, libvlc_media_player_set_agl
  * Add libvlc_media_player_set_android_context to integrate in an Android surface
- * Add libvlc_media_player_set_evas_object to draw on an EFL/Evas Object
  * Add a new libvlc dialog API to forward dialogs requests to the applications:
    libvlc_dialog_set_context, libvlc_dialog_get_context, libvlc_dialog_set_callbacks,
    libvlc_dialog_dismiss, libvlc_dialog_post_action, libvlc_dialog_post_login
@@ -528,7 +1312,7 @@ Decoder:
  * Fix crashes with libvpx
  * Use libass without caching dialog
 
-Video Ouptut:
+Video Output:
  * Fix green lines on Direct3D output
 
 Skins2:
@@ -3958,7 +4742,7 @@ Interfaces:
  * wxWidgets
     - Rename wxWindows interface in wxWidgets.
     - All the --wxwin-* options are now --wx-*
-    - Support for RTP streaming in Stream Ouput dialog
+    - Support for RTP streaming in Stream Output dialog
     - Now require wx2.6 with Unicode support
  * Skins2
     - Tree playlist

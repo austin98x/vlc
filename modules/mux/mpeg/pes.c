@@ -2,7 +2,6 @@
  * pes.c: PES packetizer used by the MPEG multiplexers
  *****************************************************************************
  * Copyright (C) 2001, 2002 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Eric Petit <titer@videolan.org>
@@ -36,7 +35,10 @@
 #include <assert.h>
 
 #include "pes.h"
+#include "repack.h"
 #include "bits.h"
+
+#include "../../demux/mpeg/timestamps.h"
 
 /** PESHeader, write a pes header
  * \param i_es_size length of payload data. (Must be < PES_PAYLOAD_SIZE_MAX
@@ -50,7 +52,7 @@
  * \param i_header_size length of padding data to insert into PES packet
  *                      header in bytes.
  */
-static inline int PESHeader( uint8_t *p_hdr, mtime_t i_pts, mtime_t i_dts,
+static inline int PESHeader( uint8_t *p_hdr, int64_t i_pts, int64_t i_dts,
                              int i_es_size, const es_format_t *p_fmt,
                              int i_stream_id, bool b_mpeg2,
                              bool b_data_alignment, int i_header_size )
@@ -108,7 +110,7 @@ static inline int PESHeader( uint8_t *p_hdr, mtime_t i_pts, mtime_t i_dts,
                 int i_pts_dts;
                 bool b_pes_extension_flag = false;
 
-                if( i_pts > 0 && i_dts > 0 &&
+                if( i_pts > 0 && i_dts > 0 && i_pts != i_dts &&
                     ( i_pts != i_dts || ( p_fmt->i_cat == VIDEO_ES &&
                       p_fmt->i_codec != VLC_CODEC_MPGV &&
                       p_fmt->i_codec != VLC_CODEC_MP2V &&
@@ -319,7 +321,7 @@ static inline int PESHeader( uint8_t *p_hdr, mtime_t i_pts, mtime_t i_dts,
 void EStoPES ( block_t **pp_pes,
                    const es_format_t *p_fmt, int i_stream_id,
                    int b_mpeg2, int b_data_alignment, int i_header_size,
-                   int i_max_pes_size, mtime_t ts_offset )
+                   int i_max_pes_size, vlc_tick_t ts_offset )
 {
     block_t *p_es = *pp_pes;
     block_t *p_pes = NULL;
@@ -343,51 +345,23 @@ void EStoPES ( block_t **pp_pes,
         i_max_pes_size = PES_PAYLOAD_SIZE_MAX;
     }
 
-    if( ( p_fmt->i_codec == VLC_CODEC_MP4V ||
-          p_fmt->i_codec == VLC_CODEC_H264 ||
-          p_fmt->i_codec == VLC_CODEC_HEVC) &&
-        p_es->i_flags & BLOCK_FLAG_TYPE_I )
-    {
-        /* For MPEG4 video, add VOL before I-frames,
-           for H264 add SPS/PPS before keyframes*/
-        p_es = block_Realloc( p_es, p_fmt->i_extra, p_es->i_buffer );
+    /* AUD Fixing
+     * For MPEG4 video, add VOL before I-frames,
+     * for H264/HEVC add xPS before keyframes */
+    p_es = PES_Repack( p_fmt->i_codec,
+                       (const uint8_t *) p_fmt->p_extra,
+                       (p_es->i_flags & BLOCK_FLAG_TYPE_I) ? p_fmt->i_extra : 0,
+                       pp_pes );
+    assert(*pp_pes == p_es);
+    if( !p_es )
+        return;
 
-        memcpy( p_es->p_buffer, p_fmt->p_extra, p_fmt->i_extra );
-    }
-
-    if( p_fmt->i_codec == VLC_CODEC_H264 )
-    {
-        unsigned offset=2;
-        while(offset < p_es->i_buffer )
-        {
-            if( p_es->p_buffer[offset-2] == 0 &&
-                p_es->p_buffer[offset-1] == 0 &&
-                p_es->p_buffer[offset] == 1 )
-                break;
-            offset++;
-        }
-        offset++;
-        if( offset+4 <= p_es->i_buffer &&
-            ((p_es->p_buffer[offset] & 0x1f) != 9) ) /* Not AUD */
-        {
-            /* Make similar AUD as libavformat does */
-            p_es = block_Realloc( p_es, 6, p_es->i_buffer );
-            p_es->p_buffer[0] = 0x00;
-            p_es->p_buffer[1] = 0x00;
-            p_es->p_buffer[2] = 0x00;
-            p_es->p_buffer[3] = 0x01;
-            p_es->p_buffer[4] = 0x09; /* FIXME: primary_pic_type from SPS/PPS */
-            p_es->p_buffer[5] = 0xf0;
-        }
-
-    }
-
-    mtime_t i_dts = 0;
-    mtime_t i_pts = 0;
-    if (p_es->i_pts > VLC_TS_INVALID)
-        i_pts = (p_es->i_pts - ts_offset) * 9 / 100;
-    if (p_es->i_dts > VLC_TS_INVALID)
-        i_dts = (p_es->i_dts - ts_offset) * 9 / 100;
+    int64_t i_dts = 0;
+    int64_t i_pts = 0;
+    if (p_es->i_pts != VLC_TICK_INVALID)
+        i_pts = TO_SCALE_NZ(p_es->i_pts - ts_offset);
+    if (p_es->i_dts != VLC_TICK_INVALID)
+        i_dts = TO_SCALE_NZ(p_es->i_dts - ts_offset);
 
     i_size = p_es->i_buffer;
     p_data = p_es->p_buffer;
@@ -437,14 +411,14 @@ void EStoPES ( block_t **pp_pes,
 
     /* Now redate all pes */
     p_pes = *pp_pes;
-    i_dts    = p_pes->i_dts;
-    mtime_t i_length = p_pes->i_length / i_pes_count;
+    vlc_tick_t i_block_dts = p_pes->i_dts;
+    vlc_tick_t i_length = p_pes->i_length / i_pes_count;
     while( p_pes )
     {
-        p_pes->i_dts = i_dts;
+        p_pes->i_dts = i_block_dts;
         p_pes->i_length = i_length;
 
-        i_dts += i_length;
+        i_block_dts += i_length;
         p_pes = p_pes->p_next;
     }
 }

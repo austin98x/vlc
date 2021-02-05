@@ -44,10 +44,10 @@ static void CloseRD( vlc_object_t * );
 VLC_SD_PROBE_HELPER( "Bonjour", N_("Bonjour Network Discovery"), SD_CAT_LAN )
 VLC_RD_PROBE_HELPER( "Bonjour_renderer", "Bonjour Renderer Discovery" )
 
-struct services_discovery_sys_t
+typedef struct services_discovery_sys_t
 {
     CFTypeRef _Nullable discoveryController;
-};
+} services_discovery_sys_t;
 
 struct vlc_renderer_discovery_sys
 {
@@ -81,6 +81,14 @@ NSString *const VLCBonjourProtocolServiceName   = @"VLCBonjourProtocolServiceNam
 NSString *const VLCBonjourIsRenderer            = @"VLCBonjourIsRenderer";
 NSString *const VLCBonjourRendererFlags         = @"VLCBonjourRendererFlags";
 NSString *const VLCBonjourRendererDemux         = @"VLCBonjourRendererDemux";
+
+/*
+ * For chromecast, the `ca=` is composed from (at least)
+ * 0x01 to indicate video support
+ * 0x04 to indivate audio support
+ */
+#define CHROMECAST_FLAG_VIDEO 0x01
+#define CHROMECAST_FLAG_AUDIO 0x04
 
 #pragma mark -
 #pragma mark Interface definition
@@ -299,20 +307,40 @@ NSString *const VLCBonjourRendererDemux         = @"VLCBonjourRendererDemux";
     NSString *uri = [NSString stringWithFormat:@"%@://%@:%ld", protocol, netService.hostName, netService.port];
     NSDictionary *txtDict = [NSNetService dictionaryFromTXTRecordData:[netService TXTRecordData]];
     NSString *displayName = netService.name;
+    int rendererFlags = 0;
 
     if ([netService.type isEqualToString:@"_googlecast._tcp."]) {
         NSData *modelData = [txtDict objectForKey:@"md"];
         NSData *nameData = [txtDict objectForKey:@"fn"];
+        NSData *flagsData = [txtDict objectForKey:@"ca"];
+
+        // Get CC capability flags from TXT data
+        if (flagsData) {
+            NSString *flagsString = [[NSString alloc] initWithData:flagsData encoding:NSUTF8StringEncoding];
+            NSInteger flags = [flagsString intValue];
+
+            if ((flags & CHROMECAST_FLAG_VIDEO) != 0) {
+                rendererFlags |= VLC_RENDERER_CAN_VIDEO;
+            }
+            if ((flags & CHROMECAST_FLAG_AUDIO) != 0) {
+                rendererFlags |= VLC_RENDERER_CAN_AUDIO;
+            }
+        }
+
+        // Get CC model and name from TXT data
         if (modelData && nameData) {
             NSString *model = [[NSString alloc] initWithData:modelData encoding:NSUTF8StringEncoding];
             NSString *name = [[NSString alloc] initWithData:nameData encoding:NSUTF8StringEncoding];
             displayName = [NSString stringWithFormat:@"%@ (%@)", name, model];
         }
     }
-    // TODO: Detect rendered capabilities and adapt to work with not just chromecast
-    vlc_renderer_item_t *p_renderer_item = vlc_renderer_item_new( "chromecast", [displayName UTF8String],
-                                                                 [uri UTF8String], NULL, "cc_demux",
-                                                                 "", VLC_RENDERER_CAN_VIDEO );
+
+    const char *extra_uri = rendererFlags & VLC_RENDERER_CAN_VIDEO ? NULL : "no-video";
+
+    // TODO: Adapt to work with not just chromecast!
+    vlc_renderer_item_t *p_renderer_item = vlc_renderer_item_new("chromecast", [displayName UTF8String],
+                                                                 [uri UTF8String], extra_uri, "cc_demux",
+                                                                 "", rendererFlags );
     if (p_renderer_item != NULL) {
         vlc_rd_add_item( p_rd, p_renderer_item );
         [_inputItemsForNetServices addObject:[NSValue valueWithPointer:p_renderer_item]];
@@ -395,9 +423,9 @@ static void CloseSD(vlc_object_t *p_this)
 static int OpenRD(vlc_object_t *p_this)
 {
     vlc_renderer_discovery_t *p_rd = (vlc_renderer_discovery_t *)p_this;
-    vlc_renderer_discovery_sys *p_sys = NULL;
+    struct vlc_renderer_discovery_sys *p_sys = NULL;
 
-    p_rd->p_sys = p_sys = calloc(1, sizeof(vlc_renderer_discovery_sys));
+    p_rd->p_sys = p_sys = calloc(1, sizeof(struct vlc_renderer_discovery_sys));
     if (!p_sys) {
         return VLC_ENOMEM;
     }
@@ -414,7 +442,7 @@ static int OpenRD(vlc_object_t *p_this)
 static void CloseRD(vlc_object_t *p_this)
 {
     vlc_renderer_discovery_t *p_rd = (vlc_renderer_discovery_t *)p_this;
-    vlc_renderer_discovery_sys *p_sys = p_rd->p_sys;
+    struct vlc_renderer_discovery_sys *p_sys = p_rd->p_sys;
 
     VLCNetServiceDiscoveryController *discoveryController = (__bridge VLCNetServiceDiscoveryController *)(p_sys->discoveryController);
     [discoveryController stopDiscovery];

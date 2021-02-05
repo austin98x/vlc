@@ -2,7 +2,6 @@
  * csa.h
  *****************************************************************************
  * Copyright (C) 2004 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -36,7 +35,7 @@ csa_t *csa_New( void );
 void   csa_Delete( csa_t * );
 
 int    csa_SetCW( vlc_object_t *p_caller, csa_t *c, char *psz_ck, bool odd );
-int    csa_UseKey( vlc_object_t *p_caller, csa_t *, bool use_odd );
+void   csa_UseKey( vlc_object_t *p_caller, csa_t *, bool use_odd );
 
 void   csa_Decrypt( csa_t *, uint8_t *pkt, int i_pkt_size );
 void   csa_Encrypt( csa_t *, uint8_t *pkt, int i_pkt_size );

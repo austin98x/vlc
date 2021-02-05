@@ -20,7 +20,8 @@
 #ifndef SMOOTHSEGMENT_HPP
 #define SMOOTHSEGMENT_HPP
 
-#include "../adaptive/playlist/SegmentTemplate.h"
+#include "../../adaptive/playlist/SegmentTemplate.h"
+#include "../../adaptive/playlist/SegmentChunk.hpp"
 
 namespace smooth
 {
@@ -28,13 +29,20 @@ namespace smooth
     {
         using namespace adaptive::playlist;
 
-        class SmoothSegment : public MediaSegmentTemplate
+        class SmoothSegmentChunk : public SegmentChunk
         {
             public:
-                SmoothSegment(SegmentInformation * = NULL);
+                SmoothSegmentChunk(AbstractChunkSource *, BaseRepresentation *);
+                virtual ~SmoothSegmentChunk();
+                virtual void onDownload(block_t **) override;
+        };
 
-            protected:
-                virtual void onChunkDownload(block_t **, SegmentChunk *, BaseRepresentation *); //reimpl
+        class SmoothSegmentTemplateSegment : public SegmentTemplateSegment
+        {
+            public:
+                SmoothSegmentTemplateSegment( ICanonicalUrl * = nullptr );
+                virtual ~SmoothSegmentTemplateSegment();
+                virtual SegmentChunk* createChunk(AbstractChunkSource *, BaseRepresentation *) override;
         };
     }
 }

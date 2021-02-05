@@ -2,7 +2,6 @@
  * gather.c: gathering stream output module
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -31,9 +30,9 @@
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
-#include <vlc_input.h>
 #include <vlc_sout.h>
 #include <vlc_block.h>
+#include <vlc_list.h>
 
 /*****************************************************************************
  * Module descriptor
@@ -43,7 +42,7 @@ static void     Close   ( vlc_object_t * );
 
 vlc_module_begin ()
     set_description( N_("Gathering stream output") )
-    set_capability( "sout stream", 50 )
+    set_capability( "sout filter", 50 )
     add_shortcut( "gather" )
     set_callbacks( Open, Close )
 vlc_module_end ()
@@ -51,23 +50,27 @@ vlc_module_end ()
 /*****************************************************************************
  * Exported prototypes
  *****************************************************************************/
-static sout_stream_id_sys_t *Add ( sout_stream_t *, const es_format_t * );
-static void              Del ( sout_stream_t *, sout_stream_id_sys_t * );
-static int               Send( sout_stream_t *, sout_stream_id_sys_t *, block_t* );
+static void *Add( sout_stream_t *, const es_format_t * );
+static void  Del( sout_stream_t *, void * );
+static int   Send( sout_stream_t *, void *, block_t * );
 
-struct sout_stream_id_sys_t
+typedef struct
 {
     bool    b_used;
     bool    b_streamswap;
 
     es_format_t fmt;
     void          *id;
-};
+    struct vlc_list node;
+} sout_stream_id_sys_t;
 
-struct sout_stream_sys_t
+typedef struct
 {
-    int              i_id;
-    sout_stream_id_sys_t **id;
+    struct vlc_list ids;
+} sout_stream_sys_t;
+
+static const struct sout_stream_operations ops = {
+    Add, Del, Send, NULL, NULL,
 };
 
 /*****************************************************************************
@@ -82,17 +85,8 @@ static int Open( vlc_object_t *p_this )
     if( p_sys == NULL )
         return VLC_EGENERIC;
 
-    if( !p_stream->p_next )
-    {
-        free( p_sys );
-        return VLC_EGENERIC;
-    }
-    p_stream->pf_add    = Add;
-    p_stream->pf_del    = Del;
-    p_stream->pf_send   = Send;
-
-    TAB_INIT( p_sys->i_id, p_sys->id );
-
+    vlc_list_init(&p_sys->ids);
+    p_stream->ops = &ops;
     return VLC_SUCCESS;
 }
 
@@ -103,17 +97,14 @@ static void Close( vlc_object_t * p_this )
 {
     sout_stream_t     *p_stream = (sout_stream_t*)p_this;
     sout_stream_sys_t *p_sys = p_stream->p_sys;
-    int i;
+    sout_stream_id_sys_t *id;
 
-    for( i = 0; i < p_sys->i_id; i++ )
+    vlc_list_foreach (id, &p_sys->ids, node)
     {
-        sout_stream_id_sys_t *id = p_sys->id[i];
-
         sout_StreamIdDel( p_stream->p_next, id->id );
         es_format_Clean( &id->fmt );
         free( id );
     }
-    TAB_CLEAN( p_sys->i_id, p_sys->id );
 
     free( p_sys );
 }
@@ -121,16 +112,14 @@ static void Close( vlc_object_t * p_this )
 /*****************************************************************************
  * Add:
  *****************************************************************************/
-static sout_stream_id_sys_t * Add( sout_stream_t *p_stream, const es_format_t *p_fmt )
+static void *Add( sout_stream_t *p_stream, const es_format_t *p_fmt )
 {
     sout_stream_sys_t *p_sys = p_stream->p_sys;
-    sout_stream_id_sys_t  *id;
-    int i;
+    sout_stream_id_sys_t *id;
 
     /* search a compatible output */
-    for( i = 0; i < p_sys->i_id; i++ )
+    vlc_list_foreach (id, &p_sys->ids, node)
     {
-        id = p_sys->id[i];
         if( id->b_used )
             continue;
 
@@ -161,20 +150,13 @@ static sout_stream_id_sys_t * Add( sout_stream_t *p_stream, const es_format_t *p
     }
 
     /* destroy all outputs from the same category */
-    for( i = 0; i < p_sys->i_id; i++ )
-    {
-        id = p_sys->id[i];
+    vlc_list_foreach (id, &p_sys->ids, node)
         if( !id->b_used && id->fmt.i_cat == p_fmt->i_cat )
         {
-            TAB_REMOVE( p_sys->i_id, p_sys->id, id );
             sout_StreamIdDel( p_stream->p_next, id->id );
             es_format_Clean( &id->fmt );
             free( id );
-
-            i = 0;
-            continue;
         }
-    }
 
     msg_Dbg( p_stream, "creating new output" );
     id = malloc( sizeof( sout_stream_id_sys_t ) );
@@ -189,26 +171,27 @@ static sout_stream_id_sys_t * Add( sout_stream_t *p_stream, const es_format_t *p
         free( id );
         return NULL;
     }
-    TAB_APPEND( p_sys->i_id, p_sys->id, id );
 
+    vlc_list_append(&id->node, &p_sys->ids);
     return id;
 }
 
 /*****************************************************************************
  * Del:
  *****************************************************************************/
-static void Del( sout_stream_t *p_stream, sout_stream_id_sys_t *id )
+static void Del( sout_stream_t *p_stream, void *_id )
 {
     VLC_UNUSED(p_stream);
+    sout_stream_id_sys_t *id = (sout_stream_id_sys_t *)_id;
     id->b_used = false;
 }
 
 /*****************************************************************************
  * Send:
  *****************************************************************************/
-static int Send( sout_stream_t *p_stream,
-                 sout_stream_id_sys_t *id, block_t *p_buffer )
+static int Send( sout_stream_t *p_stream, void *_id, block_t *p_buffer )
 {
+    sout_stream_id_sys_t *id = (sout_stream_id_sys_t *)_id;
     if ( id->b_streamswap )
     {
         id->b_streamswap = false;

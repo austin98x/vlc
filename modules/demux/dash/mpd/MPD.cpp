@@ -30,7 +30,7 @@
 
 #include "MPD.h"
 #include "ProgramInformation.h"
-#include "Period.h"
+#include "../../adaptive/playlist/BasePeriod.h"
 
 #include <vlc_common.h>
 #include <vlc_stream.h>
@@ -38,10 +38,11 @@
 using namespace dash::mpd;
 
 MPD::MPD (vlc_object_t *p_object, Profile profile_) :
-    AbstractPlaylist(p_object),
+    BasePlaylist(p_object),
     profile( profile_ )
 {
-    programInfo.Set( NULL );
+    programInfo.Set( nullptr );
+    lowLatency = false;
 }
 
 MPD::~MPD()
@@ -53,11 +54,21 @@ bool MPD::isLive() const
 {
     if(type.empty())
     {
-        Profile live(Profile::ISOLive);
+        Profile live(Profile::Name::ISOLive);
         return profile == live;
     }
     else
         return (type != "static");
+}
+
+bool MPD::isLowLatency() const
+{
+    return lowLatency;
+}
+
+void MPD::setLowLatency(bool b)
+{
+    lowLatency = b;
 }
 
 Profile MPD::getProfile() const
@@ -65,34 +76,14 @@ Profile MPD::getProfile() const
     return profile;
 }
 
-StreamFormat MPD::mimeToFormat(const std::string &mime)
-{
-    std::string::size_type pos = mime.find("/");
-    if(pos != std::string::npos)
-    {
-        std::string tail = mime.substr(pos + 1);
-        if(tail == "mp4")
-            return StreamFormat(StreamFormat::MP4);
-        else if (tail == "mp2t")
-            return StreamFormat(StreamFormat::MPEG2TS);
-        else if (tail == "vtt")
-            return StreamFormat(StreamFormat::WEBVTT);
-        else if (tail == "ttml+xml")
-            return StreamFormat(StreamFormat::TTML);
-    }
-    return StreamFormat();
-}
-
-void MPD::debug()
+void MPD::debug() const
 {
     msg_Dbg(p_object, "MPD profile=%s mediaPresentationDuration=%" PRId64
             " minBufferTime=%" PRId64,
             static_cast<std::string>(getProfile()).c_str(),
-            duration.Get() / CLOCK_FREQ,
+            SEC_FROM_VLC_TICK(duration.Get()),
             minBufferTime);
     msg_Dbg(p_object, "BaseUrl=%s", getUrlSegment().toString().c_str());
 
-    std::vector<BasePeriod *>::const_iterator i;
-    for(i = periods.begin(); i != periods.end(); ++i)
-        (*i)->debug(VLC_OBJECT(p_object));
+    BasePlaylist::debug();
 }

@@ -4,9 +4,9 @@ aout_LTLIBRARIES =
 libopensles_android_plugin_la_SOURCES = audio_output/opensles_android.c
 libopensles_android_plugin_la_LIBADD = $(LIBDL) $(LIBM)
 
-libandroid_audiotrack_plugin_la_SOURCES = audio_output/audiotrack.c \
-	video_output/android/utils.c video_output/android/utils.h
+libandroid_audiotrack_plugin_la_SOURCES = audio_output/audiotrack.c
 libandroid_audiotrack_plugin_la_CFLAGS = $(AM_CFLAGS)
+libandroid_audiotrack_plugin_la_LIBADD = libandroid_utils.la
 
 if HAVE_ANDROID
 aout_LTLIBRARIES += libandroid_audiotrack_plugin.la libopensles_android_plugin.la
@@ -62,7 +62,7 @@ endif
 libmmdevice_plugin_la_SOURCES = audio_output/mmdevice.c audio_output/mmdevice.h
 libmmdevice_plugin_la_LIBADD = $(LIBCOM) $(LIBM)
 libwinstore_plugin_la_SOURCES = audio_output/winstore.c audio_output/mmdevice.h
-libwinstore_plugin_la_LIBADD = $(LIBCOM)
+libwinstore_plugin_la_LIBADD = $(LIBCOM) -lmmdevapi
 libwasapi_plugin_la_SOURCES = audio_output/wasapi.c
 libwasapi_plugin_la_LIBADD = $(LIBCOM) -lksuser
 if HAVE_WASAPI
@@ -101,26 +101,19 @@ aout_LTLIBRARIES += libwaveout_plugin.la
 endif
 
 libauhal_plugin_la_SOURCES = audio_output/auhal.c \
-	audio_output/coreaudio_common.c audio_output/coreaudio_common.h \
-	audio_output/TPCircularBuffer.h audio_output/TPCircularBuffer.c
+	audio_output/coreaudio_common.c audio_output/coreaudio_common.h
 libauhal_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(aoutdir)' \
 	-Wl,-framework,CoreAudio,-framework,AudioUnit,-framework,AudioToolbox,-framework,CoreServices
 if HAVE_OSX
 aout_LTLIBRARIES += libauhal_plugin.la
 endif
 libaudiounit_ios_plugin_la_SOURCES = audio_output/audiounit_ios.m \
-	audio_output/coreaudio_common.c audio_output/coreaudio_common.h \
-	audio_output/TPCircularBuffer.h audio_output/TPCircularBuffer.c
+	audio_output/coreaudio_common.c audio_output/coreaudio_common.h
 libaudiounit_ios_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(aoutdir)' \
-	-Wl,-framework,CoreAudio,-framework,AudioUnit,-framework,AudioToolbox,-framework,CoreServices,-framework,UIKit,-framework,AVFoundation
+	-Wl,-framework,Foundation,-framework,CoreAudio,-framework,AudioToolbox,-framework,UIKit,-framework,AVFoundation
 if HAVE_IOS
 aout_LTLIBRARIES += libaudiounit_ios_plugin.la
 endif
 if HAVE_TVOS
 aout_LTLIBRARIES += libaudiounit_ios_plugin.la
 endif
-
-libtizen_audio_plugin_la_SOURCES = audio_output/tizen_audio.c
-libtizen_audio_plugin_la_CFLAGS = $(AM_CFLAGS)
-EXTRA_LTLIBRARIES += libtizen_audio_plugin.la
-aout_LTLIBRARIES += $(LTLIBtizen_audio)

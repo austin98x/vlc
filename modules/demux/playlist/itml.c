@@ -2,7 +2,6 @@
  * itml.c : iTunes Music Library import functions
  *******************************************************************************
  * Copyright (C) 2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Yoann Peronneau <yoann@videolan.org>
  *
@@ -46,7 +45,7 @@ static int ReadDir( stream_t *, input_item_node_t * );
 int Import_iTML( vlc_object_t *p_this )
 {
     stream_t *p_demux = (stream_t *)p_this;
-    CHECK_FILE(p_demux);
+
     if( !stream_HasExtension( p_demux, ".xml" )
      && !p_demux->obj.force )
         return VLC_EGENERIC;
@@ -60,7 +59,7 @@ int Import_iTML( vlc_object_t *p_this )
     msg_Dbg( p_demux, "using iTunes Media Library reader" );
 
     p_demux->pf_readdir = ReadDir;
-    p_demux->pf_control = access_vaDirectoryControlHelper;
+    p_demux->pf_control = PlaylistControl;
 
     return VLC_SUCCESS;
 }
@@ -73,7 +72,9 @@ static int ReadDir( stream_t *p_demux, input_item_node_t *p_subitems )
     xml_reader_t *p_xml_reader;
     const char *node;
 
-    p_demux->p_sys = (void *)(uintptr_t)0;
+    p_demux->p_sys = calloc( 1, sizeof (size_t) );
+    if( unlikely(p_demux->p_sys == NULL) )
+         return 0;
 
     /* create new xml parser from stream */
     p_xml_reader = xml_ReaderCreate( p_demux, p_demux->s );
@@ -101,13 +102,17 @@ static int ReadDir( stream_t *p_demux, input_item_node_t *p_subitems )
     }
 
     xml_elem_hnd_t pl_elements[] =
-        { {"dict",    COMPLEX_CONTENT, {.cmplx = parse_plist_dict} } };
+        {
+            {"dict",    COMPLEX_CONTENT, {.cmplx = parse_plist_dict} },
+            {NULL,      UNKNOWN_CONTENT, {NULL} }
+        };
     parse_plist_node( p_demux, p_subitems, NULL, p_xml_reader, "plist",
                       pl_elements );
 
 end:
     if( p_xml_reader )
         xml_ReaderDelete( p_xml_reader );
+    free( p_demux->p_sys );
 
     /* Needed for correct operation of go back */
     return 0;
@@ -227,7 +232,7 @@ static bool parse_dict( stream_t *p_demux, input_item_node_t *p_input_node,
             /* call the simple handler */
             else if( p_handler->pf_handler.smpl )
             {
-                p_handler->pf_handler.smpl( p_track, psz_key, psz_value, p_demux->p_sys );
+                p_handler->pf_handler.smpl( p_track, psz_key, psz_value );
             }
             FREENULL(psz_value);
             p_handler = NULL;
@@ -279,8 +284,8 @@ static bool parse_tracks_dict( stream_t *p_demux, input_item_node_t *p_input_nod
     parse_dict( p_demux, p_input_node, NULL, p_xml_reader,
                 "dict", tracks_elements );
 
-    msg_Info( p_demux, "added %zi tracks successfully",
-              (size_t)p_demux->p_sys );
+    msg_Info( p_demux, "added %zu tracks successfully",
+              *(size_t *)p_demux->p_sys );
 
     return true;
 }
@@ -327,7 +332,7 @@ static bool parse_track_dict( stream_t *p_demux, input_item_node_t *p_input_node
     add_meta( p_new_input, p_track );
     input_item_Release( p_new_input );
 
-    p_demux->p_sys = (void *)((uintptr_t)p_demux->p_sys + 1);
+    (*(size_t *)p_demux->p_sys)++;
 
     free_track( p_track );
     return i_ret;
@@ -364,9 +369,8 @@ static void free_track( track_elem_t *p_track )
 }
 
 static bool save_data( track_elem_t *p_track, const char *psz_name,
-                       char *psz_value, void *opaque )
+                       char *psz_value )
 {
-    VLC_UNUSED(opaque);
     /* exit if setting is impossible */
     if( !psz_name || !psz_value || !p_track )
         return false;
@@ -386,7 +390,7 @@ static bool save_data( track_elem_t *p_track, const char *psz_name,
     else if( !strcmp( psz_name, "Total Time" ) )
     {
         long i_num = atol( psz_value );
-        p_track->duration = (mtime_t) i_num*1000;
+        p_track->duration = (vlc_tick_t) i_num*1000;
     }
 #undef SAVE_INFO
     return true;

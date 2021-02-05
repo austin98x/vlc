@@ -94,7 +94,9 @@ const char *vlc_h2_setting_name(uint_fast16_t);
 /* Protocol default settings */
 #define VLC_H2_DEFAULT_MAX_HEADER_TABLE  4096
 #define VLC_H2_DEFAULT_INIT_WINDOW      65535
+#define VLC_H2_MIN_MAX_FRAME            16384
 #define VLC_H2_DEFAULT_MAX_FRAME        16384
+#define VLC_H2_MAX_MAX_FRAME         16777215
 
 struct vlc_h2_parser;
 struct vlc_h2_parser_cbs
@@ -105,6 +107,7 @@ struct vlc_h2_parser_cbs
     void (*error)(void *ctx, uint_fast32_t code);
     int  (*reset)(void *ctx, uint_fast32_t last_seq, uint_fast32_t code);
     void (*window_status)(void *ctx, uint32_t *rcwd);
+    void (*window_update)(void *ctx, uint_fast32_t credit);
 
     void *(*stream_lookup)(void *ctx, uint_fast32_t id);
     int  (*stream_error)(void *ctx, uint_fast32_t id, uint_fast32_t code);
@@ -113,6 +116,7 @@ struct vlc_h2_parser_cbs
     int  (*stream_data)(void *ctx, struct vlc_h2_frame *f);
     void (*stream_end)(void *ctx);
     int  (*stream_reset)(void *ctx, uint_fast32_t code);
+    void (*stream_window_update)(void *ctx, uint_fast32_t credit);
 };
 
 struct vlc_h2_parser *vlc_h2_parse_init(void *ctx,

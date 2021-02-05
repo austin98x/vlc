@@ -26,7 +26,6 @@
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
-#include <vlc_memory.h>
 #include <vlc_keystore.h>
 #include <vlc_strings.h>
 
@@ -148,7 +147,6 @@ Close(vlc_object_t *p_this)
     vlc_keystore_sys *p_sys = p_keystore->p_sys;
 
     ks_list_free(&p_sys->list);
-    vlc_mutex_destroy(&p_keystore->p_sys->lock);
     free(p_sys);
 }
 

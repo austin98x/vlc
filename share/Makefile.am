@@ -5,7 +5,7 @@ EXTRA_DIST =
 desktopdir = $(datadir)/applications
 if !HAVE_WIN32
 if !HAVE_DARWIN
-desktop_DATA = vlc.desktop
+desktop_DATA = vlc.desktop vlc-openbd.desktop vlc-opendvd.desktop vlc-openvcd.desktop vlc-opencda.desktop
 appdatadir = $(datarootdir)/metainfo
 appdata_DATA = $(appdata_in_files:.xml.in=.xml)
 appdata_in_files = vlc.appdata.xml.in
@@ -13,9 +13,10 @@ endif
 endif
 
 EXTRA_DIST += vlc.desktop.in vlc.desktop.mimetypes
+EXTRA_DIST += vlc-openbd.desktop.in vlc-opendvd.desktop.in vlc-openvcd.desktop.in vlc-opencda.desktop.in
 CLEANFILES += $(desktop_DATA) $(appdata_DATA)
 
-vlc.desktop: vlc.desktop.in $(top_builddir)/config.status
+%.desktop: %.desktop.in $(top_builddir)/config.status
 	$(AM_V_GEN)mimetypes="$$(sed 's/\s*#.*$$//g' $(srcdir)/vlc.desktop.mimetypes | egrep -v '^$$' | tr "\n" ';')"; \
 	sed \
 		-e 's,\@bindir\@,$(bindir),g' \
@@ -34,7 +35,7 @@ icons128dir = $(iconsdatadir)/128x128/apps
 icons256dir = $(iconsdatadir)/256x256/apps
 
 if !HAVE_WIN32
-dist_vlcdata_DATA = icons/vlc.ico
+dist_pkgdata_DATA = icons/vlc.ico
 dist_icons16_DATA = icons/16x16/vlc.png icons/16x16/vlc.xpm
 dist_icons32_DATA = icons/32x32/vlc.png icons/32x32/vlc.xpm \
 			icons/32x32/vlc-xmas.xpm
@@ -43,11 +44,13 @@ dist_icons128_DATA = icons/128x128/vlc.png icons/128x128/vlc-xmas.png \
                      icons/128x128/vlc-kb.png
 dist_icons256_DATA = icons/256x256/vlc.png
 
-nobase_dist_vlcdata_SCRIPTS = \
+nobase_dist_pkgdata_SCRIPTS = \
 	utils/gnome-vlc-default.sh \
 	utils/audio-vlc-default.sh \
 	utils/video-vlc-default.sh \
 	$(NULL)
+
+dist_pkgdata_SCRIPTS = ytdl-extract.py
 endif
 
 EXTRA_DIST += \
@@ -56,12 +59,12 @@ EXTRA_DIST += \
 	$(DIST_http_lua) \
 	$(DIST_solid)
 
-nobase_vlcdata_DATA =
-nobase_vlclib_DATA =
-nobase_dist_vlcdata_DATA =
+nobase_pkgdata_DATA =
+nobase_pkglibexec_SCRIPTS =
+nobase_dist_pkgdata_DATA =
 if BUILD_SKINS
-nobase_vlcdata_DATA += skins2/default.vlt
-nobase_dist_vlcdata_DATA += $(DIST_skins2)
+nobase_pkgdata_DATA += skins2/default.vlt
+nobase_dist_pkgdata_DATA += $(DIST_skins2)
 endif
 if KDE_SOLID
 soliddata_DATA = $(DIST_solid)
@@ -92,8 +95,11 @@ skins2_default_vlt_FILES = \
 skins2/default.vlt: $(skins2_default_vlt_FILES)
 	$(AM_V_at)mkdir -p skins2
 	$(AM_V_at)rm -f -- skins2/default.vlt.tmp
-	$(AM_V_GEN)GZIP=--no-name \
+	$(AM_V_GEN)tarsort= ; \
+	tar --help|grep -q sort=ORDER && tarsort=--sort=name ; \
+	GZIP=--no-name \
 	tar cvvzf skins2/default.vlt.tmp \
+		--format=ustar $$tarsort \
 		--owner=root --group=root --directory="$(srcdir)/skins2" \
 		default/
 	$(AM_V_at)mv -f -- skins2/default.vlt.tmp skins2/default.vlt
@@ -118,7 +124,7 @@ luac_verbose_0 = @echo "  LUAC   $@";
 	$(luac_verbose)$(LUAC) -o $@ $<
 
 if BUILD_LUA
-nobase_vlclib_DATA += \
+nobase_pkglibexec_SCRIPTS += \
 	lua/extensions/VLSub.luac \
 	lua/intf/cli.luac \
 	lua/intf/dummy.luac \
@@ -153,9 +159,7 @@ nobase_vlclib_DATA += \
 	lua/playlist/vocaroo.luac \
 	lua/playlist/youtube.luac \
 	lua/playlist/twitch.luac \
-	lua/sd/fmc.luac \
 	lua/sd/icecast.luac \
-	lua/sd/icast.luac \
 	lua/sd/jamendo.luac \
 	$(NULL)
 
@@ -179,7 +183,7 @@ nobase_doc_DATA = \
 	lua/sd/icast.lua \
 	$(NULL)
 
-nobase_dist_vlcdata_DATA += \
+nobase_dist_pkgdata_DATA += \
 	lua/http/view.html \
 	lua/http/mobile.html \
 	lua/http/dialogs/create_stream.html \
@@ -216,6 +220,8 @@ nobase_dist_vlcdata_DATA += \
 	lua/http/requests/vlm_cmd.xml \
 	lua/http/requests/status.xml \
 	lua/http/requests/status.json \
+	lua/http/requests/rd.json \
+	lua/http/requests/rd.xml \
 	lua/http/requests/vlm.xml \
 	lua/http/index.html \
 	lua/http/css/ui-lightness/jquery-ui-1.8.13.custom.css \
@@ -240,7 +246,7 @@ nobase_dist_vlcdata_DATA += \
 	lua/http/js/jquery.jstree.js \
 	lua/http/js/controllers.js
 endif
-MOSTLYCLEANFILES += $(nobase_vlcdata_DATA)
+MOSTLYCLEANFILES += $(nobase_pkgdata_DATA)
 
 EXTRA_DIST += \
 	lua/README.txt \
@@ -274,7 +280,6 @@ EXTRA_DIST += \
 	lua/playlist/appletrailers.lua \
 	lua/playlist/bbc_co_uk.lua \
 	lua/playlist/break.lua \
-	lua/playlist/canalplus.lua \
 	lua/playlist/cue.lua \
 	lua/playlist/dailymotion.lua \
 	lua/playlist/extreme.lua \
@@ -288,7 +293,6 @@ EXTRA_DIST += \
 	lua/playlist/mpora.lua \
 	lua/playlist/newgrounds.lua \
 	lua/playlist/pinkbike.lua \
-	lua/playlist/pluzz.lua \
 	lua/playlist/rockbox_fm_presets.lua \
 	lua/playlist/soundcloud.lua \
 	lua/playlist/vimeo.lua \
@@ -306,3 +310,6 @@ DIST_solid = \
 	solid/vlc-opencda.desktop \
 	solid/vlc-opendvd.desktop \
 	solid/vlc-openvcd.desktop
+
+EXTRA_DIST += \
+        hrtfs/dodeca_and_7channel_3DSL_HRTF.sofa

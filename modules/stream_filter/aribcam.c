@@ -84,7 +84,7 @@ static const struct error_messages_s const bcas_errors[] =
     { 0, NULL },
 };
 
-struct stream_sys_t
+typedef struct
 {
     ARIB_STD_B25 *p_b25;
     B_CAS_CARD   *p_bcas;
@@ -94,7 +94,7 @@ struct stream_sys_t
         size_t   i_size;
         block_t *p_list;
     } remain;
-};
+} stream_sys_t;
 
 static const char * GetErrorMessage( const int i_error,
                                const struct error_messages_s const *p_errors_messages )
@@ -197,7 +197,7 @@ static ssize_t Read( stream_t *p_stream, void *p_buf, size_t i_toread )
         else
         {
             if ( i_srcread < 0 )
-                msg_Err( p_stream, "Can't read %lu bytes from source stream: %d", i_toread, i_srcread );
+                msg_Err( p_stream, "Can't read %zu bytes from source stream: %d", i_toread, i_srcread );
             return 0;
         }
 

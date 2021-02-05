@@ -23,37 +23,14 @@
 #endif
 
 #include <assert.h>
+#ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
+#endif
 #include <X11/XWDFile.h>
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_codec.h>
-
-static int Open(vlc_object_t *);
-
-vlc_module_begin()
-    set_description(N_("XWD image decoder"))
-    set_capability("video decoder", 50)
-    set_category(CAT_INPUT)
-    set_subcategory(SUBCAT_INPUT_VCODEC)
-    set_callbacks(Open, NULL)
-vlc_module_end()
-
-static int Decode(decoder_t *, block_t *);
-
-static int Open(vlc_object_t *obj)
-{
-    decoder_t *dec = (decoder_t *)obj;
-
-    if (dec->fmt_in.i_codec != VLC_CODEC_XWD)
-        return VLC_EGENERIC;
-
-    dec->pf_decode = Decode;
-    es_format_Copy(&dec->fmt_out, &dec->fmt_in);
-    dec->fmt_out.i_codec = VLC_CODEC_RGB32;
-    return VLC_SUCCESS;
-}
 
 static int Decode (decoder_t *dec, block_t *block)
 {
@@ -62,7 +39,7 @@ static int Decode (decoder_t *dec, block_t *block)
     if (block == NULL) /* No Drain */
         return VLCDEC_SUCCESS;
 
-    if (block->i_pts <= VLC_TS_INVALID)
+    if (block->i_pts == VLC_TICK_INVALID)
         goto drop; /* undated block, should never happen */
     if (block->i_buffer < sz_XWDheader)
         goto drop;
@@ -150,3 +127,24 @@ drop:
     decoder_QueueVideo(dec, pic);
     return VLCDEC_SUCCESS;
 }
+
+static int Open(vlc_object_t *obj)
+{
+    decoder_t *dec = (decoder_t *)obj;
+
+    if (dec->fmt_in.i_codec != VLC_CODEC_XWD)
+        return VLC_EGENERIC;
+
+    dec->pf_decode = Decode;
+    es_format_Copy(&dec->fmt_out, &dec->fmt_in);
+    dec->fmt_out.i_codec = VLC_CODEC_RGB32;
+    return VLC_SUCCESS;
+}
+
+vlc_module_begin()
+    set_description(N_("XWD image decoder"))
+    set_capability("video decoder", 50)
+    set_category(CAT_INPUT)
+    set_subcategory(SUBCAT_INPUT_VCODEC)
+    set_callback(Open)
+vlc_module_end()

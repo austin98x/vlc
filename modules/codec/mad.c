@@ -3,7 +3,6 @@
  * using MAD (MPEG Audio Decoder)
  *****************************************************************************
  * Copyright (C) 2001-2016 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
  *          Jean-Paul Saman <jpsaman _at_ videolan _dot_ org>
@@ -59,7 +58,7 @@ static void Close( vlc_object_t * );
 /*****************************************************************************
  * Local structures
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
     struct mad_stream mad_stream;
     struct mad_frame  mad_frame;
@@ -67,7 +66,7 @@ struct decoder_sys_t
 
     int               i_reject_count;
     block_t          *p_last_buf;
-};
+} decoder_sys_t;
 
 /*****************************************************************************
  * Module descriptor

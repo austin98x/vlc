@@ -1,78 +1,132 @@
 # Qt
 
-QT_VERSION := 5.6.2
-QT_URL := https://download.qt.io/official_releases/qt/5.6/$(QT_VERSION)/submodules/qtbase-opensource-src-$(QT_VERSION).tar.xz
+QT_VERSION_MAJOR := 5.15
+QT_VERSION := $(QT_VERSION_MAJOR).1
+# Insert potential -betaX suffix here:
+QT_VERSION_FULL := $(QT_VERSION)
+QT_URL := https://download.qt.io/official_releases/qt/$(QT_VERSION_MAJOR)/$(QT_VERSION_FULL)/submodules/qtbase-everywhere-src-$(QT_VERSION_FULL).tar.xz
 
 ifdef HAVE_MACOSX
 #PKGS += qt
 endif
 ifdef HAVE_WIN32
 PKGS += qt
+DEPS_qt = fxc2 $(DEPS_fxc2)
+ifdef HAVE_CROSS_COMPILE
+DEPS_qt += wine-headers
+endif
 endif
 
-ifeq ($(call need_pkg,"Qt5Core Qt5Gui Qt5Widgets"),)
+ifeq ($(call need_pkg,"Qt5Core >= 5.11 Qt5Gui Qt5Widgets"),)
 PKGS_FOUND += qt
 endif
 
-$(TARBALLS)/qt-$(QT_VERSION).tar.xz:
-	$(call download,$(QT_URL))
+$(TARBALLS)/qtbase-everywhere-src-$(QT_VERSION_FULL).tar.xz:
+	$(call download_pkg,$(QT_URL),qt)
 
-.sum-qt: qt-$(QT_VERSION).tar.xz
+.sum-qt: qtbase-everywhere-src-$(QT_VERSION_FULL).tar.xz
 
-qt: qt-$(QT_VERSION).tar.xz .sum-qt
+qt: qtbase-everywhere-src-$(QT_VERSION_FULL).tar.xz .sum-qt
 	$(UNPACK)
-	mv qtbase-opensource-src-$(QT_VERSION) qt-$(QT_VERSION)
-	$(APPLY) $(SRC)/qt/0001-Windows-QPA-Reimplement-calculation-of-window-frames_56.patch  
-	$(APPLY) $(SRC)/qt/0002-Windows-QPA-Use-new-EnableNonClientDpiScaling-for-Wi_56.patch
-	$(APPLY) $(SRC)/qt/systray-no-sound.patch
+	$(APPLY) $(SRC)/qt/0001-allow-to-pass-user-defined-compilation-flags-to-qt.patch
+ifdef HAVE_WIN32
+	$(APPLY) $(SRC)/qt/0002-Windows-QPA-Disable-systray-notification-sounds.patch
+ifndef HAVE_WIN64
+	$(APPLY) $(SRC)/qt/0001-disable-qt_random_cpu.patch
+endif
+	$(APPLY) $(SRC)/qt/0006-ANGLE-don-t-use-msvc-intrinsics-when-crosscompiling-.patch
+	$(APPLY) $(SRC)/qt/0007-ANGLE-remove-static-assert-that-can-t-be-evaluated-b.patch
+	$(APPLY) $(SRC)/qt/0008-ANGLE-disable-ANGLE_STD_ASYNC_WORKERS-when-compiling.patch
+	$(APPLY) $(SRC)/qt/0009-Add-KHRONOS_STATIC-to-allow-static-linking-on-Windows.patch
+
+ifdef HAVE_CROSS_COMPILE
+	$(APPLY) $(SRC)/qt/0003-allow-cross-compilation-of-angle-with-wine.patch
+ifndef HAVE_CLANG
+	$(APPLY) $(SRC)/qt/0010-Windows-QPA-Fix-build-with-mingw64-Win32-threading.patch
+endif
+else
+	$(APPLY) $(SRC)/qt/qt-fix-msys-long-pathes.patch
+	$(APPLY) $(SRC)/qt/0003-fix-angle-compilation.patch
+	cd $(UNPACK_DIR); for i in QtFontDatabaseSupport QtWindowsUIAutomationSupport QtEventDispatcherSupport QtCore; do \
+		sed -i -e 's,"../../../../../src,"../src,g' include/$$i/$(QT_VERSION)/$$i/private/*.h; done
+endif
+
+endif
 	$(MOVE)
 
-ifdef HAVE_MACOSX
-QT_PLATFORM := -platform darwin-g++
-endif
+
 ifdef HAVE_WIN32
-QT_SPEC := win32-g++
-QT_PLATFORM := -xplatform win32-g++ -device-option CROSS_COMPILE=$(HOST)-
-endif
-
-QT_CONFIG := -static -opensource -confirm-license -no-pkg-config \
-	-no-sql-sqlite -no-gif -qt-libjpeg -no-openssl -no-opengl -no-dbus \
-	-no-qml-debug -no-audio-backend -no-sql-odbc -no-pch \
-	-no-compile-examples -nomake examples
-
-ifndef WITH_OPTIMIZATION
-QT_CONFIG += -debug
+QT_OPENGL := -angle
 else
-QT_CONFIG += -release
+QT_OPENGL := -opengl desktop
 endif
+
+ifdef HAVE_MACOSX
+QT_SPEC := darwin-g++
+endif
+
+ifdef HAVE_WIN32
+
+ifdef HAVE_CLANG
+QT_SPEC := win32-clang-g++
+else
+QT_SPEC := win32-g++
+endif
+
+ifdef HAVE_CROSS_COMPILE
+QT_PLATFORM := -xplatform $(QT_SPEC) -device-option CROSS_COMPILE=$(HOST)-
+else
+ifneq ($(QT_SPEC),)
+QT_PLATFORM := -platform $(QT_SPEC)
+endif
+endif
+
+endif
+
+QT_PLATFORM += -device-option VLC_EXTRA_CFLAGS="-isystem $(PREFIX)/include" \
+	-device-option VLC_EXTRA_CXXFLAGS="-isystem $(PREFIX)/include"
+
+QT_CONFIG := -static -no-shared -opensource -confirm-license -no-pkg-config \
+	-no-sql-sqlite -no-gif -qt-libjpeg -no-openssl $(QT_OPENGL) -no-dbus \
+	-no-vulkan -no-sql-odbc -no-pch -no-feature-testlib \
+	-no-compile-examples -nomake examples -nomake tests  -qt-zlib
+
+QT_CONFIG += -skip qtsql
+QT_CONFIG += -release
+
+ifeq ($(V),1)
+QT_CONFIG += -verbose
+endif
+
+ifdef HAVE_MINGW_W64
+QT_CONFIG += -no-direct2d
+endif
+
+ENV_VARS := $(HOSTVARS) DXSDK_DIR=$(PREFIX)/bin
 
 .qt: qt
-	cd $< && ./configure $(QT_PLATFORM) $(QT_CONFIG) -prefix $(PREFIX)
+	# Prevent all Qt contribs from generating and installing libtool .la files
+	cd $< && sed -i "/CONFIG/ s/ create_libtool/ -create_libtool/g" mkspecs/features/qt_module.prf
+	+cd $< && $(ENV_VARS) ./configure $(QT_PLATFORM) $(QT_CONFIG) -prefix $(PREFIX) -hostprefix $(PREFIX)/lib/qt5
 	# Make && Install libraries
-	cd $< && $(MAKE)
-	cd $</src && $(MAKE) sub-corelib-install_subtargets sub-gui-install_subtargets sub-widgets-install_subtargets sub-platformsupport-install_subtargets sub-zlib-install_subtargets sub-bootstrap-install_subtargets
+	cd $< && $(ENV_VARS) $(MAKE)
+	cd $< && $(MAKE) -C src sub-corelib-install_subtargets sub-gui-install_subtargets sub-widgets-install_subtargets sub-platformsupport-install_subtargets sub-zlib-install_subtargets sub-bootstrap-install_subtargets sub-network-install_subtargets
 	# Install tools
-	cd $</src && $(MAKE) sub-moc-install_subtargets sub-rcc-install_subtargets sub-uic-install_subtargets
+	cd $< && $(MAKE) -C src sub-moc-install_subtargets sub-rcc-install_subtargets sub-uic-install_subtargets sub-qlalr-install_subtargets
 	# Install plugins
-	cd $</src/plugins && $(MAKE) sub-platforms-install_subtargets
-	mv $(PREFIX)/plugins/platforms/libqwindows.a $(PREFIX)/lib/ && rm -rf $(PREFIX)/plugins
-	# Move includes to match what VLC expects
-	mkdir -p $(PREFIX)/include/QtGui/qpa
-	cp $(PREFIX)/include/QtGui/$(QT_VERSION)/QtGui/qpa/qplatformnativeinterface.h $(PREFIX)/include/QtGui/qpa
-	# Clean Qt mess
-	rm -rf $(PREFIX)/lib/libQt5Bootstrap* $</lib/libQt5Bootstrap*
-	# Fix .pc files to remove debug version (d)
-	cd $(PREFIX)/lib/pkgconfig; for i in Qt5Core.pc Qt5Gui.pc Qt5Widgets.pc; do sed -i -e 's/d\.a/.a/g' -e 's/d $$/ /' $$i; done
-	# Fix Qt5Gui.pc file to include qwindows (QWindowsIntegrationPlugin) and Qt5Platform Support
-	cd $(PREFIX)/lib/pkgconfig; sed -i -e 's/ -lQt5Gui/ -lqwindows -lQt5PlatformSupport -lQt5Gui/g' Qt5Gui.pc
-ifdef HAVE_CROSS_COMPILE
-	# Building Qt build tools for Xcompilation
-	cd $</include/QtCore; ln -sf $(QT_VERSION)/QtCore/private
-	cd $</qmake; $(MAKE)
-	cd $<; $(MAKE) install_qmake install_mkspecs
-	cd $</src/tools; \
-	for i in bootstrap uic rcc moc; \
-		do (cd $$i; echo $$i && ../../../bin/qmake -spec $(QT_SPEC) && $(MAKE) clean && $(MAKE) CC=$(HOST)-gcc CXX=$(HOST)-g++ LINKER=$(HOST)-g++ LIB="$(HOST)-ar -rc" && $(MAKE) install); \
-	done
+	cd $< && $(MAKE) -C src -C plugins sub-imageformats-install_subtargets sub-platforms-install_subtargets sub-styles-install_subtargets
+	$(SRC)/qt/AddStaticLink.sh "$(PREFIX)" Qt5Gui plugins/imageformats qjpeg
+ifdef HAVE_WIN32
+	# Add the private include to our project (similar to using "gui-private" in a qmake project) as well as ANGLE headers
+	sed -i.orig -e 's#-I$${includedir}/QtGui#-I$${includedir}/QtGui -I$${includedir}/QtGui/$(QT_VERSION)/QtGui -I$${includedir}/QtANGLE#' $(PREFIX)/lib/pkgconfig/Qt5Gui.pc
+	$(SRC)/qt/AddStaticLink.sh "$(PREFIX)" Qt5Gui plugins/platforms qwindows
+	# Vista styling
+	$(SRC)/qt/AddStaticLink.sh "$(PREFIX)" Qt5Widgets plugins/styles qwindowsvistastyle
 endif
+	#fix host tools headers to avoid collusion with target headers
+	mkdir -p $(PREFIX)/lib/qt5/include
+	cp -R $(PREFIX)/include/QtCore $(PREFIX)/lib/qt5/include
+	sed -i -e "s#\$\$QT_MODULE_INCLUDE_BASE#$(PREFIX)/lib/qt5/include#g" $(PREFIX)/lib/qt5/mkspecs/modules/qt_lib_bootstrap_private.pri
+	# Install a qmake with correct paths set
+	cd $< && $(MAKE) sub-qmake-qmake-aux-pro-install_subtargets install_mkspecs
 	touch $@

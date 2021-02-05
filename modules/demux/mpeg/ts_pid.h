@@ -26,6 +26,8 @@
 
 #include "ts_streams.h"
 
+typedef struct demux_sys_t demux_sys_t;
+
 typedef enum
 {
     TYPE_FREE = 0,
@@ -47,6 +49,7 @@ enum
 
 #define SEEN(x) ((x)->i_flags & FLAG_SEEN)
 #define SCRAMBLED(x) ((x).i_flags & FLAG_SCRAMBLED)
+#define PREVPKTKEEPBYTES 16
 
 struct ts_pid_t
 {
@@ -56,6 +59,7 @@ struct ts_pid_t
     uint8_t     i_cc;   /* countinuity counter */
     uint8_t     i_dup;  /* duplicate counter */
     uint8_t     type;
+    uint8_t     prevpktbytes[PREVPKTKEEPBYTES];
 
     uint16_t    i_refcount;
 
@@ -72,8 +76,10 @@ struct ts_pid_t
     struct
     {
         vlc_fourcc_t i_fourcc;
+        vlc_fourcc_t i_original_fourcc;
         int i_cat;
-        int i_pcr_count;
+        int i_dts_count;
+        int i_pcr_count; /* carries PCR field */
         uint8_t i_stream_id;
     } probed;
 

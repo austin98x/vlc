@@ -25,27 +25,11 @@
 #import "coreaudio_common.h"
 
 #import <vlc_plugin.h>
-#import <vlc_memory.h>
 
 #import <CoreAudio/CoreAudioTypes.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <mach/mach_time.h>
-
-#pragma mark -
-#pragma mark local prototypes & module descriptor
-
-static int  Open  (vlc_object_t *);
-static void Close (vlc_object_t *);
-
-vlc_module_begin ()
-    set_shortname("audiounit_ios")
-    set_description("AudioUnit output for iOS")
-    set_capability("audio output", 101)
-    set_category(CAT_AUDIO)
-    set_subcategory(SUBCAT_AUDIO_AOUT)
-    set_callbacks(Open, Close)
-vlc_module_end ()
 
 #pragma mark -
 #pragma mark private declarations
@@ -72,13 +56,60 @@ static const struct {
       AU_DEV_ENCODED }, /* This can also be forced with the --spdif option */
 };
 
+@interface SessionManager : NSObject
+{
+    NSMutableSet *_registeredInstances;
+}
++ (SessionManager *)sharedInstance;
+- (void)addAoutInstance:(AoutWrapper *)wrapperInstance;
+- (NSInteger)removeAoutInstance:(AoutWrapper *)wrapperInstance;
+@end
+
+@implementation SessionManager
++ (SessionManager *)sharedInstance
+{
+    static SessionManager *sharedInstance = nil;
+    static dispatch_once_t pred;
+
+    dispatch_once(&pred, ^{
+        sharedInstance = [SessionManager new];
+    });
+
+    return sharedInstance;
+}
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        _registeredInstances = [[NSMutableSet alloc] init];
+    }
+    return self;
+}
+
+- (void)addAoutInstance:(AoutWrapper *)wrapperInstance
+{
+    @synchronized(_registeredInstances) {
+        [_registeredInstances addObject:wrapperInstance];
+    }
+}
+
+- (NSInteger)removeAoutInstance:(AoutWrapper *)wrapperInstance
+{
+    @synchronized(_registeredInstances) {
+        [_registeredInstances removeObject:wrapperInstance];
+        return _registeredInstances.count;
+    }
+}
+@end
+
 /*****************************************************************************
  * aout_sys_t: private audio output method descriptor
  *****************************************************************************
  * This structure is part of the audio output thread descriptor.
  * It describes the CoreAudio specific properties of an output thread.
  *****************************************************************************/
-struct aout_sys_t
+typedef struct
 {
     struct aout_sys_common c;
 
@@ -87,10 +118,17 @@ struct aout_sys_t
     /* The AudioUnit we use */
     AudioUnit au_unit;
     bool      b_muted;
-    bool      b_paused;
+    bool      b_stopped;
     bool      b_preferred_channels_set;
     enum au_dev au_dev;
-};
+
+    /* sw gain */
+    float               soft_gain;
+    bool                soft_mute;
+} aout_sys_t;
+
+/* Soft volume helper */
+#include "audio_output/volume.h"
 
 enum port_type
 {
@@ -116,6 +154,7 @@ enum port_type
 - (void)audioSessionRouteChange:(NSNotification *)notification
 {
     audio_output_t *p_aout = [self aout];
+    aout_sys_t *p_sys = p_aout->sys;
     NSDictionary *userInfo = notification.userInfo;
     NSInteger routeChangeReason =
         [[userInfo valueForKey:AVAudioSessionRouteChangeReasonKey] integerValue];
@@ -125,6 +164,13 @@ enum port_type
     if (routeChangeReason == AVAudioSessionRouteChangeReasonNewDeviceAvailable
      || routeChangeReason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable)
         aout_RestartRequest(p_aout, AOUT_RESTART_OUTPUT);
+    else
+    {
+        const vlc_tick_t latency_us =
+            vlc_tick_from_sec([p_sys->avInstance outputLatency]);
+        ca_SetDeviceLatency(p_aout, latency_us);
+        msg_Dbg(p_aout, "Current device has a new latency of %lld us", latency_us);
+    }
 }
 
 - (void)handleInterruption:(NSNotification *)notification
@@ -150,7 +196,7 @@ static void
 avas_setPreferredNumberOfChannels(audio_output_t *p_aout,
                                   const audio_sample_format_t *fmt)
 {
-    struct aout_sys_t *p_sys = p_aout->sys;
+    aout_sys_t *p_sys = p_aout->sys;
 
     if (aout_BitsPerSample(fmt->i_format) == 0)
         return; /* Don't touch the number of channels for passthrough */
@@ -178,7 +224,7 @@ avas_setPreferredNumberOfChannels(audio_output_t *p_aout,
 static void
 avas_resetPreferredNumberOfChannels(audio_output_t *p_aout)
 {
-    struct aout_sys_t *p_sys = p_aout->sys;
+    aout_sys_t *p_sys = p_aout->sys;
     AVAudioSession *instance = p_sys->avInstance;
 
     if (p_sys->b_preferred_channels_set)
@@ -192,7 +238,7 @@ static int
 avas_GetOptimalChannelLayout(audio_output_t *p_aout, enum port_type *pport_type,
                              AudioChannelLayout **playout)
 {
-    struct aout_sys_t * p_sys = p_aout->sys;
+    aout_sys_t * p_sys = p_aout->sys;
     AVAudioSession *instance = p_sys->avInstance;
     AudioChannelLayout *layout = NULL;
     *pport_type = PORT_TYPE_DEFAULT;
@@ -277,7 +323,7 @@ avas_GetOptimalChannelLayout(audio_output_t *p_aout, enum port_type *pport_type,
 static int
 avas_SetActive(audio_output_t *p_aout, bool active, NSUInteger options)
 {
-    struct aout_sys_t * p_sys = p_aout->sys;
+    aout_sys_t * p_sys = p_aout->sys;
     AVAudioSession *instance = p_sys->avInstance;
     BOOL ret = false;
     NSError *error = nil;
@@ -287,9 +333,15 @@ avas_SetActive(audio_output_t *p_aout, bool active, NSUInteger options)
         ret = [instance setCategory:AVAudioSessionCategoryPlayback error:&error];
         ret = ret && [instance setMode:AVAudioSessionModeMoviePlayback error:&error];
         ret = ret && [instance setActive:YES withOptions:options error:&error];
+        [[SessionManager sharedInstance] addAoutInstance: p_sys->aoutWrapper];
+    } else {
+        NSInteger numberOfRegisteredInstances = [[SessionManager sharedInstance] removeAoutInstance: p_sys->aoutWrapper];
+        if (numberOfRegisteredInstances == 0) {
+            ret = [instance setActive:NO withOptions:options error:&error];
+        } else {
+            ret = true;
+        }
     }
-    else
-        ret = [instance setActive:NO withOptions:options error:&error];
 
     if (!ret)
     {
@@ -305,9 +357,9 @@ avas_SetActive(audio_output_t *p_aout, bool active, NSUInteger options)
 #pragma mark actual playback
 
 static void
-Pause (audio_output_t *p_aout, bool pause, mtime_t date)
+Pause (audio_output_t *p_aout, bool pause, vlc_tick_t date)
 {
-    struct aout_sys_t * p_sys = p_aout->sys;
+    aout_sys_t * p_sys = p_aout->sys;
 
     /* We need to start / stop the audio unit here because otherwise the OS
      * won't believe us that we stopped the audio output so in case of an
@@ -315,7 +367,7 @@ Pause (audio_output_t *p_aout, bool pause, mtime_t date)
      * multi-tasking, the multi-tasking view would still show a playing state
      * despite we are paused, same for lock screen */
 
-    if (pause == p_sys->b_paused)
+    if (pause == p_sys->b_stopped)
         return;
 
     OSStatus err;
@@ -341,43 +393,43 @@ Pause (audio_output_t *p_aout, bool pause, mtime_t date)
             }
         }
     }
-    p_sys->b_paused = pause;
+    p_sys->b_stopped = pause;
     ca_Pause(p_aout, pause, date);
-}
 
-static void
-Flush(audio_output_t *p_aout, bool wait)
-{
-    struct aout_sys_t * p_sys = p_aout->sys;
-
-    ca_Flush(p_aout, wait);
+    /* Since we stopped the AudioUnit, we can't really recover the delay from
+     * the last playback. So it's better to flush everything now to avoid
+     * synchronization glitches when resuming from pause. The main drawback is
+     * that we loose 1-2 sec of audio when resuming. The order is important
+     * here, ca_Flush need to be called when paused. */
+    if (pause)
+        ca_Flush(p_aout);
 }
 
 static int
 MuteSet(audio_output_t *p_aout, bool mute)
 {
-    struct aout_sys_t * p_sys = p_aout->sys;
+    aout_sys_t * p_sys = p_aout->sys;
 
     p_sys->b_muted = mute;
     if (p_sys->au_unit != NULL)
     {
         Pause(p_aout, mute, 0);
         if (mute)
-            ca_Flush(p_aout, false);
+            ca_Flush(p_aout);
     }
 
     return VLC_SUCCESS;
 }
 
 static void
-Play(audio_output_t * p_aout, block_t * p_block)
+Play(audio_output_t * p_aout, block_t * p_block, vlc_tick_t date)
 {
-    struct aout_sys_t * p_sys = p_aout->sys;
+    aout_sys_t * p_sys = p_aout->sys;
 
     if (p_sys->b_muted)
         block_Release(p_block);
     else
-        ca_Play(p_aout, p_block);
+        ca_Play(p_aout, p_block, date);
 }
 
 #pragma mark initialization
@@ -385,12 +437,12 @@ Play(audio_output_t * p_aout, block_t * p_block)
 static void
 Stop(audio_output_t *p_aout)
 {
-    struct aout_sys_t   *p_sys = p_aout->sys;
+    aout_sys_t   *p_sys = p_aout->sys;
     OSStatus err;
 
     [[NSNotificationCenter defaultCenter] removeObserver:p_sys->aoutWrapper];
 
-    if (!p_sys->b_paused)
+    if (!p_sys->b_stopped)
     {
         err = AudioOutputUnitStop(p_sys->au_unit);
         if (err != noErr)
@@ -412,12 +464,16 @@ Stop(audio_output_t *p_aout)
 static int
 Start(audio_output_t *p_aout, audio_sample_format_t *restrict fmt)
 {
-    struct aout_sys_t *p_sys = p_aout->sys;
+    aout_sys_t *p_sys = p_aout->sys;
     OSStatus err;
     OSStatus status;
     AudioChannelLayout *layout = NULL;
 
     if (aout_FormatNbChannels(fmt) == 0 || AOUT_FMT_HDMI(fmt))
+        return VLC_EGENERIC;
+
+    /* XXX: No more passthrough since iOS 11 */
+    if (AOUT_FMT_SPDIF(fmt))
         return VLC_EGENERIC;
 
     aout_FormatPrint(p_aout, "VLC is looking for:", fmt);
@@ -444,6 +500,13 @@ Start(audio_output_t *p_aout, audio_sample_format_t *restrict fmt)
      * should correspond to this number */
     avas_setPreferredNumberOfChannels(p_aout, fmt);
 
+    BOOL success = [p_sys->avInstance setPreferredSampleRate:fmt->i_rate error:nil];
+    if (!success)
+    {
+        /* Not critical, we can use any sample rates */
+        msg_Dbg(p_aout, "failed to set preferred sample rate");
+    }
+
     enum port_type port_type;
     int ret = avas_GetOptimalChannelLayout(p_aout, &port_type, &layout);
     if (ret != VLC_SUCCESS)
@@ -469,8 +532,11 @@ Start(audio_output_t *p_aout, audio_sample_format_t *restrict fmt)
     if (err != noErr)
         ca_LogWarn("failed to set IO mode");
 
-    ret = au_Initialize(p_aout, p_sys->au_unit, fmt, layout,
-                        [p_sys->avInstance outputLatency] * CLOCK_FREQ);
+    const vlc_tick_t latency_us =
+        vlc_tick_from_sec([p_sys->avInstance outputLatency]);
+    msg_Dbg(p_aout, "Current device has a latency of %lld us", latency_us);
+
+    ret = au_Initialize(p_aout, p_sys->au_unit, fmt, layout, latency_us, NULL);
     if (ret != VLC_SUCCESS)
         goto error;
 
@@ -491,7 +557,9 @@ Start(audio_output_t *p_aout, audio_sample_format_t *restrict fmt)
     fmt->channel_type = AUDIO_CHANNEL_TYPE_BITMAP;
     p_aout->mute_set  = MuteSet;
     p_aout->pause = Pause;
-    p_aout->flush = Flush;
+
+    aout_SoftVolumeStart( p_aout );
+
     msg_Dbg(p_aout, "analog AudioUnit output successfully opened for %4.4s %s",
             (const char *)&fmt->i_format, aout_FormatPrintChannels(fmt));
     return VLC_SUCCESS;
@@ -543,7 +611,6 @@ Close(vlc_object_t *obj)
 
     [sys->aoutWrapper release];
 
-    ca_Close(aout);
     free(sys);
 }
 
@@ -551,10 +618,16 @@ static int
 Open(vlc_object_t *obj)
 {
     audio_output_t *aout = (audio_output_t *)obj;
-    aout_sys_t *sys = calloc(1, sizeof (*sys));
 
+    aout_sys_t *sys = aout->sys = calloc(1, sizeof (*sys));
     if (unlikely(sys == NULL))
         return VLC_ENOMEM;
+
+    if (ca_Open(aout) != VLC_SUCCESS)
+    {
+        free(sys);
+        return VLC_EGENERIC;
+    }
 
     sys->avInstance = [AVAudioSession sharedInstance];
     assert(sys->avInstance != NULL);
@@ -569,14 +642,27 @@ Open(vlc_object_t *obj)
     sys->b_muted = false;
     sys->b_preferred_channels_set = false;
     sys->au_dev = var_InheritBool(aout, "spdif") ? AU_DEV_ENCODED : AU_DEV_PCM;
-    aout->sys = sys;
     aout->start = Start;
     aout->stop = Stop;
     aout->device_select = DeviceSelect;
 
+    aout_SoftVolumeInit( aout );
+
     for (unsigned int i = 0; i< sizeof(au_devs) / sizeof(au_devs[0]); ++i)
         aout_HotplugReport(aout, au_devs[i].psz_id, au_devs[i].psz_name);
 
-    ca_Open(aout);
     return VLC_SUCCESS;
 }
+
+#pragma mark -
+#pragma mark module descriptor
+
+vlc_module_begin ()
+    set_shortname("audiounit_ios")
+    set_description("AudioUnit output for iOS")
+    set_capability("audio output", 101)
+    set_category(CAT_AUDIO)
+    set_subcategory(SUBCAT_AUDIO_AOUT)
+    add_sw_gain()
+    set_callbacks(Open, Close)
+vlc_module_end ()

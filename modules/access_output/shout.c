@@ -2,7 +2,6 @@
  * shout.c: This module forwards vorbis streams to an icecast server
  *****************************************************************************
  * Copyright (C) 2005 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Daniel Fischer <dan at subsignal dot org>
  *          Derk-Jan Hartman <hartman at videolan dot org>
@@ -152,10 +151,10 @@ static const char *const ppsz_sout_options[] = {
 static ssize_t Write( sout_access_out_t *, block_t * );
 static int Control( sout_access_out_t *, int, va_list );
 
-struct sout_access_out_sys_t
+typedef struct
 {
     shout_t *p_shout;
-};
+} sout_access_out_sys_t;
 
 /*****************************************************************************
  * Open: open the shout connection
@@ -176,16 +175,18 @@ static int Open( vlc_object_t *p_this )
 
     config_ChainParse( p_access, SOUT_CFG_PREFIX, ppsz_sout_options, p_access->p_cfg );
 
-    if( !p_access->psz_path )
-    {
-        msg_Err( p_access,
-                 "please specify url=user:password@host:port/mountpoint" );
-        return VLC_EGENERIC;
-    }
-
     vlc_UrlParse( &url , p_access->psz_path );
     if( url.i_port <= 0 )
         url.i_port = 8000;
+
+    if( url.psz_host == NULL )
+    {   /* Backward compatibility with bind@path syntax */
+        vlc_UrlClean( &url );
+        if( unlikely(asprintf( &psz_url, "//%s", p_access->psz_path ) == -1) )
+            return VLC_ENOMEM;
+        vlc_UrlParse( &url, psz_url );
+        free( psz_url );
+    }
 
     p_sys = p_access->p_sys = malloc( sizeof( sout_access_out_sys_t ) );
     if( !p_sys )
@@ -365,7 +366,7 @@ static int Open( vlc_object_t *p_this )
         if ( i_ret != SHOUTERR_CONNECTED )
         {
             msg_Warn( p_access, "unable to establish connection, retrying..." );
-            msleep( 30000000 );
+            vlc_tick_sleep( VLC_TICK_FROM_SEC(30) );
         }
     }
 

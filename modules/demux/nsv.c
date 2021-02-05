@@ -2,7 +2,6 @@
  * nsv.c: NullSoft Video demuxer.
  *****************************************************************************
  * Copyright (C) 2004-2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -29,6 +28,8 @@
 # include "config.h"
 #endif
 
+#include <limits.h>
+
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
@@ -52,13 +53,14 @@ vlc_module_begin ()
     set_subcategory( SUBCAT_INPUT_DEMUX )
     set_callbacks( Open, Close )
     add_shortcut( "nsv" )
+    add_file_extension("nsv")
 vlc_module_end ()
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
 
-struct demux_sys_t
+typedef struct
 {
     es_format_t  fmt_audio;
     es_out_id_t *p_audio;
@@ -69,12 +71,12 @@ struct demux_sys_t
     es_format_t  fmt_sub;
     es_out_id_t  *p_sub;
 
-    int64_t     i_pcr;
-    int64_t     i_time;
-    int64_t     i_pcr_inc;
+    vlc_tick_t  i_pcr;
+    vlc_tick_t  i_time;
+    vlc_tick_t  i_pcr_inc;
 
     bool b_start_record;
-};
+} demux_sys_t;
 
 static int Demux  ( demux_t *p_demux );
 static int Control( demux_t *p_demux, int i_query, va_list args );
@@ -159,15 +161,12 @@ static int Demux( demux_t *p_demux )
     for( ;; )
     {
         if( vlc_stream_Peek( p_demux->s, &p_peek, 8 ) < 8 )
-        {
-            msg_Warn( p_demux, "cannot peek" );
-            return 0;
-        }
+            return VLC_DEMUXER_EOF;
 
         if( !memcmp( p_peek, "NSVf", 4 ) )
         {
             if( ReadNSVf( p_demux ) )
-                return -1;
+                return VLC_DEMUXER_EGENERIC;
         }
         else if( !memcmp( p_peek, "NSVs", 4 ) )
         {
@@ -179,7 +178,7 @@ static int Demux( demux_t *p_demux )
             }
 
             if( ReadNSVs( p_demux ) )
-                return -1;
+                return VLC_DEMUXER_EGENERIC;
             break;
         }
         else if( GetWLE( p_peek ) == 0xbeef )
@@ -188,7 +187,7 @@ static int Demux( demux_t *p_demux )
             if( vlc_stream_Read( p_demux->s, NULL, 2 ) < 2 )
             {
                 msg_Warn( p_demux, "cannot read" );
-                return 0;
+                return VLC_DEMUXER_EOF;
             }
             break;
         }
@@ -196,18 +195,18 @@ static int Demux( demux_t *p_demux )
         {
             msg_Err( p_demux, "invalid signature 0x%x (%4.4s)", GetDWLE( p_peek ), (const char*)p_peek );
             if( ReSynch( p_demux ) )
-                return -1;
+                return VLC_DEMUXER_EGENERIC;
         }
     }
 
     if( vlc_stream_Read( p_demux->s, header, 5 ) < 5 )
     {
         msg_Warn( p_demux, "cannot read" );
-        return 0;
+        return VLC_DEMUXER_EOF;
     }
 
     /* Set PCR */
-    es_out_SetPCR( p_demux->out, VLC_TS_0 + p_sys->i_pcr );
+    es_out_SetPCR( p_demux->out, VLC_TICK_0 + p_sys->i_pcr );
 
     /* Read video */
     i_size = ( header[0] >> 4 ) | ( header[1] << 4 ) | ( header[2] << 12 );
@@ -222,7 +221,7 @@ static int Demux( demux_t *p_demux )
             if( vlc_stream_Read( p_demux->s, aux, 6 ) < 6 )
             {
                 msg_Warn( p_demux, "cannot read" );
-                return 0;
+                return VLC_DEMUXER_EOF;
             }
             i_aux = GetWLE( aux );
             fcc   = VLC_FOURCC( aux[2], aux[3], aux[4], aux[5] );
@@ -236,10 +235,11 @@ static int Demux( demux_t *p_demux )
                 {
                     p_sys->fmt_sub.i_codec = VLC_FOURCC( 's', 'u', 'b', 't' );
                     p_sys->p_sub = es_out_Add( p_demux->out, &p_sys->fmt_sub );
-                    es_out_Control( p_demux->out, ES_OUT_SET_ES, p_sys->p_sub );
+                    if( p_sys->p_sub )
+                        es_out_Control( p_demux->out, ES_OUT_SET_ES, p_sys->p_sub );
                 }
                 if( vlc_stream_Read( p_demux->s, NULL, 2 ) < 2 )
-                    return 0;
+                    return VLC_DEMUXER_EOF;
 
                 if( ( p_frame = vlc_stream_Block( p_demux->s, i_aux - 2 ) ) )
                 {
@@ -256,10 +256,13 @@ static int Demux( demux_t *p_demux )
                     }
 
                     /* Skip the first part (it is the language name) */
-                    p_frame->i_pts = VLC_TS_0 + p_sys->i_pcr;
-                    p_frame->i_dts = VLC_TS_0 + p_sys->i_pcr + 4000000;    /* 4s */
+                    p_frame->i_pts = VLC_TICK_0 + p_sys->i_pcr;
+                    p_frame->i_dts = VLC_TICK_0 + p_sys->i_pcr + VLC_TICK_FROM_SEC(4);
 
-                    es_out_Send( p_demux->out, p_sys->p_sub, p_frame );
+                    if( p_sys->p_sub )
+                        es_out_Send( p_demux->out, p_sys->p_sub, p_frame );
+                    else
+                        block_Release( p_frame );
                 }
             }
             else
@@ -268,7 +271,7 @@ static int Demux( demux_t *p_demux )
                 if( vlc_stream_Read( p_demux->s, NULL, i_aux ) < i_aux )
                 {
                     msg_Warn( p_demux, "cannot read" );
-                    return 0;
+                    return VLC_DEMUXER_EOF;
                 }
             }
             i_size -= 6 + i_aux;
@@ -277,7 +280,7 @@ static int Demux( demux_t *p_demux )
         /* msg_Dbg( p_demux, "frame video size=%d", i_size ); */
         if( i_size > 0 && ( p_frame = vlc_stream_Block( p_demux->s, i_size ) ) )
         {
-            p_frame->i_dts = VLC_TS_0 + p_sys->i_pcr;
+            p_frame->i_dts = VLC_TICK_0 + p_sys->i_pcr;
 
             if( p_sys->p_video )
                 es_out_Send( p_demux->out, p_sys->p_video, p_frame );
@@ -299,7 +302,7 @@ static int Demux( demux_t *p_demux )
         {
             uint8_t h[4];
             if( vlc_stream_Read( p_demux->s, h, 4 ) < 4 )
-                return 0;
+                return VLC_DEMUXER_EOF;
 
             p_sys->fmt_audio.audio.i_channels = h[1];
             p_sys->fmt_audio.audio.i_rate = GetWLE( &h[2] );
@@ -314,7 +317,7 @@ static int Demux( demux_t *p_demux )
         if( ( p_frame = vlc_stream_Block( p_demux->s, i_size ) ) )
         {
             p_frame->i_dts =
-            p_frame->i_pts = VLC_TS_0 + p_sys->i_pcr;
+            p_frame->i_pts = VLC_TICK_0 + p_sys->i_pcr;
 
             if( p_sys->p_audio )
                 es_out_Send( p_demux->out, p_sys->p_audio, p_frame );
@@ -333,7 +336,7 @@ static int Demux( demux_t *p_demux )
         p_sys->i_time += p_sys->i_pcr_inc;
     }
 
-    return 1;
+    return VLC_DEMUXER_SUCCESS;
 }
 
 /*****************************************************************************
@@ -344,7 +347,7 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
     demux_sys_t *p_sys = p_demux->p_sys;
     double f, *pf;
     bool b_bool, *pb_bool;
-    int64_t i64, *pi64;
+    int64_t i64;
 
     switch( i_query )
     {
@@ -376,30 +379,28 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
             return VLC_SUCCESS;
 
         case DEMUX_GET_TIME:
-            pi64 = va_arg( args, int64_t * );
             if( p_sys->i_time < 0 )
             {
-                *pi64 = 0;
+                *va_arg( args, vlc_tick_t * ) = 0;
                 return VLC_EGENERIC;
             }
-            *pi64 = p_sys->i_time;
+            *va_arg( args, vlc_tick_t * ) = p_sys->i_time;
             return VLC_SUCCESS;
 
 #if 0
         case DEMUX_GET_LENGTH:
-            pi64 = va_arg( args, int64_t * );
             if( p_sys->i_mux_rate > 0 )
             {
-                *pi64 = (int64_t)1000000 * ( stream_Size( p_demux->s ) / 50 ) / p_sys->i_mux_rate;
+                *va_arg( args, vlc_tick_t * ) = vlc_tick_from_samples( stream_Size( p_demux->s ) / 50, p_sys->i_mux_rate);
                 return VLC_SUCCESS;
             }
-            *pi64 = 0;
+            *va_arg( args, vlc_tick_t * ) = 0;
             return VLC_EGENERIC;
 
 #endif
         case DEMUX_GET_FPS:
             pf = va_arg( args, double * );
-            *pf = (double)1000000.0 / (double)p_sys->i_pcr_inc;
+            *pf = (double)CLOCK_FREQ / (double)p_sys->i_pcr_inc;
             return VLC_SUCCESS;
 
         case DEMUX_CAN_RECORD:
@@ -483,10 +484,14 @@ static int ReadNSVf( demux_t *p_demux )
 
     if( i_header_size == 0 || i_header_size == UINT32_MAX )
         return VLC_EGENERIC;
-
-
-    return vlc_stream_Read( p_demux->s, NULL, i_header_size ) == i_header_size
-        ? VLC_SUCCESS : VLC_EGENERIC;
+#if (UINT32_MAX > SSIZE_MAX)
+    if( i_header_size > SSIZE_MAX )
+        return VLC_EGENERIC;
+#endif
+    if ( vlc_stream_Read( p_demux->s, NULL, i_header_size )
+                                 < (ssize_t)i_header_size )
+         return VLC_EGENERIC;
+    return VLC_SUCCESS;
 }
 /*****************************************************************************
  * ReadNSVs:
@@ -611,12 +616,12 @@ static int ReadNSVs( demux_t *p_demux )
     else if( header[16] != 0 )
     {
         /* Integer frame rate */
-        p_sys->i_pcr_inc = 1000000 / header[16];
+        p_sys->i_pcr_inc = vlc_tick_from_samples(1, header[16]);
     }
     else
     {
         msg_Dbg( p_demux, "invalid fps (0x00)" );
-        p_sys->i_pcr_inc = 40000;
+        p_sys->i_pcr_inc = VLC_TICK_FROM_MS(40);
     }
     //msg_Dbg( p_demux, "    - fps=%.3f", 1000000.0 / (double)p_sys->i_pcr_inc );
 

@@ -34,8 +34,8 @@
 #include <vlc_memstream.h>
 #include <assert.h>
 
-#include "../codec/substext.h"
-#include "../demux/mp4/minibox.h"
+#include "../substext.h"
+#include "../../demux/mp4/minibox.h"
 #include "webvtt.h"
 
 
@@ -122,8 +122,8 @@ struct webvtt_dom_cue_t
 {
     WEBVTT_NODE_BASE_MEMBERS
     char *psz_id;
-    mtime_t i_start;
-    mtime_t i_stop;
+    vlc_tick_t i_start;
+    vlc_tick_t i_stop;
     webvtt_cue_settings_t settings;
     unsigned i_lines;
     text_style_t *p_cssstyle;
@@ -139,7 +139,7 @@ typedef struct
 typedef struct
 {
     WEBVTT_NODE_BASE_MEMBERS
-    mtime_t i_start;
+    vlc_tick_t i_start;
     char *psz_tag;
     char *psz_attrs;
     text_style_t *p_cssstyle;
@@ -151,14 +151,14 @@ struct webvtt_dom_node_t
     WEBVTT_NODE_BASE_MEMBERS
 };
 
-struct decoder_sys_t
+typedef struct
 {
     webvtt_dom_tag_t *p_root;
 #ifdef HAVE_CSS
     /* CSS */
     vlc_css_rule_t *p_css_rules;
 #endif
-};
+} decoder_sys_t;
 
 #define ATOM_iden VLC_FOURCC('i', 'd', 'e', 'n')
 #define ATOM_payl VLC_FOURCC('p', 'a', 'y', 'l')
@@ -551,13 +551,14 @@ static webvtt_dom_node_t * webvtt_domnode_getFirstChild( webvtt_dom_node_t *p_no
 }
 #define webvtt_domnode_getFirstChild(a) webvtt_domnode_getFirstChild((webvtt_dom_node_t *)a)
 
-static mtime_t webvtt_domnode_GetPlaybackTime( const webvtt_dom_node_t *p_node, bool b_end )
+#ifdef HAVE_CSS
+static vlc_tick_t webvtt_domnode_GetPlaybackTime( const webvtt_dom_node_t *p_node, bool b_end )
 {
     for( ; p_node; p_node = p_node->p_parent )
     {
         if( p_node->type == NODE_TAG )
         {
-            mtime_t i_start = ((const webvtt_dom_tag_t *) p_node)->i_start;
+            vlc_tick_t i_start = ((const webvtt_dom_tag_t *) p_node)->i_start;
             if( i_start > -1 && !b_end )
                 return i_start;
         }
@@ -569,10 +570,9 @@ static mtime_t webvtt_domnode_GetPlaybackTime( const webvtt_dom_node_t *p_node, 
     if( p_node )
         return b_end ? ((const webvtt_dom_cue_t *) p_node)->i_stop:
                        ((const webvtt_dom_cue_t *) p_node)->i_start;
-    return VLC_TS_INVALID;
+    return VLC_TICK_INVALID;
 }
 
-#ifdef HAVE_CSS
 static bool webvtt_domnode_Match_Class( const webvtt_dom_node_t *p_node, const char *psz )
 {
     const size_t i_len = strlen( psz );
@@ -620,11 +620,11 @@ static bool webvtt_domnode_Match_Tag( const webvtt_dom_node_t *p_node, const cha
 }
 
 static bool webvtt_domnode_Match_PseudoClass( const webvtt_dom_node_t *p_node, const char *psz,
-                                              mtime_t i_playbacktime )
+                                              vlc_tick_t i_playbacktime )
 {
     if( !strcmp(psz, "past") || !strcmp(psz, "future") )
     {
-        mtime_t i_start = webvtt_domnode_GetPlaybackTime( p_node, false );
+        vlc_tick_t i_start = webvtt_domnode_GetPlaybackTime( p_node, false );
         return ( *psz == 'p' ) ? i_start < i_playbacktime : i_start > i_playbacktime;
     }
     return false;
@@ -716,10 +716,9 @@ static bool webvtt_domnode_Match_Attribute( const webvtt_dom_node_t *p_node,
     return false;
 }
 
-static bool webvtt_domnode_MatchType( decoder_t *p_dec, const webvtt_dom_node_t *p_node,
-                                      const vlc_css_selector_t *p_sel, mtime_t i_playbacktime )
+static bool webvtt_domnode_MatchType( const webvtt_dom_node_t *p_node,
+                                      const vlc_css_selector_t *p_sel, vlc_tick_t i_playbacktime )
 {
-    VLC_UNUSED(p_dec);
     switch( p_sel->type )
     {
         case SELECTOR_SIMPLE:
@@ -785,26 +784,26 @@ static void webvtt_domnode_setCSSStyle( webvtt_dom_node_t *p_node, text_style_t 
 }
 
 #ifdef HAVE_CSS
-static void webvtt_domnode_SelectNodesInTree( decoder_t *p_dec, const vlc_css_selector_t *p_sel,
-                                              const webvtt_dom_node_t *p_tree, int i_max_depth,
-                                              mtime_t i_playbacktime, vlc_array_t *p_results );
+static void webvtt_domnode_SelectNodesInTree( const webvtt_dom_node_t *p_tree,
+                                              const vlc_css_selector_t *p_sel, int i_max_depth,
+                                              vlc_tick_t i_playbacktime, vlc_array_t *p_results );
 
-static void webvtt_domnode_SelectChildNodesInTree( decoder_t *p_dec, const vlc_css_selector_t *p_sel,
-                                                   const webvtt_dom_node_t *p_root, int i_max_depth,
-                                                   mtime_t i_playbacktime, vlc_array_t *p_results )
+static void webvtt_domnode_SelectChildNodesInTree( const webvtt_dom_node_t *p_tree,
+                                                   const vlc_css_selector_t *p_sel, int i_max_depth,
+                                                   vlc_tick_t i_playbacktime, vlc_array_t *p_results )
 {
-    const webvtt_dom_node_t *p_child = webvtt_domnode_getFirstChild( p_root );
+    const webvtt_dom_node_t *p_child = webvtt_domnode_getFirstChild( p_tree );
     if( i_max_depth > 0 )
     {
         for( ; p_child; p_child = p_child->p_next )
-            webvtt_domnode_SelectNodesInTree( p_dec, p_sel, p_child, i_max_depth - 1,
+            webvtt_domnode_SelectNodesInTree( p_child, p_sel, i_max_depth - 1,
                                               i_playbacktime, p_results );
     }
 }
 
-static void webvtt_domnode_SelectNodesBySpeficier( decoder_t *p_dec, const vlc_css_selector_t *p_spec,
-                                                   const webvtt_dom_node_t *p_node,
-                                                   mtime_t i_playbacktime, vlc_array_t *p_results )
+static void webvtt_domnode_SelectNodesBySpeficier( const webvtt_dom_node_t *p_node,
+                                                   const vlc_css_selector_t *p_spec,
+                                                   vlc_tick_t i_playbacktime, vlc_array_t *p_results )
 {
     if( p_spec == NULL )
         return;
@@ -812,64 +811,66 @@ static void webvtt_domnode_SelectNodesBySpeficier( decoder_t *p_dec, const vlc_c
     switch( p_spec->combinator )
     {
         case RELATION_DESCENDENT:
-            webvtt_domnode_SelectChildNodesInTree( p_dec, p_spec, p_node, WEBVTT_MAX_DEPTH,
+            webvtt_domnode_SelectChildNodesInTree( p_node, p_spec, WEBVTT_MAX_DEPTH,
                                                    i_playbacktime, p_results );
             break;
         case RELATION_DIRECTADJACENT:
             for( const webvtt_dom_node_t *p_adj = p_node->p_next; p_adj; p_adj = p_adj->p_next )
-                webvtt_domnode_SelectChildNodesInTree( p_dec, p_spec, p_adj, 1,
+                webvtt_domnode_SelectChildNodesInTree( p_adj, p_spec, 1,
                                                        i_playbacktime, p_results );
             break;
         case RELATION_INDIRECTADJACENT:
             for( const webvtt_dom_node_t *p_adj = webvtt_domnode_getFirstChild( p_node->p_parent );
                                           p_adj && p_adj != p_node; p_adj = p_adj->p_next )
-                webvtt_domnode_SelectChildNodesInTree( p_dec, p_spec, p_adj, 1,
+                webvtt_domnode_SelectChildNodesInTree( p_adj, p_spec, 1,
                                                        i_playbacktime, p_results );
             break;
         case RELATION_CHILD:
-            webvtt_domnode_SelectChildNodesInTree( p_dec, p_spec, p_node, 1,
+            webvtt_domnode_SelectChildNodesInTree( p_node, p_spec, 1,
                                                    i_playbacktime, p_results );
             break;
         case RELATION_SELF:
-            webvtt_domnode_SelectNodesInTree( p_dec, p_spec, p_node, WEBVTT_MAX_DEPTH,
+            webvtt_domnode_SelectNodesInTree( p_node, p_spec, WEBVTT_MAX_DEPTH,
                                               i_playbacktime, p_results );
     }
 }
 
-static void webvtt_domnode_SelectNodesInTree( decoder_t *p_dec, const vlc_css_selector_t *p_sel,
-                                              const webvtt_dom_node_t *p_root, int i_max_depth,
-                                              mtime_t i_playbacktime, vlc_array_t *p_results )
+static void webvtt_domnode_SelectNodesInTree( const webvtt_dom_node_t *p_node,
+                                              const vlc_css_selector_t *p_sel, int i_max_depth,
+                                              vlc_tick_t i_playbacktime, vlc_array_t *p_results )
 {
-    if( p_root == NULL )
+    if( p_node == NULL )
         return;
 
-    if( webvtt_domnode_MatchType( p_dec, p_root, p_sel, i_playbacktime ) )
+    if( webvtt_domnode_MatchType( p_node, p_sel, i_playbacktime ) )
     {
         if( p_sel->specifiers.p_first == NULL )
         {
             /* End of matching, this node is part of results */
-            (void) vlc_array_append( p_results, (void *) p_root );
+            (void) vlc_array_append( p_results, (void *) p_node );
         }
-        else webvtt_domnode_SelectNodesBySpeficier( p_dec, p_sel->specifiers.p_first, p_root,
+        else webvtt_domnode_SelectNodesBySpeficier( p_node, p_sel->specifiers.p_first,
                                                     i_playbacktime, p_results );
     }
 
     /* lookup other subnodes */
-    webvtt_domnode_SelectChildNodesInTree( p_dec, p_sel, p_root, i_max_depth - 1,
+    webvtt_domnode_SelectChildNodesInTree( p_node, p_sel, i_max_depth - 1,
                                            i_playbacktime, p_results );
 }
 
-static void webvtt_domnode_SelectRuleNodes( decoder_t *p_dec, const vlc_css_rule_t *p_rule,
-                                            mtime_t i_playbacktime, vlc_array_t *p_results )
+static void webvtt_domnode_SelectRuleNodes( const webvtt_dom_node_t *p_root, const vlc_css_rule_t *p_rule,
+                                            vlc_tick_t i_playbacktime, vlc_array_t *p_results )
 {
-    const webvtt_dom_node_t *p_cues = p_dec->p_sys->p_root->p_child;
+    if(!p_root || p_root->type != NODE_TAG)
+        return;
+    const webvtt_dom_node_t *p_cues = ((const webvtt_dom_tag_t *)p_root)->p_child;
     for( const vlc_css_selector_t *p_sel = p_rule->p_selectors; p_sel; p_sel = p_sel->p_next )
     {
         vlc_array_t tempresults;
         vlc_array_init( &tempresults );
         for( const webvtt_dom_node_t *p_node = p_cues; p_node; p_node = p_node->p_next )
         {
-            webvtt_domnode_SelectNodesInTree( p_dec, p_sel, p_node, WEBVTT_MAX_DEPTH,
+            webvtt_domnode_SelectNodesInTree( p_node, p_sel, WEBVTT_MAX_DEPTH,
                                               i_playbacktime, &tempresults );
         }
         for( size_t i=0; i<vlc_array_count(&tempresults); i++ )
@@ -927,7 +928,7 @@ static const char *SplitTag( const char *psz_tag, size_t *pi_tag, const char **p
 /*****************************************************************************
  *
  *****************************************************************************/
-static webvtt_dom_cue_t * webvtt_dom_cue_New( mtime_t i_start, mtime_t i_end )
+static webvtt_dom_cue_t * webvtt_dom_cue_New( vlc_tick_t i_start, vlc_tick_t i_end )
 {
     webvtt_dom_cue_t *p_cue = calloc( 1, sizeof(*p_cue) );
     if( p_cue )
@@ -1076,7 +1077,7 @@ static void webvtt_region_ClearCues( webvtt_region_t *p_region )
     p_region->p_child = NULL;
 }
 
-static void ClearCuesByTime( webvtt_dom_node_t **pp_next, mtime_t i_time )
+static void ClearCuesByTime( webvtt_dom_node_t **pp_next, vlc_tick_t i_time )
 {
     while( *pp_next )
     {
@@ -1261,7 +1262,10 @@ static webvtt_dom_node_t * CreateDomNodes( const char *psz_text, unsigned *pi_li
                      * like <b><v stuff>foo</b> */
                     p_parent = webvtt_domnode_getParentByTag( p_parent, psz_tagname );
                     if( p_parent ) /* continue as parent next */
+                    {
                         pp_append = &p_parent->p_next;
+                        p_parent = p_parent->p_parent;
+                    }
                     else /* back as top node */
                         pp_append = &p_head->p_next;
                     while( *pp_append )
@@ -1308,7 +1312,7 @@ static text_style_t * ComputeStyle( decoder_t *p_dec, const webvtt_dom_node_t *p
     VLC_UNUSED(p_dec);
     text_style_t *p_style = NULL;
     text_style_t *p_dfltstyle = NULL;
-    mtime_t i_tagtime = -1;
+    vlc_tick_t i_tagtime = -1;
 
     for( const webvtt_dom_node_t *p_node = p_leaf ; p_node; p_node = p_node->p_parent )
     {
@@ -1364,7 +1368,8 @@ static text_style_t * ComputeStyle( decoder_t *p_dec, const webvtt_dom_node_t *p
                 else if ( !strcmp( p_tagnode->psz_tag, "v" ) && p_tagnode->psz_attrs )
                 {
 #ifdef HAVE_CSS
-                    if( p_dec->p_sys->p_css_rules == NULL ) /* Only auto style when no CSS sheet */
+                    decoder_sys_t *p_sys = p_dec->p_sys;
+                    if( p_sys->p_css_rules == NULL ) /* Only auto style when no CSS sheet */
 #endif
                     {
                         if( p_style || (p_style = text_style_Create( STYLE_NO_DEFAULTS )) )
@@ -1461,12 +1466,12 @@ static int GetCueTextAlignment( const webvtt_dom_cue_t *p_cue )
             return SUBPICTURE_ALIGN_LEFT;
         case WEBVTT_ALIGN_RIGHT:
             return SUBPICTURE_ALIGN_RIGHT;
-        case WEBVTT_ALIGN_START:
-            return ((p_cue->settings.vertical == WEBVTT_ALIGN_RIGHT) ?
-                     SUBPICTURE_ALIGN_LEFT : SUBPICTURE_ALIGN_RIGHT);
-        case WEBVTT_ALIGN_END:
-            return ((p_cue->settings.vertical == WEBVTT_ALIGN_RIGHT)) ?
+        case WEBVTT_ALIGN_START: /* vertical provides rl or rl base direction */
+            return (p_cue->settings.vertical == WEBVTT_ALIGN_RIGHT) ?
                      SUBPICTURE_ALIGN_RIGHT : SUBPICTURE_ALIGN_LEFT;
+        case WEBVTT_ALIGN_END:
+            return (p_cue->settings.vertical == WEBVTT_ALIGN_RIGHT) ?
+                     SUBPICTURE_ALIGN_LEFT : SUBPICTURE_ALIGN_RIGHT;
         default:
             return 0;
     }
@@ -1480,6 +1485,38 @@ struct render_variables_s
     float i_top_offset;
     float i_top;
 };
+
+static text_segment_t *ConvertRubyNodeToSegment( const webvtt_dom_node_t *p_node )
+{
+    text_segment_ruby_t *p_ruby = NULL;
+    text_segment_ruby_t **pp_rt_append = &p_ruby;
+
+    const char *psz_base = NULL;
+
+    for( ; p_node ; p_node = p_node->p_next )
+    {
+        if( p_node->type == NODE_TEXT )
+        {
+            const webvtt_dom_text_t *p_textnode = (const webvtt_dom_text_t *) p_node;
+            psz_base = p_textnode->psz_text;
+        }
+        else if( p_node->type == NODE_TAG )
+        {
+            const webvtt_dom_tag_t *p_tag = (const webvtt_dom_tag_t *)p_node;
+            if( !strcmp(p_tag->psz_tag, "rt") && p_tag->p_child &&
+                p_tag->p_child->type == NODE_TEXT )
+            {
+                const webvtt_dom_text_t *p_rttext = (const webvtt_dom_text_t *)p_tag->p_child;
+                *pp_rt_append = text_segment_ruby_New( psz_base, p_rttext->psz_text );
+                if( *pp_rt_append )
+                    pp_rt_append = &(*pp_rt_append)->p_next;
+            }
+            psz_base = NULL;
+        }
+    }
+
+    return ( p_ruby ) ? text_segment_FromRuby( p_ruby ) : NULL;
+}
 
 static text_segment_t *ConvertNodesToSegments( decoder_t *p_dec,
                                                struct render_variables_s *p_vars,
@@ -1510,8 +1547,11 @@ static text_segment_t *ConvertNodesToSegments( decoder_t *p_dec,
         else if( p_node->type == NODE_TAG )
         {
             const webvtt_dom_tag_t *p_tag = (const webvtt_dom_tag_t *)p_node;
-            *pp_append = ConvertNodesToSegments( p_dec, p_vars, p_cue,
-                                                 p_tag->p_child );
+            if( strcmp(p_tag->psz_tag, "ruby") )
+                *pp_append = ConvertNodesToSegments( p_dec, p_vars, p_cue,
+                                                     p_tag->p_child );
+            else
+                *pp_append = ConvertRubyNodeToSegment( p_tag->p_child );
         }
     }
     return p_head;
@@ -1559,7 +1599,7 @@ static void ChainCueSegments( const webvtt_dom_cue_t *p_cue, text_segment_t *p_n
     }
 }
 
-static text_segment_t * ConvertCuesToSegments( decoder_t *p_dec, mtime_t i_start, mtime_t i_stop,
+static text_segment_t * ConvertCuesToSegments( decoder_t *p_dec, vlc_tick_t i_start, vlc_tick_t i_stop,
                                                struct render_variables_s *p_vars,
                                                const webvtt_dom_cue_t *p_cue )
 {
@@ -1582,7 +1622,7 @@ static text_segment_t * ConvertCuesToSegments( decoder_t *p_dec, mtime_t i_start
 }
 
 static void GetTimedTags( const webvtt_dom_node_t *p_node,
-                           mtime_t i_start, mtime_t i_stop, vlc_array_t *p_times )
+                           vlc_tick_t i_start, vlc_tick_t i_stop, vlc_array_t *p_times )
 {
     for( ; p_node; p_node = p_node->p_next )
     {
@@ -1608,17 +1648,20 @@ static void GetTimedTags( const webvtt_dom_node_t *p_node,
 
 static void CreateSpuOrNewUpdaterRegion( decoder_t *p_dec,
                                          subpicture_t **pp_spu,
-                                         subpicture_updater_sys_region_t **pp_updtregion )
+                                         substext_updater_region_t **pp_updtregion )
 {
     if( *pp_spu == NULL )
     {
         *pp_spu = decoder_NewSubpictureText( p_dec );
         if( *pp_spu )
-            *pp_updtregion = &(*pp_spu)->updater.p_sys->region;
+        {
+            subtext_updater_sys_t *p_spusys = (*pp_spu)->updater.p_sys;
+            *pp_updtregion = &p_spusys->region;
+        }
     }
     else
     {
-        subpicture_updater_sys_region_t *p_new =
+        substext_updater_region_t *p_new =
                                 SubpictureUpdaterSysRegionNew( );
         if( p_new )
         {
@@ -1639,14 +1682,17 @@ static void ClearCSSStyles( webvtt_dom_node_t *p_node )
 
 #ifdef HAVE_CSS
 static void ApplyCSSRules( decoder_t *p_dec, const vlc_css_rule_t *p_rule,
-                           mtime_t i_playbacktime )
+                           vlc_tick_t i_playbacktime )
 {
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
     for ( ;  p_rule ; p_rule = p_rule->p_next )
     {
         vlc_array_t results;
         vlc_array_init( &results );
 
-        webvtt_domnode_SelectRuleNodes( p_dec, p_rule, i_playbacktime, &results );
+        webvtt_domnode_SelectRuleNodes( (webvtt_dom_node_t *) p_sys->p_root,
+                                        p_rule, i_playbacktime, &results );
 
         for( const vlc_css_declaration_t *p_decl = p_rule->p_declarations;
                                           p_decl; p_decl = p_decl->p_next )
@@ -1675,17 +1721,18 @@ static void ApplyCSSRules( decoder_t *p_dec, const vlc_css_rule_t *p_rule,
 }
 #endif
 
-static void RenderRegions( decoder_t *p_dec, mtime_t i_start, mtime_t i_stop )
+static void RenderRegions( decoder_t *p_dec, vlc_tick_t i_start, vlc_tick_t i_stop )
 {
     subpicture_t *p_spu = NULL;
-    subpicture_updater_sys_region_t *p_updtregion = NULL;
+    substext_updater_region_t *p_updtregion = NULL;
+    decoder_sys_t *p_sys = p_dec->p_sys;
 
 #ifdef HAVE_CSS
-    ApplyCSSRules( p_dec, p_dec->p_sys->p_css_rules, i_start );
+    ApplyCSSRules( p_dec, p_sys->p_css_rules, i_start );
 #endif
 
     const webvtt_dom_cue_t *p_rlcue = NULL;
-    for( const webvtt_dom_node_t *p_node = p_dec->p_sys->p_root->p_child;
+    for( const webvtt_dom_node_t *p_node = p_sys->p_root->p_child;
                                   p_node; p_node = p_node->p_next )
     {
         if( p_node->type == NODE_REGION )
@@ -1792,7 +1839,7 @@ static void RenderRegions( decoder_t *p_dec, mtime_t i_start, mtime_t i_stop )
         p_spu->b_ephemer  = true; /* !important */
         p_spu->b_absolute = false; /* can't be absolute as snap to lines can overlap ! */
 
-        subpicture_updater_sys_t *p_spu_sys = p_spu->updater.p_sys;
+        subtext_updater_sys_t *p_spu_sys = p_spu->updater.p_sys;
         p_spu_sys->p_default_style->f_font_relsize = WEBVTT_DEFAULT_LINE_HEIGHT_VH /
                                                      WEBVTT_LINE_TO_HEIGHT_RATIO;
         decoder_QueueSub( p_dec, p_spu );
@@ -1807,7 +1854,7 @@ static int timedtagsArrayCmp( const void *a, const void *b )
     return result == 0 ? 0 : result > 0 ? 1 : -1;
 }
 
-static void Render( decoder_t *p_dec, mtime_t i_start, mtime_t i_stop )
+static void Render( decoder_t *p_dec, vlc_tick_t i_start, vlc_tick_t i_stop )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
@@ -1815,9 +1862,10 @@ static void Render( decoder_t *p_dec, mtime_t i_start, mtime_t i_stop )
     vlc_array_init( &timedtags );
 
     GetTimedTags( p_sys->p_root->p_child, i_start, i_stop, &timedtags );
-    qsort( timedtags.pp_elems, timedtags.i_count, sizeof(*timedtags.pp_elems), timedtagsArrayCmp );
+    if( timedtags.i_count )
+        qsort( timedtags.pp_elems, timedtags.i_count, sizeof(*timedtags.pp_elems), timedtagsArrayCmp );
 
-    mtime_t i_substart = i_start;
+    vlc_tick_t i_substart = i_start;
     for( size_t i=0; i<timedtags.i_count; i++ )
     {
          const webvtt_dom_tag_t *p_tag =
@@ -1842,8 +1890,9 @@ static void Render( decoder_t *p_dec, mtime_t i_start, mtime_t i_stop )
 
 static int ProcessISOBMFF( decoder_t *p_dec,
                            const uint8_t *p_buffer, size_t i_buffer,
-                           mtime_t i_start, mtime_t i_stop )
+                           vlc_tick_t i_start, vlc_tick_t i_stop )
 {
+    decoder_sys_t *p_sys = p_dec->p_sys;
     mp4_box_iterator_t it;
     mp4_box_iterator_Init( &it, p_buffer, i_buffer );
     while( mp4_box_iterator_Next( &it ) )
@@ -1881,7 +1930,7 @@ static int ProcessISOBMFF( decoder_t *p_dec,
                 free( psz );
             }
 
-            webvtt_region_t *p_region = webvtt_region_GetByID( p_dec->p_sys,
+            webvtt_region_t *p_region = webvtt_region_GetByID( p_sys,
                                                                p_cue->settings.psz_region );
             if( p_region )
             {
@@ -1890,8 +1939,8 @@ static int ProcessISOBMFF( decoder_t *p_dec,
             }
             else
             {
-                webvtt_domnode_AppendLast( &p_dec->p_sys->p_root->p_child, p_cue );
-                p_cue->p_parent = (webvtt_dom_node_t *) p_dec->p_sys->p_root;
+                webvtt_domnode_AppendLast( &p_sys->p_root->p_child, p_cue );
+                p_cue->p_parent = (webvtt_dom_node_t *) p_sys->p_root;
             }
         }
     }
@@ -1903,6 +1952,7 @@ struct parser_ctx
     webvtt_region_t *p_region;
 #ifdef HAVE_CSS
     struct vlc_memstream css;
+    bool b_css_memstream_opened;
 #endif
     decoder_t *p_dec;
 };
@@ -1929,7 +1979,7 @@ static void ParserHeaderHandler( void *priv, enum webvtt_header_line_e s,
             ctx->p_region = NULL;
         }
 #ifdef HAVE_CSS
-        else if( ctx->css.stream )
+        else if( ctx->b_css_memstream_opened )
         {
             if( vlc_memstream_close( &ctx->css ) == VLC_SUCCESS )
             {
@@ -1962,7 +2012,7 @@ static void ParserHeaderHandler( void *priv, enum webvtt_header_line_e s,
                 ctx->p_region = webvtt_region_New();
 #ifdef HAVE_CSS
             else if( s == WEBVTT_HEADER_STYLE )
-                (void) vlc_memstream_open( &ctx->css );
+                ctx->b_css_memstream_opened = !vlc_memstream_open( &ctx->css );
 #endif
             return;
         }
@@ -1971,7 +2021,7 @@ static void ParserHeaderHandler( void *priv, enum webvtt_header_line_e s,
     if( s == WEBVTT_HEADER_REGION && ctx->p_region )
         webvtt_region_Parse( ctx->p_region, (char*) psz_line );
 #ifdef HAVE_CSS
-    else if( s == WEBVTT_HEADER_STYLE && ctx->css.stream )
+    else if( s == WEBVTT_HEADER_STYLE && ctx->b_css_memstream_opened )
     {
         vlc_memstream_puts( &ctx->css, psz_line );
         vlc_memstream_putc( &ctx->css, '\n' );
@@ -1990,7 +2040,7 @@ static void LoadExtradata( decoder_t *p_dec )
 
    struct parser_ctx ctx;
 #ifdef HAVE_CSS
-   ctx.css.stream = NULL;
+   ctx.b_css_memstream_opened = false;
 #endif
    ctx.p_region = NULL;
    ctx.p_dec = p_dec;
@@ -2010,6 +2060,15 @@ static void LoadExtradata( decoder_t *p_dec )
 }
 
 /****************************************************************************
+ * Flush:
+ ****************************************************************************/
+static void Flush( decoder_t *p_dec )
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    ClearCuesByTime( &p_sys->p_root->p_child, INT64_MAX );
+}
+
+/****************************************************************************
  * DecodeBlock: decoder data entry point
  ****************************************************************************/
 static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
@@ -2017,13 +2076,15 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     if( p_block == NULL ) /* No Drain */
         return VLCDEC_SUCCESS;
 
-    mtime_t i_start = p_block->i_pts - VLC_TS_0;
-    mtime_t i_stop = i_start + p_block->i_length;
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    vlc_tick_t i_start = p_block->i_pts - VLC_TICK_0;
+    vlc_tick_t i_stop = i_start + p_block->i_length;
 
     if( p_block->i_flags & BLOCK_FLAG_DISCONTINUITY )
-        ClearCuesByTime( &p_dec->p_sys->p_root->p_child, INT64_MAX );
+        Flush( p_dec );
     else
-        ClearCuesByTime( &p_dec->p_sys->p_root->p_child, i_start );
+        ClearCuesByTime( &p_sys->p_root->p_child, i_start );
 
     ProcessISOBMFF( p_dec, p_block->p_buffer, p_block->i_buffer,
                     i_start, i_stop );
@@ -2035,9 +2096,9 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
 }
 
 /*****************************************************************************
- * CloseDecoder: clean up the decoder
+ * webvtt_CloseDecoder: clean up the decoder
  *****************************************************************************/
-void CloseDecoder( vlc_object_t *p_this )
+void webvtt_CloseDecoder( vlc_object_t *p_this )
 {
     decoder_t *p_dec = (decoder_t *)p_this;
     decoder_sys_t *p_sys = p_dec->p_sys;
@@ -2052,9 +2113,9 @@ void CloseDecoder( vlc_object_t *p_this )
 }
 
 /*****************************************************************************
- * OpenDecoder: probe the decoder and return score
+ * webvtt_OpenDecoder: probe the decoder and return score
  *****************************************************************************/
-int OpenDecoder( vlc_object_t *p_this )
+int webvtt_OpenDecoder( vlc_object_t *p_this )
 {
     decoder_t *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
@@ -2076,6 +2137,7 @@ int OpenDecoder( vlc_object_t *p_this )
     p_sys->p_root->psz_tag = strdup( "video" );
 
     p_dec->pf_decode = DecodeBlock;
+    p_dec->pf_flush  = Flush;
 
     if( p_dec->fmt_in.i_extra )
         LoadExtradata( p_dec );

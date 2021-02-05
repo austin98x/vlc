@@ -2,7 +2,6 @@
  * rotate.c : video rotation filter
  *****************************************************************************
  * Copyright (C) 2000-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea -at- videolan -dot- org>
  *
@@ -36,6 +35,7 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
+#include <vlc_mouse.h>
 #include <vlc_picture.h>
 #include "filter_picture.h"
 #include "../control/motionlib.h"
@@ -43,11 +43,12 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
+static int  Create    ( filter_t * );
 
-static picture_t *Filter( filter_t *, picture_t * );
+static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse,
+                  const vlc_mouse_t *p_old );
 static picture_t *FilterPacked( filter_t *, picture_t * );
+VIDEO_FILTER_WRAPPER_CLOSE(Filter, Destroy)
 
 static int RotateCallback( vlc_object_t *p_this, char const *psz_var,
                            vlc_value_t oldval, vlc_value_t newval,
@@ -67,7 +68,6 @@ static int RotateCallback( vlc_object_t *p_this, char const *psz_var,
 vlc_module_begin ()
     set_description( N_("Rotate video filter") )
     set_shortname( N_( "Rotate" ))
-    set_capability( "video filter", 0 )
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
@@ -76,7 +76,7 @@ vlc_module_begin ()
               MOTION_LONGTEXT, false )
 
     add_shortcut( "rotate" )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
@@ -86,11 +86,11 @@ static const char *const ppsz_filter_options[] = {
 /*****************************************************************************
  * filter_sys_t
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     atomic_uint_fast32_t sincos;
     motion_sensors_t *p_motion;
-};
+} filter_sys_t;
 
 typedef union {
     uint32_t u;
@@ -100,7 +100,7 @@ typedef union {
     };
 } sincos_t;
 
-static void store_trigo( struct filter_sys_t *sys, float f_angle )
+static void store_trigo( filter_sys_t *sys, float f_angle )
 {
     sincos_t sincos;
 
@@ -111,7 +111,7 @@ static void store_trigo( struct filter_sys_t *sys, float f_angle )
     atomic_store(&sys->sincos, sincos.u);
 }
 
-static void fetch_trigo( struct filter_sys_t *sys, int *i_sin, int *i_cos )
+static void fetch_trigo( filter_sys_t *sys, int *i_sin, int *i_cos )
 {
     sincos_t sincos = { .u = atomic_load(&sys->sincos) };
 
@@ -119,12 +119,16 @@ static void fetch_trigo( struct filter_sys_t *sys, int *i_sin, int *i_cos )
     *i_cos = sincos.cos;
 }
 
+static const struct vlc_filter_operations packed_filter_ops =
+{
+    .filter_video = FilterPacked, .video_mouse = Mouse, .close = Destroy,
+};
+
 /*****************************************************************************
  * Create: allocates Distort video filter
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     if( p_filter->fmt_in.video.i_chroma != p_filter->fmt_out.video.i_chroma )
@@ -136,11 +140,11 @@ static int Create( vlc_object_t *p_this )
     switch( p_filter->fmt_in.video.i_chroma )
     {
         CASE_PLANAR_YUV
-            p_filter->pf_video_filter = Filter;
+            p_filter->ops = &Filter_ops;
             break;
 
         CASE_PACKED_YUV_422
-            p_filter->pf_video_filter = FilterPacked;
+            p_filter->ops = &packed_filter_ops;
             break;
 
         default:
@@ -183,9 +187,8 @@ static int Create( vlc_object_t *p_this )
 /*****************************************************************************
  * Destroy: destroy Distort filter
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     if( p_sys->p_motion != NULL )
@@ -201,19 +204,44 @@ static void Destroy( vlc_object_t *p_this )
 /*****************************************************************************
  *
  *****************************************************************************/
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse,
+                  const vlc_mouse_t *p_old )
 {
-    picture_t *p_outpic;
+    VLC_UNUSED( p_old );
+
+    const video_format_t *p_fmt = &p_filter->fmt_out.video;
     filter_sys_t *p_sys = p_filter->p_sys;
 
-    if( !p_pic ) return NULL;
+    const int i_x = p_mouse->i_x;
+    const int i_y = p_mouse->i_y;
 
-    p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
+    if( p_sys->p_motion != NULL )
     {
-        picture_Release( p_pic );
-        return NULL;
+        int i_angle = motion_get_angle( p_sys->p_motion );
+        store_trigo( p_sys, i_angle / 20.f );
     }
+
+    int i_sin, i_cos;
+    fetch_trigo( p_sys, &i_sin, &i_cos );
+
+    p_mouse->i_x = ( p_fmt->i_visible_width >> 1 );
+    p_mouse->i_y = ( p_fmt->i_visible_height >> 1 );
+
+    const int i_rx = ( i_x - p_mouse->i_x );
+    const int i_ry = ( i_y - p_mouse->i_y );
+
+    p_mouse->i_x += ( ( i_rx * i_cos - i_ry * i_sin )>> 12 );
+    p_mouse->i_y += ( ( i_rx * i_sin + i_ry * i_cos )>> 12 );
+
+    return VLC_SUCCESS;
+}
+
+/*****************************************************************************
+ *
+ *****************************************************************************/
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
+{
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     if( p_sys->p_motion != NULL )
     {
@@ -322,8 +350,6 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
             i_col_orig0 += i_col_next;
         }
     }
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }
 
 /*****************************************************************************

@@ -41,8 +41,7 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Open (vlc_object_t *);
-static void Close(vlc_object_t *);
+static int  Open (filter_t *);
 
 #define CFG_PREFIX "transform-"
 
@@ -58,7 +57,6 @@ vlc_module_begin()
     set_description(N_("Video transformation filter"))
     set_shortname(N_("Transformation"))
     set_help(N_("Rotate or flip the video"))
-    set_capability("video filter", 0)
     set_category(CAT_VIDEO)
     set_subcategory(SUBCAT_VIDEO_VFILTER)
 
@@ -67,7 +65,7 @@ vlc_module_begin()
         change_safe()
 
     add_shortcut("transform")
-    set_callbacks(Open, Close)
+    set_callback_video_filter(Open)
 vlc_module_end()
 
 /*****************************************************************************
@@ -198,6 +196,7 @@ static void PlaneYUY2_##f(plane_t *restrict dst, const plane_t *restrict src) \
     } \
 }
 
+#undef PLANES // already exists on Windows
 #define PLANES(f) \
 PLANE(f,8) PLANE(f,16) PLANE(f,32)
 
@@ -258,14 +257,12 @@ static bool dsc_is_rotated(const transform_description_t *dsc)
     return dsc->plane32 != dsc->yuyv;
 }
 
-static const size_t n_transforms =
-    sizeof (descriptions) / sizeof (descriptions[0]);
-
-struct filter_sys_t {
+typedef struct
+{
     const vlc_chroma_description_t *chroma;
     void (*plane[PICTURE_PLANE_MAX])(plane_t *, const plane_t *);
     convert_t convert;
-};
+} filter_sys_t;
 
 static picture_t *Filter(filter_t *filter, picture_t *src)
 {
@@ -287,23 +284,21 @@ static picture_t *Filter(filter_t *filter, picture_t *src)
 }
 
 static int Mouse(filter_t *filter, vlc_mouse_t *mouse,
-                 const vlc_mouse_t *mold, const vlc_mouse_t *mnew)
+                 const vlc_mouse_t *mold)
 {
     VLC_UNUSED( mold );
 
     const video_format_t *fmt = &filter->fmt_out.video;
     const filter_sys_t   *sys = filter->p_sys;
 
-    *mouse = *mnew;
     sys->convert(&mouse->i_x, &mouse->i_y,
                  fmt->i_visible_width, fmt->i_visible_height,
                  mouse->i_x, mouse->i_y);
     return VLC_SUCCESS;
 }
 
-static int Open(vlc_object_t *object)
+static int Open(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)object;
     const video_format_t *src = &filter->fmt_in.video;
     video_format_t       *dst = &filter->fmt_out.video;
 
@@ -312,8 +307,8 @@ static int Open(vlc_object_t *object)
     if (chroma == NULL)
         return VLC_EGENERIC;
 
-    filter_sys_t *sys = malloc(sizeof(*sys));
-    if (!sys)
+    filter_sys_t *sys = vlc_obj_malloc(VLC_OBJECT(filter), sizeof(*sys));
+    if (unlikely(!sys))
         return VLC_ENOMEM;
 
     sys->chroma = chroma;
@@ -327,7 +322,7 @@ static int Open(vlc_object_t *object)
     char *type_name = var_InheritString(filter, CFG_PREFIX"type");
     const transform_description_t *dsc = NULL;
 
-    for (size_t i = 0; i < n_transforms; i++)
+    for (size_t i = 0; i < ARRAY_SIZE(descriptions); i++)
         if (type_name && !strcmp(descriptions[i].name, type_name)) {
             dsc = &descriptions[i];
             break;
@@ -353,7 +348,7 @@ static int Open(vlc_object_t *object)
         default:
             msg_Err(filter, "Unsupported pixel size %u (chroma %4.4s)",
                     chroma->pixel_size, (char *)&src->i_chroma);
-            goto error;
+            return VLC_EGENERIC;
     }
 
     for (unsigned i = 1; i < PICTURE_PLANE_MAX; i++)
@@ -372,7 +367,7 @@ static int Open(vlc_object_t *object)
                      != chroma->p[i].h.num * chroma->p[i].w.den) {
                         msg_Err(filter, "Format rotation not possible "
                                 "(chroma %4.4s)", (char *)&src->i_chroma);
-                        goto error;
+                        return VLC_EGENERIC;
                     }
             }
         }
@@ -398,7 +393,7 @@ static int Open(vlc_object_t *object)
          dst->i_y_offset       != src_trans.i_y_offset)) {
 
             msg_Err(filter, "Format change is not allowed");
-            goto error;
+            return VLC_EGENERIC;
     }
     else if(filter->b_allow_fmt_out_change) {
 
@@ -419,7 +414,7 @@ static int Open(vlc_object_t *object)
             if (dsc_is_rotated(dsc)) {
                 msg_Err(filter, "Format rotation not possible (chroma %4.4s)",
                         (char *)&src->i_chroma);
-                goto error;
+                return VLC_EGENERIC;
             }
             /* fallthrough */
         case VLC_CODEC_YUYV:
@@ -428,22 +423,15 @@ static int Open(vlc_object_t *object)
             break;
         case VLC_CODEC_NV12:
         case VLC_CODEC_NV21:
-            goto error;
+            return VLC_EGENERIC;
     }
 
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_video = Filter,
+        .video_mouse = Mouse,
+    };
+    filter->ops = &filter_ops;
     filter->p_sys           = sys;
-    filter->pf_video_filter = Filter;
-    filter->pf_video_mouse  = Mouse;
     return VLC_SUCCESS;
-error:
-    free(sys);
-    return VLC_EGENERIC;
-}
-
-static void Close(vlc_object_t *object)
-{
-    filter_t     *filter = (filter_t *)object;
-    filter_sys_t *sys    = filter->p_sys;
-
-    free(sys);
 }

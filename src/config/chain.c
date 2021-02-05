@@ -2,7 +2,6 @@
  * chain.c : configuration module chain parsing stuff
  *****************************************************************************
  * Copyright (C) 2002-2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
  *          Laurent Aimar <fenrir@via.ecp.fr>
@@ -259,8 +258,8 @@ void config_ChainDestroy( config_chain_t *p_cfg )
 
         p_next = p_cfg->p_next;
 
-        FREENULL( p_cfg->psz_name );
-        FREENULL( p_cfg->psz_value );
+        free( p_cfg->psz_name );
+        free( p_cfg->psz_value );
         free( p_cfg );
 
         p_cfg = p_next;
@@ -269,7 +268,7 @@ void config_ChainDestroy( config_chain_t *p_cfg )
 
 #undef config_ChainParse
 void config_ChainParse( vlc_object_t *p_this, const char *psz_prefix,
-                        const char *const *ppsz_options, config_chain_t *cfg )
+                        const char *const *ppsz_options, const config_chain_t *cfg )
 {
     if( psz_prefix == NULL ) psz_prefix = "";
     size_t plen = 1 + strlen( psz_prefix );
@@ -294,13 +293,13 @@ void config_ChainParse( vlc_object_t *p_this, const char *psz_prefix,
             {
                 case CONFIG_ITEM_INTEGER:
                     var_Change( p_this, name, VLC_VAR_SETMINMAX,
-                        &(vlc_value_t){ .i_int = p_conf->min.i },
-                        &(vlc_value_t){ .i_int = p_conf->max.i } );
+                        (vlc_value_t){ .i_int = p_conf->min.i },
+                        (vlc_value_t){ .i_int = p_conf->max.i } );
                     break;
                 case CONFIG_ITEM_FLOAT:
                     var_Change( p_this, name, VLC_VAR_SETMINMAX,
-                        &(vlc_value_t){ .f_float = p_conf->min.f },
-                        &(vlc_value_t){ .f_float = p_conf->max.f } );
+                        (vlc_value_t){ .f_float = p_conf->min.f },
+                        (vlc_value_t){ .f_float = p_conf->max.f } );
                     break;
             }
         }
@@ -400,8 +399,8 @@ void config_ChainParse( vlc_object_t *p_this, const char *psz_prefix,
                 val.b_bool = b_yes;
                 break;
             case VLC_VAR_INTEGER:
-                val.i_int = strtol( cfg->psz_value ? cfg->psz_value : "0",
-                                    NULL, 0 );
+                val.i_int = strtoll( cfg->psz_value ? cfg->psz_value : "0",
+                                     NULL, 0 );
                 break;
             case VLC_VAR_FLOAT:
                 val.f_float = us_atof( cfg->psz_value ? cfg->psz_value : "0" );

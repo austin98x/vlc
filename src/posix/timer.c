@@ -23,7 +23,6 @@
 #endif
 
 #include <stdatomic.h>
-#include <stdnoreturn.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <assert.h>
@@ -46,28 +45,29 @@ struct vlc_timer
     vlc_mutex_t  lock;
     void       (*func) (void *);
     void        *data;
-    mtime_t      value, interval;
+    vlc_tick_t   value, interval;
+    bool         live;
     atomic_uint  overruns;
 };
 
-noreturn static void *vlc_timer_thread (void *data)
+static void *vlc_timer_thread (void *data)
 {
     struct vlc_timer *timer = data;
 
     vlc_mutex_lock (&timer->lock);
-    mutex_cleanup_push (&timer->lock);
 
-    for (;;)
+    while (timer->live)
     {
-        while (timer->value == 0)
+        if (timer->value == 0)
         {
             assert(timer->interval == 0);
             vlc_cond_wait (&timer->reschedule, &timer->lock);
+            continue;
         }
 
         if (timer->interval != 0)
         {
-            mtime_t now = mdate();
+            vlc_tick_t now = vlc_tick_now();
 
             if (now > timer->value)
             {   /* Update overrun counter */
@@ -80,7 +80,7 @@ noreturn static void *vlc_timer_thread (void *data)
             }
         }
 
-        mtime_t value = timer->value;
+        vlc_tick_t value = timer->value;
 
         if (vlc_cond_timedwait(&timer->reschedule, &timer->lock, value) == 0)
             continue;
@@ -94,16 +94,12 @@ noreturn static void *vlc_timer_thread (void *data)
         }
 
         vlc_mutex_unlock (&timer->lock);
-
-        int canc = vlc_savecancel ();
         timer->func (timer->data);
-        vlc_restorecancel (canc);
-
         vlc_mutex_lock (&timer->lock);
     }
 
-    vlc_cleanup_pop ();
-    vlc_assert_unreachable ();
+    vlc_mutex_unlock (&timer->lock);
+    return NULL;
 }
 
 int vlc_timer_create (vlc_timer_t *id, void (*func) (void *), void *data)
@@ -119,13 +115,12 @@ int vlc_timer_create (vlc_timer_t *id, void (*func) (void *), void *data)
     timer->data = data;
     timer->value = 0;
     timer->interval = 0;
+    timer->live = true;
     atomic_init(&timer->overruns, 0);
 
     if (vlc_clone (&timer->thread, vlc_timer_thread, timer,
                    VLC_THREAD_PRIORITY_INPUT))
     {
-        vlc_cond_destroy (&timer->reschedule);
-        vlc_mutex_destroy (&timer->lock);
         free (timer);
         return ENOMEM;
     }
@@ -136,21 +131,23 @@ int vlc_timer_create (vlc_timer_t *id, void (*func) (void *), void *data)
 
 void vlc_timer_destroy (vlc_timer_t timer)
 {
-    vlc_cancel (timer->thread);
+    vlc_mutex_lock(&timer->lock);
+    timer->live = false;
+    vlc_cond_signal(&timer->reschedule);
+    vlc_mutex_unlock(&timer->lock);
+
     vlc_join (timer->thread, NULL);
-    vlc_cond_destroy (&timer->reschedule);
-    vlc_mutex_destroy (&timer->lock);
     free (timer);
 }
 
 void vlc_timer_schedule (vlc_timer_t timer, bool absolute,
-                         mtime_t value, mtime_t interval)
+                         vlc_tick_t value, vlc_tick_t interval)
 {
-    if (value == 0)
+    if (value == VLC_TIMER_DISARM)
         interval = 0;
     else
     if (!absolute)
-        value += mdate();
+        value += vlc_tick_now();
 
     vlc_mutex_lock (&timer->lock);
     timer->value = value;

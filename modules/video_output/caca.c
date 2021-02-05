@@ -2,7 +2,6 @@
  * caca.c: Color ASCII Art "vout display" module using libcaca
  *****************************************************************************
  * Copyright (C) 2003-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Sam Hocevar <sam@zoy.org>
  *          Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
@@ -30,10 +29,14 @@
 # include "config.h"
 #endif
 
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <vlc_common.h>
+#include <vlc_queue.h>
 #include <vlc_plugin.h>
 #include <vlc_vout_display.h>
-#include <vlc_picture_pool.h>
 #if !defined(_WIN32) && !defined(__APPLE__)
 # ifdef X_DISPLAY_MISSING
 #  error Xlib required due to XInitThreads
@@ -42,35 +45,6 @@
 #endif
 
 #include <caca.h>
-#include "event_thread.h"
-
-/*****************************************************************************
- * Module descriptor
- *****************************************************************************/
-static int  Open (vlc_object_t *);
-static void Close(vlc_object_t *);
-
-vlc_module_begin()
-    set_shortname("Caca")
-    set_category(CAT_VIDEO)
-    set_subcategory(SUBCAT_VIDEO_VOUT)
-    set_description(N_("Color ASCII art video output"))
-    set_capability("vout display", 15)
-    set_callbacks(Open, Close)
-vlc_module_end()
-
-/*****************************************************************************
- * Local prototypes
- *****************************************************************************/
-static picture_pool_t *Pool  (vout_display_t *, unsigned);
-static void           Prepare(vout_display_t *, picture_t *, subpicture_t *);
-static void    PictureDisplay(vout_display_t *, picture_t *, subpicture_t *);
-static int            Control(vout_display_t *, int, va_list);
-
-/* */
-static void Manage(vout_display_t *);
-static void Refresh(vout_display_t *);
-static void Place(vout_display_t *, vout_display_place_t *);
 
 /* */
 struct vout_display_sys_t {
@@ -78,201 +52,91 @@ struct vout_display_sys_t {
     caca_display_t *dp;
     cucul_dither_t *dither;
 
-    picture_pool_t *pool;
-    vout_display_event_thread_t *et;
+    bool dead;
+    vlc_queue_t q;
+    vlc_thread_t thread;
+    vout_window_t *window;
+    vout_display_place_t place;
+
+    vlc_tick_t cursor_timeout;
+    vlc_tick_t cursor_deadline;
 };
 
-/**
- * This function initializes libcaca vout method.
- */
-static int Open(vlc_object_t *object)
+typedef struct vlc_caca_event {
+    struct vlc_caca_event *next;
+    int key;
+} vlc_caca_event_t;
+
+static void *VoutDisplayEventKeyDispatch(void *data)
 {
-    vout_display_t *vd = (vout_display_t *)object;
-    vout_display_sys_t *sys;
-
-    if (vout_display_IsWindowed(vd))
-        return VLC_EGENERIC;
-#if !defined(__APPLE__) && !defined(_WIN32)
-# ifndef X_DISPLAY_MISSING
-    if (!vlc_xlib_init(object))
-        return VLC_EGENERIC;
-# endif
-#endif
-
-#if defined(_WIN32)
-    CONSOLE_SCREEN_BUFFER_INFO csbiInfo;
-    SMALL_RECT rect;
-    COORD coord;
-    HANDLE hstdout;
-
-    if (!AllocConsole()) {
-        msg_Err(vd, "cannot create console");
-        return VLC_EGENERIC;
-    }
-
-    hstdout =
-        CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                  NULL, CONSOLE_TEXTMODE_BUFFER, NULL);
-    if (!hstdout || hstdout == INVALID_HANDLE_VALUE) {
-        msg_Err(vd, "cannot create screen buffer");
-        FreeConsole();
-        return VLC_EGENERIC;
-    }
-
-    if (!SetConsoleActiveScreenBuffer(hstdout)) {
-        msg_Err(vd, "cannot set active screen buffer");
-        FreeConsole();
-        return VLC_EGENERIC;
-    }
-
-    coord = GetLargestConsoleWindowSize(hstdout);
-    msg_Dbg(vd, "SetConsoleWindowInfo: %ix%i", coord.X, coord.Y);
-
-    /* Force size for now */
-    coord.X = 100;
-    coord.Y = 40;
-
-    if (!SetConsoleScreenBufferSize(hstdout, coord))
-        msg_Warn(vd, "SetConsoleScreenBufferSize %i %i",
-                  coord.X, coord.Y);
-
-    /* Get the current screen buffer size and window position. */
-    if (GetConsoleScreenBufferInfo(hstdout, &csbiInfo)) {
-        rect.Top = 0; rect.Left = 0;
-        rect.Right = csbiInfo.dwMaximumWindowSize.X - 1;
-        rect.Bottom = csbiInfo.dwMaximumWindowSize.Y - 1;
-        if (!SetConsoleWindowInfo(hstdout, TRUE, &rect))
-            msg_Dbg(vd, "SetConsoleWindowInfo failed: %ix%i",
-                     rect.Right, rect.Bottom);
-    }
-#endif
-
-    /* Allocate structure */
-    vd->sys = sys = calloc(1, sizeof(*sys));
-    if (!sys)
-        goto error;
-
-    sys->cv = cucul_create_canvas(0, 0);
-    if (!sys->cv) {
-        msg_Err(vd, "cannot initialize libcucul");
-        goto error;
-    }
-
-    const char *driver = NULL;
-#ifdef __APPLE__
-    // Make sure we don't try to open a window.
-    driver = "ncurses";
-#endif
-
-    sys->dp = caca_create_display_with_driver(sys->cv, driver);
-    if (!sys->dp) {
-        msg_Err(vd, "cannot initialize libcaca");
-        goto error;
-    }
-
-    if (vd->cfg->display.title)
-        caca_set_display_title(sys->dp,
-                               vd->cfg->display.title);
-    else
-        caca_set_display_title(sys->dp,
-                               VOUT_TITLE "(Colour AsCii Art)");
-
-    sys->et = VoutDisplayEventCreateThread(vd);
-
-    /* Fix format */
-    video_format_t fmt = vd->fmt;
-    if (fmt.i_chroma != VLC_CODEC_RGB32) {
-        fmt.i_chroma = VLC_CODEC_RGB32;
-        fmt.i_rmask = 0x00ff0000;
-        fmt.i_gmask = 0x0000ff00;
-        fmt.i_bmask = 0x000000ff;
-    }
-
-    /* Setup vout_display now that everything is fine */
-    vd->fmt = fmt;
-    vd->info.needs_hide_mouse = true;
-
-    vd->pool    = Pool;
-    vd->prepare = Prepare;
-    vd->display = PictureDisplay;
-    vd->control = Control;
-    vd->manage  = Manage;
-
-    /* Fix initial state */
-    Refresh(vd);
-
-    return VLC_SUCCESS;
-
-error:
-    if (sys) {
-        if (sys->pool)
-            picture_pool_Release(sys->pool);
-        if (sys->dither)
-            cucul_free_dither(sys->dither);
-        if (sys->dp)
-            caca_free_display(sys->dp);
-        if (sys->cv)
-            cucul_free_canvas(sys->cv);
-
-        free(sys);
-    }
-#if defined(_WIN32)
-    FreeConsole();
-#endif
-    return VLC_EGENERIC;
-}
-
-/**
- * Close a libcaca video output
- */
-static void Close(vlc_object_t *object)
-{
-    vout_display_t *vd = (vout_display_t *)object;
+    vout_display_t *vd = data;
     vout_display_sys_t *sys = vd->sys;
+    vlc_caca_event_t *event;
 
-    VoutDisplayEventKillThread(sys->et);
-    if (sys->pool)
-        picture_pool_Release(sys->pool);
-    if (sys->dither)
-        cucul_free_dither(sys->dither);
-    caca_free_display(sys->dp);
-    cucul_free_canvas(sys->cv);
+    while ((event = vlc_queue_DequeueKillable(&sys->q, &sys->dead)) != NULL) {
+        vout_window_ReportKeyPress(sys->window, event->key);
+        free(event);
+    }
 
-#if defined(_WIN32)
-    FreeConsole();
-#endif
+    return NULL;
+}
 
-    free(sys);
+static void VoutDisplayEventKey(vout_display_sys_t *sys, int key)
+{
+    vlc_caca_event_t *event = malloc(sizeof (*event));
+
+    if (likely(event != NULL)) {
+        event->key = key;
+        vlc_queue_Enqueue(&sys->q, event);
+    }
 }
 
 /**
- * Return a pool of direct buffers
+ * Compute the place in canvas unit.
  */
-static picture_pool_t *Pool(vout_display_t *vd, unsigned count)
+static void Place(vout_display_t *vd)
 {
     vout_display_sys_t *sys = vd->sys;
 
-    if (!sys->pool)
-        sys->pool = picture_pool_NewFromFormat(&vd->fmt, count);
-    return sys->pool;
+    const int canvas_width   = cucul_get_canvas_width(sys->cv);
+    const int canvas_height  = cucul_get_canvas_height(sys->cv);
+    const int display_width  = caca_get_display_width(sys->dp);
+    const int display_height = caca_get_display_height(sys->dp);
+
+    if (display_width > 0 && display_height > 0) {
+        sys->place.x      =  sys->place.x      * canvas_width  / display_width;
+        sys->place.y      =  sys->place.y      * canvas_height / display_height;
+        sys->place.width  = (sys->place.width  * canvas_width  + display_width/2)  / display_width;
+        sys->place.height = (sys->place.height * canvas_height + display_height/2) / display_height;
+    } else {
+        sys->place.x = 0;
+        sys->place.y = 0;
+        sys->place.width  = canvas_width;
+        sys->place.height = display_height;
+    }
 }
+
+static void Manage(vout_display_t *vd);
 
 /**
  * Prepare a picture for display */
-static void Prepare(vout_display_t *vd, picture_t *picture, subpicture_t *subpicture)
+static void Prepare(vout_display_t *vd, picture_t *picture,
+                    subpicture_t *subpicture, vlc_tick_t date)
 {
+    Manage(vd);
+    VLC_UNUSED(date);
+
     vout_display_sys_t *sys = vd->sys;
 
     if (!sys->dither) {
         /* Create the libcaca dither object */
         sys->dither = cucul_create_dither(32,
-                                            vd->source.i_visible_width,
-                                            vd->source.i_visible_height,
+                                            vd->source->i_visible_width,
+                                            vd->source->i_visible_height,
                                             picture->p[0].i_pitch,
-                                            vd->fmt.i_rmask,
-                                            vd->fmt.i_gmask,
-                                            vd->fmt.i_bmask,
+                                            picture->format.i_rmask,
+                                            picture->format.i_gmask,
+                                            picture->format.i_bmask,
                                             0x00000000);
 
         if (!sys->dither) {
@@ -281,16 +145,13 @@ static void Prepare(vout_display_t *vd, picture_t *picture, subpicture_t *subpic
         }
     }
 
-    vout_display_place_t place;
-    Place(vd, &place);
-
     cucul_set_color_ansi(sys->cv, CUCUL_COLOR_DEFAULT, CUCUL_COLOR_BLACK);
     cucul_clear_canvas(sys->cv);
 
-    const int crop_offset = vd->source.i_y_offset * picture->p->i_pitch +
-                            vd->source.i_x_offset * picture->p->i_pixel_pitch;
-    cucul_dither_bitmap(sys->cv, place.x, place.y,
-                        place.width, place.height,
+    const int crop_offset = vd->source->i_y_offset * picture->p->i_pitch +
+                            vd->source->i_x_offset * picture->p->i_pixel_pitch;
+    cucul_dither_bitmap(sys->cv, sys->place.x, sys->place.y,
+                        sys->place.width, sys->place.height,
                         sys->dither,
                         &picture->p->p_pixels[crop_offset]);
     VLC_UNUSED(subpicture);
@@ -299,88 +160,36 @@ static void Prepare(vout_display_t *vd, picture_t *picture, subpicture_t *subpic
 /**
  * Display a picture
  */
-static void PictureDisplay(vout_display_t *vd, picture_t *picture, subpicture_t *subpicture)
+static void PictureDisplay(vout_display_t *vd, picture_t *picture)
 {
-    Refresh(vd);
-    picture_Release(picture);
-    VLC_UNUSED(subpicture);
+    vout_display_sys_t *sys = vd->sys;
+
+    caca_refresh_display(sys->dp);
+    VLC_UNUSED(picture);
 }
 
 /**
  * Control for vout display
  */
-static int Control(vout_display_t *vd, int query, va_list args)
+static int Control(vout_display_t *vd, int query)
 {
     vout_display_sys_t *sys = vd->sys;
 
-    (void) args;
-
     switch (query) {
-    case VOUT_DISPLAY_HIDE_MOUSE:
-        caca_set_mouse(sys->dp, 0);
-        return VLC_SUCCESS;
-
-    case VOUT_DISPLAY_CHANGE_DISPLAY_SIZE:
-    case VOUT_DISPLAY_CHANGE_ZOOM:
-    case VOUT_DISPLAY_CHANGE_DISPLAY_FILLED:
-    case VOUT_DISPLAY_CHANGE_SOURCE_ASPECT:
-        return VLC_EGENERIC;
-
     case VOUT_DISPLAY_CHANGE_SOURCE_CROP:
         if (sys->dither)
             cucul_free_dither(sys->dither);
         sys->dither = NULL;
+        /* fall through */
+    case VOUT_DISPLAY_CHANGE_DISPLAY_SIZE:
+    case VOUT_DISPLAY_CHANGE_ZOOM:
+    case VOUT_DISPLAY_CHANGE_DISPLAY_FILLED:
+    case VOUT_DISPLAY_CHANGE_SOURCE_ASPECT:
         return VLC_SUCCESS;
 
     default:
         msg_Err(vd, "Unsupported query in vout display caca");
         return VLC_EGENERIC;
-    }
-}
-
-/**
- * Refresh the display and send resize event
- */
-static void Refresh(vout_display_t *vd)
-{
-    vout_display_sys_t *sys = vd->sys;
-
-    /* */
-    caca_refresh_display(sys->dp);
-
-    /* */
-    const unsigned width  = caca_get_display_width(sys->dp);
-    const unsigned height = caca_get_display_height(sys->dp);
-
-    if (width  != vd->cfg->display.width ||
-        height != vd->cfg->display.height)
-        vout_display_SendEventDisplaySize(vd, width, height);
-}
-
-/**
- * Compute the place in canvas unit.
- */
-static void Place(vout_display_t *vd, vout_display_place_t *place)
-{
-    vout_display_sys_t *sys = vd->sys;
-
-    vout_display_PlacePicture(place, &vd->source, vd->cfg, false);
-
-    const int canvas_width   = cucul_get_canvas_width(sys->cv);
-    const int canvas_height  = cucul_get_canvas_height(sys->cv);
-    const int display_width  = caca_get_display_width(sys->dp);
-    const int display_height = caca_get_display_height(sys->dp);
-
-    if (display_width > 0 && display_height > 0) {
-        place->x      =  place->x      * canvas_width  / display_width;
-        place->y      =  place->y      * canvas_height / display_height;
-        place->width  = (place->width  * canvas_width  + display_width/2)  / display_width;
-        place->height = (place->height * canvas_height + display_height/2) / display_height;
-    } else {
-        place->x = 0;
-        place->y = 0;
-        place->width  = canvas_width;
-        place->height = display_height;
     }
 }
 
@@ -467,12 +276,19 @@ static const struct {
     { -1, -1 }
 };
 
+#define INVALID_DEADLINE  INT64_MAX
+
 /**
  * Proccess pending event
  */
 static void Manage(vout_display_t *vd)
 {
     vout_display_sys_t *sys = vd->sys;
+
+    if (sys->cursor_deadline != INVALID_DEADLINE && sys->cursor_deadline < vlc_tick_now()) {
+        caca_set_mouse(sys->dp, 0);
+        sys->cursor_deadline = INVALID_DEADLINE;
+    }
 
     struct caca_event ev;
     while (caca_get_event(sys->dp, CACA_EVENT_ANY, &ev, 0) > 0) {
@@ -485,52 +301,46 @@ static void Manage(vout_display_t *vd)
                     const int vlc = keys[i].vlc;
 
                     if (vlc >= 0)
-                        vout_display_SendEventKey(vd, vlc);
+                        VoutDisplayEventKey(sys, vlc);
                     return;
                 }
             }
             if (caca >= 0x20 && caca <= 0x7f) {
-                vout_display_SendEventKey(vd, caca);
+                VoutDisplayEventKey(sys, caca);
                 return;
             }
             break;
         }
         case CACA_EVENT_RESIZE:
-            vout_display_SendEventDisplaySize(vd, caca_get_event_resize_width(&ev),
-                                                  caca_get_event_resize_height(&ev));
             break;
-        case CACA_EVENT_MOUSE_MOTION: {
-            vout_display_place_t place;
-            Place(vd, &place);
-
-            const unsigned x = vd->source.i_x_offset +
-                               (int64_t)(caca_get_event_mouse_x(&ev) - place.x) *
-                                    vd->source.i_visible_width / place.width;
-            const unsigned y = vd->source.i_y_offset +
-                               (int64_t)(caca_get_event_mouse_y(&ev) - place.y) *
-                                    vd->source.i_visible_height / place.height;
-
+        case CACA_EVENT_MOUSE_MOTION:
             caca_set_mouse(sys->dp, 1);
-            vout_display_SendEventMouseMoved(vd, x, y);
+            sys->cursor_deadline = vlc_tick_now() + sys->cursor_timeout;
+            vout_window_ReportMouseMoved(sys->window,
+                                         caca_get_event_mouse_x(&ev),
+                                         caca_get_event_mouse_y(&ev));
             break;
-        }
         case CACA_EVENT_MOUSE_PRESS:
         case CACA_EVENT_MOUSE_RELEASE: {
             caca_set_mouse(sys->dp, 1);
+            sys->cursor_deadline = vlc_tick_now() + sys->cursor_timeout;
+
             const int caca = caca_get_event_mouse_button(&ev);
             for (int i = 0; mouses[i].caca != -1; i++) {
                 if (mouses[i].caca == caca) {
                     if (caca_get_event_type(&ev) == CACA_EVENT_MOUSE_PRESS)
-                        vout_display_SendEventMousePressed(vd, mouses[i].vlc);
+                        vout_window_ReportMousePressed(sys->window,
+                                                       mouses[i].vlc);
                     else
-                        vout_display_SendEventMouseReleased(vd, mouses[i].vlc);
+                        vout_window_ReportMouseReleased(sys->window,
+                                                        mouses[i].vlc);
                     return;
                 }
             }
             break;
         }
         case CACA_EVENT_QUIT:
-            vout_display_SendEventClose(vd);
+            vout_window_ReportClose(sys->window);
             break;
         default:
             break;
@@ -538,3 +348,181 @@ static void Manage(vout_display_t *vd)
     }
 }
 
+/**
+ * Close a libcaca video output
+ */
+static void Close(vout_display_t *vd)
+{
+    vout_display_sys_t *sys = vd->sys;
+
+    vlc_queue_Kill(&sys->q, &sys->dead);
+    vlc_join(sys->thread, NULL);
+
+    if (sys->dither)
+        cucul_free_dither(sys->dither);
+    caca_free_display(sys->dp);
+    cucul_free_canvas(sys->cv);
+
+#if defined(_WIN32)
+    FreeConsole();
+#endif
+
+    free(sys);
+}
+
+static const struct vlc_display_operations ops = {
+    Close, Prepare, PictureDisplay, Control, NULL, NULL,
+};
+
+/**
+ * This function initializes libcaca vout method.
+ */
+static int Open(vout_display_t *vd, const vout_display_cfg_t *cfg,
+                video_format_t *fmtp, vlc_video_context *context)
+{
+    vout_display_sys_t *sys;
+
+    (void) context;
+
+    if (vout_display_cfg_IsWindowed(cfg))
+        return VLC_EGENERIC;
+#if !defined(__APPLE__) && !defined(_WIN32)
+# ifndef X_DISPLAY_MISSING
+    if (!vlc_xlib_init(VLC_OBJECT(vd)))
+        return VLC_EGENERIC;
+# endif
+#endif
+
+#if defined(_WIN32)
+    CONSOLE_SCREEN_BUFFER_INFO csbiInfo;
+    SMALL_RECT rect;
+    COORD coord;
+    HANDLE hstdout;
+
+    if (!AllocConsole()) {
+        msg_Err(vd, "cannot create console");
+        return VLC_EGENERIC;
+    }
+
+    hstdout =
+        CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  NULL, CONSOLE_TEXTMODE_BUFFER, NULL);
+    if (!hstdout || hstdout == INVALID_HANDLE_VALUE) {
+        msg_Err(vd, "cannot create screen buffer");
+        FreeConsole();
+        return VLC_EGENERIC;
+    }
+
+    if (!SetConsoleActiveScreenBuffer(hstdout)) {
+        msg_Err(vd, "cannot set active screen buffer");
+        FreeConsole();
+        return VLC_EGENERIC;
+    }
+
+    coord = GetLargestConsoleWindowSize(hstdout);
+    msg_Dbg(vd, "SetConsoleWindowInfo: %ix%i", coord.X, coord.Y);
+
+    /* Force size for now */
+    coord.X = 100;
+    coord.Y = 40;
+
+    if (!SetConsoleScreenBufferSize(hstdout, coord))
+        msg_Warn(vd, "SetConsoleScreenBufferSize %i %i",
+                  coord.X, coord.Y);
+
+    /* Get the current screen buffer size and window position. */
+    if (GetConsoleScreenBufferInfo(hstdout, &csbiInfo)) {
+        rect.Top = 0; rect.Left = 0;
+        rect.Right = csbiInfo.dwMaximumWindowSize.X - 1;
+        rect.Bottom = csbiInfo.dwMaximumWindowSize.Y - 1;
+        if (!SetConsoleWindowInfo(hstdout, TRUE, &rect))
+            msg_Dbg(vd, "SetConsoleWindowInfo failed: %ix%i",
+                     rect.Right, rect.Bottom);
+    }
+#endif
+
+    /* Allocate structure */
+    vd->sys = sys = calloc(1, sizeof(*sys));
+    if (!sys)
+        goto error;
+
+    sys->cv = cucul_create_canvas(0, 0);
+    if (!sys->cv) {
+        msg_Err(vd, "cannot initialize libcucul");
+        goto error;
+    }
+
+    sys->window = cfg->window;
+    const char *driver = NULL;
+#ifdef __APPLE__
+    // Make sure we don't try to open a window.
+    driver = "ncurses";
+#endif
+
+    sys->dp = caca_create_display_with_driver(sys->cv, driver);
+    if (!sys->dp) {
+        msg_Err(vd, "cannot initialize libcaca");
+        goto error;
+    }
+
+    char *title = var_InheritString(vd, "video-title");
+    caca_set_display_title(sys->dp,
+        (title != NULL) ? title : VOUT_TITLE "(Colour AsCii Art)");
+    free(title);
+
+    sys->dead = false;
+    vlc_queue_Init(&sys->q, offsetof (vlc_caca_event_t, next));
+
+    if (vlc_clone(&sys->thread, VoutDisplayEventKeyDispatch, vd,
+                  VLC_THREAD_PRIORITY_LOW))
+        goto error;
+
+    sys->cursor_timeout = VLC_TICK_FROM_MS( var_InheritInteger(vd, "mouse-hide-timeout") );
+    sys->cursor_deadline = INVALID_DEADLINE;
+
+    /* Fix format */
+    if (fmtp->i_chroma != VLC_CODEC_RGB32) {
+        fmtp->i_chroma = VLC_CODEC_RGB32;
+        fmtp->i_rmask = 0x00ff0000;
+        fmtp->i_gmask = 0x0000ff00;
+        fmtp->i_bmask = 0x000000ff;
+    }
+
+    /* Setup vout_display now that everything is fine */
+    vd->ops = &ops;
+
+    /* Fix initial state */
+    caca_refresh_display(sys->dp);
+
+    Place(vd);
+
+    return VLC_SUCCESS;
+
+error:
+    if (sys) {
+        if (sys->dither)
+            cucul_free_dither(sys->dither);
+        if (sys->dp)
+            caca_free_display(sys->dp);
+        if (sys->cv)
+            cucul_free_canvas(sys->cv);
+
+        free(sys);
+    }
+#if defined(_WIN32)
+    FreeConsole();
+#endif
+    return VLC_EGENERIC;
+}
+
+/*****************************************************************************
+ * Module descriptor
+ *****************************************************************************/
+vlc_module_begin()
+    set_shortname("Caca")
+    set_category(CAT_VIDEO)
+    set_subcategory(SUBCAT_VIDEO_VOUT)
+    set_description(N_("Color ASCII art video output"))
+    set_callback_display(Open, 15)
+vlc_module_end()

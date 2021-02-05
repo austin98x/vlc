@@ -2,7 +2,6 @@
  * blend2.cpp: Blend one picture with alpha onto another picture
  *****************************************************************************
  * Copyright (C) 2012 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -37,13 +36,12 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Open (vlc_object_t *);
-static void Close(vlc_object_t *);
+static int  Open (filter_t *);
+static void Close(filter_t *);
 
 vlc_module_begin()
     set_description(N_("Video pictures blending"))
-    set_capability("video blending", 100)
-    set_callbacks(Open, Close)
+    set_callback_video_blending(Open, 100)
 vlc_module_end()
 
 static inline unsigned div255(unsigned v)
@@ -59,6 +57,8 @@ void merge(T *dst, unsigned src, unsigned f)
 {
     *dst = div255((255 - f) * (*dst) + src * f);
 }
+
+namespace {
 
 struct CPixel {
     unsigned i, j, k;
@@ -145,8 +145,8 @@ private:
     {
         if (plane == 1 || plane == 2)
             return (pixel*)&data[plane][(x + dx) / rx * sizeof(pixel)];
-        else
-            return (pixel*)&data[plane][(x + dx) /  1 * sizeof(pixel)];
+
+        return (pixel*)&data[plane][(x + dx) /  1 * sizeof(pixel)];
     }
     uint8_t *data[4];
 };
@@ -279,15 +279,12 @@ public:
             }
             offset_a = 3;
         } else {
-#ifdef WORDS_BIGENDIAN
-            offset_r = (8 * bytes - fmt->i_lrshift) / 8;
-            offset_g = (8 * bytes - fmt->i_lgshift) / 8;
-            offset_b = (8 * bytes - fmt->i_lbshift) / 8;
-#else
-            offset_r = fmt->i_lrshift / 8;
-            offset_g = fmt->i_lgshift / 8;
-            offset_b = fmt->i_lbshift / 8;
-#endif
+            if (GetPackedRgbIndexes(fmt, &offset_r, &offset_g, &offset_b) != VLC_SUCCESS) {
+                /* at least init to something on error to silence compiler warnings */
+                offset_r = 0;
+                offset_g = 1;
+                offset_b = 2;
+            }
         }
         data = CPicture::getLine<1>(0);
     }
@@ -337,25 +334,30 @@ private:
     {
         return &data[(x + dx) * bytes];
     }
-    unsigned offset_r;
-    unsigned offset_g;
-    unsigned offset_b;
+    int offset_r;
+    int offset_g;
+    int offset_b;
     unsigned offset_a;
     uint8_t *data;
 };
 
 class CPictureRGB16 : public CPicture {
+private:
+    unsigned rshift, gshift, bshift;
 public:
     CPictureRGB16(const CPicture &cfg) : CPicture(cfg)
     {
         data = CPicture::getLine<1>(0);
+        rshift = vlc_ctz(fmt->i_rmask);
+        gshift = vlc_ctz(fmt->i_gmask);
+        bshift = vlc_ctz(fmt->i_bmask);
     }
     void get(CPixel *px, unsigned dx, bool = true) const
     {
         const uint16_t data = *getPointer(dx);
-        px->i = (data & fmt->i_rmask) >> fmt->i_lrshift;
-        px->j = (data & fmt->i_gmask) >> fmt->i_lgshift;
-        px->k = (data & fmt->i_bmask) >> fmt->i_lbshift;
+        px->i = (data & fmt->i_rmask) >> rshift;
+        px->j = (data & fmt->i_gmask) >> gshift;
+        px->k = (data & fmt->i_bmask) >> bshift;
     }
     void merge(unsigned dx, const CPixel &spx, unsigned a, bool full)
     {
@@ -366,9 +368,9 @@ public:
         ::merge(&dpx.j, spx.j, a);
         ::merge(&dpx.k, spx.k, a);
 
-        *getPointer(dx) = (dpx.i << fmt->i_lrshift) |
-                          (dpx.j << fmt->i_lgshift) |
-                          (dpx.k << fmt->i_lbshift);
+        *getPointer(dx) = (dpx.i << rshift) |
+                          (dpx.j << gshift) |
+                          (dpx.k << bshift);
     }
     void nextLine()
     {
@@ -459,15 +461,20 @@ struct convertYuv8ToRgb {
 };
 
 struct convertRgbToRgbSmall {
-    convertRgbToRgbSmall(const video_format_t *dst, const video_format_t *) : fmt(*dst) {}
+    convertRgbToRgbSmall(const video_format_t *dst, const video_format_t *)
+    {
+        rshift = 8 - vlc_popcount(dst->i_rmask);
+        bshift = 8 - vlc_popcount(dst->i_bmask);
+        gshift = 8 - vlc_popcount(dst->i_gmask);
+    }
     void operator()(CPixel &p)
     {
-        p.i >>= fmt.i_rrshift;
-        p.j >>= fmt.i_rgshift;
-        p.k >>= fmt.i_rbshift;
+        p.i >>= rshift;
+        p.j >>= gshift;
+        p.k >>= bshift;
     }
 private:
-    const video_format_t &fmt;
+    unsigned rshift, gshift, bshift;
 };
 
 struct convertYuvpToAny {
@@ -519,6 +526,8 @@ private:
     G g;
 };
 
+} // namespace
+
 template <class TDst, class TSrc, class TConvert>
 void Blend(const CPicture &dst_data, const CPicture &src_data,
            unsigned width, unsigned height, int alpha)
@@ -550,6 +559,8 @@ void Blend(const CPicture &dst_data, const CPicture &src_data,
 
 typedef void (*blend_function_t)(const CPicture &dst_data, const CPicture &src_data,
                                  unsigned width, unsigned height, int alpha);
+
+namespace {
 
 static const struct {
     vlc_fourcc_t     dst;
@@ -597,9 +608,11 @@ static const struct {
 #ifdef WORDS_BIGENDIAN
     YUV(VLC_CODEC_I422_9B,  CPictureI422_16,  convert8To9Bits),
     YUV(VLC_CODEC_I422_10B, CPictureI422_16,  convert8To10Bits),
+    YUV(VLC_CODEC_I422_16B, CPictureI422_16,  convert8To16Bits),
 #else
     YUV(VLC_CODEC_I422_9L,  CPictureI422_16,  convert8To9Bits),
     YUV(VLC_CODEC_I422_10L, CPictureI422_16,  convert8To10Bits),
+    YUV(VLC_CODEC_I422_16L, CPictureI422_16,  convert8To16Bits),
 #endif
 
     YUV(VLC_CODEC_J444,     CPictureI444_8,   convertNone),
@@ -630,14 +643,16 @@ struct filter_sys_t {
     blend_function_t blend;
 };
 
+} // namespace
+
 /**
  * It blends 2 picture together.
  */
-static void Blend(filter_t *filter,
+static void DoBlend(filter_t *filter,
                   picture_t *dst, const picture_t *src,
                   int x_offset, int y_offset, int alpha)
 {
-    filter_sys_t *sys = filter->p_sys;
+    filter_sys_t *sys = reinterpret_cast<filter_sys_t *>( filter->p_sys );
 
     if( x_offset < 0 || y_offset < 0 )
     {
@@ -664,9 +679,17 @@ static void Blend(filter_t *filter,
                width, height, alpha);
 }
 
-static int Open(vlc_object_t *object)
+static const struct FilterOperationInitializer {
+    struct vlc_filter_operations ops {};
+    FilterOperationInitializer()
+    {
+        ops.blend_video = DoBlend;
+        ops.close       = Close;
+    };
+} filter_ops;
+
+static int Open(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)object;
     const vlc_fourcc_t src = filter->fmt_in.video.i_chroma;
     const vlc_fourcc_t dst = filter->fmt_out.video.i_chroma;
 
@@ -683,14 +706,13 @@ static int Open(vlc_object_t *object)
         return VLC_EGENERIC;
     }
 
-    filter->pf_video_blend = Blend;
+    filter->ops = &filter_ops.ops;
     filter->p_sys          = sys;
     return VLC_SUCCESS;
 }
 
-static void Close(vlc_object_t *object)
+static void Close(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)object;
-    delete filter->p_sys;
+    filter_sys_t *p_sys = reinterpret_cast<filter_sys_t *>( filter->p_sys );
+    delete p_sys;
 }
-

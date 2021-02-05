@@ -2,7 +2,6 @@
  * subtitle.c: subtitle decoder using libavcodec library
  *****************************************************************************
  * Copyright (C) 2009 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -38,13 +37,14 @@
 
 #include "avcodec.h"
 
-struct decoder_sys_t {
+typedef struct
+{
     AVCodecContext *p_context;
     const AVCodec  *p_codec;
     bool b_need_ephemer; /* Does the format need the ephemer flag (no end time set) */
-};
+} decoder_sys_t;
 
-static subpicture_t *ConvertSubtitle(decoder_t *, AVSubtitle *, mtime_t pts,
+static subpicture_t *ConvertSubtitle(decoder_t *, AVSubtitle *, vlc_tick_t pts,
                                      AVCodecContext *avctx);
 static int  DecodeSubtitle(decoder_t *, block_t *);
 static void Flush(decoder_t *);
@@ -219,7 +219,7 @@ static subpicture_t *DecodeBlock(decoder_t *dec, block_t **block_ptr)
     av_init_packet(&pkt);
     pkt.data = block->p_buffer;
     pkt.size = block->i_buffer;
-    pkt.pts  = block->i_pts;
+    pkt.pts  = TO_AV_TS(block->i_pts);
 
     int has_subtitle = 0;
     int used = avcodec_decode_subtitle2(sys->p_context,
@@ -242,7 +242,7 @@ static subpicture_t *DecodeBlock(decoder_t *dec, block_t **block_ptr)
     subpicture_t *spu = NULL;
     if (has_subtitle)
         spu = ConvertSubtitle(dec, &subtitle,
-                              subtitle.pts,
+                              FROM_AV_TS(subtitle.pts),
                               sys->p_context);
 
     /* */
@@ -310,19 +310,21 @@ static subpicture_region_t *ConvertRegionRGBA(AVSubtitleRect *ffregion)
 /**
  * Convert a libavcodec subtitle to our format.
  */
-static subpicture_t *ConvertSubtitle(decoder_t *dec, AVSubtitle *ffsub, mtime_t pts,
+static subpicture_t *ConvertSubtitle(decoder_t *dec, AVSubtitle *ffsub, vlc_tick_t pts,
                                      AVCodecContext *avctx)
 {
     subpicture_t *spu = decoder_NewSubpicture(dec, NULL);
     if (!spu)
         return NULL;
 
+    decoder_sys_t *p_sys = dec->p_sys;
+
     //msg_Err(dec, "%lld %d %d",
     //        pts, ffsub->start_display_time, ffsub->end_display_time);
-    spu->i_start    = pts + ffsub->start_display_time * INT64_C(1000);
-    spu->i_stop     = pts + ffsub->end_display_time * INT64_C(1000);
+    spu->i_start    = pts + VLC_TICK_FROM_MS(ffsub->start_display_time);
+    spu->i_stop     = pts + VLC_TICK_FROM_MS(ffsub->end_display_time);
     spu->b_absolute = true; /* We have offset and size for subtitle */
-    spu->b_ephemer  = dec->p_sys->b_need_ephemer;
+    spu->b_ephemer  = p_sys->b_need_ephemer;
                     /* We only show subtitle for i_stop time only */
 
     if (avctx->coded_width != 0 && avctx->coded_height != 0) {

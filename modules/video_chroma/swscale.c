@@ -2,7 +2,6 @@
  * swscale.c: scaling and chroma conversion using libswscale
  *****************************************************************************
  * Copyright (C) 1999-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -52,32 +51,30 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  OpenScaler( vlc_object_t * );
-static void CloseScaler( vlc_object_t * );
+static int  OpenScaler( filter_t * );
+static void CloseScaler( filter_t * );
 
 #define SCALEMODE_TEXT N_("Scaling mode")
 #define SCALEMODE_LONGTEXT N_("Scaling mode to use.")
 
 static const int pi_mode_values[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-const char *const ppsz_mode_descriptions[] =
+static const char *const ppsz_mode_descriptions[] =
 { N_("Fast bilinear"), N_("Bilinear"), N_("Bicubic (good quality)"),
-  N_("Experimental"), N_("Nearest neighbour (bad quality)"),
+  N_("Experimental"), N_("Nearest neighbor (bad quality)"),
   N_("Area"), N_("Luma bicubic / chroma bilinear"), N_("Gauss"),
   N_("SincR"), N_("Lanczos"), N_("Bicubic spline") };
 
 vlc_module_begin ()
     set_description( N_("Video scaling filter") )
     set_shortname( N_("Swscale" ) )
-    set_capability( "video converter", 150 )
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
-    set_callbacks( OpenScaler, CloseScaler )
+    set_callback_video_converter( OpenScaler, 150 )
     add_integer( "swscale-mode", 2, SCALEMODE_TEXT, SCALEMODE_LONGTEXT, true )
         change_integer_list( pi_mode_values, ppsz_mode_descriptions )
 vlc_module_end ()
 
 /* Version checking */
-#if LIBSWSCALE_VERSION_INT >= ((0<<16)+(5<<8)+0)
 /****************************************************************************
  * Local prototypes
  ****************************************************************************/
@@ -85,7 +82,7 @@ vlc_module_end ()
 /**
  * Internal swscale filter structure.
  */
-struct filter_sys_t
+typedef struct
 {
     SwsFilter *p_filter;
     int i_cpu_mask, i_sws_flags;
@@ -106,7 +103,7 @@ struct filter_sys_t
     bool b_copy;
     bool b_swap_uvi;
     bool b_swap_uvo;
-};
+} filter_sys_t;
 
 static picture_t *Filter( filter_t *, picture_t * );
 static int  Init( filter_t * );
@@ -140,12 +137,15 @@ static int GetSwsCpuMask(void);
 /* XXX is it always 3 even for BIG_ENDIAN (blend.c seems to think so) ? */
 #define OFFSET_A (3)
 
+static const struct vlc_filter_operations filter_ops = {
+    .filter_video = Filter, .close = CloseScaler,
+};
+
 /*****************************************************************************
  * OpenScaler: probe the filter and return score
  *****************************************************************************/
-static int OpenScaler( vlc_object_t *p_this )
+static int OpenScaler( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t*)p_this;
     filter_sys_t *p_sys;
 
     int i_sws_mode;
@@ -193,7 +193,7 @@ static int OpenScaler( vlc_object_t *p_this )
     }
 
     /* */
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &filter_ops;
 
     msg_Dbg( p_filter, "%ix%i (%ix%i) chroma: %4.4s -> %ix%i (%ix%i) chroma: %4.4s with scaling using %s",
              p_filter->fmt_in.video.i_visible_width, p_filter->fmt_in.video.i_visible_height,
@@ -210,9 +210,8 @@ static int OpenScaler( vlc_object_t *p_this )
 /*****************************************************************************
  * CloseFilter: clean up the filter
  *****************************************************************************/
-static void CloseScaler( vlc_object_t *p_this )
+static void CloseScaler( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t*)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     Clean( p_filter );
@@ -232,10 +231,8 @@ static int GetSwsCpuMask(void)
 #if defined(__i386__) || defined(__x86_64__)
     if( vlc_CPU_MMX() )
         i_sws_cpu |= SWS_CPU_CAPS_MMX;
-#if (LIBSWSCALE_VERSION_INT >= ((0<<16)+(5<<8)+0))
     if( vlc_CPU_MMXEXT() )
         i_sws_cpu |= SWS_CPU_CAPS_MMX2;
-#endif
     if( vlc_CPU_3dNOW() )
         i_sws_cpu |= SWS_CPU_CAPS_3DNOW;
 #elif defined(__ppc__) || defined(__ppc64__) || defined(__powerpc__)
@@ -372,7 +369,9 @@ static int Init( filter_t *p_filter )
     ScalerConfiguration cfg;
     if( GetParameters( &cfg, p_fmti, p_fmto, p_sys->i_sws_flags ) )
     {
-        msg_Err( p_filter, "format not supported" );
+        msg_Err( p_filter, "format not supported '%4.4s' %ux%u -> '%4.4s' %ux%u",
+                 (const char *)&p_fmti->i_chroma, p_fmti->i_visible_width, p_fmti->i_visible_height,
+                 (const char *)&p_fmto->i_chroma, p_fmto->i_visible_width, p_fmto->i_visible_height );
         return VLC_EGENERIC;
     }
     if( p_fmti->i_visible_width == 0 || p_fmti->i_visible_height == 0 ||
@@ -588,8 +587,9 @@ static void Convert( filter_t *p_filter, struct SwsContext *ctx,
 {
     filter_sys_t *p_sys = p_filter->p_sys;
     uint8_t palette[AVPALETTE_SIZE];
-    uint8_t *src[4]; int src_stride[4];
-    uint8_t *dst[4]; int dst_stride[4];
+    uint8_t *src[4], *dst[4];
+    const uint8_t *csrc[4];
+    int src_stride[4], dst_stride[4];
 
     GetPixels( src, src_stride, p_sys->desc_in, &p_filter->fmt_in.video,
                p_src, i_plane_count, b_swap_uvi );
@@ -606,11 +606,14 @@ static void Convert( filter_t *p_filter, struct SwsContext *ctx,
     GetPixels( dst, dst_stride, p_sys->desc_out, &p_filter->fmt_out.video,
                p_dst, i_plane_count, b_swap_uvo );
 
+    for (size_t i = 0; i < ARRAY_SIZE(src); i++)
+        csrc[i] = src[i];
+
 #if LIBSWSCALE_VERSION_INT  >= ((0<<16)+(5<<8)+0)
-    sws_scale( ctx, src, src_stride, 0, i_height,
+    sws_scale( ctx, csrc, src_stride, 0, i_height,
                dst, dst_stride );
 #else
-    sws_scale_ordered( ctx, src, src_stride, 0, i_height,
+    sws_scale_ordered( ctx, csrc, src_stride, 0, i_height,
                        dst, dst_stride );
 #endif
 }
@@ -704,16 +707,3 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
     picture_Release( p_pic );
     return p_pic_dst;
 }
-
-#else /* LIBSWSCALE_VERSION_INT >= ((0<<16)+(5<<8)+0) */
-
-int OpenScaler( vlc_object_t *p_this )
-{
-    return VLC_EGENERIC;
-}
-
-void CloseScaler( vlc_object_t *p_this )
-{
-}
-
-#endif /* LIBSWSCALE_VERSION_INT >= ((0<<16)+(5<<8)+0) */

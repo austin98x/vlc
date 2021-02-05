@@ -33,6 +33,8 @@ libspatializer_plugin_la_SOURCES = \
 	audio_filter/spatializer/revmodel.hpp \
 	audio_filter/spatializer/spatializer.cpp
 libspatializer_plugin_la_LIBADD = $(LIBM)
+libcenter_plugin_la_SOURCES = audio_filter/center.c
+libcenter_plugin_la_LIBADD  = $(LIBM)
 
 audio_filter_LTLIBRARIES = \
 	libaudiobargraph_a_plugin.la \
@@ -46,7 +48,8 @@ audio_filter_LTLIBRARIES = \
 	libscaletempo_plugin.la \
 	libscaletempo_pitch_plugin.la \
 	libspatializer_plugin.la \
-	libstereo_widen_plugin.la
+	libstereo_widen_plugin.la \
+	libcenter_plugin.la
 
 # Channel mixers
 libdolby_surround_decoder_plugin_la_SOURCES = \
@@ -67,9 +70,14 @@ libsimple_channel_mixer_plugin_la_LIBADD =
 if HAVE_NEON
 EXTRA_LTLIBRARIES += libsimple_channel_mixer_plugin_arm_neon.la
 libsimple_channel_mixer_plugin_arm_neon_la_SOURCES = arm_neon/simple_channel_mixer.S
+# Intentionally leaving out AM_LDFLAGS from this one; it's not meant to be
+# built like a plugin.
+libsimple_channel_mixer_plugin_arm_neon_la_LDFLAGS = -static
 
 libsimple_channel_mixer_plugin_la_LIBADD += libsimple_channel_mixer_plugin_arm_neon.la
-libsimple_channel_mixer_plugin_la_CFLAGS += -DCAN_COMPILE_ARM
+libsimple_channel_mixer_plugin_la_CFLAGS += -DCAN_COMPILE_NEON
+libsimple_channel_mixer_plugin_la_SOURCES += \
+	audio_filter/channel_mixer/simple_neon.h
 endif
 
 audio_filter_LTLIBRARIES += \
@@ -117,14 +125,21 @@ libsoxr_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(SOXR_CFLAGS)
 libsoxr_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(audio_filterdir)'
 libsoxr_plugin_la_LIBADD = $(SOXR_LIBS) $(LIBM)
 
+libebur128_plugin_la_SOURCES = audio_filter/libebur128.c
+libebur128_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(EBUR128_CFLAGS)
+libebur128_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(audio_filterdir)'
+libebur128_plugin_la_LIBADD = $(EBUR128_LIBS)
+
 audio_filter_LTLIBRARIES += \
 	$(LTLIBsamplerate) \
 	$(LTLIBsoxr) \
+	$(LTLIBebur128) \
 	libugly_resampler_plugin.la
 EXTRA_LTLIBRARIES += \
 	libbandlimited_resampler_plugin.la \
 	libsamplerate_plugin.la \
-	libsoxr_plugin.la
+	libsoxr_plugin.la \
+	libebur128_plugin.la
 
 libspeex_resampler_plugin_la_SOURCES = audio_filter/resampler/speex.c
 libspeex_resampler_plugin_la_CFLAGS = $(AM_CFLAGS) $(SPEEXDSP_CFLAGS)
@@ -132,3 +147,11 @@ libspeex_resampler_plugin_la_LIBADD = $(SPEEXDSP_LIBS)
 if HAVE_SPEEXDSP
 audio_filter_LTLIBRARIES += libspeex_resampler_plugin.la
 endif
+
+librnnoise_plugin_la_SOURCES = audio_filter/rnnoise.c
+librnnoise_plugin_la_CFLAGS = $(AM_CFLAGS) $(RNNOISE_CFLAGS)
+librnnoise_plugin_la_LIBADD = $(RNNOISE_LIBS) $(LIBM)
+librnnoise_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(audio_filterdir)'
+
+audio_filter_LTLIBRARIES += $(LTLIBrnnoise)
+EXTRA_LTLIBRARIES += librnnoise_plugin.la

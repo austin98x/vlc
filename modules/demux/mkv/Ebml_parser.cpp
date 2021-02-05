@@ -3,7 +3,6 @@
  * EbmlParser for the matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -25,6 +24,8 @@
 
 #include "Ebml_parser.hpp"
 #include "stream_io_callback.hpp"
+
+namespace mkv {
 
 /*****************************************************************************
  * Ebml Stream parser
@@ -128,11 +129,12 @@ const EbmlSemanticContext Context_KaxSegmentVLC = EbmlSemanticContext(KaxSegment
                                                                       GetEbmlNoGlobal_Context,
                                                                       KaxSegment_Context.GetMaster());
 
-EbmlElement *EbmlParser::Get()
+EbmlElement *EbmlParser::Get( bool allow_overshoot )
 {
     int i_ulev = 0;
     int n_call = 0;
     EbmlElement *p_prev = NULL;
+    bool do_read = true;
 
     if( mi_user_level != mi_level )
     {
@@ -162,7 +164,7 @@ next:
         if (i_max_read == 0)
         {
             /* check if the parent still has data to read */
-            if ( mi_level > 1 &&
+            if ( mi_level > 1 && m_el[mi_level-2]->IsFiniteSize() &&
                  m_el[mi_level-1]->GetEndPosition() < m_el[mi_level-2]->GetEndPosition() )
             {
                 uint64 top = m_el[mi_level-2]->GetEndPosition();
@@ -176,7 +178,13 @@ next:
         while ( size_lvl && m_el[size_lvl-1]->IsFiniteSize() && m_el[size_lvl]->IsFiniteSize() &&
                 m_el[size_lvl-1]->GetEndPosition() == m_el[size_lvl]->GetEndPosition() )
             size_lvl--;
-        if (size_lvl == 0 || !m_el[size_lvl-1]->IsFiniteSize() || !m_el[size_lvl]->IsFiniteSize() )
+        if (size_lvl == 0 && !allow_overshoot)
+        {
+            i_ulev = mi_level; // trick to go all the way up
+            m_el[mi_level] = NULL;
+            do_read = false;
+        }
+        else if (size_lvl == 0 || !m_el[size_lvl-1]->IsFiniteSize() || !m_el[size_lvl]->IsFiniteSize() )
             i_max_read = UINT64_MAX;
         else {
             uint64 top = m_el[size_lvl-1]->GetEndPosition();
@@ -185,25 +193,29 @@ next:
         }
     }
 
-    // If the parent is a segment, use the segment context when creating children
-    // (to prolong their lifetime), otherwise just continue as normal
-    EbmlSemanticContext e_context =
-            EBML_CTX_MASTER( EBML_CONTEXT(m_el[mi_level - 1]) ) == EBML_CTX_MASTER( Context_KaxSegmentVLC )
-            ? Context_KaxSegmentVLC
-            : EBML_CONTEXT(m_el[mi_level - 1]);
-
-    /* Ignore unknown level 0 or 1 elements */
-    m_el[mi_level] = unlikely(!i_max_read) ? NULL :
-                     m_es->FindNextElement( e_context,
-                                            i_ulev, i_max_read,
-                                            (  mb_dummy | (mi_level > 1) ), 1 );
-
-    if( m_el[mi_level] == NULL )
+    if (do_read)
     {
-        if ( i_max_read != UINT64_MAX && !static_cast<vlc_stream_io_callback *>(&m_es->I_O())->IsEOF() )
+        // If the parent is a segment, use the segment context when creating children
+        // (to prolong their lifetime), otherwise just continue as normal
+        EbmlSemanticContext e_context =
+                EBML_CTX_MASTER( EBML_CONTEXT(m_el[mi_level - 1]) ) == EBML_CTX_MASTER( Context_KaxSegmentVLC )
+                ? Context_KaxSegmentVLC
+                : EBML_CONTEXT(m_el[mi_level - 1]);
+
+        /* Ignore unknown level 0 or 1 elements */
+        m_el[mi_level] = unlikely(!i_max_read) ? NULL :
+                         m_es->FindNextElement( e_context,
+                                                i_ulev, i_max_read,
+                                                (  mb_dummy | (mi_level > 1) ), 1 );
+
+        if( m_el[mi_level] == NULL )
         {
-            msg_Dbg(p_demux, "found nothing, go up");
-            i_ulev = 1;
+            vlc_stream_io_callback *io_callback = dynamic_cast<vlc_stream_io_callback *>(&m_es->I_O());
+            if ( i_max_read != UINT64_MAX && io_callback != NULL && !io_callback->IsEOF() )
+            {
+                msg_Dbg(p_demux, "found nothing, go up");
+                i_ulev = 1;
+            }
         }
     }
 
@@ -213,8 +225,6 @@ next:
         {
             if( !mb_keep )
             {
-                if( MKV_IS_ID( p_prev, KaxBlockVirtual ) )
-                    static_cast<KaxBlockVirtualWorkaround*>(p_prev)->Fix(); // !! WARNING : TODO !! this is undefined-behavior
                 delete p_prev;
                 p_prev = NULL;
             }
@@ -274,8 +284,6 @@ next:
             {
                 if( !mb_keep )
                 {
-                    if( MKV_IS_ID( p_prev, KaxBlockVirtual ) )
-                        static_cast<KaxBlockVirtualWorkaround*>(p_prev)->Fix(); // !! WARNING : TODO !! this is undefined-behavior
                     delete p_prev;
                     p_prev = NULL;
                 }
@@ -292,6 +300,7 @@ next:
                      m_el[mi_level]->GetElementPosition() );
 
             if( mi_level >= 1 &&
+                m_el[mi_level]->IsFiniteSize() && m_el[mi_level-1]->IsFiniteSize() &&
                 m_el[mi_level]->GetElementPosition() >= m_el[mi_level-1]->GetEndPosition() )
             {
                 msg_Err(p_demux, "This element is outside its known parent... upping level");
@@ -307,8 +316,6 @@ next:
             {
                 if( !mb_keep )
                 {
-                    if( MKV_IS_ID( p_prev, KaxBlockVirtual ) )
-                        static_cast<KaxBlockVirtualWorkaround*>(p_prev)->Fix(); // !! WARNING : TODO !! this is undefined-behavior
                     delete p_prev;
                     p_prev = NULL;
                 }
@@ -322,8 +329,6 @@ next:
     {
         if( !mb_keep )
         {
-            if( MKV_IS_ID( p_prev, KaxBlockVirtual ) )
-                static_cast<KaxBlockVirtualWorkaround*>(p_prev)->Fix();
             delete p_prev;
         }
         mb_keep = false;
@@ -341,3 +346,4 @@ bool EbmlParser::IsTopPresent( EbmlElement *el ) const
     return false;
 }
 
+} // namespace

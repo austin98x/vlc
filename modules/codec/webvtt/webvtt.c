@@ -39,16 +39,16 @@ vlc_module_begin ()
     set_capability( "spu decoder", 10 )
     set_shortname( N_("WEBVTT decoder"))
     set_description( N_("WEBVTT subtitles decoder") )
-    set_callbacks( OpenDecoder, CloseDecoder )
+    set_callbacks( webvtt_OpenDecoder, webvtt_CloseDecoder )
     set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_SCODEC )
     add_submodule()
         set_shortname( "WEBVTT" )
         set_description( N_("WEBVTT subtitles parser") )
-        set_capability( "demux", 3 )
+        set_capability( "demux", 11 )
         set_category( CAT_INPUT )
         set_subcategory( SUBCAT_INPUT_DEMUX )
-        set_callbacks( OpenDemux, CloseDemux )
+        set_callbacks( webvtt_OpenDemux, webvtt_CloseDemux )
         add_shortcut( "webvtt" )
     add_submodule()
         set_shortname( "WEBVTT" )
@@ -56,14 +56,14 @@ vlc_module_begin ()
         set_capability( "demux", 0 )
         set_category( CAT_INPUT )
         set_subcategory( SUBCAT_INPUT_DEMUX )
-        set_callbacks( OpenDemuxStream, CloseDemux )
+        set_callbacks( webvtt_OpenDemuxStream, webvtt_CloseDemux )
         add_shortcut( "webvttstream" )
 #ifdef ENABLE_SOUT
     add_submodule()
         set_description( "WEBVTT text encoder" )
         set_capability( "encoder", 101 )
         set_subcategory( SUBCAT_INPUT_SCODEC )
-        set_callbacks( OpenEncoder, CloseEncoder )
+        set_callback( webvtt_OpenEncoder )
 #endif
 vlc_module_end ()
 
@@ -87,15 +87,13 @@ struct webvtt_text_parser_t
     webvtt_cue_t *p_cue;
 };
 
-static mtime_t MakeTime( unsigned t[4] )
+static vlc_tick_t MakeTime( unsigned t[4] )
 {
-    return t[0] * 3600 * CLOCK_FREQ +
-           t[1] * 60 * CLOCK_FREQ +
-           t[2] * CLOCK_FREQ +
-           t[3] * 1000;
+    return vlc_tick_from_sec( t[0] * 3600 + t[1] * 60 + t[2] ) +
+           VLC_TICK_FROM_MS(t[3]);
 }
 
-bool webvtt_scan_time( const char *psz, mtime_t *p_time )
+bool webvtt_scan_time( const char *psz, vlc_tick_t *p_time )
 {
     unsigned t[4];
     if( sscanf( psz, "%2u:%2u.%3u",
@@ -105,7 +103,7 @@ bool webvtt_scan_time( const char *psz, mtime_t *p_time )
         *p_time = MakeTime( t );
         return true;
     }
-    else if( sscanf( psz, "%2u:%2u:%2u.%3u",
+    else if( sscanf( psz, "%u:%2u:%2u.%3u",
                           &t[0], &t[1], &t[2], &t[3] ) == 4 )
     {
         *p_time = MakeTime( t );
@@ -154,7 +152,8 @@ void webvtt_text_parser_Delete( webvtt_text_parser_t *p )
 static void forward_line( webvtt_text_parser_t *p, const char *psz_line, bool b_new )
 {
     if( p->pf_header )
-        p->pf_header( p->priv, p->section, b_new, psz_line );
+        p->pf_header( p->priv, (enum webvtt_header_line_e)p->section,
+                      b_new, psz_line );
 }
 
 void webvtt_text_parser_Feed( webvtt_text_parser_t *p, char *psz_line )
@@ -244,12 +243,12 @@ void webvtt_text_parser_Feed( webvtt_text_parser_t *p, char *psz_line )
         const char *psz_split = strstr( p->reads[1], " --> " );
         if( psz_split )
         {
-            mtime_t i_start, i_stop;
+            vlc_tick_t i_start, i_stop;
 
             if( webvtt_scan_time( p->reads[1], &i_start ) &&
                 webvtt_scan_time( psz_split + 5,  &i_stop ) && i_start <= i_stop )
             {
-                const char *psz_attrs = strchr( psz_split + 5 + 9, ' ' );
+                const char *psz_attrs = strchr( psz_split + 5 + 5, ' ' );
                 p->p_cue = ( p->pf_get_cue ) ? p->pf_get_cue( p->priv ) : NULL;
                 if( p->p_cue )
                 {

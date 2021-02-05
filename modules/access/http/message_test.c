@@ -34,6 +34,8 @@
 #include "message.h"
 #include "h2frame.h"
 
+const char vlc_module_name[] = "test_http_msg";
+
 static void check_req(const struct vlc_http_msg *m)
 {
     const char *str;
@@ -115,7 +117,7 @@ static void check_msg(struct vlc_http_msg *in,
 
     cb(in);
 
-    m1 = vlc_http_msg_format(in, &len, false);
+    m1 = vlc_http_msg_format(in, &len, false, true);
     assert(m1 != NULL);
     assert(strlen(m1) == len);
     out = vlc_http_msg_headers(m1);

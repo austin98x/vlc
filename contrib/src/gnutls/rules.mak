@@ -1,14 +1,14 @@
 # GnuTLS
 
-GNUTLS_VERSION := 3.5.16
-GNUTLS_URL := ftp://ftp.gnutls.org/gcrypt/gnutls/v3.5/gnutls-$(GNUTLS_VERSION).tar.xz
+GNUTLS_VERSION := 3.6.15
+GNUTLS_URL := https://www.gnupg.org/ftp/gcrypt/gnutls/v3.6/gnutls-$(GNUTLS_VERSION).tar.xz
 
 ifdef BUILD_NETWORK
 ifndef HAVE_DARWIN_OS
 PKGS += gnutls
 endif
 endif
-ifeq ($(call need_pkg,"gnutls >= 3.3.6"),)
+ifeq ($(call need_pkg,"gnutls >= 3.5.0"),)
 PKGS_FOUND += gnutls
 endif
 
@@ -19,25 +19,21 @@ $(TARBALLS)/gnutls-$(GNUTLS_VERSION).tar.xz:
 
 gnutls: gnutls-$(GNUTLS_VERSION).tar.xz .sum-gnutls
 	$(UNPACK)
-	$(APPLY) $(SRC)/gnutls/32b5628-upstream.patch
-	$(APPLY) $(SRC)/gnutls/gnutls-pkgconfig-static.patch
-ifdef HAVE_WIN32
-	$(APPLY) $(SRC)/gnutls/gnutls-win32.patch
-	$(APPLY) $(SRC)/gnutls/gnutls-loadlibrary.patch
-ifdef HAVE_WINSTORE
-	$(APPLY) $(SRC)/gnutls/gnutls-winrt.patch
-	$(APPLY) $(SRC)/gnutls/winrt-topendir.patch
-endif
-endif
-ifdef HAVE_ANDROID
-	$(APPLY) $(SRC)/gnutls/no-create-time-h.patch
-endif
-	$(APPLY) $(SRC)/gnutls/read-file-limits.h.patch
-ifdef HAVE_MACOSX
-	$(APPLY) $(SRC)/gnutls/gnutls-disable-getentropy-osx.patch
-	$(APPLY) $(SRC)/gnutls/gnutls-disable-connectx-macos.patch
-endif
-	$(APPLY) $(SRC)/gnutls/gnutls-libidn.patch
+	$(APPLY) $(SRC)/gnutls/gnutls-fix-mangling.patch
+
+	# backport gnulib patch
+	$(APPLY) $(SRC)/gnutls/0001-Don-t-assume-that-UNICODE-is-not-defined.patch
+
+	# fix forbidden UWP call which can't be upstreamed as they won't
+	# differentiate for winstore, only _WIN32_WINNT
+	$(APPLY) $(SRC)/gnutls/0001-fcntl-do-not-call-GetHandleInformation-in-Winstore-a.patch
+
+	# forbidden RtlSecureZeroMemory call in winstore builds
+	$(APPLY) $(SRC)/gnutls/0001-explicit_bzero-Do-not-call-SecureZeroMemory-on-UWP-b.patch
+
+	# disable the dllimport in static linking (pkg-config --static doesn't handle Cflags.private)
+	cd $(UNPACK_DIR) && sed -i.orig -e s/"_SYM_EXPORT __declspec(dllimport)"/"_SYM_EXPORT"/g lib/includes/gnutls/gnutls.h.in
+
 	$(call pkg_static,"lib/gnutls.pc.in")
 	$(UPDATE_AUTOCONFIG)
 	$(MOVE)
@@ -47,14 +43,13 @@ GNUTLS_CONF := \
 	--without-p11-kit \
 	--disable-cxx \
 	--disable-srp-authentication \
-	--disable-psk-authentication-FIXME \
 	--disable-anon-authentication \
-	--disable-openpgp-authentication \
 	--disable-openssl-compatibility \
 	--disable-guile \
 	--disable-nls \
 	--without-libintl-prefix \
 	--disable-doc \
+	--disable-tools \
 	--disable-tests \
 	--with-included-libtasn1 \
 	--with-included-unistring \
@@ -67,18 +62,25 @@ DEPS_gnutls = nettle $(DEPS_nettle)
 ifdef HAVE_ANDROID
 GNUTLS_ENV += gl_cv_header_working_stdint_h=yes
 endif
-ifdef HAVE_TIZEN
-	GNUTLS_CONF += --with-default-trust-store-dir=/etc/ssl/certs/
-endif
 ifdef HAVE_WINSTORE
 ifeq ($(ARCH),x86_64)
 	GNUTLS_CONF += --disable-hardware-acceleration
 endif
 endif
+ifdef HAVE_WIN32
+	GNUTLS_CONF += --without-idn
+ifeq ($(ARCH),aarch64)
+	# Gnutls' aarch64 assembly unconditionally uses ELF specific directives
+	GNUTLS_CONF += --disable-hardware-acceleration
+endif
+endif
+
+ifdef HAVE_NACL
+	GNUTLS_CONF += --disable-hardware-acceleration
+endif
 
 .gnutls: gnutls
-	$(RECONF)
 	cd $< && $(GNUTLS_ENV) ./configure $(GNUTLS_CONF)
-	cd $</gl && $(MAKE) install
-	cd $</lib && $(MAKE) install
+	cd $< && $(MAKE) -C gl install
+	cd $< && $(MAKE) -C lib install
 	touch $@

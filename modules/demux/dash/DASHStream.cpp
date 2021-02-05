@@ -35,38 +35,33 @@ block_t * DASHStream::checkBlock(block_t *p_block, bool)
     return p_block;
 }
 
-AbstractDemuxer * DASHStream::createDemux(const StreamFormat &format)
+AbstractDemuxer *DASHStream::newDemux(vlc_object_t *p_obj, const StreamFormat &format,
+                                      es_out_t *out, AbstractSourceStream *source) const
 {
-    AbstractDemuxer *ret = NULL;
+    AbstractDemuxer *ret = nullptr;
     switch((unsigned)format)
     {
         case StreamFormat::MP4:
-            ret = new Demuxer(p_realdemux, "mp4", fakeesout->getEsOut(), demuxersource);
+        case StreamFormat::MPEG2TS:
+            ret = AbstractStream::newDemux(p_obj, format, out, source);
             break;
 
-        case StreamFormat::MPEG2TS:
-            ret = new Demuxer(p_realdemux, "ts", fakeesout->getEsOut(), demuxersource);
+        case StreamFormat::WEBM:
+            ret = new Demuxer(p_obj, "mkv_trusted", out, source);
             break;
 
         case StreamFormat::WEBVTT:
-            ret = new SlaveDemuxer(p_realdemux, "webvtt", fakeesout->getEsOut(), demuxersource);
+            ret = new SlaveDemuxer(p_obj, "webvtt", out, source);
             break;
 
         case StreamFormat::TTML:
-            ret = new SlaveDemuxer(p_realdemux, "ttml", fakeesout->getEsOut(), demuxersource);
+            ret = new SlaveDemuxer(p_obj, "ttml", out, source);
             break;
 
         default:
         case StreamFormat::UNSUPPORTED:
             break;
     }
-
-    if(ret && !ret->create())
-    {
-        delete ret;
-        ret = NULL;
-    }
-    else commandsqueue->Commit();
 
     return ret;
 }
@@ -78,7 +73,7 @@ AbstractStream * DASHStreamFactory::create(demux_t *realdemux, const StreamForma
     if(stream && !stream->init(format, tracker, manager))
     {
         delete stream;
-        return NULL;
+        return nullptr;
     }
     return stream;
 }

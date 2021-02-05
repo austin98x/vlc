@@ -34,10 +34,7 @@
 #include "config/vlc_getopt.h"
 
 #include <mmsystem.h>
-#include <winsock.h>
-#if VLC_WINSTORE_APP && !defined(__MINGW32__)
-typedef UINT MMRESULT;
-#endif
+#include <winsock2.h>
 
 static int system_InitWSA(int hi, int lo)
 {

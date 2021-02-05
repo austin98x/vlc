@@ -2,7 +2,6 @@
  * misc.c
  *****************************************************************************
  * Copyright (C) 2007-2008 the VideoLAN team
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *          Pierre d'Herbemont <pdherbemont # videolan.org>
@@ -34,7 +33,9 @@
 # include "config.h"
 #endif
 
+#include <errno.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
@@ -42,6 +43,7 @@
 #include <vlc_interface.h>
 #include <vlc_actions.h>
 #include <vlc_interrupt.h>
+#include <vlc_rand.h>
 
 #include "../vlc.h"
 #include "../libs.h"
@@ -77,13 +79,39 @@ vlc_object_t * vlclua_get_this( lua_State *L )
     return vlclua_get_object( L, vlclua_set_this );
 }
 
+vlc_player_t *vlclua_get_player_internal( lua_State *L )
+{
+    vlc_playlist_t *playlist = vlclua_get_playlist_internal(L);
+    return vlc_playlist_GetPlayer(playlist);
+}
+
 /*****************************************************************************
  * VLC error code translation
  *****************************************************************************/
 int vlclua_push_ret( lua_State *L, int i_error )
 {
     lua_pushnumber( L, i_error );
-    lua_pushstring( L, vlc_error( i_error ) );
+
+    int err;
+
+    switch( i_error )
+    {
+        case VLC_SUCCESS:   err = 0;         break;
+        case VLC_ENOMEM:    err = ENOMEM;    break;
+        case VLC_ETIMEOUT:  err = ETIMEDOUT; break;
+        case VLC_EBADVAR:   err = EINVAL;    break;
+        case VLC_ENOMOD:    err = ENOENT;    break;
+        case VLC_ENOOBJ:    err = ENOENT;    break;
+        case VLC_ENOVAR:    err = ENOENT;    break;
+        case VLC_EGENERIC:
+            lua_pushstring( L, "generic error" );
+            return 2;
+        default:
+            lua_pushstring( L, "unknown error" );
+            return 2;
+    }
+
+    lua_pushstring( L, vlc_strerror_c(err) );
     return 2;
 }
 
@@ -122,13 +150,13 @@ static int vlclua_quit( lua_State *L )
     vlc_object_t *p_this = vlclua_get_this( L );
     /* The rc.c code also stops the playlist ... not sure if this is needed
      * though. */
-    libvlc_Quit( p_this->obj.libvlc );
+    libvlc_Quit( vlc_object_instance(p_this) );
     return 0;
 }
 
 static int vlclua_mdate( lua_State *L )
 {
-    lua_pushnumber( L, mdate() );
+    lua_pushnumber( L, vlc_tick_now() );
     return 1;
 }
 

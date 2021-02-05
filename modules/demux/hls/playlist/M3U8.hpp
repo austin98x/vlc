@@ -21,17 +21,7 @@
 #ifndef M3U8_H_
 #define M3U8_H_
 
-#include "../adaptive/playlist/AbstractPlaylist.hpp"
-#include <vlc_threads.h>
-#include <map>
-
-namespace adaptive
-{
-    namespace http
-    {
-        class AuthStorage;
-    }
-}
+#include "../../adaptive/playlist/BasePlaylist.hpp"
 
 namespace hls
 {
@@ -39,22 +29,13 @@ namespace hls
     {
         using namespace adaptive::playlist;
 
-        class M3U8 : public AbstractPlaylist
+        class M3U8 : public BasePlaylist
         {
             public:
-                M3U8(vlc_object_t *, adaptive::http::AuthStorage * /* ugly data ref, tobefixed */ );
+                M3U8(vlc_object_t *);
                 virtual ~M3U8();
 
-                std::vector<uint8_t>            getEncryptionKey(const std::string &);
-                virtual bool                    isLive() const;
-                virtual void                    debug();
-                adaptive::http::AuthStorage *   getAuth(); /* ugly data ref, tobefixed */
-
-            private:
-                adaptive::http::AuthStorage *auth; /* ugly data ref, tobefixed */
-                std::string data;
-                vlc_mutex_t keystore_lock;
-                std::map<std::string, std::vector<uint8_t> > keystore;
+                virtual bool isLive() const override;
         };
     }
 }

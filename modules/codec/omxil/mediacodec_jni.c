@@ -39,7 +39,7 @@
 #include "mediacodec.h"
 
 char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
-                         int profile, bool *p_adaptive);
+                         int profile, int *p_quirks);
 
 #define THREAD_NAME "mediacodec_jni"
 
@@ -314,11 +314,41 @@ struct mc_api_sys
     jobject input_buffers, output_buffers;
 };
 
+static char *GetManufacturer(JNIEnv *env)
+{
+    char *manufacturer = NULL;
+
+    jclass clazz = (*env)->FindClass(env, "android/os/Build");
+    if (CHECK_EXCEPTION())
+        return NULL;
+
+    jfieldID id = (*env)->GetStaticFieldID(env, clazz, "MANUFACTURER",
+                                           "Ljava/lang/String;");
+    if (CHECK_EXCEPTION())
+        goto end;
+
+    jstring jstr = (*env)->GetStaticObjectField(env, clazz, id);
+
+    if (CHECK_EXCEPTION())
+        goto end;
+
+    const char *str = (*env)->GetStringUTFChars(env, jstr, 0);
+    if (str)
+    {
+        manufacturer = strdup(str);
+        (*env)->ReleaseStringUTFChars(env, jstr, str);
+    }
+
+end:
+    (*env)->DeleteLocalRef(env, clazz);
+    return manufacturer;
+}
+
 /*****************************************************************************
  * MediaCodec_GetName
  *****************************************************************************/
 char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
-                         int profile, bool *p_adaptive)
+                         int profile, int *p_quirks)
 {
     JNIEnv *env;
     int num_codecs;
@@ -425,11 +455,11 @@ char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
                             switch (omx_profile)
                             {
                                 case 0x1: /* OMX_VIDEO_HEVCProfileMain */
-                                    codec_profile = HEVC_PROFILE_MAIN;
+                                    codec_profile = VLC_HEVC_PROFILE_MAIN;
                                     break;
                                 case 0x2:    /* OMX_VIDEO_HEVCProfileMain10 */
                                 case 0x1000: /* OMX_VIDEO_HEVCProfileMain10HDR10 */
-                                    codec_profile = HEVC_PROFILE_MAIN_10;
+                                    codec_profile = VLC_HEVC_PROFILE_MAIN_10;
                                     break;
                             }
                         }
@@ -453,8 +483,36 @@ char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
             {
                 memcpy(psz_name, name_ptr, name_len);
                 psz_name[name_len] = '\0';
+
+                bool ignore_size = false;
+
+                /* The AVC/HEVC MediaCodec implementation on Amazon fire TV
+                 * seems to report the Output surface size instead of the Video
+                 * size. This bug is specific to Amazon devices since other MTK
+                 * implementations report the correct size. The manufacturer is
+                 * checked only if the codec matches the MTK one in order to
+                 * avoid extra manufacturer check for other every devices.
+                 * */
+                static const char mtk_dec[] = "OMX.MTK.VIDEO.DECODER.";
+                if (strncmp(psz_name, mtk_dec, sizeof(mtk_dec) - 1) == 0)
+                {
+                    char *manufacturer = GetManufacturer(env);
+                    if (manufacturer && strcmp(manufacturer, "Amazon") == 0)
+                        ignore_size = true;
+                    free(manufacturer);
+                }
+
+                if (ignore_size)
+                {
+                    *p_quirks |= MC_API_VIDEO_QUIRKS_IGNORE_SIZE;
+                    /* If the MediaCodec size is ignored, the adaptive mode
+                     * should be disabled in order to trigger the hxxx_helper
+                     * parsers that will parse the correct video size. Hence
+                     * the following 'else if' */
+                }
+                else if (b_adaptive)
+                    *p_quirks |= MC_API_VIDEO_QUIRKS_ADAPTIVE;
             }
-            *p_adaptive = b_adaptive;
         }
 loopclean:
         if (name)
@@ -479,56 +537,9 @@ loopclean:
 }
 
 /*****************************************************************************
- * Stop
+ * ConfigureDecoder
  *****************************************************************************/
-static int Stop(mc_api *api)
-{
-    mc_api_sys *p_sys = api->p_sys;
-    JNIEnv *env;
-
-    api->b_direct_rendering = false;
-
-    GET_ENV();
-
-    if (p_sys->input_buffers)
-    {
-        (*env)->DeleteGlobalRef(env, p_sys->input_buffers);
-        p_sys->input_buffers = NULL;
-    }
-    if (p_sys->output_buffers)
-    {
-        (*env)->DeleteGlobalRef(env, p_sys->output_buffers);
-        p_sys->output_buffers = NULL;
-    }
-    if (p_sys->codec)
-    {
-        if (api->b_started)
-        {
-            (*env)->CallVoidMethod(env, p_sys->codec, jfields.stop);
-            if (CHECK_EXCEPTION())
-                msg_Err(api->p_obj, "Exception in MediaCodec.stop");
-            api->b_started = false;
-        }
-
-        (*env)->CallVoidMethod(env, p_sys->codec, jfields.release);
-        if (CHECK_EXCEPTION())
-            msg_Err(api->p_obj, "Exception in MediaCodec.release");
-        (*env)->DeleteGlobalRef(env, p_sys->codec);
-        p_sys->codec = NULL;
-    }
-    if (p_sys->buffer_info)
-    {
-        (*env)->DeleteGlobalRef(env, p_sys->buffer_info);
-        p_sys->buffer_info = NULL;
-    }
-    msg_Dbg(api->p_obj, "MediaCodec via JNI closed");
-    return 0;
-}
-
-/*****************************************************************************
- * Start
- *****************************************************************************/
-static int Start(mc_api *api, union mc_api_args *p_args)
+static int ConfigureDecoder(mc_api *api, union mc_api_args* p_args)
 {
     mc_api_sys *p_sys = api->p_sys;
     JNIEnv* env = NULL;
@@ -538,9 +549,6 @@ static int Start(mc_api *api, union mc_api_args *p_args)
     jstring jcodec_name = NULL;
     jobject jcodec = NULL;
     jobject jformat = NULL;
-    jobject jinput_buffers = NULL;
-    jobject joutput_buffers = NULL;
-    jobject jbuffer_info = NULL;
     jobject jsurface = NULL;
 
     assert(api->psz_mime && api->psz_name);
@@ -599,6 +607,7 @@ static int Start(mc_api *api, union mc_api_args *p_args)
                                                  p_args->audio.i_sample_rate,
                                                  p_args->audio.i_channel_count);
     }
+
     /* No limits for input size */
     SET_INTEGER(jformat, "max-input-size", 0);
 
@@ -613,6 +622,8 @@ static int Start(mc_api *api, union mc_api_args *p_args)
                                  "with an output surface.");
             goto error;
         }
+
+        api->b_direct_rendering = b_direct_rendering;
     }
     else
     {
@@ -623,7 +634,85 @@ static int Start(mc_api *api, union mc_api_args *p_args)
             msg_Warn(api->p_obj, "Exception occurred in MediaCodec.configure");
             goto error;
         }
+        api->b_direct_rendering = false;
     }
+
+    i_ret = 0;
+
+error:
+    if (jmime)
+        (*env)->DeleteLocalRef(env, jmime);
+    if (jcodec_name)
+        (*env)->DeleteLocalRef(env, jcodec_name);
+    if (jcodec)
+        (*env)->DeleteLocalRef(env, jcodec);
+    if (jformat)
+        (*env)->DeleteLocalRef(env, jformat);
+
+    return i_ret;
+}
+
+/*****************************************************************************
+ * Stop
+ *****************************************************************************/
+static int Stop(mc_api *api)
+{
+    mc_api_sys *p_sys = api->p_sys;
+    JNIEnv *env;
+
+    api->b_direct_rendering = false;
+
+    GET_ENV();
+
+    if (p_sys->input_buffers)
+    {
+        (*env)->DeleteGlobalRef(env, p_sys->input_buffers);
+        p_sys->input_buffers = NULL;
+    }
+    if (p_sys->output_buffers)
+    {
+        (*env)->DeleteGlobalRef(env, p_sys->output_buffers);
+        p_sys->output_buffers = NULL;
+    }
+    if (p_sys->codec)
+    {
+        if (api->b_started)
+        {
+            (*env)->CallVoidMethod(env, p_sys->codec, jfields.stop);
+            if (CHECK_EXCEPTION())
+                msg_Err(api->p_obj, "Exception in MediaCodec.stop");
+            api->b_started = false;
+        }
+
+        (*env)->CallVoidMethod(env, p_sys->codec, jfields.release);
+        if (CHECK_EXCEPTION())
+            msg_Err(api->p_obj, "Exception in MediaCodec.release");
+        (*env)->DeleteGlobalRef(env, p_sys->codec);
+        p_sys->codec = NULL;
+    }
+    if (p_sys->buffer_info)
+    {
+        (*env)->DeleteGlobalRef(env, p_sys->buffer_info);
+        p_sys->buffer_info = NULL;
+    }
+    msg_Dbg(api->p_obj, "MediaCodec via JNI closed");
+    return 0;
+}
+
+/*****************************************************************************
+ * Start
+ *****************************************************************************/
+static int Start(mc_api *api)
+{
+    mc_api_sys *p_sys = api->p_sys;
+    JNIEnv* env = NULL;
+    jobject jinput_buffers = NULL;
+    jobject joutput_buffers = NULL;
+    jobject jbuffer_info = NULL;
+
+    GET_ENV();
+
+    int i_ret = MC_API_ERROR;
 
     (*env)->CallVoidMethod(env, p_sys->codec, jfields.start);
     if (CHECK_EXCEPTION())
@@ -635,7 +724,6 @@ static int Start(mc_api *api, union mc_api_args *p_args)
 
     if (jfields.get_input_buffers && jfields.get_output_buffers)
     {
-
         jinput_buffers = (*env)->CallObjectMethod(env, p_sys->codec,
                                                   jfields.get_input_buffers);
         if (CHECK_EXCEPTION())
@@ -658,19 +746,10 @@ static int Start(mc_api *api, union mc_api_args *p_args)
                                      jfields.buffer_info_ctor);
     p_sys->buffer_info = (*env)->NewGlobalRef(env, jbuffer_info);
 
-    api->b_direct_rendering = b_direct_rendering;
     i_ret = 0;
     msg_Dbg(api->p_obj, "MediaCodec via JNI opened");
 
 error:
-    if (jmime)
-        (*env)->DeleteLocalRef(env, jmime);
-    if (jcodec_name)
-        (*env)->DeleteLocalRef(env, jcodec_name);
-    if (jcodec)
-        (*env)->DeleteLocalRef(env, jcodec);
-    if (jformat)
-        (*env)->DeleteLocalRef(env, jformat);
     if (jinput_buffers)
         (*env)->DeleteLocalRef(env, jinput_buffers);
     if (joutput_buffers)
@@ -705,7 +784,7 @@ static int Flush(mc_api *api)
 /*****************************************************************************
  * DequeueInput
  *****************************************************************************/
-static int DequeueInput(mc_api *api, mtime_t i_timeout)
+static int DequeueInput(mc_api *api, vlc_tick_t i_timeout)
 {
     mc_api_sys *p_sys = api->p_sys;
     JNIEnv *env;
@@ -731,7 +810,7 @@ static int DequeueInput(mc_api *api, mtime_t i_timeout)
  * QueueInput
  *****************************************************************************/
 static int QueueInput(mc_api *api, int i_index, const void *p_buf,
-                      size_t i_size, mtime_t i_ts, bool b_config)
+                      size_t i_size, vlc_tick_t i_ts, bool b_config)
 {
     mc_api_sys *p_sys = api->p_sys;
     JNIEnv *env;
@@ -785,7 +864,7 @@ static int QueueInput(mc_api *api, int i_index, const void *p_buf,
 /*****************************************************************************
  * DequeueOutput
  *****************************************************************************/
-static int DequeueOutput(mc_api *api, mtime_t i_timeout)
+static int DequeueOutput(mc_api *api, vlc_tick_t i_timeout)
 {
     mc_api_sys *p_sys = api->p_sys;
     JNIEnv *env;
@@ -983,24 +1062,23 @@ static void Clean(mc_api *api)
 }
 
 /*****************************************************************************
- * Configure
+ * Prepare
  *****************************************************************************/
-static int Configure(mc_api *api, int i_profile)
+static int Prepare(mc_api *api, int i_profile)
 {
     free(api->psz_name);
-    bool b_adaptive;
+
+    api->i_quirks = 0;
     api->psz_name = MediaCodec_GetName(api->p_obj, api->psz_mime,
-                                       i_profile, &b_adaptive);
+                                       i_profile, &api->i_quirks);
     if (!api->psz_name)
         return MC_API_ERROR;
-    api->i_quirks = OMXCodec_GetQuirks(api->i_cat, api->i_codec, api->psz_name,
-                                       strlen(api->psz_name));
+    api->i_quirks |= OMXCodec_GetQuirks(api->i_cat, api->i_codec, api->psz_name,
+                                        strlen(api->psz_name));
 
     /* Allow interlaced picture after API 21 */
     if (jfields.get_input_buffer && jfields.get_output_buffer)
         api->i_quirks |= MC_API_VIDEO_QUIRKS_SUPPORT_INTERLACED;
-    if (b_adaptive)
-        api->i_quirks |= MC_API_VIDEO_QUIRKS_ADAPTIVE;
     return 0;
 }
 
@@ -1021,7 +1099,8 @@ int MediaCodecJni_Init(mc_api *api)
         return MC_API_ERROR;
 
     api->clean = Clean;
-    api->configure = Configure;
+    api->prepare = Prepare;
+    api->configure_decoder = ConfigureDecoder;
     api->start = Start;
     api->stop = Stop;
     api->flush = Flush;

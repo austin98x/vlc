@@ -27,7 +27,6 @@ extern "C" {
 
 /* Internal configuration prototypes and structures */
 
-int  config_CreateDir( vlc_object_t *, const char * );
 int  config_AutoSaveConfigFile( vlc_object_t * );
 
 void config_Free (module_config_t *, size_t);
@@ -54,6 +53,16 @@ extern vlc_rwlock_t config_lock;
 extern bool config_dirty;
 
 bool config_IsSafe (const char *);
+
+/**
+ * Gets the arch-specific installation directory.
+ *
+ * This function determines the directory containing the architecture-specific
+ * installed asset files (such as executable plugins and compiled byte code).
+ *
+ * @return a heap-allocated string (use free() to release it), or NULL on error
+ */
+char *config_GetLibDir(void) VLC_USED VLC_MALLOC;
 
 /* The configuration file */
 #define CONFIG_FILE                     "vlcrc"

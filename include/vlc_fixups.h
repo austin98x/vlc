@@ -90,6 +90,8 @@ typedef struct
 
 #if !defined (HAVE_ALIGNED_ALLOC) || \
     !defined (HAVE_MEMRCHR) || \
+    !defined (HAVE_POSIX_MEMALIGN) || \
+    !defined (HAVE_QSORT_R) || \
     !defined (HAVE_STRLCPY) || \
     !defined (HAVE_STRNDUP) || \
     !defined (HAVE_STRNLEN) || \
@@ -164,10 +166,6 @@ int vasprintf (char **, const char *, va_list);
 #endif
 
 /* string.h */
-#ifndef HAVE_FFSLL
-int ffsll(long long);
-#endif
-
 #ifndef HAVE_MEMRCHR
 void *memrchr(const void *, int, size_t);
 #endif
@@ -297,13 +295,25 @@ static inline char *getenv (const char *name)
 }
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef HAVE_SETENV
 int setenv (const char *, const char *, int);
 int unsetenv (const char *);
 #endif
 
+#ifndef HAVE_POSIX_MEMALIGN
+int posix_memalign(void **, size_t, size_t);
+#endif
+
 #ifndef HAVE_ALIGNED_ALLOC
 void *aligned_alloc(size_t, size_t);
+#endif
+
+#ifdef __cplusplus
+} /* extern "C" */
 #endif
 
 #if defined (_WIN32) && defined(__MINGW32__)
@@ -318,18 +328,20 @@ void *aligned_alloc(size_t, size_t);
 # define HAVE_USELOCALE
 #endif
 
+#if !defined(HAVE_NEWLOCALE) && defined(HAVE_CXX_LOCALE_T) && defined(__cplusplus)
+# include <locale>
+# define HAVE_NEWLOCALE
+#endif
+
 /* locale.h */
 #ifndef HAVE_USELOCALE
-#define LC_ALL_MASK      0
-#define LC_NUMERIC_MASK  0
-#define LC_MESSAGES_MASK 0
-#define LC_GLOBAL_LOCALE ((locale_t)(uintptr_t)1)
+# ifndef HAVE_NEWLOCALE
+#  define LC_ALL_MASK      0
+#  define LC_NUMERIC_MASK  0
+#  define LC_MESSAGES_MASK 0
+#  define LC_GLOBAL_LOCALE ((locale_t)(uintptr_t)1)
 typedef void *locale_t;
-static inline locale_t uselocale(locale_t loc)
-{
-    (void)loc;
-    return NULL;
-}
+
 static inline void freelocale(locale_t loc)
 {
     (void)loc;
@@ -337,6 +349,15 @@ static inline void freelocale(locale_t loc)
 static inline locale_t newlocale(int mask, const char * locale, locale_t base)
 {
     (void)mask; (void)locale; (void)base;
+    return NULL;
+}
+# else
+#  include <locale.h>
+# endif
+
+static inline locale_t uselocale(locale_t loc)
+{
+    (void)loc;
     return NULL;
 }
 #endif
@@ -395,8 +416,8 @@ enum
 struct pollfd
 {
     int fd;
-    unsigned events;
-    unsigned revents;
+    short events;
+    short revents;
 };
 #endif
 #ifndef HAVE_POLL
@@ -406,11 +427,13 @@ int poll (struct pollfd *, unsigned, int);
 
 #ifndef HAVE_IF_NAMEINDEX
 #include <errno.h>
+# ifndef HAVE_STRUCT_IF_NAMEINDEX
 struct if_nameindex
 {
     unsigned if_index;
     char    *if_name;
 };
+# endif
 # define if_nameindex()         (errno = ENOBUFS, NULL)
 # define if_freenameindex(list) (void)0
 #endif
@@ -439,6 +462,14 @@ struct msghdr
     size_t        msg_controllen;
     int           msg_flags;
 };
+
+# ifndef HAVE_IF_NAMETOINDEX
+#  include <stdlib.h> /* a define may change from the real atoi declaration */
+static inline int if_nametoindex(const char *name)
+{
+    return atoi(name);
+}
+# endif
 #endif
 
 #ifdef _NEWLIB_VERSION
@@ -474,15 +505,24 @@ typedef enum {
 } VISIT;
 
 void *tsearch( const void *key, void **rootp, int(*cmp)(const void *, const void *) );
-void *tfind( const void *key, const void **rootp, int(*cmp)(const void *, const void *) );
+void *tfind( const void *key, void * const *rootp, int(*cmp)(const void *, const void *) );
 void *tdelete( const void *key, void **rootp, int(*cmp)(const void *, const void *) );
 void twalk( const void *root, void(*action)(const void *nodep, VISIT which, int depth) );
-void tdestroy( void *root, void (*free_node)(void *nodep) );
-#else // HAVE_SEARCH_H
-# ifndef HAVE_TDESTROY
-void vlc_tdestroy( void *, void (*)(void *) );
-#  define tdestroy vlc_tdestroy
+void *lfind( const void *key, const void *base, size_t *nmemb,
+             size_t size, int(*cmp)(const void *, const void *) );
+#endif /* HAVE_SEARCH_H */
+
+#ifdef _WIN64
+# ifdef HAVE_SEARCH_H
+#  include <search.h>
 # endif
+/* the Win32 prototype of lfind() expects an unsigned* for 'nelp' */
+# define lfind(a,b,c,d,e) \
+         lfind((a),(b), &(unsigned){ (*(c) > UINT_MAX) ? UINT_MAX : *(c) }, (d),(e))
+#endif /* _WIN64 */
+
+#ifndef HAVE_TDESTROY
+void tdestroy( void *root, void (*free_node)(void *nodep) );
 #endif
 
 /* Random numbers */
@@ -623,10 +663,6 @@ void sincosf(float, float *, float *);
 char *realpath(const char * restrict pathname, char * restrict resolved_path);
 #endif
 
-#ifdef _WIN32
-FILE *vlc_win32_tmpfile(void);
-#endif
-
 /* mingw-w64 has a broken IN6_IS_ADDR_MULTICAST macro */
 #if defined(_WIN32) && defined(__MINGW64_VERSION_MAJOR)
 # define IN6_IS_ADDR_MULTICAST IN6_IS_ADDR_MULTICAST
@@ -634,6 +670,27 @@ FILE *vlc_win32_tmpfile(void);
 
 #ifdef __APPLE__
 # define fdatasync fsync
+
+# include <time.h>
+# ifndef TIMER_ABSTIME
+#  define TIMER_ABSTIME 0x01
+# endif
+# ifndef CLOCK_REALTIME
+#  define CLOCK_REALTIME 0
+# endif
+# ifndef CLOCK_MONOTONIC
+#  define CLOCK_MONOTONIC 6
+# endif
+# ifndef HAVE_CLOCK_GETTIME
+int clock_gettime(clockid_t clock_id, struct timespec *tp);
+# endif
+# ifndef HAVE_CLOCK_GETRES
+int clock_getres(clockid_t clock_id, struct timespec *tp);
+# endif
+# ifndef HAVE_CLOCK_NANOSLEEP
+int clock_nanosleep(clockid_t clock_id, int flags,
+        const struct timespec *rqtp, struct timespec *rmtp);
+# endif
 #endif
 
 #ifdef __cplusplus

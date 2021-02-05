@@ -3,7 +3,6 @@
  *****************************************************************************
  * Copyright (C) 2009 VLC authors and VideoLAN
  * Copyright (C) 2009 Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -39,32 +38,21 @@
  *****************************************************************************/
 struct picture_fifo_t {
     vlc_mutex_t lock;
-    picture_t   *first;
-    picture_t   **last_ptr;
+    vlc_picture_chain_t pics;
 };
 
 static void PictureFifoReset(picture_fifo_t *fifo)
 {
-    fifo->first    = NULL;
-    fifo->last_ptr = &fifo->first;
+    vlc_picture_chain_Init( &fifo->pics );
 }
 static void PictureFifoPush(picture_fifo_t *fifo, picture_t *picture)
 {
-    assert(!picture->p_next);
-    *fifo->last_ptr = picture;
-    fifo->last_ptr  = &picture->p_next;
+    assert(!picture_HasChainedPics(picture));
+    vlc_picture_chain_Append( &fifo->pics, picture );
 }
 static picture_t *PictureFifoPop(picture_fifo_t *fifo)
 {
-    picture_t *picture = fifo->first;
-
-    if (picture) {
-        fifo->first = picture->p_next;
-        if (!fifo->first)
-            fifo->last_ptr = &fifo->first;
-        picture->p_next = NULL;
-    }
-    return picture;
+    return vlc_picture_chain_PopFront( &fifo->pics );
 }
 
 picture_fifo_t *picture_fifo_New(void)
@@ -92,57 +80,46 @@ picture_t *picture_fifo_Pop(picture_fifo_t *fifo)
 
     return picture;
 }
-picture_t *picture_fifo_Peek(picture_fifo_t *fifo)
+bool picture_fifo_IsEmpty(picture_fifo_t *fifo)
 {
     vlc_mutex_lock(&fifo->lock);
-    picture_t *picture = fifo->first;
-    if (picture)
-        picture_Hold(picture);
+    bool empty = vlc_picture_chain_IsEmpty( &fifo->pics );
     vlc_mutex_unlock(&fifo->lock);
 
-    return picture;
+    return empty;
 }
-void picture_fifo_Flush(picture_fifo_t *fifo, mtime_t date, bool flush_before)
+void picture_fifo_Flush(picture_fifo_t *fifo, vlc_tick_t date, bool flush_before)
 {
     picture_t *picture;
 
+    vlc_picture_chain_t flush_chain;
+
+    vlc_picture_chain_Init(&flush_chain);
+
     vlc_mutex_lock(&fifo->lock);
+    if (date == VLC_TICK_INVALID)
+        vlc_picture_chain_GetAndClear(&fifo->pics, &flush_chain);
+    else {
+        vlc_picture_chain_t filter_chain;
+        vlc_picture_chain_GetAndClear(&fifo->pics, &filter_chain);
 
-    picture = fifo->first;
-    PictureFifoReset(fifo);
+        while ( !vlc_picture_chain_IsEmpty( &filter_chain ) ) {
+            picture = vlc_picture_chain_PopFront( &filter_chain );
 
-    picture_fifo_t tmp;
-    PictureFifoReset(&tmp);
-
-    while (picture) {
-        picture_t *next = picture->p_next;
-
-        picture->p_next = NULL;
-        if (( flush_before && picture->date <= date) ||
-            (!flush_before && picture->date >= date))
-            PictureFifoPush(&tmp, picture);
-        else
-            PictureFifoPush(fifo, picture);
-        picture = next;
+            if (( flush_before && picture->date <= date) ||
+                (!flush_before && picture->date >= date))
+                vlc_picture_chain_Append( &flush_chain, picture );
+            else
+                PictureFifoPush(fifo, picture);
+        }
     }
     vlc_mutex_unlock(&fifo->lock);
 
-    while ((picture = PictureFifoPop(&tmp)) != NULL)
+    while ((picture = vlc_picture_chain_PopFront(&flush_chain)) != NULL)
         picture_Release(picture);
-}
-void picture_fifo_OffsetDate(picture_fifo_t *fifo, mtime_t delta)
-{
-    vlc_mutex_lock(&fifo->lock);
-    for (picture_t *picture = fifo->first; picture != NULL;) {
-        picture->date += delta;
-        picture = picture->p_next;
-    }
-    vlc_mutex_unlock(&fifo->lock);
 }
 void picture_fifo_Delete(picture_fifo_t *fifo)
 {
-    picture_fifo_Flush(fifo, INT64_MAX, true);
-    vlc_mutex_destroy(&fifo->lock);
+    picture_fifo_Flush(fifo, VLC_TICK_INVALID, true);
     free(fifo);
 }
-

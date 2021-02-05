@@ -2,7 +2,6 @@
  * video_widgets.c : OSD widgets manipulation functions
  *****************************************************************************
  * Copyright (C) 2004-2010 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Yoann Peronneau <yoann@videolan.org>
  *         Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
@@ -212,13 +211,16 @@ static subpicture_region_t *OSDIcon(int type, const video_format_t *fmt)
     const int x      = fmt->i_x_offset + fmt->i_visible_width - margin_ratio * size - width;
     const int y      = fmt->i_y_offset                        + margin_ratio * size;
 
+    if( width < 1 || height < 1 )
+        return NULL;
+
     subpicture_region_t *r = OSDRegion(__MAX(x, 0),
                                        __MIN(y, (int)fmt->i_visible_height - height),
                                        width, height);
     if (!r)
         return NULL;
 
-    DrawRect(r, STYLE_FILLED, COL_TRANSPARENT, 0, 0, width, height);
+    DrawRect(r, STYLE_FILLED, COL_TRANSPARENT, 0, 0, width - 1, height - 1);
 
     if (type == OSD_PAUSE_ICON) {
         int bar_width = width / 3;
@@ -243,15 +245,15 @@ static subpicture_region_t *OSDIcon(int type, const video_format_t *fmt)
     return r;
 }
 
-struct subpicture_updater_sys_t {
+typedef struct {
     int type;
     int position;
-};
+} osdwidget_spu_updater_sys_t;
 
 static int OSDWidgetValidate(subpicture_t *subpic,
                            bool has_src_changed, const video_format_t *fmt_src,
                            bool has_dst_changed, const video_format_t *fmt_dst,
-                           mtime_t ts)
+                           vlc_tick_t ts)
 {
     VLC_UNUSED(subpic); VLC_UNUSED(ts);
     VLC_UNUSED(fmt_src); VLC_UNUSED(has_src_changed);
@@ -265,9 +267,9 @@ static int OSDWidgetValidate(subpicture_t *subpic,
 static void OSDWidgetUpdate(subpicture_t *subpic,
                           const video_format_t *fmt_src,
                           const video_format_t *fmt_dst,
-                          mtime_t ts)
+                          vlc_tick_t ts)
 {
-    subpicture_updater_sys_t *sys = subpic->updater.p_sys;
+    osdwidget_spu_updater_sys_t *sys = subpic->updater.p_sys;
     VLC_UNUSED(fmt_src); VLC_UNUSED(ts);
 
     video_format_t fmt = *fmt_dst;
@@ -297,7 +299,7 @@ static void OSDWidget(vout_thread_t *vout, int channel, int type, int position)
     if (type == OSD_HOR_SLIDER || type == OSD_VERT_SLIDER)
         position = VLC_CLIP(position, 0, 100);
 
-    subpicture_updater_sys_t *sys = malloc(sizeof(*sys));
+    osdwidget_spu_updater_sys_t *sys = malloc(sizeof(*sys));
     if (!sys)
         return;
     sys->type     = type;
@@ -316,8 +318,8 @@ static void OSDWidget(vout_thread_t *vout, int channel, int type, int position)
     }
 
     subpic->i_channel  = channel;
-    subpic->i_start    = mdate();
-    subpic->i_stop     = subpic->i_start + 1200000;
+    subpic->i_start    = vlc_tick_now();
+    subpic->i_stop     = subpic->i_start + VLC_TICK_FROM_MS(1200);
     subpic->b_ephemer  = true;
     subpic->b_absolute = true;
     subpic->b_fade     = true;

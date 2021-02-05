@@ -37,9 +37,8 @@
 
 # define DEST_PICS_POOL_SZ 3
 
-struct filter_sys_t
+typedef struct
 {
-    struct vlc_vaapi_instance *va_inst;
     VADisplay           dpy;
     picture_pool_t *    dest_pics;
     VASurfaceID *       va_surface_ids;
@@ -47,7 +46,7 @@ struct filter_sys_t
 
     bool                derive_failed;
     bool                image_fallback_failed;
-};
+} filter_sys_t;
 
 static int CreateFallbackImage(filter_t *filter, picture_t *src_pic,
                                VADisplay va_dpy, VAImage *image_fallback)
@@ -108,9 +107,9 @@ FillPictureFromVAImage(picture_t *dest,
                 Copy420_SP_to_SP(dest, src_planes, src_pitches, src_img->height,
                                  cache);
                 break;
-            case VLC_CODEC_I420_10B:
+            case VLC_CODEC_I420_10L:
                 Copy420_16_SP_to_P(dest, src_planes, src_pitches,
-                                   src_img->height, cache);
+                                   src_img->height, 6, cache);
                 break;
             default:
                 vlc_assert_unreachable();
@@ -170,7 +169,7 @@ DownloadSurface(filter_t *filter, picture_t *src_pic)
     if (vlc_vaapi_MapBuffer(VLC_OBJECT(filter), va_dpy, src_img.buf, &src_buf))
         goto error;
 
-    FillPictureFromVAImage(dest, &src_img, src_buf, &filter->p_sys->cache);
+    FillPictureFromVAImage(dest, &src_img, src_buf, &filter_sys->cache);
 
     vlc_vaapi_UnmapBuffer(VLC_OBJECT(filter), va_dpy, src_img.buf);
     vlc_vaapi_DestroyImage(VLC_OBJECT(filter), va_dpy, src_img.image_id);
@@ -216,10 +215,10 @@ FillVAImageFromPicture(VAImage *dest_img, uint8_t *dest_buf,
                         src->format.i_height, cache);
 
         break;
-    case VLC_CODEC_I420_10B:
+    case VLC_CODEC_I420_10L:
         assert(dest_pic->format.i_chroma == VLC_CODEC_VAAPI_420_10BPP);
         Copy420_16_P_to_SP(dest_pic, src_planes, src_pitches,
-                           src->format.i_height, cache);
+                           src->format.i_height, -6, cache);
         break;
     case VLC_CODEC_P010:
     {
@@ -239,10 +238,11 @@ FillVAImageFromPicture(VAImage *dest_img, uint8_t *dest_buf,
 static picture_t *
 UploadSurface(filter_t *filter, picture_t *src)
 {
-    VADisplay const va_dpy = filter->p_sys->dpy;
+    filter_sys_t   *p_sys = filter->p_sys;
+    VADisplay const va_dpy = p_sys->dpy;
     VAImage         dest_img;
     void *          dest_buf;
-    picture_t *     dest_pic = picture_pool_Wait(filter->p_sys->dest_pics);
+    picture_t *     dest_pic = picture_pool_Wait(p_sys->dest_pics);
 
     if (!dest_pic)
     {
@@ -259,7 +259,7 @@ UploadSurface(filter_t *filter, picture_t *src)
         goto error;
 
     FillVAImageFromPicture(&dest_img, dest_buf, dest_pic,
-                           src, &filter->p_sys->cache);
+                           src, &p_sys->cache);
 
     if (vlc_vaapi_UnmapBuffer(VLC_OBJECT(filter), va_dpy, dest_img.buf)
         || vlc_vaapi_DestroyImage(VLC_OBJECT(filter),
@@ -289,7 +289,7 @@ static int CheckFmt(const video_format_t *in, const video_format_t *out,
             break;
         case VLC_CODEC_VAAPI_420_10BPP:
             if (out->i_chroma == VLC_CODEC_P010
-             || out->i_chroma == VLC_CODEC_I420_10B)
+             || out->i_chroma == VLC_CODEC_I420_10L)
             {
                 *pixel_bytes = 2;
                 return VLC_SUCCESS;
@@ -306,7 +306,7 @@ static int CheckFmt(const video_format_t *in, const video_format_t *out,
             break;
         case VLC_CODEC_VAAPI_420_10BPP:
             if (in->i_chroma == VLC_CODEC_P010
-             || in->i_chroma == VLC_CODEC_I420_10B)
+             || in->i_chroma == VLC_CODEC_I420_10L)
             {
                 *pixel_bytes = 2;
                 return VLC_SUCCESS;
@@ -316,10 +316,17 @@ static int CheckFmt(const video_format_t *in, const video_format_t *out,
     return VLC_EGENERIC;
 }
 
+static const struct vlc_filter_operations filter_upload_ops = {
+    .filter_video = UploadSurface,   .close = vlc_vaapi_CloseChroma,
+};
+
+static const struct vlc_filter_operations filter_download_ops = {
+    .filter_video = DownloadSurface, .close = vlc_vaapi_CloseChroma,
+};
+
 int
-vlc_vaapi_OpenChroma(vlc_object_t *obj)
+vlc_vaapi_OpenChroma(filter_t *filter)
 {
-    filter_t *const     filter = (filter_t *)obj;
     filter_sys_t *      filter_sys;
 
     if (filter->fmt_in.video.i_height != filter->fmt_out.video.i_height
@@ -333,33 +340,42 @@ vlc_vaapi_OpenChroma(vlc_object_t *obj)
                  &pixel_bytes))
         return VLC_EGENERIC;
 
-    filter->pf_video_filter = is_upload ? UploadSurface : DownloadSurface;
+    filter->ops = is_upload ? &filter_upload_ops : &filter_download_ops;
 
     if (!(filter_sys = calloc(1, sizeof(filter_sys_t))))
     {
-        msg_Err(obj, "unable to allocate memory");
+        msg_Err(filter, "unable to allocate memory");
         return VLC_ENOMEM;
     }
     filter_sys->derive_failed = false;
     filter_sys->image_fallback_failed = false;
     if (is_upload)
     {
-        filter_sys->va_inst = vlc_vaapi_FilterHoldInstance(filter,
-                                                           &filter_sys->dpy);
-
-        if (filter_sys->va_inst == NULL)
+        vlc_decoder_device *dec_device = filter_HoldDecoderDeviceType( filter, VLC_DECODER_DEVICE_VAAPI );
+        if (dec_device == NULL)
         {
             free(filter_sys);
             return VLC_EGENERIC;
         }
 
+        filter->vctx_out = vlc_video_context_Create( dec_device, VLC_VIDEO_CONTEXT_VAAPI, 0, NULL );
+        vlc_decoder_device_Release(dec_device);
+        if (!filter->vctx_out)
+        {
+            free(filter_sys);
+            return VLC_EGENERIC;
+        }
+
+        filter_sys->dpy = dec_device->opaque;
+
         filter_sys->dest_pics =
-            vlc_vaapi_PoolNew(obj, filter_sys->va_inst, filter_sys->dpy,
+            vlc_vaapi_PoolNew(VLC_OBJECT(filter), filter->vctx_out, filter_sys->dpy,
                               DEST_PICS_POOL_SZ, &filter_sys->va_surface_ids,
-                              &filter->fmt_out.video, true);
+                              &filter->fmt_out.video);
         if (!filter_sys->dest_pics)
         {
-            vlc_vaapi_FilterReleaseInstance(filter, filter_sys->va_inst);
+            vlc_video_context_Release(filter->vctx_out);
+            filter->vctx_out = NULL;
             free(filter_sys);
             return VLC_EGENERIC;
         }
@@ -368,7 +384,6 @@ vlc_vaapi_OpenChroma(vlc_object_t *obj)
     {
         /* Don't fetch the vaapi instance since it may be not created yet at
          * this point (in case of cpu rendering) */
-        filter_sys->va_inst = NULL;
         filter_sys->dpy = NULL;
         filter_sys->dest_pics = NULL;
     }
@@ -379,14 +394,15 @@ vlc_vaapi_OpenChroma(vlc_object_t *obj)
         if (is_upload)
         {
             picture_pool_Release(filter_sys->dest_pics);
-            vlc_vaapi_FilterReleaseInstance(filter, filter_sys->va_inst);
+            vlc_video_context_Release(filter->vctx_out);
+            filter->vctx_out = NULL;
         }
         free(filter_sys);
         return VLC_EGENERIC;
     }
 
     filter->p_sys = filter_sys;
-    msg_Warn(obj, "Using SW chroma filter for %dx%d %4.4s -> %4.4s",
+    msg_Warn(filter, "Using SW chroma filter for %dx%d %4.4s -> %4.4s",
              filter->fmt_in.video.i_width,
              filter->fmt_in.video.i_height,
              (const char *) &filter->fmt_in.video.i_chroma,
@@ -396,16 +412,15 @@ vlc_vaapi_OpenChroma(vlc_object_t *obj)
 }
 
 void
-vlc_vaapi_CloseChroma(vlc_object_t *obj)
+vlc_vaapi_CloseChroma(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)obj;
     filter_sys_t *const filter_sys = filter->p_sys;
 
     if (filter_sys->dest_pics)
         picture_pool_Release(filter_sys->dest_pics);
-    if (filter_sys->va_inst != NULL)
-        vlc_vaapi_FilterReleaseInstance(filter, filter_sys->va_inst);
     CopyCleanCache(&filter_sys->cache);
+    if (filter->vctx_out)
+        vlc_video_context_Release(filter->vctx_out);
 
     free(filter_sys);
 }

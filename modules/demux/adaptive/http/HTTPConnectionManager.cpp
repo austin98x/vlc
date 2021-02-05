@@ -28,7 +28,7 @@
 #include "HTTPConnectionManager.h"
 #include "HTTPConnection.hpp"
 #include "ConnectionParams.hpp"
-#include "Sockets.hpp"
+#include "Transport.hpp"
 #include "Downloader.hpp"
 #include <vlc_url.h>
 #include <vlc_http.h>
@@ -39,7 +39,7 @@ AbstractConnectionManager::AbstractConnectionManager(vlc_object_t *p_object_)
     : IDownloadRateObserver()
 {
     p_object = p_object_;
-    rateObserver = NULL;
+    rateObserver = nullptr;
 }
 
 AbstractConnectionManager::~AbstractConnectionManager()
@@ -47,7 +47,7 @@ AbstractConnectionManager::~AbstractConnectionManager()
 
 }
 
-void AbstractConnectionManager::updateDownloadRate(const adaptive::ID &sourceid, size_t size, mtime_t time)
+void AbstractConnectionManager::updateDownloadRate(const adaptive::ID &sourceid, size_t size, vlc_tick_t time)
 {
     if(rateObserver)
         rateObserver->updateDownloadRate(sourceid, size, time);
@@ -58,33 +58,25 @@ void AbstractConnectionManager::setDownloadRateObserver(IDownloadRateObserver *o
     rateObserver = obs;
 }
 
-HTTPConnectionManager::HTTPConnectionManager    (vlc_object_t *p_object_, ConnectionFactory *factory_)
-    : AbstractConnectionManager( p_object_ )
-{
-    vlc_mutex_init(&lock);
-    downloader = new (std::nothrow) Downloader();
-    downloader->start();
-    factory = factory_;
-}
 
-HTTPConnectionManager::HTTPConnectionManager    (vlc_object_t *p_object_, AuthStorage *storage)
-    : AbstractConnectionManager( p_object_ )
+HTTPConnectionManager::HTTPConnectionManager    (vlc_object_t *p_object_)
+    : AbstractConnectionManager( p_object_ ),
+      localAllowed(false)
 {
     vlc_mutex_init(&lock);
     downloader = new (std::nothrow) Downloader();
     downloader->start();
-    if(var_InheritBool(p_object, "adaptive-use-access"))
-        factory = new (std::nothrow) StreamUrlConnectionFactory();
-    else
-        factory = new (std::nothrow) ConnectionFactory( storage );
 }
 
 HTTPConnectionManager::~HTTPConnectionManager   ()
 {
     delete downloader;
-    delete factory;
     this->closeAllConnections();
-    vlc_mutex_destroy(&lock);
+    while(!factories.empty())
+    {
+        delete factories.front();
+        factories.pop_front();
+    }
 }
 
 void HTTPConnectionManager::closeAllConnections      ()
@@ -111,23 +103,31 @@ AbstractConnection * HTTPConnectionManager::reuseConnection(ConnectionParams &pa
         if(conn->canReuse(params))
             return conn;
     }
-    return NULL;
+    return nullptr;
 }
 
 AbstractConnection * HTTPConnectionManager::getConnection(ConnectionParams &params)
 {
-    if(unlikely(!factory || !downloader))
-        return NULL;
+    if(unlikely(factories.empty() || !downloader))
+        return nullptr;
+
+    if(params.isLocal())
+    {
+        if(!localAllowed)
+            return nullptr;
+    }
 
     vlc_mutex_lock(&lock);
     AbstractConnection *conn = reuseConnection(params);
     if(!conn)
     {
-        conn = factory->createConnection(p_object, params);
+        for(auto it = factories.begin(); it != factories.end() && !conn; ++it)
+            conn = (*it)->createConnection(p_object, params);
+
         if(!conn)
         {
             vlc_mutex_unlock(&lock);
-            return NULL;
+            return nullptr;
         }
 
         connectionPool.push_back(conn);
@@ -135,7 +135,7 @@ AbstractConnection * HTTPConnectionManager::getConnection(ConnectionParams &para
         if (!conn->prepare(params))
         {
             vlc_mutex_unlock(&lock);
-            return NULL;
+            return nullptr;
         }
     }
 
@@ -156,4 +156,14 @@ void HTTPConnectionManager::cancel(AbstractChunkSource *source)
     HTTPChunkBufferedSource *src = dynamic_cast<HTTPChunkBufferedSource *>(source);
     if(src)
         downloader->cancel(src);
+}
+
+void HTTPConnectionManager::setLocalConnectionsAllowed()
+{
+    localAllowed = true;
+}
+
+void HTTPConnectionManager::addFactory(AbstractConnectionFactory *factory)
+{
+    factories.push_back(factory);
 }

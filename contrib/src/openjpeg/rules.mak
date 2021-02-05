@@ -3,6 +3,10 @@
 OPENJPEG_VERSION := 2.3.0
 OPENJPEG_URL := https://github.com/uclouvain/openjpeg/archive/v$(OPENJPEG_VERSION).tar.gz
 
+ifdef HAVE_WIN32
+DEPS_openjpeg += pthreads $(DEPS_pthreads)
+endif
+
 $(TARBALLS)/openjpeg-v$(OPENJPEG_VERSION).tar.gz:
 	$(call download_pkg,$(OPENJPEG_URL),openjpeg)
 
@@ -23,8 +27,8 @@ endif
 
 .openjpeg: openjpeg toolchain.cmake
 	cd $< && $(HOSTVARS) $(CMAKE) \
-		-DBUILD_SHARED_LIBS:bool=OFF -DBUILD_PKGCONFIG_FILES=ON \
+		-DBUILD_PKGCONFIG_FILES=ON \
 			-DBUILD_CODEC:bool=OFF \
 		.
-	cd $< && $(MAKE) install
+	cd $< && $(CMAKEBUILD) . --target install
 	touch $@

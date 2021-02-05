@@ -40,8 +40,8 @@ using namespace adaptive;
  * http://arxiv.org/abs/1601.06748
  */
 
-#define minimumBufferS (CLOCK_FREQ * 6)  /* Qmin */
-#define bufferTargetS  (CLOCK_FREQ * 30) /* Qmax */
+#define minimumBufferS VLC_TICK_FROM_SEC(6)  /* Qmin */
+#define bufferTargetS  VLC_TICK_FROM_SEC(30) /* Qmax */
 
 NearOptimalContext::NearOptimalContext()
     : buffering_min( minimumBufferS )
@@ -50,32 +50,30 @@ NearOptimalContext::NearOptimalContext()
     , last_download_rate( 0 )
 { }
 
-NearOptimalAdaptationLogic::NearOptimalAdaptationLogic( vlc_object_t *p_obj )
-    : AbstractAdaptationLogic()
+NearOptimalAdaptationLogic::NearOptimalAdaptationLogic(vlc_object_t *obj)
+    : AbstractAdaptationLogic(obj)
     , currentBps( 0 )
     , usedBps( 0 )
-    , p_obj( p_obj )
 {
     vlc_mutex_init(&lock);
 }
 
 NearOptimalAdaptationLogic::~NearOptimalAdaptationLogic()
 {
-    vlc_mutex_destroy(&lock);
 }
 
 BaseRepresentation *
 NearOptimalAdaptationLogic::getNextQualityIndex( BaseAdaptationSet *adaptSet, RepresentationSelector &selector,
-                                                 float gammaP, mtime_t VD, mtime_t Q )
+                                                 float gammaP, float VD, float Q )
 {
-    BaseRepresentation *ret = NULL;
-    BaseRepresentation *prev = NULL;
+    BaseRepresentation *ret = nullptr;
+    BaseRepresentation *prev = nullptr;
     float argmax;
     for(BaseRepresentation *rep = selector.lowest(adaptSet);
                             rep && rep != prev; rep = selector.higher(adaptSet, rep))
     {
         float arg = ( VD * (getUtility(rep) + gammaP) - Q ) / rep->getBandwidth();
-        if(ret == NULL || argmax <= arg)
+        if(ret == nullptr || argmax <= arg)
         {
             ret = rep;
             argmax = arg;
@@ -89,8 +87,13 @@ BaseRepresentation *NearOptimalAdaptationLogic::getNextRepresentation(BaseAdapta
 {
     RepresentationSelector selector(maxwidth, maxheight);
 
-    const float umin = getUtility(selector.lowest(adaptSet));
-    const float umax = getUtility(selector.highest(adaptSet));
+    BaseRepresentation *lowest = selector.lowest(adaptSet);
+    BaseRepresentation *highest = selector.highest(adaptSet);
+    if(lowest == nullptr || highest == nullptr)
+        return nullptr;
+
+    const float umin = getUtility(lowest);
+    const float umax = getUtility(highest);
 
     vlc_mutex_lock(&lock);
 
@@ -107,10 +110,10 @@ BaseRepresentation *NearOptimalAdaptationLogic::getNextRepresentation(BaseAdapta
     vlc_mutex_unlock(&lock);
 
     const float gammaP = 1.0 + (umax - umin) / ((float)ctxcopy.buffering_target / ctxcopy.buffering_min - 1.0);
-    const float Vd = ((float)ctxcopy.buffering_min / CLOCK_FREQ - 1.0) / (umin + gammaP);
+    const float Vd = (secf_from_vlc_tick(ctxcopy.buffering_min) - 1.0) / (umin + gammaP);
 
     BaseRepresentation *m;
-    if(prevRep == NULL) /* Starting */
+    if(prevRep == nullptr) /* Starting */
     {
         m = selector.select(adaptSet, bps);
     }
@@ -118,7 +121,7 @@ BaseRepresentation *NearOptimalAdaptationLogic::getNextRepresentation(BaseAdapta
     {
         /* noted m* */
         m = getNextQualityIndex(adaptSet, selector, gammaP - umin /* umin == Sm, utility = std::log(S/Sm) */,
-                                Vd, (float)ctxcopy.buffering_level / CLOCK_FREQ);
+                                Vd, secf_from_vlc_tick(ctxcopy.buffering_level));
         if(m->getBandwidth() < prevRep->getBandwidth()) /* m*[n] < m*[n-1] */
         {
             BaseRepresentation *mp = selector.select(adaptSet, bps); /* m' */
@@ -178,7 +181,7 @@ unsigned NearOptimalAdaptationLogic::getMaxCurrentBw() const
     return i_max_bitrate;
 }
 
-void NearOptimalAdaptationLogic::updateDownloadRate(const ID &id, size_t dlsize, mtime_t time)
+void NearOptimalAdaptationLogic::updateDownloadRate(const ID &id, size_t dlsize, vlc_tick_t time)
 {
     vlc_mutex_lock(&lock);
     std::map<ID, NearOptimalContext>::iterator it = streams.find(id);
@@ -191,27 +194,31 @@ void NearOptimalAdaptationLogic::updateDownloadRate(const ID &id, size_t dlsize,
     vlc_mutex_unlock(&lock);
 }
 
-void NearOptimalAdaptationLogic::trackerEvent(const SegmentTrackerEvent &event)
+void NearOptimalAdaptationLogic::trackerEvent(const TrackerEvent &ev)
 {
-    switch(event.type)
+    switch(ev.getType())
     {
-    case SegmentTrackerEvent::SWITCHING:
+    case TrackerEvent::Type::RepresentationSwitch:
         {
+            const RepresentationSwitchEvent &event =
+                    static_cast<const RepresentationSwitchEvent &>(ev);
             vlc_mutex_lock(&lock);
-            if(event.u.switching.prev)
-                usedBps -= event.u.switching.prev->getBandwidth();
-            if(event.u.switching.next)
-                usedBps += event.u.switching.next->getBandwidth();
+            if(event.prev)
+                usedBps -= event.prev->getBandwidth();
+            if(event.next)
+                usedBps += event.next->getBandwidth();
                  BwDebug(msg_Info(p_obj, "New total bandwidth usage %zu kBps", (usedBps / 8000)));
             vlc_mutex_unlock(&lock);
         }
         break;
 
-    case SegmentTrackerEvent::BUFFERING_STATE:
+    case TrackerEvent::Type::BufferingStateUpdate:
         {
-            const ID &id = *event.u.buffering.id;
+            const BufferingStateUpdatedEvent &event =
+                    static_cast<const BufferingStateUpdatedEvent &>(ev);
+            const ID &id = *event.id;
             vlc_mutex_lock(&lock);
-            if(event.u.buffering.enabled)
+            if(event.enabled)
             {
                 if(streams.find(id) == streams.end())
                 {
@@ -227,17 +234,19 @@ void NearOptimalAdaptationLogic::trackerEvent(const SegmentTrackerEvent &event)
             }
             vlc_mutex_unlock(&lock);
             BwDebug(msg_Info(p_obj, "Stream %s is now known %sactive", id.str().c_str(),
-                         (event.u.buffering.enabled) ? "" : "in"));
+                         (event.enabled) ? "" : "in"));
         }
         break;
 
-    case SegmentTrackerEvent::BUFFERING_LEVEL_CHANGE:
+    case TrackerEvent::Type::BufferingLevelChange:
         {
-            const ID &id = *event.u.buffering.id;
+            const BufferingLevelChangedEvent &event =
+                    static_cast<const BufferingLevelChangedEvent &>(ev);
+            const ID &id = *event.id;
             vlc_mutex_lock(&lock);
             NearOptimalContext &ctx = streams[id];
-            ctx.buffering_level = event.u.buffering_level.current;
-            ctx.buffering_target = event.u.buffering_level.target;
+            ctx.buffering_level = event.current;
+            ctx.buffering_target = event.target;
             vlc_mutex_unlock(&lock);
         }
         break;

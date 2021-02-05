@@ -31,7 +31,7 @@
 
 static block_t *Encode ( encoder_t *, subpicture_t * );
 
-int OpenEncoder( vlc_object_t *p_this )
+int webvtt_OpenEncoder( vlc_object_t *p_this )
 {
     encoder_t *p_enc = (encoder_t *)p_this;
 
@@ -46,11 +46,31 @@ int OpenEncoder( vlc_object_t *p_this )
 }
 
 
-void CloseEncoder( vlc_object_t *p_this )
+static void WriteText( const char *psz, bo_t *box, char *c_last )
 {
-    (void)p_this;
+    /* We need to break any double newline sequence
+     * in or over segments */
+    while(*psz)
+    {
+        const char *p = strchr( psz, '\n' );
+        if( p )
+        {
+            bo_add_mem( box, p - psz, psz );
+            if( *c_last == '\n' )
+                bo_add_8( box, '!' ); /* Add space */
+            bo_add_8( box, '\n' );
+            *c_last = '\n';
+            psz = p + 1;
+        }
+        else
+        {
+            size_t len = strlen(psz);
+            bo_add_mem( box, len, psz );
+            *c_last = (len > 0) ? psz[len - 1] : '\0';
+            break;
+        }
+    }
 }
-
 
 static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
 {
@@ -81,14 +101,28 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
         bo_add_32be( &box, 0 );
         bo_add_fourcc( &box, "payl" );
 
+        char prevchar = '\0';
         /* This should already be UTF-8 encoded, so not much effort... */
         for( const text_segment_t *p_segment = p_region->p_text;
              p_segment; p_segment = p_segment->p_next )
         {
             if( p_segment->psz_text == NULL )
                 continue;
-            if( p_segment != p_region->p_text )
-                bo_add_8( &box, '\n' );
+
+            if( p_segment->p_ruby )
+            {
+                bo_add_mem( &box, 6, "<ruby>" );
+                for( const text_segment_ruby_t *p_ruby = p_segment->p_ruby;
+                                                p_ruby; p_ruby = p_ruby->p_next )
+                {
+                    WriteText( p_ruby->psz_base, &box, &prevchar );
+                    bo_add_mem( &box, 4, "<rt>" );
+                    WriteText( p_ruby->psz_rt, &box, &prevchar );
+                    bo_add_mem( &box, 5, "</rt>" );
+                }
+                bo_add_mem( &box, 7, "</ruby>" );
+                continue;
+            }
 
             const text_style_t *style = p_segment->style;
             if( style && style->i_features )
@@ -103,7 +137,9 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
                         bo_add_mem( &box, 3, "<i>" );
                 }
             }
-            bo_add_mem( &box, strlen(p_segment->psz_text), p_segment->psz_text );
+
+            WriteText( p_segment->psz_text, &box, &prevchar );
+
             if( style && style->i_features )
             {
                 if( style->i_features & STYLE_HAS_FLAGS )

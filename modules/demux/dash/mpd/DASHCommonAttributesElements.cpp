@@ -28,7 +28,7 @@
 #include "DASHCommonAttributesElements.h"
 
 #include "ContentDescription.h"
-#include "../adaptive/StreamFormat.hpp"
+#include "../../adaptive/StreamFormat.hpp"
 
 #include <vlc_common.h>
 #include <vlc_arrays.h>
@@ -113,7 +113,7 @@ const std::list<ContentDescription*> &DASHCommonAttributesElements::getContentPr
 
 void DASHCommonAttributesElements::addContentProtection(ContentDescription *desc)
 {
-    if ( desc != NULL )
+    if ( desc != nullptr )
         this->contentProtections.push_back( desc );
 }
 

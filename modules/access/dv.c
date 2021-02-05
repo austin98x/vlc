@@ -2,7 +2,6 @@
  * dv.c: Digital video/Firewire input (file: access plug-in)
  *****************************************************************************
  * Copyright (C) 2005 M2X
- * $Id$
  *
  * Authors: Jean-Paul Saman <jpsaman at m2x dot nl>
  *
@@ -92,7 +91,7 @@ static int AVCPlay( stream_t *, int );
 static int AVCPause( stream_t *, int );
 static int AVCStop( stream_t *, int );
 
-struct access_sys_t
+typedef struct
 {
     raw1394handle_t p_avc1394;
     raw1394handle_t p_raw1394;
@@ -108,7 +107,7 @@ struct access_sys_t
     event_thread_t *p_ev;
     vlc_mutex_t lock;
     block_t *p_frame;
-};
+} access_sys_t;
 
 #define ISOCHRONOUS_QUEUE_LENGTH 1000
 #define ISOCHRONOUS_MAX_PACKET_SIZE 4096
@@ -239,7 +238,6 @@ static void Close( vlc_object_t *p_this )
             raw1394_iso_shutdown( p_sys->p_raw1394 );
 
         vlc_join( p_sys->p_ev->thread, NULL );
-        vlc_mutex_destroy( &p_sys->p_ev->lock );
 
         /* Cleanup frame data */
         if( p_sys->p_ev->p_frame )
@@ -257,8 +255,6 @@ static void Close( vlc_object_t *p_this )
         raw1394_destroy_handle( p_sys->p_raw1394 );
 
     AVCClose( p_access );
-
-    vlc_mutex_destroy( &p_sys->lock );
 }
 
 /*****************************************************************************
@@ -282,8 +278,8 @@ static int Control( stream_t *p_access, int i_query, va_list args )
             break;
 
         case STREAM_GET_PTS_DELAY:
-            *va_arg( args, int64_t * ) =
-                INT64_C(1000) * var_InheritInteger( p_access, "live-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS( var_InheritInteger( p_access, "live-caching" ) );
             break;
 
         /* */
@@ -389,7 +385,7 @@ Raw1394Handler(raw1394handle_t handle, unsigned char *data,
             if( p_sys->p_ev->p_frame )
             {
                 /* Push current frame to p_access thread. */
-                //p_sys->p_ev->p_frame->i_pts = mdate();
+                //p_sys->p_ev->p_frame->i_pts = vlc_tick_now();
                 block_ChainAppend( &p_sys->p_frame, p_sys->p_ev->p_frame );
             }
             /* reset list */

@@ -35,7 +35,12 @@ typedef xcb_atom_t Atom;
 #ifdef HAVE_SEARCH_H
 # include <search.h>
 #endif
-#include <poll.h>
+#ifdef HAVE_POLL_H
+# include <poll.h>
+#endif
+#ifdef _WIN32
+# include <winsock2.h>
+#endif
 
 static int  Open (vlc_object_t *);
 static void Close (vlc_object_t *);
@@ -57,7 +62,7 @@ vlc_module_begin ()
     VLC_SD_PROBE_SUBMODULE
 vlc_module_end ()
 
-struct services_discovery_sys_t
+typedef struct
 {
     xcb_connection_t *conn;
     vlc_thread_t      thread;
@@ -66,7 +71,7 @@ struct services_discovery_sys_t
     xcb_window_t      root_window;
     void             *apps;
     input_item_t     *apps_root;
-};
+} services_discovery_sys_t;
 
 static void *Run (void *);
 static void UpdateApps (services_discovery_t *);
@@ -164,7 +169,8 @@ static int Open (vlc_object_t *obj)
     }
 
     p_sys->apps = NULL;
-    p_sys->apps_root = input_item_NewExt("vlc://nop", _("Applications"), -1,
+    p_sys->apps_root = input_item_NewExt(INPUT_ITEM_URI_NOP, _("Applications"),
+                                         INPUT_DURATION_INDEFINITE,
                                          ITEM_TYPE_NODE, ITEM_LOCAL);
     if (likely(p_sys->apps_root != NULL))
         services_discovery_AddItem(sd, p_sys->apps_root);
@@ -329,7 +335,7 @@ static void UpdateApps (services_discovery_t *sd)
         xcb_window_t id = *(ent++);
         struct app *app;
 
-        struct app **pa = tfind (&id, &oldnodes, cmpapp);
+        void **pa = tfind (&id, &oldnodes, cmpapp);
         if (pa != NULL) /* existing entry */
         {
             app = *pa;

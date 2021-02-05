@@ -2,7 +2,6 @@
  * vlc_codecs.h: codec related structures needed by the demuxers and decoders
  *****************************************************************************
  * Copyright (C) 1999-2001 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Gildas Bazin <gbazin@videolan.org>
  *
@@ -43,7 +42,7 @@ typedef struct _GUID
 } GUID, *REFGUID, *LPGUID;
 #endif /* GUID_DEFINED */
 
-typedef GUID guid_t;
+typedef GUID vlc_guid_t;
 
 #ifdef HAVE_ATTRIBUTE_PACKED
 #   define ATTR_PACKED __attribute__((__packed__))
@@ -180,7 +179,7 @@ ATTR_PACKED
 
 #if defined(__SUNPRO_C) || defined(_MSC_VER)
 #   pragma pack()
-#elif defined(__APPLE__) && !HAVE_ATTRIBUTE_PACKED
+#elif defined(__APPLE__) && !defined(HAVE_ATTRIBUTE_PACKED)
 #   pragma pack(pop)
 #endif
 

@@ -61,7 +61,7 @@ static const soxr_datatype_t soxr_resampler_quality_list[] =
 
 static int OpenConverter( vlc_object_t * );
 static int OpenResampler( vlc_object_t * );
-static void Close( vlc_object_t * );
+static void Close( filter_t * );
 
 vlc_module_begin ()
     set_shortname( N_("SoX Resampler") )
@@ -71,24 +71,24 @@ vlc_module_begin ()
                 SOXR_QUALITY_TEXT, NULL, true )
         change_integer_list( soxr_resampler_quality_vlclist,
                              soxr_resampler_quality_vlctext )
-    set_capability ( "audio converter", 0 )
-    set_callbacks( OpenConverter, Close )
+    set_capability ( "audio converter", 51 )
+    set_callback( OpenConverter )
 
     add_submodule()
-    set_capability( "audio resampler", 0 )
-    set_callbacks( OpenResampler, Close )
+    set_capability( "audio resampler", 51 )
+    set_callback( OpenResampler )
     add_shortcut( "soxr" )
 vlc_module_end ()
 
-struct filter_sys_t
+typedef struct
 {
     soxr_t  soxr;
     soxr_t  vr_soxr;
     soxr_t  last_soxr;
     double  f_fixed_ratio;
     size_t  i_last_olen;
-    mtime_t i_last_pts;
-};
+    vlc_tick_t i_last_pts;
+} filter_sys_t;
 
 static block_t *Resample( filter_t *, block_t * );
 static block_t *Drain( filter_t * );
@@ -131,7 +131,7 @@ Open( vlc_object_t *p_obj, bool b_change_ratio )
      || !SoXR_GetFormat( p_filter->fmt_out.audio.i_format, &i_otype ) )
         return VLC_EGENERIC;
 
-    filter_sys_t *p_sys = calloc( 1, sizeof( struct filter_sys_t ) );
+    filter_sys_t *p_sys = calloc( 1, sizeof( filter_sys_t ) );
     if( unlikely( p_sys == NULL ) )
         return VLC_ENOMEM;
 
@@ -167,7 +167,7 @@ Open( vlc_object_t *p_obj, bool b_change_ratio )
      * up a delay).  */
     if( b_change_ratio )
     {
-        soxr_quality_spec_t q_spec = soxr_quality_spec( SOXR_LQ, SOXR_VR );
+        q_spec = soxr_quality_spec( SOXR_LQ, SOXR_VR );
         p_sys->vr_soxr = soxr_create( 1, f_ratio, i_channels,
                                       &error, &io_spec, &q_spec, NULL );
         if( error )
@@ -188,10 +188,15 @@ Open( vlc_object_t *p_obj, bool b_change_ratio )
              (const char *)&p_filter->fmt_out.audio.i_format,
              p_filter->fmt_out.audio.i_rate );
 
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = Resample,
+        .drain_audio = Drain,
+        .flush = Flush,
+        .close = Close,
+    };
+    p_filter->ops = &filter_ops;
     p_filter->p_sys = p_sys;
-    p_filter->pf_audio_filter = Resample;
-    p_filter->pf_flush = Flush;
-    p_filter->pf_audio_drain = Drain;
     return VLC_SUCCESS;
 }
 
@@ -219,9 +224,8 @@ OpenConverter( vlc_object_t *p_obj )
 }
 
 static void
-Close( vlc_object_t *p_obj )
+Close( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_obj;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     soxr_delete( p_sys->soxr );
@@ -239,8 +243,18 @@ SoXR_Resample( filter_t *p_filter, soxr_t soxr, block_t *p_in, size_t i_olen )
     const size_t i_oframesize = p_filter->fmt_out.audio.i_bytes_per_frame;
     const size_t i_ilen = p_in ? p_in->i_nb_samples : 0;
 
-    block_t *p_out = i_ilen >= i_olen ? p_in
-                   : block_Alloc( i_olen * i_oframesize );
+    block_t *p_out;
+    if( i_ilen >= i_olen )
+    {
+        i_olen = i_ilen;
+        p_out = p_in;
+    }
+    else
+    {
+        p_out = block_Alloc( i_olen * i_oframesize );
+        if( p_out == NULL )
+            goto error;
+    }
 
     soxr_error_t error = soxr_process( soxr, p_in ? p_in->p_buffer : NULL,
                                        i_ilen, &i_idone, p_out->p_buffer,
@@ -257,7 +271,7 @@ SoXR_Resample( filter_t *p_filter, soxr_t soxr, block_t *p_in, size_t i_olen )
 
     p_out->i_buffer = i_odone * i_oframesize;
     p_out->i_nb_samples = i_odone;
-    p_out->i_length = i_odone * CLOCK_FREQ / p_filter->fmt_out.audio.i_rate;
+    p_out->i_length = vlc_tick_from_samples(i_odone, p_filter->fmt_out.audio.i_rate);
 
     if( p_in )
     {
@@ -290,7 +304,7 @@ static block_t *
 Resample( filter_t *p_filter, block_t *p_in )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
-    const mtime_t i_pts = p_in->i_pts;
+    const vlc_tick_t i_pts = p_in->i_pts;
 
     if( p_sys->vr_soxr )
     {
@@ -302,12 +316,13 @@ Resample( filter_t *p_filter, block_t *p_in )
         block_t *p_flushed_out = NULL, *p_out = NULL;
         const double f_ratio = p_filter->fmt_out.audio.i_rate
                              / (double) p_filter->fmt_in.audio.i_rate;
-        const size_t i_olen = SoXR_GetOutLen( p_in->i_nb_samples, f_ratio );
+        size_t i_olen = SoXR_GetOutLen( p_in->i_nb_samples,
+            f_ratio > p_sys->f_fixed_ratio ? f_ratio : p_sys->f_fixed_ratio );
 
         if( f_ratio != p_sys->f_fixed_ratio )
         {
             /* using variable resampler */
-            soxr_set_io_ratio( p_sys->vr_soxr, 1 / f_ratio, i_olen );
+            soxr_set_io_ratio( p_sys->vr_soxr, 1 / f_ratio, 0 /* instant change */ );
             soxr = p_sys->vr_soxr;
         }
         else if( f_ratio == 1.0f )
@@ -336,7 +351,7 @@ Resample( filter_t *p_filter, block_t *p_in )
             assert( !p_out );
             p_out = SoXR_Resample( p_filter, soxr, p_in, i_olen );
             if( !p_out )
-                return NULL;
+                goto error;
         }
 
         if( p_flushed_out )
@@ -348,7 +363,7 @@ Resample( filter_t *p_filter, block_t *p_in )
             block_ChainAppend( &p_flushed_out, p_out );
             p_out = block_ChainGather( p_flushed_out );
             if( !p_out )
-                return NULL;
+                goto error;
             p_out->i_nb_samples = i_nb_samples;
         }
         p_out->i_pts = i_pts;
@@ -365,6 +380,9 @@ Resample( filter_t *p_filter, block_t *p_in )
             p_out->i_pts = i_pts;
         return p_out;
     }
+error:
+    block_Release( p_in );
+    return NULL;
 }
 
 static block_t *

@@ -29,7 +29,7 @@
 #include "Segment.h"
 #include "BaseAdaptationSet.h"
 #include "BaseRepresentation.h"
-#include "AbstractPlaylist.hpp"
+#include "BasePlaylist.hpp"
 #include "SegmentChunk.hpp"
 #include "../http/BytesRange.hpp"
 #include "../http/HTTPConnectionManager.h"
@@ -39,35 +39,43 @@
 using namespace adaptive::http;
 using namespace adaptive::playlist;
 
-const int ISegment::SEQUENCE_INVALID = 0;
-const int ISegment::SEQUENCE_FIRST   = 1;
-
 ISegment::ISegment(const ICanonicalUrl *parent):
     ICanonicalUrl( parent ),
     startByte  (0),
     endByte    (0)
 {
     debugName = "Segment";
-    classId = CLASSID_ISEGMENT;
     startTime.Set(0);
     duration.Set(0);
-    chunksuse.Set(0);
-    sequence = SEQUENCE_INVALID;
+    sequence = 0;
     templated = false;
     discontinuity = false;
 }
 
 ISegment::~ISegment()
 {
-    assert(chunksuse.Get() == 0);
 }
 
-void ISegment::onChunkDownload(block_t **, SegmentChunk *, BaseRepresentation *)
+bool ISegment::prepareChunk(SharedResources *res, SegmentChunk *chunk, BaseRepresentation *rep)
 {
+    CommonEncryption enc = encryption;
+    enc.mergeWith(rep->intheritEncryption());
 
+    if(enc.method != CommonEncryption::Method::None)
+    {
+        CommonEncryptionSession *encryptionSession = new CommonEncryptionSession();
+        if(!encryptionSession->start(res, enc))
+        {
+            delete encryptionSession;
+            return false;
+        }
+        chunk->setEncryptionSession(encryptionSession);
+    }
+    return true;
 }
 
-SegmentChunk* ISegment::toChunk(size_t index, BaseRepresentation *rep, AbstractConnectionManager *connManager)
+SegmentChunk* ISegment::toChunk(SharedResources *res, AbstractConnectionManager *connManager,
+                                size_t index, BaseRepresentation *rep)
 {
     const std::string url = getUrlSegment().toString(index, rep);
     HTTPChunkBufferedSource *source = new (std::nothrow) HTTPChunkBufferedSource(url, connManager,
@@ -77,9 +85,16 @@ SegmentChunk* ISegment::toChunk(size_t index, BaseRepresentation *rep, AbstractC
         if(startByte != endByte)
             source->setBytesRange(BytesRange(startByte, endByte));
 
-        SegmentChunk *chunk = new (std::nothrow) SegmentChunk(this, source, rep);
-        if( chunk )
+        SegmentChunk *chunk = createChunk(source, rep);
+        if(chunk)
         {
+            chunk->sequence = index;
+            chunk->discontinuity = discontinuity;
+            if(!prepareChunk(res, chunk, rep))
+            {
+                delete chunk;
+                return nullptr;
+            }
             connManager->start(source);
             return chunk;
         }
@@ -88,7 +103,7 @@ SegmentChunk* ISegment::toChunk(size_t index, BaseRepresentation *rep, AbstractC
             delete source;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 bool ISegment::isTemplate() const
@@ -104,7 +119,7 @@ void ISegment::setByteRange(size_t start, size_t end)
 
 void ISegment::setSequenceNumber(uint64_t seq)
 {
-    sequence = SEQUENCE_FIRST + seq;
+    sequence = seq;
 }
 
 uint64_t ISegment::getSequenceNumber() const
@@ -126,7 +141,7 @@ void ISegment::debug(vlc_object_t *obj, int indent) const
     if(startByte!=endByte)
         ss << " @" << startByte << ".." << endByte;
     if(startTime.Get() > 0)
-    	 ss << " stime " << startTime.Get();
+        ss << " stime " << startTime.Get();
     ss << " duration " << duration.Get();
     msg_Dbg(obj, "%s", ss.str().c_str());
 }
@@ -162,16 +177,20 @@ int ISegment::compare(ISegment *other) const
     return 0;
 }
 
-int ISegment::getClassId() const
+void ISegment::setEncryption(CommonEncryption &e)
 {
-    return classId;
+    encryption = e;
 }
 
 Segment::Segment(ICanonicalUrl *parent) :
         ISegment(parent)
 {
-    size = -1;
-    classId = CLASSID_SEGMENT;
+}
+
+SegmentChunk* Segment::createChunk(AbstractChunkSource *source, BaseRepresentation *rep)
+{
+     /* act as factory */
+    return new (std::nothrow) SegmentChunk(source, rep);
 }
 
 void Segment::addSubSegment(SubSegment *subsegment)
@@ -180,15 +199,14 @@ void Segment::addSubSegment(SubSegment *subsegment)
     {
         /* Use our own sequence number, and since it it now
            uneffective, also for next subsegments numbering */
-        subsegment->setSequenceNumber(getSequenceNumber());
-        setSequenceNumber(getSequenceNumber());
+        subsegment->setSequenceNumber(subsegments.size());
     }
     subsegments.push_back(subsegment);
 }
 
 Segment::~Segment()
 {
-    std::vector<SubSegment*>::iterator it;
+    std::vector<Segment*>::iterator it;
     for(it=subsegments.begin();it!=subsegments.end();++it)
         delete *it;
 }
@@ -210,7 +228,7 @@ void Segment::debug(vlc_object_t *obj, int indent) const
         std::string text(indent, ' ');
         text.append("Segment");
         msg_Dbg(obj, "%s", text.c_str());
-        std::vector<SubSegment *>::const_iterator l;
+        std::vector<Segment *>::const_iterator l;
         for(l = subsegments.begin(); l != subsegments.end(); ++l)
             (*l)->debug(obj, indent + 1);
     }
@@ -231,57 +249,28 @@ Url Segment::getUrlSegment() const
     }
 }
 
-std::vector<ISegment*> Segment::subSegments()
+const std::vector<Segment*> & Segment::subSegments() const
 {
-    std::vector<ISegment*> list;
-    if(!subsegments.empty())
-    {
-        std::vector<SubSegment*>::iterator it;
-        for(it=subsegments.begin();it!=subsegments.end();++it)
-            list.push_back(*it);
-    }
-    else
-    {
-        list.push_back(this);
-    }
-    return list;
+    return subsegments;
 }
 
 InitSegment::InitSegment(ICanonicalUrl *parent) :
     Segment(parent)
 {
     debugName = "InitSegment";
-    classId = CLASSID_INITSEGMENT;
 }
 
 IndexSegment::IndexSegment(ICanonicalUrl *parent) :
     Segment(parent)
 {
     debugName = "IndexSegment";
-    classId = CLASSID_INDEXSEGMENT;
 }
 
-SubSegment::SubSegment(ISegment *main, size_t start, size_t end) :
-    ISegment(main)
+SubSegment::SubSegment(Segment *main, size_t start, size_t end) :
+    Segment(main)
 {
     setByteRange(start, end);
     debugName = "SubSegment";
-    classId = CLASSID_SUBSEGMENT;
 }
 
-Url SubSegment::getUrlSegment() const
-{
-    return getParentUrlSegment();
-}
 
-std::vector<ISegment*> SubSegment::subSegments()
-{
-    std::vector<ISegment*> list;
-    list.push_back(this);
-    return list;
-}
-
-void SubSegment::addSubSegment(SubSegment *)
-{
-
-}

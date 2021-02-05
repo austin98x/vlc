@@ -2,7 +2,6 @@
  * aes3.c: aes3 decoder/packetizer module
  *****************************************************************************
  * Copyright (C) 2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@videolan.org>
  *
@@ -38,7 +37,6 @@
  *****************************************************************************/
 static int  OpenDecoder   ( vlc_object_t * );
 static int  OpenPacketizer( vlc_object_t * );
-static void Close         ( vlc_object_t * );
 
 vlc_module_begin ()
 
@@ -46,25 +44,25 @@ vlc_module_begin ()
     set_subcategory( SUBCAT_INPUT_ACODEC )
     set_description( N_("AES3/SMPTE 302M audio decoder") )
     set_capability( "audio decoder", 100 )
-    set_callbacks( OpenDecoder, Close )
+    set_callback( OpenDecoder )
 
     add_submodule ()
     set_description( N_("AES3/SMPTE 302M audio packetizer") )
     set_capability( "packetizer", 100 )
-    set_callbacks( OpenPacketizer, Close )
+    set_callback( OpenPacketizer )
 
 vlc_module_end ()
 
 /*****************************************************************************
  * decoder_sys_t : aes3 decoder descriptor
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
     /*
      * Output properties
      */
     date_t end_date;
-};
+} decoder_sys_t;
 
 #define AES3_HEADER_LEN 4
 
@@ -94,15 +92,6 @@ static int OpenPacketizer( vlc_object_t *p_this )
     decoder_t *p_dec = (decoder_t*)p_this;
 
     return Open( p_dec, true );
-}
-
-/*****************************************************************************
- * Close : aes3 decoder destruction
- *****************************************************************************/
-static void Close( vlc_object_t *p_this )
-{
-    decoder_t *p_dec = (decoder_t*)p_this;
-    free( p_dec->p_sys );
 }
 
 static const uint8_t reverse[256] = {
@@ -231,7 +220,7 @@ static void Flush( decoder_t *p_dec )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    date_Set( &p_sys->end_date, 0 );
+    date_Set( &p_sys->end_date, VLC_TICK_INVALID );
 }
 
 /*****************************************************************************
@@ -272,14 +261,13 @@ static int Open( decoder_t *p_dec, bool b_packetizer )
         return VLC_EGENERIC;
 
     /* Allocate the memory needed to store the decoder's structure */
-    p_dec->p_sys = p_sys = malloc( sizeof(decoder_sys_t) );
+    p_sys = vlc_obj_malloc( VLC_OBJECT(p_dec), sizeof(*p_sys) );
 
     if( unlikely( !p_sys ) )
         return VLC_EGENERIC;
 
     /* Misc init */
     date_Init( &p_sys->end_date, 48000, 1 );
-    date_Set( &p_sys->end_date, 0 );
 
     /* Set output properties */
     p_dec->fmt_out.audio.i_rate = 48000;
@@ -289,7 +277,6 @@ static int Open( decoder_t *p_dec, bool b_packetizer )
     {
         p_dec->fmt_out.i_codec = VLC_CODEC_302M;
 
-        p_dec->pf_decode       = NULL;
         p_dec->pf_packetize    = Packetize;
     }
     else
@@ -298,9 +285,9 @@ static int Open( decoder_t *p_dec, bool b_packetizer )
         p_dec->fmt_out.audio.i_bitspersample = 16;
 
         p_dec->pf_decode    = Decode;
-        p_dec->pf_packetize = NULL;
     }
     p_dec->pf_flush            = Flush;
+    p_dec->p_sys = p_sys;
     return VLC_SUCCESS;
 }
 
@@ -340,13 +327,13 @@ static block_t * Parse( decoder_t *p_dec, int *pi_frame_length, int *pi_bits,
     }
 
     /* Date management */
-    if( p_block->i_pts > VLC_TS_INVALID &&
+    if( p_block->i_pts != VLC_TICK_INVALID &&
         p_block->i_pts != date_Get( &p_sys->end_date ) )
     {
         date_Set( &p_sys->end_date, p_block->i_pts );
     }
 
-    if( !date_Get( &p_sys->end_date ) )
+    if( date_Get( &p_sys->end_date ) == VLC_TICK_INVALID )
     {
         /* We've just started the stream, wait for the first PTS. */
         block_Release( p_block );

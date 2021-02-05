@@ -43,11 +43,7 @@ RepresentationSelector::~RepresentationSelector()
 BaseRepresentation * RepresentationSelector::lowest(BaseAdaptationSet *adaptSet) const
 {
     std::vector<BaseRepresentation *> reps = adaptSet->getRepresentations();
-    /* No maxsize check here */
-    BaseRepresentation *rep = (reps.empty()) ? NULL : *(reps.begin());
-    if(rep && rep->getWidth() <= maxwidth && rep->getHeight() <= maxheight)
-        return rep;
-    return NULL;
+    return (reps.empty()) ? nullptr : *(reps.begin());
 }
 
 BaseRepresentation * RepresentationSelector::highest(BaseAdaptationSet *adaptSet) const
@@ -60,7 +56,7 @@ BaseRepresentation * RepresentationSelector::highest(BaseAdaptationSet *adaptSet
         if( (*it)->getWidth() <= maxwidth && (*it)->getHeight() <= maxheight )
             return *it;
     }
-    return NULL;
+    return lowest(adaptSet);
 }
 
 BaseRepresentation * RepresentationSelector::higher(BaseAdaptationSet *adaptSet, BaseRepresentation *rep) const
@@ -88,34 +84,25 @@ BaseRepresentation * RepresentationSelector::select(BaseAdaptationSet *adaptSet)
 }
 BaseRepresentation * RepresentationSelector::select(BaseAdaptationSet *adaptSet, uint64_t bitrate) const
 {
-    if (adaptSet == NULL)
-        return NULL;
+    if (adaptSet == nullptr)
+        return nullptr;
 
-    BaseRepresentation *best = NULL;
     std::vector<BaseRepresentation *> reps = adaptSet->getRepresentations();
-    BaseRepresentation *candidate = select(reps, (best)?best->getBandwidth():0, bitrate);
-    if (candidate)
-    {
-        if (candidate->getBandwidth() > bitrate) /* none matched, returned lowest */
-            return candidate;
-        best = candidate;
-    }
-
-    return best;
+    return select(reps, 0, bitrate);
 }
 
 BaseRepresentation * RepresentationSelector::select(std::vector<BaseRepresentation *>& reps,
                                                 uint64_t minbitrate, uint64_t maxbitrate) const
 {
-    BaseRepresentation  *candidate = NULL, *lowest = NULL;
+    BaseRepresentation  *candidate = nullptr, *lowest = nullptr;
     std::vector<BaseRepresentation *>::const_iterator repIt;
     for(repIt=reps.begin(); repIt!=reps.end(); ++repIt)
     {
-        if( (*repIt)->getWidth() > maxwidth || (*repIt)->getHeight() > maxheight )
-            continue;
-
         if ( !lowest || (*repIt)->getBandwidth() < lowest->getBandwidth())
             lowest = *repIt;
+
+        if( (*repIt)->getWidth() > maxwidth || (*repIt)->getHeight() > maxheight )
+            continue;
 
         if ( (*repIt)->getBandwidth() < maxbitrate &&
              (*repIt)->getBandwidth() > minbitrate )

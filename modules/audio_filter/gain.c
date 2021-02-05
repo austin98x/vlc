@@ -41,15 +41,15 @@
  *****************************************************************************/
 
 static int      Open        ( vlc_object_t * );
-static void     Close       ( vlc_object_t * );
+static void     Close       ( filter_t * );
 static block_t  *Process    ( filter_t *, block_t * );
 
-struct filter_sys_t
+typedef struct
 {
     audio_volume_t volume;
     float f_gain;
     module_t *module;
-};
+} filter_sys_t;
 
 /*****************************************************************************
  * Module descriptor
@@ -68,7 +68,7 @@ vlc_module_begin()
                GAIN_VALUE_LONGTEXT, false )
 
     set_capability( "audio filter", 0 )
-    set_callbacks( Open, Close )
+    set_callback( Open )
 vlc_module_end()
 
 
@@ -89,15 +89,20 @@ static int Open( vlc_object_t *p_this )
     if( p_sys->module == NULL )
     {
         msg_Warn( p_filter, "unsupported format" );
-        vlc_object_release( &p_sys->volume );
+        vlc_object_delete(&p_sys->volume);
         return VLC_EGENERIC;
     }
 
-    p_sys->f_gain = var_InheritFloat( p_filter->obj.parent, "gain-value" );
+    p_sys->f_gain = var_InheritFloat( vlc_object_parent(p_filter),
+                                      "gain-value" );
     msg_Dbg( p_filter, "gain multiplier sets to %.2fx", p_sys->f_gain );
 
     p_filter->fmt_out.audio = p_filter->fmt_in.audio;
-    p_filter->pf_audio_filter = Process;
+
+    static const struct vlc_filter_operations filter_ops =
+        { .filter_audio = Process, .close = Close };
+    p_filter->ops = &filter_ops;
+
     return VLC_SUCCESS;
 }
 
@@ -119,11 +124,10 @@ static block_t *Process( filter_t *p_filter, block_t *p_block )
  * Close: close filter
  *****************************************************************************/
 
-static void Close( vlc_object_t *p_this )
+static void Close( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t*)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     module_unneed( &p_sys->volume, p_sys->module );
-    vlc_object_release( &p_sys->volume );
+    vlc_object_delete(&p_sys->volume);
 }

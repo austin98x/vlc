@@ -47,6 +47,7 @@ int MediaCodecNdk_Init(mc_api*);
 
 /* MediaCodec only QUIRKS */
 #define MC_API_VIDEO_QUIRKS_ADAPTIVE 0x1000
+#define MC_API_VIDEO_QUIRKS_IGNORE_SIZE 0x2000
 
 struct mc_api_out
 {
@@ -60,7 +61,7 @@ struct mc_api_out
         struct
         {
             int i_index;
-            mtime_t i_ts;
+            vlc_tick_t i_ts;
             const uint8_t *p_ptr;
             size_t i_size;
         } buf;
@@ -116,7 +117,7 @@ struct mc_api
     enum es_format_category_e i_cat;
     vlc_fourcc_t    i_codec;
 
-    /* Set after configure */
+    /* Set after prepare */
     int  i_quirks;
     char *psz_name;
     bool b_support_rotation;
@@ -125,8 +126,9 @@ struct mc_api
     bool b_direct_rendering;
 
     void (*clean)(mc_api *);
-    int (*configure)(mc_api *, int i_profile);
-    int (*start)(mc_api *, union mc_api_args *p_args);
+    int (*prepare)(mc_api *, int i_profile);
+    int (*configure_decoder)(mc_api *, union mc_api_args* p_args);
+    int (*start)(mc_api *);
     int (*stop)(mc_api *);
     int (*flush)(mc_api *);
 
@@ -136,13 +138,13 @@ struct mc_api
      * - MC_API_INFO_OUTPUT_FORMAT_CHANGED if output format changed
      * - MC_API_INFO_OUTPUT_BUFFERS_CHANGED if buffers changed
      * - MC_API_ERROR in case of error. */
-    int (*dequeue_in)(mc_api *, mtime_t i_timeout);
-    int (*dequeue_out)(mc_api *, mtime_t i_timeout);
+    int (*dequeue_in)(mc_api *, vlc_tick_t i_timeout);
+    int (*dequeue_out)(mc_api *, vlc_tick_t i_timeout);
 
     /* i_index is the index returned by dequeue_in and should be >= 0
      * Returns 0 if buffer is successfully queued, or MC_API_ERROR */
     int (*queue_in)(mc_api *, int i_index, const void *p_buf, size_t i_size,
-                    mtime_t i_ts, bool b_config);
+                    vlc_tick_t i_ts, bool b_config);
 
     /* i_index is the index returned by dequeue_out and should be >= 0,
      * MC_API_INFO_OUTPUT_FORMAT_CHANGED, or MC_API_INFO_OUTPUT_BUFFERS_CHANGED.

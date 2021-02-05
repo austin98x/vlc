@@ -2,7 +2,6 @@
  * antiflicker.c : antiflicker video effect plugin for vlc
  *****************************************************************************
  * Copyright (C) 2000-2011 VLC authors and VideoLAN
- * $Id:
  *
  * Authors: Dharani Prabhu <dharani.prabhu.s@gmail.com>
  *
@@ -41,13 +40,12 @@
  * Local prototypes
  *****************************************************************************/
 static int GetLuminanceAvg( picture_t * p_pic );
-static picture_t *Filter( filter_t *, picture_t * );
 static int AntiFlickerCallback( vlc_object_t *p_this, char const *psz_var,
                            vlc_value_t oldval, vlc_value_t newval,
                            void *p_data );
 
-static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
+static int  Create    ( filter_t * );
+VIDEO_FILTER_WRAPPER_CLOSE( Filter, Destroy )
 
 #define WINDOW_TEXT N_("Window size")
 #define WINDOW_LONGTEXT N_("Number of frames (0 to 100)")
@@ -67,7 +65,6 @@ static void Destroy   ( vlc_object_t * );
 vlc_module_begin ()
     set_description( N_("Antiflicker video filter") )
     set_shortname( N_( "antiflicker" ))
-    set_capability( "video filter", 0 )
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
@@ -78,7 +75,7 @@ vlc_module_begin ()
         SFTN_TEXT, SFTN_LONGTEXT, false )
 
     add_shortcut( "antiflicker" )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -87,26 +84,25 @@ vlc_module_end ()
  * This structure is part of the video output thread descriptor.
  * It describes the Distort specific properties of an output thread.
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     atomic_int i_window_size;
     atomic_int i_softening;
     int ia_luminance_data[MAX_WINDOW_SZ];
     uint8_t *p_old_data;
-};
+} filter_sys_t;
 
 /*****************************************************************************
  * Create: allocates Distort video thread output method
  *****************************************************************************
  * This function allocates and initializes a Distort vout method.
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     switch( p_filter->fmt_in.video.i_chroma )
     {
         CASE_PLANAR_YUV
+            assert(p_filter->vctx_in == NULL);
             break;
 
         default:
@@ -116,37 +112,38 @@ static int Create( vlc_object_t *p_this )
     }
 
     /* Allocate structure */
-    p_filter->p_sys = malloc( sizeof( *p_filter->p_sys ) );
-    if( p_filter->p_sys == NULL )
+    filter_sys_t *p_sys = malloc( sizeof( filter_sys_t ) );
+    if( p_sys == NULL )
         return VLC_ENOMEM;
+    p_filter->p_sys = p_sys;
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
 
     /* Initialize the arguments */
-    atomic_init( &p_filter->p_sys->i_window_size,
+    atomic_init( &p_sys->i_window_size,
                 var_CreateGetIntegerCommand( p_filter,
                                              FILTER_PREFIX"window-size" ) );
-    atomic_init( &p_filter->p_sys->i_softening,
+    atomic_init( &p_sys->i_softening,
                  var_CreateGetIntegerCommand( p_filter,
                                              FILTER_PREFIX"softening-size" ) );
 
-    p_filter->p_sys->p_old_data = calloc( p_filter->fmt_in.video.i_width *
-     (p_filter->fmt_in.video.i_height+1),sizeof(*p_filter->p_sys->p_old_data) );
+    p_sys->p_old_data = calloc( p_filter->fmt_in.video.i_width *
+     (p_filter->fmt_in.video.i_height+1),sizeof(*p_sys->p_old_data) );
 
-    if( p_filter->p_sys->p_old_data == NULL )
+    if( p_sys->p_old_data == NULL )
     {
-        free( p_filter->p_sys );
+        free( p_sys );
         return VLC_ENOMEM;
     }
 
-    memset( p_filter->p_sys->ia_luminance_data, 0,
-                    sizeof(p_filter->p_sys->ia_luminance_data) );
-    p_filter->p_sys->ia_luminance_data[p_filter->p_sys->i_window_size - 1] = 256;
+    memset( p_sys->ia_luminance_data, 0,
+                    sizeof(p_sys->ia_luminance_data) );
+    p_sys->ia_luminance_data[p_sys->i_window_size - 1] = 256;
 
     var_AddCallback(p_filter,FILTER_PREFIX "window-size",
-        AntiFlickerCallback, p_filter->p_sys);
+        AntiFlickerCallback, p_sys);
     var_AddCallback(p_filter,FILTER_PREFIX "softening-size",
-        AntiFlickerCallback, p_filter->p_sys);
+        AntiFlickerCallback, p_sys);
 
     return VLC_SUCCESS;
 }
@@ -156,16 +153,16 @@ static int Create( vlc_object_t *p_this )
  *****************************************************************************
  * Terminate an output method created by DistortCreateOutputMethod
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     var_DelCallback(p_filter,FILTER_PREFIX "window-size",
-        AntiFlickerCallback, p_filter->p_sys);
+        AntiFlickerCallback, p_sys);
     var_DelCallback(p_filter,FILTER_PREFIX "softening-size",
-        AntiFlickerCallback, p_filter->p_sys);
-    free(p_filter->p_sys->p_old_data);
-    free( p_filter->p_sys );
+        AntiFlickerCallback, p_sys);
+    free( p_sys->p_old_data );
+    free( p_sys );
 }
 
 /*****************************************************************************
@@ -200,21 +197,15 @@ static int GetLuminanceAvg( picture_t *p_pic )
  * The function uses moving average of past frames to adjust the luminance
  * of current frame also applies temporaral smoothening if enabled.
  *****************************************************************************/
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
 {
-    if( !p_pic ) return NULL;
-
-    picture_t *p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        picture_Release( p_pic );
-        return NULL;
-    }
 
     /****************** Get variables *************************/
 
-    int i_window_size = atomic_load( &p_filter->p_sys->i_window_size );
-    int i_softening = atomic_load( &p_filter->p_sys->i_softening );
+    filter_sys_t *p_sys = p_filter->p_sys;
+
+    int i_window_size = atomic_load( &p_sys->i_window_size );
+    int i_softening = atomic_load( &p_sys->i_softening );
 
     uint8_t *p_yplane_in = p_pic->p[Y_PLANE].p_pixels;
     uint8_t *p_yplane_out = p_outpic->p[Y_PLANE].p_pixels;
@@ -231,9 +222,9 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
     /*Identify as scene change if the luminance average deviates
      more than the threshold value or if it is the first frame*/
 
-    if( abs(lum_avg - p_filter->p_sys->
+    if( abs(lum_avg - p_sys->
         ia_luminance_data[i_window_size - 1]) > SCENE_CHANGE_THRESHOLD
-        || p_filter->p_sys->ia_luminance_data[i_window_size - 1] == 256)
+        || p_sys->ia_luminance_data[i_window_size - 1] == 256)
     {
         scene_changed = true;
     }
@@ -242,24 +233,24 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
     {
         //reset the luminance data
         for (int i = 0; i < i_window_size; ++i)
-            p_filter->p_sys->ia_luminance_data[i] = lum_avg;
+            p_sys->ia_luminance_data[i] = lum_avg;
         plane_CopyPixels( &p_outpic->p[Y_PLANE], &p_pic->p[Y_PLANE] );
     }
     else
     {
         /******* Compute the adjustment factor using moving average ********/
         for (int i = 0; i < i_window_size-1 ; ++i)
-            p_filter->p_sys->ia_luminance_data[i] =
-                           p_filter->p_sys->ia_luminance_data[i+1];
+            p_sys->ia_luminance_data[i] =
+                           p_sys->ia_luminance_data[i+1];
 
-        p_filter->p_sys->ia_luminance_data[i_window_size - 1] = lum_avg;
+        p_sys->ia_luminance_data[i_window_size - 1] = lum_avg;
 
         float scale = 1.0;
         if (lum_avg > 0)
         {
              float filt = 0;
              for (int i = 0; i < i_window_size; i++)
-                  filt += (float) p_filter->p_sys->ia_luminance_data[i];
+                  filt += (float) p_sys->ia_luminance_data[i];
              scale = filt/(i_window_size*lum_avg);
         }
 
@@ -286,11 +277,11 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 
     if (scene_changed || i_softening == 0)
     {
-       return CopyInfoAndRelease( p_outpic, p_pic );
+       return;
     }
 
     /******* Temporal softening phase. Adapted from code by Steven Don ******/
-    uint8_t *p_yplane_out_old = p_filter->p_sys->p_old_data;
+    uint8_t *p_yplane_out_old = p_sys->p_old_data;
     int i_video_width = p_filter->fmt_in.video.i_width;
 
     for( int i_line = 0 ; i_line < i_num_lines ; i_line++ )
@@ -316,8 +307,6 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
                 p_yplane_out_old[i_line*i_video_width+i_col];
         }
     }
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }
 
 /*****************************************************************************

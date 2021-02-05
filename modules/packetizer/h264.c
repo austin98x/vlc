@@ -2,7 +2,6 @@
  * h264.c: h264/avc video packetizer
  *****************************************************************************
  * Copyright (C) 2001, 2002, 2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Eric Petit <titer@videolan.org>
@@ -69,7 +68,7 @@ vlc_module_end ()
  * Local prototypes
  ****************************************************************************/
 
-struct decoder_sys_t
+typedef struct
 {
     /* */
     packetizer_t packetizer;
@@ -114,23 +113,24 @@ struct decoder_sys_t
     int i_next_block_flags;
     bool b_recovered;
     unsigned i_recoveryfnum;
+    unsigned i_recoverystartfnum;
 
     /* POC */
     h264_poc_context_t pocctx;
     struct
     {
-        mtime_t pts;
+        vlc_tick_t pts;
         int num;
     } prevdatedpoc;
 
-    mtime_t i_frame_pts;
-    mtime_t i_frame_dts;
+    vlc_tick_t i_frame_pts;
+    vlc_tick_t i_frame_dts;
 
     date_t dts;
 
     /* */
     cc_storage_t *p_ccs;
-};
+} decoder_sys_t;
 
 #define BLOCK_FLAG_PRIVATE_AUD (1 << BLOCK_FLAG_PRIVATE_SHIFT)
 #define BLOCK_FLAG_PRIVATE_SEI (2 << BLOCK_FLAG_PRIVATE_SHIFT)
@@ -144,6 +144,7 @@ static void PacketizeFlush( decoder_t * );
 static void PacketizeReset( void *p_private, bool b_broken );
 static block_t *PacketizeParse( void *p_private, bool *pb_ts_used, block_t * );
 static int PacketizeValidate( void *p_private, block_t * );
+static block_t * PacketizeDrain( void *p_private );
 
 static block_t *ParseNALBlock( decoder_t *, bool *pb_ts_used, block_t * );
 
@@ -210,26 +211,30 @@ static void ActivateSets( decoder_t *p_dec, const h264_sequence_parameter_set_t 
             p_dec->fmt_out.video.i_sar_den = p_sps->vui.i_sar_den;
         }
 
-        if( p_sps->vui.b_valid )
+        if( !p_dec->fmt_out.video.i_frame_rate ||
+            !p_dec->fmt_out.video.i_frame_rate_base )
         {
-            if( !p_dec->fmt_in.video.i_frame_rate_base &&
-                p_sps->vui.i_num_units_in_tick > 0 && p_sps->vui.i_time_scale > 1 )
+            /* on first run == if fmt_in does not provide frame rate info */
+            /* If we have frame rate info in the stream */
+            if(p_sps->vui.b_valid &&
+               p_sps->vui.i_num_units_in_tick > 0 &&
+               p_sps->vui.i_time_scale > 1 )
             {
-                const unsigned i_rate_base = p_sps->vui.i_num_units_in_tick;
-                const unsigned i_rate = p_sps->vui.i_time_scale >> 1; /* num_clock_ts == 2 */
-                if( i_rate_base != p_dec->fmt_out.video.i_frame_rate_base ||
-                    i_rate != p_dec->fmt_out.video.i_frame_rate )
-                {
-                    p_dec->fmt_out.video.i_frame_rate_base = i_rate_base;
-                    p_dec->fmt_out.video.i_frame_rate = i_rate;
-                    date_Change( &p_sys->dts, p_sps->vui.i_time_scale, p_sps->vui.i_num_units_in_tick );
-                }
+                date_Change( &p_sys->dts, p_sps->vui.i_time_scale,
+                                          p_sps->vui.i_num_units_in_tick );
             }
-            if( p_dec->fmt_in.video.primaries == COLOR_PRIMARIES_UNDEF )
-                h264_get_colorimetry( p_sps, &p_dec->fmt_out.video.primaries,
-                                      &p_dec->fmt_out.video.transfer,
-                                      &p_dec->fmt_out.video.space,
-                                      &p_dec->fmt_out.video.b_color_range_full );
+            /* else use the default num/den */
+            p_dec->fmt_out.video.i_frame_rate = p_sys->dts.i_divider_num >> 1; /* num_clock_ts == 2 */
+            p_dec->fmt_out.video.i_frame_rate_base = p_sys->dts.i_divider_den;
+        }
+
+        if( p_dec->fmt_in.video.primaries == COLOR_PRIMARIES_UNDEF &&
+            p_sps->vui.b_valid )
+        {
+            h264_get_colorimetry( p_sps, &p_dec->fmt_out.video.primaries,
+                                  &p_dec->fmt_out.video.transfer,
+                                  &p_dec->fmt_out.video.space,
+                                  &p_dec->fmt_out.video.color_range );
         }
 
         if( p_dec->fmt_out.i_extra == 0 && p_pps )
@@ -326,14 +331,15 @@ static int Open( vlc_object_t *p_this )
     p_sys->p_ccs = cc_storage_new();
     if( unlikely(!p_sys->p_ccs) )
     {
-        free( p_dec->p_sys );
+        free( p_sys );
         return VLC_ENOMEM;
     }
 
     packetizer_Init( &p_sys->packetizer,
                      p_h264_startcode, sizeof(p_h264_startcode), startcode_FindAnnexB,
                      p_h264_startcode, 1, 5,
-                     PacketizeReset, PacketizeParse, PacketizeValidate, p_dec );
+                     PacketizeReset, PacketizeParse, PacketizeValidate, PacketizeDrain,
+                     p_dec );
 
     p_sys->b_slice = false;
     p_sys->frame.p_head = NULL;
@@ -362,16 +368,15 @@ static int Open( vlc_object_t *p_this )
     p_sys->i_next_block_flags = 0;
     p_sys->b_recovered = false;
     p_sys->i_recoveryfnum = UINT_MAX;
-    p_sys->i_frame_dts = VLC_TS_INVALID;
-    p_sys->i_frame_pts = VLC_TS_INVALID;
+    p_sys->i_frame_dts = VLC_TICK_INVALID;
+    p_sys->i_frame_pts = VLC_TICK_INVALID;
     p_sys->i_dpb_output_delay = 0;
 
     /* POC */
     h264_poc_context_init( &p_sys->pocctx );
-    p_sys->prevdatedpoc.pts = VLC_TS_INVALID;
+    p_sys->prevdatedpoc.pts = VLC_TICK_INVALID;
 
     date_Init( &p_sys->dts, 30000 * 2, 1001 );
-    date_Set( &p_sys->dts, VLC_TS_INVALID );
 
     /* Setup properties */
     es_format_Copy( &p_dec->fmt_out, &p_dec->fmt_in );
@@ -518,7 +523,8 @@ static block_t *PacketizeAVC1( decoder_t *p_dec, block_t **pp_block )
  *****************************************************************************/
 static block_t *GetCc( decoder_t *p_dec, decoder_cc_desc_t *p_desc )
 {
-    return cc_storage_get_current( p_dec->p_sys->p_ccs, p_desc );
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    return cc_storage_get_current( p_sys->p_ccs, p_desc );
 }
 
 /****************************************************************************
@@ -526,8 +532,8 @@ static block_t *GetCc( decoder_t *p_dec, decoder_cc_desc_t *p_desc )
  ****************************************************************************/
 static void ResetOutputVariables( decoder_sys_t *p_sys )
 {
-    p_sys->i_frame_dts = VLC_TS_INVALID;
-    p_sys->i_frame_pts = VLC_TS_INVALID;
+    p_sys->i_frame_dts = VLC_TICK_INVALID;
+    p_sys->i_frame_pts = VLC_TICK_INVALID;
     p_sys->slice.type = H264_SLICE_TYPE_UNKNOWN;
     p_sys->b_new_sps = false;
     p_sys->b_new_pps = false;
@@ -538,25 +544,25 @@ static void ResetOutputVariables( decoder_sys_t *p_sys )
     p_sys->i_recovery_frame_cnt = UINT_MAX;
 }
 
-static void PacketizeReset( void *p_private, bool b_broken )
+static void PacketizeReset( void *p_private, bool b_flush )
 {
     decoder_t *p_dec = p_private;
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    if( b_broken || !p_sys->b_slice )
+    if( b_flush || !p_sys->b_slice )
     {
         DropStoredNAL( p_sys );
         ResetOutputVariables( p_sys );
         p_sys->p_active_pps = NULL;
         p_sys->p_active_sps = NULL;
+        p_sys->b_recovered = false;
+        p_sys->i_recoveryfnum = UINT_MAX;
         /* POC */
         h264_poc_context_init( &p_sys->pocctx );
-        p_sys->prevdatedpoc.pts = VLC_TS_INVALID;
+        p_sys->prevdatedpoc.pts = VLC_TICK_INVALID;
     }
     p_sys->i_next_block_flags = BLOCK_FLAG_DISCONTINUITY;
-    p_sys->b_recovered = false;
-    p_sys->i_recoveryfnum = UINT_MAX;
-    date_Set( &p_sys->dts, VLC_TS_INVALID );
+    date_Set( &p_sys->dts, VLC_TICK_INVALID );
 }
 static block_t *PacketizeParse( void *p_private, bool *pb_ts_used, block_t *p_block )
 {
@@ -575,6 +581,24 @@ static int PacketizeValidate( void *p_private, block_t *p_au )
     return VLC_SUCCESS;
 }
 
+static block_t * PacketizeDrain( void *p_private )
+{
+    decoder_t *p_dec = p_private;
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    if( !p_sys->b_slice )
+        return NULL;
+
+    block_t *p_out = OutputPicture( p_dec );
+    if( p_out && (p_out->i_flags & BLOCK_FLAG_DROP) )
+    {
+        block_Release( p_out );
+        p_out = NULL;
+    }
+
+    return p_out;
+}
+
 /*****************************************************************************
  * ParseNALBlock: parses annexB type NALs
  * All p_frag blocks are required to start with 0 0 0 1 4-byte startcode
@@ -585,8 +609,10 @@ static block_t *ParseNALBlock( decoder_t *p_dec, bool *pb_ts_used, block_t *p_fr
     block_t *p_pic = NULL;
 
     const int i_nal_type = p_frag->p_buffer[4]&0x1f;
-    const mtime_t i_frag_dts = p_frag->i_dts;
-    const mtime_t i_frag_pts = p_frag->i_pts;
+    const vlc_tick_t i_frag_dts = p_frag->i_dts;
+    const vlc_tick_t i_frag_pts = p_frag->i_pts;
+    bool b_au_end = p_frag->i_flags & BLOCK_FLAG_AU_END;
+    p_frag->i_flags &= ~BLOCK_FLAG_AU_END;
 
     if( p_sys->b_slice && (!p_sys->p_active_pps || !p_sys->p_active_sps) )
     {
@@ -729,14 +755,19 @@ static block_t *ParseNALBlock( decoder_t *p_dec, bool *pb_ts_used, block_t *p_fr
     }
 
     *pb_ts_used = false;
-    if( p_sys->i_frame_dts <= VLC_TS_INVALID &&
-        p_sys->i_frame_pts <= VLC_TS_INVALID )
+    if( p_sys->i_frame_dts == VLC_TICK_INVALID &&
+        p_sys->i_frame_pts == VLC_TICK_INVALID )
     {
         p_sys->i_frame_dts = i_frag_dts;
         p_sys->i_frame_pts = i_frag_pts;
         *pb_ts_used = true;
-        if( i_frag_dts > VLC_TS_INVALID )
+        if( i_frag_dts != VLC_TICK_INVALID )
             date_Set( &p_sys->dts, i_frag_dts );
+    }
+
+    if( p_sys->b_slice && b_au_end && !p_pic )
+    {
+        p_pic = OutputPicture( p_dec );
     }
 
     if( p_pic && (p_pic->i_flags & BLOCK_FLAG_DROP) )
@@ -746,6 +777,17 @@ static block_t *ParseNALBlock( decoder_t *p_dec, bool *pb_ts_used, block_t *p_fr
     }
 
     return p_pic;
+}
+
+static bool CanSwapPTSwithDTS( const h264_slice_t *p_slice,
+                               const h264_sequence_parameter_set_t *p_sps )
+{
+    if( p_slice->i_nal_ref_idc == 0 && p_slice->type == H264_SLICE_TYPE_B )
+        return true;
+    else if( p_sps->vui.b_valid )
+        return p_sps->vui.i_max_num_reorder_frames == 0;
+    else
+        return p_sps->i_profile == PROFILE_H264_CAVLC_INTRA;
 }
 
 static block_t *OutputPicture( decoder_t *p_dec )
@@ -789,6 +831,7 @@ static block_t *OutputPicture( decoder_t *p_dec )
          p_sys->i_recoveryfnum == UINT_MAX )
     {
         p_sys->i_recoveryfnum = p_sys->slice.i_frame_num + p_sys->i_recovery_frame_cnt;
+        p_sys->i_recoverystartfnum = p_sys->slice.i_frame_num;
         b_need_sps_pps = true; /* SPS/PPS must be inserted for SEI recovery */
         msg_Dbg( p_dec, "Recovering using SEI, prerolling %u reference pics", p_sys->i_recovery_frame_cnt );
     }
@@ -797,10 +840,12 @@ static block_t *OutputPicture( decoder_t *p_dec )
     {
         assert(p_sys->b_recovered == false);
         const unsigned maxFrameNum = 1 << (p_sps->i_log2_max_frame_num + 4);
-        if( (p_sys->i_recoveryfnum > maxFrameNum &&
-            (unsigned)p_sys->slice.i_frame_num <= maxFrameNum / 2 &&
-            (unsigned)p_sys->slice.i_frame_num >= p_sys->i_recoveryfnum % maxFrameNum ) ||
-            (unsigned)p_sys->slice.i_frame_num >= p_sys->i_recoveryfnum )
+
+        if( ( p_sys->i_recoveryfnum > maxFrameNum &&
+              p_sys->slice.i_frame_num < p_sys->i_recoverystartfnum &&
+              p_sys->slice.i_frame_num >= p_sys->i_recoveryfnum % maxFrameNum ) ||
+            ( p_sys->i_recoveryfnum <= maxFrameNum &&
+              p_sys->slice.i_frame_num >= p_sys->i_recoveryfnum ) )
         {
             p_sys->i_recoveryfnum = UINT_MAX;
             p_sys->b_recovered = true;
@@ -826,10 +871,11 @@ static block_t *OutputPicture( decoder_t *p_dec )
     }
 
     /* Now rebuild NAL Sequence, inserting PPS/SPS if any */
-    if( p_sys->frame.p_head->i_flags & BLOCK_FLAG_PRIVATE_AUD )
+    if( p_sys->leading.p_head &&
+       (p_sys->leading.p_head->i_flags & BLOCK_FLAG_PRIVATE_AUD) )
     {
-        block_t *p_au = p_sys->frame.p_head;
-        p_sys->frame.p_head = p_au->p_next;
+        block_t *p_au = p_sys->leading.p_head;
+        p_sys->leading.p_head = p_au->p_next;
         p_au->p_next = NULL;
         block_ChainLastAppend( &pp_pic_last, p_au );
     }
@@ -902,16 +948,16 @@ static block_t *OutputPicture( decoder_t *p_dec )
     p_pic->i_pts = p_sys->i_frame_pts;
 
     /* Fixup missing timestamps after split (multiple AU/block)*/
-    if( p_pic->i_dts <= VLC_TS_INVALID )
+    if( p_pic->i_dts == VLC_TICK_INVALID )
         p_pic->i_dts = date_Get( &p_sys->dts );
 
     if( p_sys->slice.type == H264_SLICE_TYPE_I )
-        p_sys->prevdatedpoc.pts = VLC_TS_INVALID;
+        p_sys->prevdatedpoc.pts = VLC_TICK_INVALID;
 
-    if( p_pic->i_pts == VLC_TS_INVALID )
+    if( p_pic->i_pts == VLC_TICK_INVALID )
     {
-        if( p_sys->prevdatedpoc.pts > VLC_TS_INVALID &&
-            date_Get( &p_sys->dts ) != VLC_TS_INVALID )
+        if( p_sys->prevdatedpoc.pts != VLC_TICK_INVALID &&
+            date_Get( &p_sys->dts ) != VLC_TICK_INVALID )
         {
             date_t pts = p_sys->dts;
             date_Set( &pts, p_sys->prevdatedpoc.pts );
@@ -923,15 +969,17 @@ static block_t *OutputPicture( decoder_t *p_dec )
                 date_Decrement( &pts, -diff );
 
             p_pic->i_pts = date_Get( &pts );
+            /* non monotonically increasing dts on some videos 33333 33333...35000 */
+            if( p_pic->i_pts < p_pic->i_dts )
+                p_pic->i_pts = p_pic->i_dts;
         }
         /* In case there's no PTS at all */
-        else if( p_sys->slice.i_nal_ref_idc == 0 &&
-                 p_sys->slice.type == H264_SLICE_TYPE_B )
+        else if( CanSwapPTSwithDTS( &p_sys->slice, p_sps ) )
         {
             p_pic->i_pts = p_pic->i_dts;
         }
         else if( p_sys->slice.type == H264_SLICE_TYPE_I &&
-                 date_Get( &p_sys->dts ) != VLC_TS_INVALID )
+                 date_Get( &p_sys->dts ) != VLC_TICK_INVALID )
         {
             /* Hell no PTS on IDR. We're totally blind */
             date_t pts = p_sys->dts;
@@ -939,8 +987,15 @@ static block_t *OutputPicture( decoder_t *p_dec )
             p_pic->i_pts = date_Get( &pts );
         }
     }
+    else if( p_pic->i_dts == VLC_TICK_INVALID &&
+             CanSwapPTSwithDTS( &p_sys->slice, p_sps ) )
+    {
+        p_pic->i_dts = p_pic->i_pts;
+        if( date_Get( &p_sys->dts ) == VLC_TICK_INVALID )
+            date_Set( &p_sys->dts, p_pic->i_pts );
+    }
 
-    if( p_pic->i_pts > VLC_TS_INVALID )
+    if( p_pic->i_pts != VLC_TICK_INVALID )
     {
         p_sys->prevdatedpoc.pts = p_pic->i_pts;
         p_sys->prevdatedpoc.num = PictureOrderCount;
@@ -948,17 +1003,9 @@ static block_t *OutputPicture( decoder_t *p_dec )
 
     if( p_pic->i_length == 0 )
     {
-        if( p_sps->vui.i_time_scale )
-        {
-            p_pic->i_length = CLOCK_FREQ * i_num_clock_ts *
-                              p_sps->vui.i_num_units_in_tick / p_sps->vui.i_time_scale;
-        }
-        else
-        {
-            date_t next = p_sys->dts;
-            date_Increment( &next, i_num_clock_ts );
-            p_pic->i_length = date_Get( &next ) - date_Get( &p_sys->dts );
-        }
+        date_t next = p_sys->dts;
+        date_Increment( &next, i_num_clock_ts );
+        p_pic->i_length = date_Get( &next ) - date_Get( &p_sys->dts );
     }
 
 #if 0
@@ -966,14 +1013,14 @@ static block_t *OutputPicture( decoder_t *p_dec )
                     tFOC, bFOC, PictureOrderCount,
                     p_sys->slice.type, p_sys->b_recovered, p_pic->i_flags,
                     p_sys->slice.i_nal_ref_idc, p_sys->slice.i_frame_num, p_sys->slice.i_field_pic_flag,
-                    p_pic->i_pts - p_pic->i_dts, p_pic->i_pts % (100*CLOCK_FREQ), p_pic->i_length);
+                    p_pic->i_pts - p_pic->i_dts, p_pic->i_pts % VLC_TICK_FROM_SEC(100), p_pic->i_length);
 #endif
 
     /* save for next pic fixups */
-    if( date_Get( &p_sys->dts ) != VLC_TS_INVALID )
+    if( date_Get( &p_sys->dts ) != VLC_TICK_INVALID )
     {
         if( p_sys->i_next_block_flags & BLOCK_FLAG_DISCONTINUITY )
-            date_Set( &p_sys->dts, VLC_TS_INVALID );
+            date_Set( &p_sys->dts, VLC_TICK_INVALID );
         else
             date_Increment( &p_sys->dts, i_num_clock_ts );
     }
@@ -1181,9 +1228,13 @@ static bool ParseSeiCallback( const hxxx_sei_data_t *p_sei_data, void *cbdata )
             /* Look for SEI recovery point */
         case HXXX_SEI_RECOVERY_POINT:
         {
-            if( !p_sys->b_recovered )
-                msg_Dbg( p_dec, "Seen SEI recovery point, %d recovery frames", p_sei_data->recovery.i_frames );
-            p_sys->i_recovery_frame_cnt = p_sei_data->recovery.i_frames;
+            h264_sei_recovery_point_t reco;
+            if( !p_sys->b_recovered &&
+                h264_decode_sei_recovery_point( p_sei_data->p_bs, &reco ) )
+            {
+                msg_Dbg( p_dec, "Seen SEI recovery point, %u recovery frames", reco.i_frames );
+                p_sys->i_recovery_frame_cnt = reco.i_frames;
+            }
         } break;
 
         default:

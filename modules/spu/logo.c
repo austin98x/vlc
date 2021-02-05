@@ -2,7 +2,6 @@
  * logo.c : logo video plugin for vlc
  *****************************************************************************
  * Copyright (C) 2003-2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *          Simon Latapie <garf@videolan.org>
@@ -80,21 +79,20 @@ static const char *const ppsz_pos_descriptions[] =
 { N_("Center"), N_("Left"), N_("Right"), N_("Top"), N_("Bottom"),
   N_("Top-Left"), N_("Top-Right"), N_("Bottom-Left"), N_("Bottom-Right") };
 
-static int  OpenSub  ( vlc_object_t * );
-static int  OpenVideo( vlc_object_t * );
-static void Close    ( vlc_object_t * );
+static int  OpenSub  ( filter_t * );
+static int  OpenVideo( filter_t * );
+static void Close    ( filter_t * );
 
 vlc_module_begin ()
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_SUBPIC )
     set_help(LOGO_HELP)
-    set_capability( "sub source", 0 )
-    set_callbacks( OpenSub, Close )
+    set_callback_sub_source( OpenSub, 0 )
     set_description( N_("Logo sub source") )
     set_shortname( N_("Logo overlay") )
     add_shortcut( "logo" )
 
-    add_loadfile( CFG_PREFIX "file", NULL, FILE_TEXT, FILE_LONGTEXT, false )
+    add_loadfile(CFG_PREFIX "file", NULL, FILE_TEXT, FILE_LONGTEXT)
     add_integer( CFG_PREFIX "x", -1, POSX_TEXT, POSX_LONGTEXT, true )
     add_integer( CFG_PREFIX "y", -1, POSY_TEXT, POSY_LONGTEXT, true )
     /* default to 1000 ms per image, continuously cycle through them */
@@ -107,8 +105,7 @@ vlc_module_begin ()
 
     /* video output filter submodule */
     add_submodule ()
-    set_capability( "video filter", 0 )
-    set_callbacks( OpenVideo, Close )
+    set_callback_video_filter( OpenVideo )
     set_description( N_("Logo video filter") )
     add_shortcut( "logo" )
 vlc_module_end ()
@@ -139,7 +136,7 @@ typedef struct
     unsigned int i_count;   /* the number of logo images to be displayed */
 
     int i_repeat;         /* how often to repeat the images, image time in ms */
-    mtime_t i_next_pic;     /* when to bring up a new logo image */
+    vlc_tick_t i_next_pic;     /* when to bring up a new logo image */
 
     unsigned int i_counter; /* index into the list of logo images */
 
@@ -151,9 +148,9 @@ typedef struct
 /**
  * Private logo data holder
  */
-struct filter_sys_t
+typedef struct
 {
-    filter_t *p_blend;
+    vlc_blender_t *p_blend;
 
     vlc_mutex_t lock;
 
@@ -169,7 +166,7 @@ struct filter_sys_t
 
     /* */
     bool b_mouse_grab;
-};
+} filter_sys_t;
 
 static const char *const ppsz_filter_options[] = {
     "file", "x", "y", "delay", "repeat", "opacity", "position", NULL
@@ -185,43 +182,52 @@ static const char *const ppsz_filter_callbacks[] = {
     NULL
 };
 
-static int OpenCommon( vlc_object_t *, bool b_sub );
+static int OpenCommon( filter_t *, bool b_sub );
 
-static subpicture_t *FilterSub( filter_t *, mtime_t );
+static subpicture_t *FilterSub( filter_t *, vlc_tick_t );
 static picture_t    *FilterVideo( filter_t *, picture_t * );
 
-static int Mouse( filter_t *, vlc_mouse_t *, const vlc_mouse_t *, const vlc_mouse_t * );
+static int Mouse( filter_t *, vlc_mouse_t *, const vlc_mouse_t * );
 
 static int LogoCallback( vlc_object_t *, char const *,
                          vlc_value_t, vlc_value_t, void * );
 
 static void LogoListLoad( vlc_object_t *, logo_list_t *, const char * );
 static void LogoListUnload( logo_list_t * );
-static logo_t *LogoListNext( logo_list_t *p_list, mtime_t i_date );
+static logo_t *LogoListNext( logo_list_t *p_list, vlc_tick_t i_date );
 static logo_t *LogoListCurrent( logo_list_t *p_list );
 
 /**
  * Open the sub source
  */
-static int OpenSub( vlc_object_t *p_this )
+static int OpenSub( filter_t *p_filter )
 {
-    return OpenCommon( p_this, true );
+    return OpenCommon( p_filter, true );
 }
 
 /**
  * Open the video filter
  */
-static int OpenVideo( vlc_object_t *p_this )
+static int OpenVideo( filter_t *p_filter )
 {
-    return OpenCommon( p_this, false );
+    return OpenCommon( p_filter, false );
 }
+
+static const struct vlc_filter_operations filter_sub_ops = {
+    .source_sub = FilterSub, .close = Close,
+};
+
+static const struct vlc_filter_operations filter_video_ops = {
+    .filter_video = FilterVideo,
+    .video_mouse = Mouse,
+    .close = Close,
+};
 
 /**
  * Common open function
  */
-static int OpenCommon( vlc_object_t *p_this, bool b_sub )
+static int OpenCommon( filter_t *p_filter, bool b_sub )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
     char *psz_filename;
 
@@ -267,7 +273,7 @@ static int OpenCommon( vlc_object_t *p_this, bool b_sub )
         return VLC_ENOMEM;
     }
     if( *psz_filename == '\0' )
-        msg_Warn( p_this, "no logo file specified" );
+        msg_Warn( p_filter, "no logo file specified" );
 
     p_list->i_alpha = var_CreateGetIntegerCommand( p_filter, "logo-opacity");
     p_list->i_alpha = VLC_CLIP( p_list->i_alpha, 0, 255 );
@@ -284,7 +290,7 @@ static int OpenCommon( vlc_object_t *p_this, bool b_sub )
         p_sys->i_pos = 0;
 
     vlc_mutex_init( &p_sys->lock );
-    LogoListLoad( p_this, p_list, psz_filename );
+    LogoListLoad( VLC_OBJECT(p_filter), p_list, psz_filename );
     p_sys->b_spu_update = true;
     p_sys->b_mouse_grab = false;
 
@@ -294,14 +300,9 @@ static int OpenCommon( vlc_object_t *p_this, bool b_sub )
 
     /* Misc init */
     if( b_sub )
-    {
-        p_filter->pf_sub_source = FilterSub;
-    }
+        p_filter->ops = &filter_sub_ops;
     else
-    {
-        p_filter->pf_video_filter = FilterVideo;
-        p_filter->pf_video_mouse = Mouse;
-    }
+        p_filter->ops = &filter_video_ops;
 
     free( psz_filename );
     return VLC_SUCCESS;
@@ -310,9 +311,8 @@ static int OpenCommon( vlc_object_t *p_this, bool b_sub )
 /**
  * Common close function
  */
-static void Close( vlc_object_t *p_this )
+static void Close( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     for( int i = 0; ppsz_filter_callbacks[i]; i++ )
@@ -322,7 +322,6 @@ static void Close( vlc_object_t *p_this )
     if( p_sys->p_blend )
         filter_DeleteBlend( p_sys->p_blend );
 
-    vlc_mutex_destroy( &p_sys->lock );
     LogoListUnload( &p_sys->list );
     free( p_sys );
 }
@@ -330,7 +329,7 @@ static void Close( vlc_object_t *p_this )
 /**
  * Sub source
  */
-static subpicture_t *FilterSub( filter_t *p_filter, mtime_t date )
+static subpicture_t *FilterSub( filter_t *p_filter, vlc_tick_t date )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
     logo_list_t *p_list = &p_sys->list;
@@ -381,12 +380,15 @@ static subpicture_t *FilterSub( filter_t *p_filter, mtime_t date )
         goto exit;
 
     /* Create new SPU region */
-    memset( &fmt, 0, sizeof(video_format_t) );
-    fmt.i_chroma = VLC_CODEC_YUVA;
+    video_format_Init( &fmt, VLC_CODEC_YUVA );
     fmt.i_sar_num = fmt.i_sar_den = 1;
     fmt.i_width = fmt.i_visible_width = p_pic->p[Y_PLANE].i_visible_pitch;
     fmt.i_height = fmt.i_visible_height = p_pic->p[Y_PLANE].i_visible_lines;
     fmt.i_x_offset = fmt.i_y_offset = 0;
+    fmt.transfer    = p_pic->format.transfer;
+    fmt.primaries   = p_pic->format.primaries;
+    fmt.space       = p_pic->format.space;
+    fmt.color_range = p_pic->format.color_range;
     p_region = subpicture_region_New( &fmt );
     if( !p_region )
     {
@@ -511,8 +513,8 @@ exit:
     return p_dst;
 }
 
-static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse,
-                  const vlc_mouse_t *p_old, const vlc_mouse_t *p_new )
+static int Mouse( filter_t *p_filter, vlc_mouse_t *p_new,
+                  const vlc_mouse_t *p_old )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
 
@@ -542,9 +544,9 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse,
             int i_dx, i_dy;
             vlc_mouse_GetMotion( &i_dx, &i_dy, p_old, p_new );
             p_sys->i_pos_x = VLC_CLIP( p_sys->i_pos_x + i_dx, 0,
-                                    p_filter->fmt_in.video.i_width  - i_logo_w );
+                                    (int)p_filter->fmt_in.video.i_width  - i_logo_w );
             p_sys->i_pos_y = VLC_CLIP( p_sys->i_pos_y + i_dy, 0,
-                                    p_filter->fmt_in.video.i_height - i_logo_h );
+                                    (int)p_filter->fmt_in.video.i_height - i_logo_h );
         }
 
         if( p_sys->b_mouse_grab || b_over )
@@ -555,7 +557,6 @@ static int Mouse( filter_t *p_filter, vlc_mouse_t *p_mouse,
     }
     vlc_mutex_unlock( &p_sys->lock );
 
-    *p_mouse = *p_new;
     return VLC_SUCCESS;
 }
 
@@ -609,20 +610,18 @@ static picture_t *LoadImage( vlc_object_t *p_this, const char *psz_filename )
     if( !psz_filename )
         return NULL;
 
-    video_format_t fmt_in;
-    video_format_Init( &fmt_in, 0 );
-
-    video_format_t fmt_out;
-    video_format_Init( &fmt_out, VLC_CODEC_YUVA );
-
     image_handler_t *p_image = image_HandlerCreate( p_this );
     if( !p_image )
         return NULL;
 
+    video_format_t fmt_out;
+    video_format_Init( &fmt_out, VLC_CODEC_YUVA );
+
     char *psz_url = vlc_path2uri( psz_filename, NULL );
-    picture_t *p_pic = image_ReadUrl( p_image, psz_url, &fmt_in, &fmt_out );
+    picture_t *p_pic = image_ReadUrl( p_image, psz_url, &fmt_out );
     free( psz_url );
     image_HandlerDelete( p_image );
+    video_format_Clean( &fmt_out );
 
     return p_pic;
 }
@@ -730,14 +729,14 @@ static void LogoListUnload( logo_list_t *p_list )
 /**
  * Go to the next logo and return its pointer.
  */
-static logo_t *LogoListNext( logo_list_t *p_list, mtime_t i_date )
+static logo_t *LogoListNext( logo_list_t *p_list, vlc_tick_t i_date )
 {
     p_list->i_counter = ( p_list->i_counter + 1 ) % p_list->i_count;
 
     logo_t *p_logo = LogoListCurrent( p_list );
 
-    p_list->i_next_pic = i_date + ( p_logo->i_delay != -1 ?
-                          p_logo->i_delay : p_list->i_delay ) * 1000;
+    p_list->i_next_pic = i_date + VLC_TICK_FROM_MS( p_logo->i_delay != -1 ?
+                          p_logo->i_delay : p_list->i_delay );
     return p_logo;
 }
 /**

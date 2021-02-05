@@ -30,6 +30,9 @@
 
 #include <vlc_common.h>
 
+/* from gstreamer/fourcc.c */
+vlc_fourcc_t GetGstVLCFourcc( const char* );
+
 #define gst_vlc_picture_plane_allocator_parent_class parent_class
 G_DEFINE_TYPE (GstVlcPicturePlaneAllocator, gst_vlc_picture_plane_allocator, \
         GST_TYPE_ALLOCATOR);
@@ -42,9 +45,9 @@ static void gst_vlc_picture_plane_allocator_free( GstAllocator *p_allocator,
         GstMemory *p_gmem);
 static gpointer gst_vlc_picture_plane_map( GstMemory *p_gmem,
         gsize i_maxsize, GstMapFlags flags );
-static gboolean gst_vlc_picture_plane_unmap( GstVlcPicturePlane *p_mem );
+static void gst_vlc_picture_plane_unmap( GstMemory *p_mem );
 static GstMemory* gst_vlc_picture_plane_copy(
-        GstVlcPicturePlane *p_mem, gssize i_offset, gssize i_size );
+        GstMemory *p_mem, gssize i_offset, gssize i_size );
 
 #define GST_VLC_PICTURE_PLANE_ALLOCATOR_NAME "vlcpictureplane"
 
@@ -69,9 +72,9 @@ static void gst_vlc_picture_plane_allocator_init(
     GstAllocator *p_alloc = GST_ALLOCATOR_CAST( p_allocator );
 
     p_alloc->mem_type = GST_VLC_PICTURE_PLANE_ALLOCATOR_NAME;
-    p_alloc->mem_map = (GstMemoryMapFunction) gst_vlc_picture_plane_map;
-    p_alloc->mem_unmap = (GstMemoryUnmapFunction) gst_vlc_picture_plane_unmap;
-    p_alloc->mem_copy = (GstMemoryShareFunction) gst_vlc_picture_plane_copy;
+    p_alloc->mem_map = gst_vlc_picture_plane_map;
+    p_alloc->mem_unmap = gst_vlc_picture_plane_unmap;
+    p_alloc->mem_copy = gst_vlc_picture_plane_copy;
     /* fallback is_span */
 
     GST_OBJECT_FLAG_SET( p_allocator, GST_ALLOCATOR_FLAG_CUSTOM_ALLOC );
@@ -116,20 +119,34 @@ static gpointer gst_vlc_picture_plane_map( GstMemory *p_gmem,
         return NULL;
 }
 
-static gboolean gst_vlc_picture_plane_unmap(
-        GstVlcPicturePlane *p_mem )
+static void gst_vlc_picture_plane_unmap( GstMemory *p_mem )
 {
     VLC_UNUSED( p_mem );
-    return TRUE;
 }
 
 static GstMemory* gst_vlc_picture_plane_copy(
-        GstVlcPicturePlane *p_mem, gssize i_offset, gssize i_size )
+        GstMemory *p_mem, gssize i_offset, gssize i_size )
 {
     VLC_UNUSED( p_mem );
     VLC_UNUSED( i_offset );
     VLC_UNUSED( i_size );
     return NULL;
+}
+
+static vlc_fourcc_t gst_vlc_to_map_format( const char* psz_fourcc )
+{
+    if( !psz_fourcc )
+        return VLC_CODEC_UNKNOWN;
+
+    if( strlen( psz_fourcc ) != 4 )
+    {
+        return GetGstVLCFourcc( psz_fourcc );
+    }
+    else
+    {
+        return vlc_fourcc_GetCodecFromString(
+                VIDEO_ES, psz_fourcc );
+    }
 }
 
 void gst_vlc_picture_plane_allocator_release(
@@ -223,10 +240,10 @@ bool gst_vlc_set_vout_fmt( GstVideoInfo *p_info, GstVideoAlignment *p_align,
     vlc_fourcc_t i_chroma;
     int i_padded_width, i_padded_height;
 
-    i_chroma = p_outfmt->i_codec = vlc_fourcc_GetCodecFromString(
-            VIDEO_ES,
-            gst_structure_get_string( p_str, "format" ) );
-    if( !i_chroma )
+    const char* psz_fourcc = gst_structure_get_string( p_str, "format" );
+
+    i_chroma = p_outfmt->i_codec = gst_vlc_to_map_format( psz_fourcc );
+    if( !i_chroma || i_chroma == VLC_CODEC_UNKNOWN )
     {
         msg_Err( p_dec, "video chroma type not supported" );
         return false;

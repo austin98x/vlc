@@ -58,7 +58,7 @@
 #endif
 
 #include <errno.h>
-#ifdef HAVE_POLL
+#ifdef HAVE_POLL_H
 # include <poll.h>
 #endif
 
@@ -87,11 +87,11 @@ vlc_module_begin()
     set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACCESS )
     set_description( N_("RDP Remote Desktop") )
-    set_capability( "access_demux", 0 )
+    set_capability( "access", 0 )
 
     add_string( CFG_PREFIX "user", NULL, USER_TEXT, USER_LONGTEXT, false )
         change_safe()
-    add_password( CFG_PREFIX "password", NULL, PASS_TEXT, PASS_LONGTEXT, false )
+    add_password(CFG_PREFIX "password", NULL, PASS_TEXT, PASS_LONGTEXT)
         change_safe()
     add_float( CFG_PREFIX "fps", 5, RDP_FPS, RDP_FPS_LONGTEXT, true )
 
@@ -103,7 +103,7 @@ vlc_module_end()
 
 #define RDP_MAX_FD 32
 
-struct demux_sys_t
+typedef struct
 {
     vlc_thread_t thread;
     freerdp *p_instance;
@@ -112,16 +112,14 @@ struct demux_sys_t
 
     float f_fps;
     int i_frame_interval;
-    mtime_t i_starttime;
+    vlc_tick_t i_starttime;
 
     es_out_id_t *es;
 
     /* pre-connect params */
     char *psz_hostname;
     int i_port;
-    /* cancelability */
-    int i_cancel_state;
-};
+} demux_sys_t;
 
 /* context */
 
@@ -281,7 +279,6 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
 {
     demux_sys_t *p_sys = p_demux->p_sys;
     bool *pb;
-    int64_t *pi64;
     double *p_dbl;
     vlc_meta_t *p_meta;
 
@@ -302,19 +299,16 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = INT64_C(1000)
-                  * var_InheritInteger( p_demux, "live-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS(var_InheritInteger( p_demux, "live-caching" ));
             return VLC_SUCCESS;
 
         case DEMUX_GET_TIME:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = mdate() - p_sys->i_starttime;
+            *va_arg( args, vlc_tick_t * ) = vlc_tick_now() - p_sys->i_starttime;
             return VLC_SUCCESS;
 
         case DEMUX_GET_LENGTH:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = 0;
+            *va_arg( args, vlc_tick_t * ) = 0;
             return VLC_SUCCESS;
 
         case DEMUX_GET_FPS:
@@ -339,17 +333,17 @@ static void *DemuxThread( void *p_data )
 {
     demux_t *p_demux = (demux_t *) p_data;
     demux_sys_t *p_sys = p_demux->p_sys;
-    p_sys->i_starttime = mdate();
-    mtime_t i_next_frame_date = mdate() + p_sys->i_frame_interval;
+    p_sys->i_starttime = vlc_tick_now();
+    vlc_tick_t i_next_frame_date = vlc_tick_now() + p_sys->i_frame_interval;
     int i_ret;
 
     for(;;)
     {
         i_ret = 0;
-        p_sys->i_cancel_state = vlc_savecancel();
+        int cancel_state = vlc_savecancel();
         if ( freerdp_shall_disconnect( p_sys->p_instance ) )
         {
-            vlc_restorecancel( p_sys->i_cancel_state );
+            vlc_restorecancel( cancel_state );
             msg_Warn( p_demux, "RDP server closed session" );
             es_out_Del( p_demux->out, p_sys->es );
             p_sys->es = NULL;
@@ -370,13 +364,13 @@ static void *DemuxThread( void *p_data )
         if ( freerdp_get_fds( p_sys->p_instance, fds.pp_rfds, &fds.i_nbr,
                               fds.pp_wfds, &fds.i_nbw ) != true )
         {
-            vlc_restorecancel( p_sys->i_cancel_state );
+            vlc_restorecancel( cancel_state );
             msg_Err( p_demux, "cannot get FDS" );
         }
         else
         if ( (fds.i_nbr + fds.i_nbw) > 0 && p_sys->es )
         {
-            vlc_restorecancel( p_sys->i_cancel_state );
+            vlc_restorecancel( cancel_state );
             int i_count = 0;
 
             for( int i = 0; i < fds.i_nbr; i++ )
@@ -393,22 +387,22 @@ static void *DemuxThread( void *p_data )
             }
             i_ret = poll( fds.ufds, i_count, p_sys->i_frame_interval * 1000/2 );
         } else {
-            vlc_restorecancel( p_sys->i_cancel_state );
+            vlc_restorecancel( cancel_state );
         }
 
-        mwait( i_next_frame_date );
+        vlc_tick_wait( i_next_frame_date );
         i_next_frame_date += p_sys->i_frame_interval;
 
         if ( i_ret >= 0 )
         {
             /* Do the rendering */
-            p_sys->i_cancel_state = vlc_savecancel();
+            cancel_state = vlc_savecancel();
             freerdp_check_fds( p_sys->p_instance );
-            vlc_restorecancel( p_sys->i_cancel_state );
+            vlc_restorecancel( cancel_state );
             block_t *p_block = block_Duplicate( p_sys->p_block );
             if (likely( p_block && p_sys->p_block ))
             {
-                p_sys->p_block->i_dts = p_sys->p_block->i_pts = mdate() - p_sys->i_starttime;
+                p_sys->p_block->i_dts = p_sys->p_block->i_pts = vlc_tick_now() - p_sys->i_starttime;
                 es_out_SetPCR( p_demux->out, p_sys->p_block->i_pts );
                 es_out_Send( p_demux->out, p_sys->es, p_sys->p_block );
                 p_sys->p_block = p_block;
@@ -426,12 +420,15 @@ static int Open( vlc_object_t *p_this )
     demux_t      *p_demux = (demux_t*)p_this;
     demux_sys_t  *p_sys;
 
+    if (p_demux->out == NULL)
+        return VLC_EGENERIC;
+
     p_sys = vlc_obj_calloc( p_this, 1, sizeof(demux_sys_t) );
     if( !p_sys ) return VLC_ENOMEM;
 
     p_sys->f_fps = var_InheritFloat( p_demux, CFG_PREFIX "fps" );
     if ( p_sys->f_fps <= 0 ) p_sys->f_fps = 1.0;
-    p_sys->i_frame_interval = 1000000 / p_sys->f_fps;
+    p_sys->i_frame_interval = CLOCK_FREQ / p_sys->f_fps;
 
 #if FREERDP_VERSION_MAJOR == 1 && FREERDP_VERSION_MINOR < 2
     freerdp_channels_global_init();
@@ -458,7 +455,7 @@ static int Open( vlc_object_t *p_this )
 
     /* Parse uri params for pre-connect */
     vlc_url_t url;
-    vlc_UrlParse( &url, p_demux->psz_location );
+    vlc_UrlParse( &url, p_demux->psz_url );
 
     if ( !EMPTY_STR(url.psz_host) )
         p_sys->psz_hostname = strdup( url.psz_host );

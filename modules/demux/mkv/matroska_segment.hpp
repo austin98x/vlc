@@ -2,7 +2,6 @@
  * matroska_segment.hpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -25,6 +24,7 @@
 #ifndef VLC_MKV_MATROSKA_SEGMENT_HPP_
 #define VLC_MKV_MATROSKA_SEGMENT_HPP_
 
+#include "demux.hpp"
 #include "mkv.hpp"
 #include "matroska_segment_seeker.hpp"
 #include <vector>
@@ -35,6 +35,8 @@
 #include <memory>
 
 #include "Ebml_parser.hpp"
+
+namespace mkv {
 
 class EbmlParser;
 
@@ -90,8 +92,8 @@ public:
     uint64_t                i_timescale;
 
     /* duration of the segment */
-    mtime_t                 i_duration;
-    mtime_t                 i_mk_start_time;
+    vlc_tick_t              i_duration;
+    vlc_tick_t              i_mk_start_time;
 
     /* all tracks */
     tracks_map_t tracks;
@@ -141,10 +143,10 @@ public:
     bool PreloadClusters( uint64 i_cluster_position );
     void InformationCreate();
 
-    bool FastSeek( demux_t &, mtime_t i_mk_date, mtime_t i_mk_time_offset );
-    bool Seek( demux_t &, mtime_t i_mk_date, mtime_t i_mk_time_offset );
+    bool Seek( demux_t &, vlc_tick_t i_mk_date, vlc_tick_t i_mk_time_offset, bool b_accurate );
 
-    int BlockGet( KaxBlock * &, KaxSimpleBlock * &, bool *, bool *, int64_t *);
+    int BlockGet( KaxBlock * &, KaxSimpleBlock * &, KaxBlockAdditions * &,
+                  bool *, bool *, int64_t *);
 
     mkv_track_t * FindTrackByBlock(const KaxBlock *, const KaxSimpleBlock * );
 
@@ -177,5 +179,6 @@ private:
     friend SegmentSeeker;
 };
 
+} // namespace
 
 #endif

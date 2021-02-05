@@ -22,58 +22,20 @@
 #endif
 
 #include "M3U8.hpp"
-#include "Representation.hpp"
-#include "../adaptive/playlist/BasePeriod.h"
-#include "../adaptive/playlist/BaseAdaptationSet.h"
-#include "../adaptive/tools/Retrieve.hpp"
-
-#include <vlc_common.h>
-#include <vlc_stream.h>
-#include <vlc_block.h>
+#include "HLSRepresentation.hpp"
+#include "../../adaptive/playlist/BasePeriod.h"
+#include "../../adaptive/playlist/BaseAdaptationSet.h"
 
 using namespace hls::playlist;
 
-M3U8::M3U8 (vlc_object_t *p_object, AuthStorage *auth_) :
-    AbstractPlaylist(p_object)
+M3U8::M3U8 (vlc_object_t *p_object) :
+    BasePlaylist(p_object)
 {
-    auth = auth_;
-    minUpdatePeriod.Set( 5 * CLOCK_FREQ );
-    vlc_mutex_init(&keystore_lock);
+    minUpdatePeriod.Set( VLC_TICK_FROM_SEC(5) );
 }
 
 M3U8::~M3U8()
 {
-    vlc_mutex_destroy(&keystore_lock);
-}
-
-std::vector<uint8_t> M3U8::getEncryptionKey(const std::string &uri)
-{
-    std::vector<uint8_t> key;
-
-    vlc_mutex_lock( &keystore_lock );
-    std::map<std::string, std::vector<uint8_t> >::iterator it = keystore.find(uri);
-    if(it == keystore.end())
-    {
-        /* Pretty bad inside the lock */
-        block_t *p_block = Retrieve::HTTP(p_object, auth, uri);
-        if(p_block)
-        {
-            if(p_block->i_buffer == 16)
-            {
-                key.resize(16);
-                memcpy(&key[0], p_block->p_buffer, 16);
-                keystore.insert(std::pair<std::string, std::vector<uint8_t> >(uri, key));
-            }
-            block_Release(p_block);
-        }
-    }
-    else
-    {
-        key = (*it).second;
-    }
-    vlc_mutex_unlock(&keystore_lock);
-
-    return key;
 }
 
 bool M3U8::isLive() const
@@ -90,7 +52,7 @@ bool M3U8::isLive() const
             std::vector<BaseRepresentation *>::iterator itr;
             for(itr = adaptSet->getRepresentations().begin(); itr != adaptSet->getRepresentations().end(); ++itr)
             {
-                const Representation *rep = dynamic_cast<const Representation *>(*itr);
+                const HLSRepresentation *rep = dynamic_cast<const HLSRepresentation *>(*itr);
                 if(rep->initialized())
                 {
                     if(rep->isLive())
@@ -103,17 +65,5 @@ bool M3U8::isLive() const
     }
 
     return b_live;
-}
-
-AuthStorage * M3U8::getAuth()
-{
-    return auth;
-}
-
-void M3U8::debug()
-{
-    std::vector<BasePeriod *>::const_iterator i;
-    for(i = periods.begin(); i != periods.end(); ++i)
-        (*i)->debug(VLC_OBJECT(p_object));
 }
 

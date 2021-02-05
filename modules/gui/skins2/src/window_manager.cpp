@@ -2,7 +2,6 @@
  * window_manager.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -438,10 +437,10 @@ void WindowManager::showAll( bool firstTime ) const
 
 void WindowManager::show( TopWindow &rWindow ) const
 {
-    rWindow.show();
-
     if( isOpacityNeeded() )
         rWindow.setOpacity( m_alpha );
+
+    rWindow.show();
 }
 
 

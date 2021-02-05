@@ -2,7 +2,6 @@
  * mpgv.c : MPEG-I/II Video demuxer
  *****************************************************************************
  * Copyright (C) 2001-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -52,14 +51,14 @@ vlc_module_end ()
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-struct demux_sys_t
+typedef struct
 {
     bool  b_start;
 
     es_out_id_t *p_es;
 
     decoder_t *p_packetizer;
-};
+} demux_sys_t;
 
 static int Demux( demux_t * );
 static int Control( demux_t *, int, va_list );
@@ -78,6 +77,26 @@ static void Close( vlc_object_t * p_this )
     free( p_sys );
 }
 
+static int CheckMPEGStartCode( const uint8_t *p_peek )
+{
+    switch( p_peek[3] )
+    {
+        case 0x00:
+            if( (p_peek[5] & 0x38) == 0x00 )
+                return VLC_EGENERIC;
+            break;
+        case 0xB0:
+        case 0xB1:
+        case 0xB6:
+            return VLC_EGENERIC;
+        default:
+            if( p_peek[3] > 0xB9 )
+                return VLC_EGENERIC;
+            break;
+    }
+    return VLC_SUCCESS;
+}
+
 /*****************************************************************************
  * Open: initializes demux structures
  *****************************************************************************/
@@ -91,11 +110,8 @@ static int Open( vlc_object_t * p_this )
 
     es_format_t  fmt;
 
-    if( vlc_stream_Peek( p_demux->s, &p_peek, 4 ) < 4 )
-    {
-        msg_Dbg( p_demux, "cannot peek" );
+    if( vlc_stream_Peek( p_demux->s, &p_peek, 8 ) < 8 )
         return VLC_EGENERIC;
-    }
 
     if( p_demux->obj.force )
         b_forced = true;
@@ -107,12 +123,11 @@ static int Open( vlc_object_t * p_this )
         msg_Err( p_demux, "this doesn't look like an MPEG ES stream, continuing" );
     }
 
-    if( p_peek[3] > 0xb9 )
+    if( CheckMPEGStartCode( p_peek ) != VLC_SUCCESS )
     {
         if( !b_forced ) return VLC_EGENERIC;
         msg_Err( p_demux, "this seems to be a system stream (PS plug-in ?), but continuing" );
     }
-
     p_demux->pf_demux  = Demux;
     p_demux->pf_control= Control;
     p_demux->p_sys     = p_sys = malloc( sizeof( demux_sys_t ) );
@@ -158,7 +173,7 @@ static int Demux( demux_t *p_demux )
     if( p_block_in )
     {
         p_block_in->i_pts =
-        p_block_in->i_dts = ( p_sys->b_start ) ? VLC_TS_0 : VLC_TS_INVALID;
+        p_block_in->i_dts = ( p_sys->b_start ) ? VLC_TICK_0 : VLC_TICK_INVALID;
     }
 
     while( (p_block_out = p_sys->p_packetizer->pf_packetize( p_sys->p_packetizer,

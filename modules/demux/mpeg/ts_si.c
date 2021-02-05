@@ -263,10 +263,13 @@ static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
                 msg_Dbg( p_demux, "    - type=%"PRIu8" provider=%s name=%s",
                          pD->i_service_type, str1, str2 );
 
-                vlc_meta_SetTitle( p_meta, str2 );
-                vlc_meta_SetPublisher( p_meta, str1 );
-                if( pD->i_service_type >= 0x01 && pD->i_service_type <= 0x10 )
-                    psz_type = ppsz_type[pD->i_service_type];
+                if( !str2 || strcmp( "Service01", str2 ) ) /* Skip bogus libav/ffmpeg SDT */
+                {
+                    vlc_meta_SetTitle( p_meta, str2 );
+                    vlc_meta_SetPublisher( p_meta, str1 );
+                    if( pD->i_service_type >= 0x01 && pD->i_service_type <= 0x10 )
+                        psz_type = ppsz_type[pD->i_service_type];
+                }
                 free( str1 );
                 free( str2 );
             }
@@ -455,7 +458,8 @@ static void EITExtractDrDescItems( demux_t *p_demux, const dvbpsi_extended_event
                 continue;
             }
 
-            msg_Dbg( p_demux, "       - desc='%s' item='%s'", psz_key, psz_itm );
+            msg_Dbg( p_demux, "       - desc='%s' item='%s'",
+                     psz_key ? psz_key : "(null)", psz_itm );
             if( b_appending )
             {
                 /* Continued items */
@@ -766,7 +770,6 @@ static void SINewTableCallBack( dvbpsi_t *h, uint8_t i_table_id,
     assert( h );
     ts_pid_t *p_pid = (ts_pid_t *) p_pid_cbdata;
     demux_t *p_demux = (demux_t *) h->p_sys;
-    demux_sys_t *p_sys = p_demux->p_sys;
 #if 0
     msg_Dbg( p_demux, "SINewTableCallback: table 0x%"PRIx8"(%"PRIu16") ext=0x%"PRIx16"(%"PRIu16")",
              i_table_id, i_table_id, i_extension, i_extension );

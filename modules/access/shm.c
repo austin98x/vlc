@@ -84,7 +84,7 @@ vlc_module_begin ()
     set_description (N_("Shared memory framebuffer"))
     set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_ACCESS)
-    set_capability ("access_demux", 0)
+    set_capability ("access", 0)
     set_callbacks (Open, Close)
 
     add_float ("shm-fps", 10.0, FPS_TEXT, FPS_LONGTEXT, true)
@@ -109,6 +109,8 @@ vlc_module_begin ()
 #endif
     add_shortcut ("shm")
 vlc_module_end ()
+
+typedef struct demux_sys_t demux_sys_t;
 
 static int Control (demux_t *, int, va_list);
 static void DemuxFile (void *);
@@ -138,6 +140,9 @@ struct demux_sys_t
 static int Open (vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
+
     demux_sys_t *sys = vlc_obj_malloc(obj, sizeof (*sys));
     if (unlikely(sys == NULL))
         return VLC_ENOMEM;
@@ -221,7 +226,7 @@ static int Open (vlc_object_t *obj)
     if (rate <= 0.f)
         goto error;
 
-    mtime_t interval = llroundf((float)CLOCK_FREQ / rate);
+    vlc_tick_t interval = llroundf((float)CLOCK_FREQ / rate);
     if (!interval)
         goto error;
 
@@ -240,7 +245,7 @@ static int Open (vlc_object_t *obj)
     /* Initializes demux */
     if (vlc_timer_create (&sys->timer, Demux, demux))
         goto error;
-    vlc_timer_schedule (sys->timer, false, 1, interval);
+    vlc_timer_schedule_asap (sys->timer, interval);
 
     demux->p_sys = sys;
     demux->pf_demux   = NULL;
@@ -282,15 +287,14 @@ static int Control (demux_t *demux, int query, va_list args)
         case DEMUX_GET_LENGTH:
         case DEMUX_GET_TIME:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = 0;
+            *va_arg (args, vlc_tick_t *) = 0;
             return VLC_SUCCESS;
         }
 
         case DEMUX_GET_PTS_DELAY:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = INT64_C(1000) * var_InheritInteger (demux, "live-caching");
+            *va_arg (args, vlc_tick_t *) =
+                VLC_TICK_FROM_MS( var_InheritInteger (demux, "live-caching") );
             return VLC_SUCCESS;
         }
 
@@ -323,7 +327,7 @@ static void DemuxFile (void *data)
     block_t *block = block_File(sys->fd, true);
     if (block == NULL)
         return;
-    block->i_pts = block->i_dts = mdate ();
+    block->i_pts = block->i_dts = vlc_tick_now ();
 
     /* Send block */
     es_out_SetPCR(demux->out, block->i_pts);
@@ -346,7 +350,7 @@ static void DemuxIPC (void *data)
     if (block == NULL)
         return;
     memcpy (block->p_buffer, sys->mem.addr, sys->mem.length);
-    block->i_pts = block->i_dts = mdate ();
+    block->i_pts = block->i_dts = vlc_tick_now ();
 
     /* Send block */
     es_out_SetPCR(demux->out, block->i_pts);

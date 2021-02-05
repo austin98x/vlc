@@ -2,7 +2,6 @@
  * common.h : Common macros for the VLC deinterlacer
  *****************************************************************************
  * Copyright (C) 2000-2017 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Sam Hocevar <sam@zoy.org>
  *         Steve Lhomme <robux4@gmail.com>
@@ -47,7 +46,7 @@
  * @see Deinterlace()
  */
 typedef struct {
-    mtime_t pi_date;
+    vlc_tick_t pi_date;
     int     pi_nb_fields;
     bool    pb_top_field_first;
 } metadata_history_t;
@@ -101,7 +100,7 @@ void InitDeinterlacingContext( struct deinterlace_ctx * );
  * @param p_pic the picture which field we want the duration
  * @return the duration of the field or 0 if there's no known framerate
  */
-mtime_t GetFieldDuration( const struct deinterlace_ctx *,
+vlc_tick_t GetFieldDuration( const struct deinterlace_ctx *,
                           const video_format_t *fmt, const picture_t *p_pic );
 
 /**
@@ -123,5 +122,6 @@ picture_t *DoDeinterlacing( filter_t *, struct deinterlace_ctx *, picture_t * );
  */
 void FlushDeinterlacing( struct deinterlace_ctx * );
 
+picture_t *AllocPicture( filter_t * );
 
 #endif

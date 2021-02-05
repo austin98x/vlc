@@ -2,7 +2,6 @@
  * generic_window.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -43,6 +42,7 @@ class EvtDragLeave;
 class EvtDragOver;
 class EvtDragDrop;
 class WindowManager;
+struct vout_window_t;
 
 
 /// Generic window class
@@ -111,8 +111,8 @@ public:
     /// Window type, mainly useful when overloaded (for VoutWindow)
     virtual std::string getType() const { return "Generic"; }
 
-    /// windows handle
-    vlc_wnd_type getOSHandle() const;
+    /// window handle
+    void updateWindowConfiguration( struct vout_window_t *pWnd ) const;
 
     /// window type
     WindowType_t getType() { return m_type; }
@@ -121,9 +121,10 @@ public:
     void setParent( GenericWindow* pParent,
                     int x = 0, int y = 0, int w = -1, int h = -1 );
 
-protected:
     /// Get the OS window
     OSWindow *getOSWindow() const { return m_pOsWindow; }
+
+protected:
 
     /// These methods do not need to be public since they are accessed
     /// only by the window manager or by inheritant classes.

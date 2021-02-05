@@ -2,7 +2,6 @@
  * gradient.c : Gradient and edge detection video effects plugin for vlc
  *****************************************************************************
  * Copyright (C) 2000-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Samuel Hocevar <sam@zoy.org>
  *          Antoine Cellerier <dionoea -at- videolan -dot- org>
@@ -44,13 +43,12 @@ enum { GRADIENT, EDGE, HOUGH };
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
+static int  Create    ( filter_t * );
 
-static picture_t *Filter( filter_t *, picture_t * );
 static int GradientCallback( vlc_object_t *, char const *,
                              vlc_value_t, vlc_value_t,
                              void * );
+VIDEO_FILTER_WRAPPER_CLOSE(Filter, Destroy)
 
 static void FilterGradient( filter_t *, picture_t *, picture_t * );
 static void FilterEdge    ( filter_t *, picture_t *, picture_t * );
@@ -81,7 +79,6 @@ vlc_module_begin ()
     set_description( N_("Gradient video filter") )
     set_shortname( N_( "Gradient" ))
     set_help(GRADIENT_HELP)
-    set_capability( "video filter", 0 )
     set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
@@ -95,7 +92,7 @@ vlc_module_begin ()
                 CARTOON_TEXT, CARTOON_LONGTEXT, false )
 
     add_shortcut( "gradient" )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
@@ -108,7 +105,7 @@ static const char *const ppsz_filter_options[] = {
  * This structure is part of the video output thread descriptor.
  * It describes the Distort specific properties of an output thread.
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     vlc_mutex_t lock;
     int i_mode;
@@ -123,16 +120,15 @@ struct filter_sys_t
 
     /* For hough mode */
     int *p_pre_hough;
-};
+} filter_sys_t;
 
 /*****************************************************************************
  * Create: allocates Distort video thread output method
  *****************************************************************************
  * This function allocates and initializes a Distort vout method.
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     char *psz_method;
 
     switch( p_filter->fmt_in.video.i_chroma )
@@ -147,13 +143,14 @@ static int Create( vlc_object_t *p_this )
     }
 
     /* Allocate structure */
-    p_filter->p_sys = malloc( sizeof( filter_sys_t ) );
-    if( p_filter->p_sys == NULL )
+    filter_sys_t *p_sys = malloc( sizeof( filter_sys_t ) );
+    if( p_sys == NULL )
         return VLC_ENOMEM;
+    p_filter->p_sys = p_sys;
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
 
-    p_filter->p_sys->p_pre_hough = NULL;
+    p_sys->p_pre_hough = NULL;
 
     config_ChainParse( p_filter, FILTER_PREFIX, ppsz_filter_options,
                    p_filter->p_cfg );
@@ -163,46 +160,46 @@ static int Create( vlc_object_t *p_this )
     {
         msg_Err( p_filter, "configuration variable "
                  FILTER_PREFIX "mode empty" );
-        p_filter->p_sys->i_mode = GRADIENT;
+        p_sys->i_mode = GRADIENT;
     }
     else
     {
         if( !strcmp( psz_method, "gradient" ) )
         {
-            p_filter->p_sys->i_mode = GRADIENT;
+            p_sys->i_mode = GRADIENT;
         }
         else if( !strcmp( psz_method, "edge" ) )
         {
-            p_filter->p_sys->i_mode = EDGE;
+            p_sys->i_mode = EDGE;
         }
         else if( !strcmp( psz_method, "hough" ) )
         {
-            p_filter->p_sys->i_mode = HOUGH;
+            p_sys->i_mode = HOUGH;
         }
         else
         {
             msg_Err( p_filter, "no valid gradient mode provided (%s)", psz_method );
-            p_filter->p_sys->i_mode = GRADIENT;
+            p_sys->i_mode = GRADIENT;
         }
     }
     free( psz_method );
 
-    p_filter->p_sys->i_gradient_type =
+    p_sys->i_gradient_type =
         var_CreateGetIntegerCommand( p_filter, FILTER_PREFIX "type" );
-    p_filter->p_sys->b_cartoon =
+    p_sys->b_cartoon =
         var_CreateGetBoolCommand( p_filter, FILTER_PREFIX "cartoon" );
 
-    vlc_mutex_init( &p_filter->p_sys->lock );
+    vlc_mutex_init( &p_sys->lock );
     var_AddCallback( p_filter, FILTER_PREFIX "mode",
-                     GradientCallback, p_filter->p_sys );
+                     GradientCallback, p_sys );
     var_AddCallback( p_filter, FILTER_PREFIX "type",
-                     GradientCallback, p_filter->p_sys );
+                     GradientCallback, p_sys );
     var_AddCallback( p_filter, FILTER_PREFIX "cartoon",
-                     GradientCallback, p_filter->p_sys );
+                     GradientCallback, p_sys );
 
-    p_filter->p_sys->p_buf32 = NULL;
-    p_filter->p_sys->p_buf32_bis = NULL;
-    p_filter->p_sys->p_buf8 = NULL;
+    p_sys->p_buf32 = NULL;
+    p_sys->p_buf32_bis = NULL;
+    p_sys->p_buf8 = NULL;
 
     return VLC_SUCCESS;
 }
@@ -212,9 +209,8 @@ static int Create( vlc_object_t *p_this )
  *****************************************************************************
  * Terminate an output method created by DistortCreateOutputMethod
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     var_DelCallback( p_filter, FILTER_PREFIX "mode",
@@ -223,7 +219,6 @@ static void Destroy( vlc_object_t *p_this )
                      GradientCallback, p_sys );
     var_DelCallback( p_filter, FILTER_PREFIX "cartoon",
                      GradientCallback, p_sys );
-    vlc_mutex_destroy( &p_sys->lock );
 
     free( p_sys->p_buf32 );
     free( p_sys->p_buf32_bis );
@@ -240,21 +235,12 @@ static void Destroy( vlc_object_t *p_this )
  * until it is displayed and switch the two rendering buffers, preparing next
  * frame.
  *****************************************************************************/
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
 {
-    picture_t *p_outpic;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
-    if( !p_pic ) return NULL;
-
-    p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        picture_Release( p_pic );
-        return NULL;
-    }
-
-    vlc_mutex_lock( &p_filter->p_sys->lock );
-    switch( p_filter->p_sys->i_mode )
+    vlc_mutex_lock( &p_sys->lock );
+    switch( p_sys->i_mode )
     {
         case EDGE:
             FilterEdge( p_filter, p_pic, p_outpic );
@@ -271,9 +257,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
         default:
             break;
     }
-    vlc_mutex_unlock( &p_filter->p_sys->lock );
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
+    vlc_mutex_unlock( &p_sys->lock );
 }
 
 /*****************************************************************************
@@ -340,6 +324,8 @@ static void GaussianConvolution( picture_t *p_inpic, uint32_t *p_smooth )
 static void FilterGradient( filter_t *p_filter, picture_t *p_inpic,
                                                 picture_t *p_outpic )
 {
+    filter_sys_t *p_sys = p_filter->p_sys;
+
     const int i_src_pitch = p_inpic->p[Y_PLANE].i_pitch;
     const int i_src_visible = p_inpic->p[Y_PLANE].i_visible_pitch;
     const int i_dst_pitch = p_outpic->p[Y_PLANE].i_pitch;
@@ -349,14 +335,14 @@ static void FilterGradient( filter_t *p_filter, picture_t *p_inpic,
     uint8_t *p_outpix = p_outpic->p[Y_PLANE].p_pixels;
 
     uint32_t *p_smooth;
-    if( !p_filter->p_sys->p_buf32 )
-        p_filter->p_sys->p_buf32 =
+    if( !p_sys->p_buf32 )
+        p_sys->p_buf32 =
             vlc_alloc( i_num_lines * i_src_visible, sizeof(uint32_t));
-    p_smooth = p_filter->p_sys->p_buf32;
+    p_smooth = p_sys->p_buf32;
 
     if( !p_smooth ) return;
 
-    if( p_filter->p_sys->b_cartoon )
+    if( p_sys->b_cartoon )
     {
         plane_CopyPixels( &p_outpic->p[U_PLANE], &p_inpic->p[U_PLANE] );
         plane_CopyPixels( &p_outpic->p[V_PLANE], &p_inpic->p[V_PLANE] );
@@ -396,9 +382,9 @@ static void FilterGradient( filter_t *p_filter, picture_t *p_inpic,
                     + ((int)p_smooth[(y + 1) * i_src_visible + x - 1] \
                      - (int)p_smooth[(y + 1) * i_src_visible + x + 1]));
 
-    if( p_filter->p_sys->i_gradient_type )
+    if( p_sys->i_gradient_type )
     {
-        if( p_filter->p_sys->b_cartoon )
+        if( p_sys->b_cartoon )
         {
             FOR
             if( a > 60 )
@@ -459,6 +445,8 @@ static void FilterGradient( filter_t *p_filter, picture_t *p_inpic,
 static void FilterEdge( filter_t *p_filter, picture_t *p_inpic,
                                             picture_t *p_outpic )
 {
+    filter_sys_t *p_sys = p_filter->p_sys;
+
     const int i_src_pitch = p_inpic->p[Y_PLANE].i_pitch;
     const int i_src_visible = p_inpic->p[Y_PLANE].i_visible_pitch;
     const int i_dst_pitch = p_outpic->p[Y_PLANE].i_pitch;
@@ -471,24 +459,24 @@ static void FilterEdge( filter_t *p_filter, picture_t *p_inpic,
     uint32_t *p_grad;
     uint8_t *p_theta;
 
-    if( !p_filter->p_sys->p_buf32 )
-        p_filter->p_sys->p_buf32 =
+    if( !p_sys->p_buf32 )
+        p_sys->p_buf32 =
             vlc_alloc( i_num_lines * i_src_visible, sizeof(uint32_t));
-    p_smooth = p_filter->p_sys->p_buf32;
+    p_smooth = p_sys->p_buf32;
 
-    if( !p_filter->p_sys->p_buf32_bis )
-        p_filter->p_sys->p_buf32_bis =
+    if( !p_sys->p_buf32_bis )
+        p_sys->p_buf32_bis =
             vlc_alloc( i_num_lines * i_src_visible, sizeof(uint32_t));
-    p_grad = p_filter->p_sys->p_buf32_bis;
+    p_grad = p_sys->p_buf32_bis;
 
-    if( !p_filter->p_sys->p_buf8 )
-        p_filter->p_sys->p_buf8 =
+    if( !p_sys->p_buf8 )
+        p_sys->p_buf8 =
             vlc_alloc( i_num_lines * i_src_visible, sizeof(uint8_t));
-    p_theta = p_filter->p_sys->p_buf8;
+    p_theta = p_sys->p_buf8;
 
     if( !p_smooth || !p_grad || !p_theta ) return;
 
-    if( p_filter->p_sys->b_cartoon )
+    if( p_sys->b_cartoon )
     {
         plane_CopyPixels( &p_outpic->p[U_PLANE], &p_inpic->p[U_PLANE] );
         plane_CopyPixels( &p_outpic->p[V_PLANE], &p_inpic->p[V_PLANE] );
@@ -590,7 +578,7 @@ static void FilterEdge( filter_t *p_filter, picture_t *p_inpic,
             else
             {
                 colorize:
-                if( p_filter->p_sys->b_cartoon )
+                if( p_sys->b_cartoon )
                 {
                     if( p_smooth[y*i_src_visible+x] > 0xa0 )
                         p_outpix[y*i_dst_pitch+x] = (uint8_t)
@@ -613,10 +601,12 @@ static void FilterEdge( filter_t *p_filter, picture_t *p_inpic,
 /*****************************************************************************
  * FilterHough
  *****************************************************************************/
-#define p_pre_hough p_filter->p_sys->p_pre_hough
+#define p_pre_hough p_sys->p_pre_hough
 static void FilterHough( filter_t *p_filter, picture_t *p_inpic,
                                              picture_t *p_outpic )
 {
+    filter_sys_t *p_sys = p_filter->p_sys;
+
     int i_src_visible = p_inpic->p[Y_PLANE].i_visible_pitch;
     int i_dst_pitch = p_outpic->p[Y_PLANE].i_pitch;
     int i_num_lines = p_inpic->p[Y_PLANE].i_visible_lines;

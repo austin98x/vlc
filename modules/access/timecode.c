@@ -43,29 +43,29 @@ vlc_module_begin ()
     set_description (N_("Time code subpicture elementary stream generator"))
     set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_ACCESS)
-    set_capability ("access_demux", 0)
-    set_callbacks (Open, NULL)
+    set_capability ("access", 0)
+    set_callback(Open)
 
     add_string ("timecode-fps", "25/1", FPS_TEXT, FPS_TEXT, false)
         change_string_list (fps_values, fps_texts)
         change_safe ()
 vlc_module_end ()
 
-struct demux_sys_t
+typedef struct
 {
     es_out_id_t *es;
     date_t date;
-    mtime_t next_time;
-};
+    vlc_tick_t next_time;
+} demux_sys_t;
 
 static int DemuxOnce (demux_t *demux, bool master)
 {
     demux_sys_t *sys = demux->p_sys;
-    mtime_t pts = date_Get (&sys->date);
+    vlc_tick_t pts = date_Get (&sys->date);
     lldiv_t d;
     unsigned h, m, s, f;
 
-    d = lldiv (pts, CLOCK_FREQ);
+    d = lldiv (pts - VLC_TICK_0, CLOCK_FREQ);
     f = d.rem * sys->date.i_divider_num / sys->date.i_divider_den / CLOCK_FREQ;
     d = lldiv (d.quot, 60);
     s = d.rem;
@@ -97,7 +97,7 @@ static int Demux (demux_t *demux)
 {
     demux_sys_t *sys = demux->p_sys;
 
-    if (sys->next_time == VLC_TS_INVALID) /* Master mode */
+    if (sys->next_time == VLC_TICK_INVALID) /* Master mode */
         return DemuxOnce (demux, true);
 
     /* Slave mode */
@@ -121,22 +121,22 @@ static int Control (demux_t *demux, int query, va_list args)
             break;
 
         case DEMUX_GET_LENGTH:
-            *va_arg (args, int64_t *) = INT64_C(0);
+            *va_arg (args, vlc_tick_t *) = INT64_C(0);
             break;
 
         case DEMUX_GET_TIME:
-            *va_arg (args, int64_t *) = date_Get (&sys->date);
+            *va_arg (args, vlc_tick_t *) = date_Get (&sys->date);
             break;
 
         case DEMUX_SET_TIME:
-            date_Set (&sys->date, va_arg (args, int64_t));
+            date_Set (&sys->date, va_arg (args, vlc_tick_t));
             break;
 
         case DEMUX_SET_NEXT_DEMUX_TIME:
         {
-            const mtime_t pts = va_arg (args, int64_t );
+            const vlc_tick_t pts = va_arg (args, vlc_tick_t );
 
-            if (sys->next_time == VLC_TS_INVALID) /* first invocation? */
+            if (sys->next_time == VLC_TICK_INVALID) /* first invocation? */
             {
                 date_Set (&sys->date, pts);
                 date_Decrement (&sys->date, 1);
@@ -147,8 +147,8 @@ static int Control (demux_t *demux, int query, va_list args)
 
         case DEMUX_GET_PTS_DELAY:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = INT64_C(1000) * var_InheritInteger (demux, "live-caching");
+            *va_arg (args, vlc_tick_t *) =
+                VLC_TICK_FROM_MS( var_InheritInteger (demux, "live-caching") );
             break;
         }
 
@@ -167,8 +167,10 @@ static int Control (demux_t *demux, int query, va_list args)
 static int Open (vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
-    demux_sys_t *sys = vlc_obj_malloc(obj, sizeof (*sys));
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
 
+    demux_sys_t *sys = vlc_obj_malloc(obj, sizeof (*sys));
     if (unlikely(sys == NULL))
         return VLC_ENOMEM;
 
@@ -185,8 +187,8 @@ static int Open (vlc_object_t *obj)
     }
 
     date_Init (&sys->date, num, den);
-    date_Set (&sys->date, VLC_TS_0);
-    sys->next_time = VLC_TS_INVALID;
+    date_Set (&sys->date, VLC_TICK_0);
+    sys->next_time = VLC_TICK_INVALID;
 
     demux->p_sys = sys;
     demux->pf_demux   = Demux;

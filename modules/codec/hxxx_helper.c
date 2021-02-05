@@ -41,11 +41,6 @@ hxxx_helper_init(struct hxxx_helper *hh, vlc_object_t *p_obj,
     memset(hh, 0, sizeof(struct hxxx_helper));
     hh->p_obj = p_obj;
     hh->i_codec = i_codec;
-    switch (i_codec)
-    {
-        case VLC_CODEC_H264:
-            break;
-    }
     hh->b_need_xvcC = b_need_xvcC;
 }
 
@@ -862,7 +857,7 @@ hxxx_helper_get_current_picture_size(const struct hxxx_helper *hh,
     else if(hh->i_codec == VLC_CODEC_HEVC)
     {
         const struct hxxx_helper_nal *hsps = &hh->hevc.sps_list[hh->hevc.i_current_sps];
-        if(hsps && hevc_get_picture_size(hsps->hevc_sps, p_w, p_h, p_vw, p_vh))
+        if(hsps && hsps->hevc_sps && hevc_get_picture_size(hsps->hevc_sps, p_w, p_h, p_vw, p_vh))
             return VLC_SUCCESS;
     }
     return VLC_EGENERIC;
@@ -885,7 +880,7 @@ hxxx_helper_get_current_sar(const struct hxxx_helper *hh, int *p_num, int *p_den
     {
         const struct hxxx_helper_nal *hsps = &hh->hevc.sps_list[hh->hevc.i_current_sps];
         unsigned num, den;
-        if(hsps && hevc_get_aspect_ratio(hsps->hevc_sps, &num, &den))
+        if(hsps && hsps->hevc_sps && hevc_get_aspect_ratio(hsps->hevc_sps, &num, &den))
         {
             *p_num = num;
             *p_den = den;
@@ -923,7 +918,7 @@ hxxx_helper_get_current_profile_level(const struct hxxx_helper *hh,
     else if(hh->i_codec == VLC_CODEC_HEVC)
     {
         const struct hxxx_helper_nal *hsps = &hh->hevc.sps_list[hh->hevc.i_current_sps];
-        if (hsps &&
+        if (hsps && hsps->hevc_sps &&
             hevc_get_sps_profile_tier_level(hsps->hevc_sps, p_profile, p_level))
             return VLC_SUCCESS;
     }
@@ -931,11 +926,42 @@ hxxx_helper_get_current_profile_level(const struct hxxx_helper *hh,
 }
 
 int
+hxxx_helper_get_chroma_chroma(const struct hxxx_helper *hh, uint8_t *pi_chroma_format,
+                              uint8_t *pi_depth_luma, uint8_t *pi_depth_chroma)
+{
+    switch (hh->i_codec)
+    {
+        case VLC_CODEC_H264:
+        {
+            const struct hxxx_helper_nal *hsps = h264_helper_get_current_sps(hh);
+            if (hsps == NULL)
+                return VLC_EGENERIC;
+            return h264_get_chroma_luma(hsps->h264_sps, pi_chroma_format, pi_depth_luma,
+                                        pi_depth_chroma)
+                == true ? VLC_SUCCESS : VLC_EGENERIC;
+        }
+        case VLC_CODEC_HEVC:
+        {
+            const struct hxxx_helper_nal *hsps = &hh->hevc.sps_list[hh->hevc.i_current_sps];
+            if (hsps == NULL || hsps->hevc_sps == NULL)
+                return VLC_EGENERIC;
+
+            return hevc_get_chroma_luma(hsps->hevc_sps, pi_chroma_format, pi_depth_luma,
+                                        pi_depth_chroma)
+                == true ? VLC_SUCCESS : VLC_EGENERIC;
+        }
+        default:
+            vlc_assert_unreachable();
+    }
+}
+
+
+int
 hxxx_helper_get_colorimetry(const struct hxxx_helper *hh,
                             video_color_primaries_t *p_primaries,
                             video_transfer_func_t *p_transfer,
                             video_color_space_t *p_colorspace,
-                            bool *p_full_range)
+                            video_color_range_t *p_full_range)
 {
     switch (hh->i_codec)
     {
@@ -951,7 +977,7 @@ hxxx_helper_get_colorimetry(const struct hxxx_helper *hh,
         case VLC_CODEC_HEVC:
         {
             const struct hxxx_helper_nal *hsps = &hh->hevc.sps_list[hh->hevc.i_current_sps];
-            if (hsps == NULL)
+            if (hsps == NULL || hsps->hevc_sps == NULL)
                 return VLC_EGENERIC;
 
             return hevc_get_colorimetry(hsps->hevc_sps, p_primaries, p_transfer,

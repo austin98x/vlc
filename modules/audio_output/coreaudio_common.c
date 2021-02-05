@@ -25,165 +25,282 @@
 #import "coreaudio_common.h"
 #import <CoreAudio/CoreAudioTypes.h>
 
-#if !TARGET_OS_IPHONE
-#import <CoreServices/CoreServices.h>
-#import <vlc_dialog.h>
-#endif
-
 static inline uint64_t
 BytesToFrames(struct aout_sys_common *p_sys, size_t i_bytes)
 {
     return i_bytes * p_sys->i_frame_length / p_sys->i_bytes_per_frame;
 }
 
-static inline mtime_t
+static inline vlc_tick_t
 FramesToUs(struct aout_sys_common *p_sys, uint64_t i_nb_frames)
 {
-    return i_nb_frames * CLOCK_FREQ / p_sys->i_rate;
+    return vlc_tick_from_samples(i_nb_frames, p_sys->i_rate);
 }
 
-void
+static inline size_t
+FramesToBytes(struct aout_sys_common *p_sys, uint64_t i_frames)
+{
+    return i_frames * p_sys->i_bytes_per_frame / p_sys->i_frame_length;
+}
+
+static inline uint64_t
+UsToFrames(struct aout_sys_common *p_sys, vlc_tick_t i_us)
+{
+    assert(i_us > 0);
+    return samples_from_vlc_tick(i_us, p_sys->i_rate);
+}
+
+static inline vlc_tick_t
+HostTimeToTick(struct aout_sys_common *p_sys, int64_t i_host_time)
+{
+    return VLC_TICK_FROM_NS(i_host_time * p_sys->tinfo.numer / p_sys->tinfo.denom);
+}
+
+static inline int64_t
+TickToHostTime(struct aout_sys_common *p_sys, vlc_tick_t i_us)
+{
+    return NS_FROM_VLC_TICK(i_us * p_sys->tinfo.denom / p_sys->tinfo.numer);
+}
+
+static void
+ca_ClearOutBuffers(audio_output_t *p_aout)
+{
+    struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
+
+    block_ChainRelease(p_sys->p_out_chain);
+    p_sys->p_out_chain = NULL;
+    p_sys->pp_out_last = &p_sys->p_out_chain;
+
+    p_sys->i_out_size = 0;
+}
+
+static inline void
+lock_init(struct aout_sys_common *p_sys)
+{
+    if (likely(os_unfair_lock_lock))
+        p_sys->lock.unfair = OS_UNFAIR_LOCK_INIT;
+    else
+        vlc_mutex_init(&p_sys->lock.mutex);
+}
+
+static inline void
+lock_lock(struct aout_sys_common *p_sys)
+{
+    if (likely(os_unfair_lock_lock))
+        os_unfair_lock_lock(&p_sys->lock.unfair);
+    else
+        vlc_mutex_lock(&p_sys->lock.mutex);
+}
+
+static inline void
+lock_unlock(struct aout_sys_common *p_sys)
+{
+    if (likely(os_unfair_lock_lock))
+        os_unfair_lock_unlock(&p_sys->lock.unfair);
+    else
+        vlc_mutex_unlock(&p_sys->lock.mutex);
+}
+
+int
 ca_Open(audio_output_t *p_aout)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
-    atomic_init(&p_sys->i_underrun_size, 0);
-    atomic_init(&p_sys->b_paused, false);
-    atomic_init(&p_sys->b_do_flush, false);
+    if (mach_timebase_info(&p_sys->tinfo) != KERN_SUCCESS)
+        return VLC_EGENERIC;
+
+    assert(p_sys->tinfo.denom != 0 && p_sys->tinfo.numer != 0);
+
     vlc_sem_init(&p_sys->flush_sem, 0);
-    vlc_mutex_init(&p_sys->lock);
+    lock_init(p_sys);
+    p_sys->p_out_chain = NULL;
 
     p_aout->play = ca_Play;
     p_aout->pause = ca_Pause;
     p_aout->flush = ca_Flush;
     p_aout->time_get = ca_TimeGet;
-}
 
-void
-ca_Close(audio_output_t *p_aout)
-{
-    struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
-
-    vlc_sem_destroy(&p_sys->flush_sem);
-    vlc_mutex_destroy(&p_sys->lock);
+    return VLC_SUCCESS;
 }
 
 /* Called from render callbacks. No lock, wait, and IO here */
 void
-ca_Render(audio_output_t *p_aout, uint8_t *p_output, size_t i_requested)
+ca_Render(audio_output_t *p_aout, uint32_t i_frames, uint64_t i_host_time,
+          uint8_t *p_output, size_t i_requested)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
-    bool expected = true;
-    if (atomic_compare_exchange_weak(&p_sys->b_do_flush, &expected, false))
+    lock_lock(p_sys);
+
+    if (p_sys->b_do_flush)
     {
-        TPCircularBufferClear(&p_sys->circular_buffer);
+        ca_ClearOutBuffers(p_aout);
         /* Signal that the renderer is flushed */
+        p_sys->b_do_flush = false;
         vlc_sem_post(&p_sys->flush_sem);
     }
 
-    if (atomic_load_explicit(&p_sys->b_paused, memory_order_relaxed))
+    if (unlikely(p_sys->i_first_render_host_time == 0))
+        goto drop;
+
+    if (p_sys->b_paused)
     {
-        memset(p_output, 0, i_requested);
-        return;
+        p_sys->i_render_host_time = i_host_time;
+        goto drop;
     }
 
-    /* Pull audio from buffer */
-    int32_t i_available;
-    void *p_data = TPCircularBufferTail(&p_sys->circular_buffer,
-                                        &i_available);
-    if (i_available < 0)
-        i_available = 0;
-
-    size_t i_tocopy = __MIN(i_requested, (size_t) i_available);
-
-    if (i_tocopy > 0)
+    /* Start deferred: write silence (zeros) until we reach the first render
+     * host time. */
+    if (unlikely(p_sys->i_first_render_host_time > i_host_time ))
     {
-        memcpy(p_output, p_data, i_tocopy);
-        TPCircularBufferConsume(&p_sys->circular_buffer, i_tocopy);
+        /* Convert the requested bytes into host time and check that it does
+         * not overlap between the first_render host time and the current one.
+         * */
+        const size_t i_requested_us =
+            FramesToUs(p_sys, BytesToFrames(p_sys, i_requested));
+        const int64_t i_requested_host_time =
+            TickToHostTime(p_sys, i_requested_us);
+        if (p_sys->i_first_render_host_time >= i_host_time + i_requested_host_time)
+        {
+            /* Fill the buffer with silence */
+            goto drop;
+        }
+
+        /* Write silence to reach the first_render host time */
+        const vlc_tick_t i_silence_us =
+            HostTimeToTick(p_sys, p_sys->i_first_render_host_time - i_host_time);
+
+        const size_t i_silence_bytes =
+            FramesToBytes(p_sys, UsToFrames(p_sys, i_silence_us));
+        assert(i_silence_bytes <= i_requested);
+        memset(p_output, 0, i_silence_bytes);
+
+        i_requested -= i_silence_bytes;
+        p_output += i_silence_bytes;
+
+        /* Start the first rendering */
     }
+
+    p_sys->i_render_host_time = i_host_time;
+    p_sys->i_render_frames = i_frames;
+
+    size_t i_copied = 0;
+    block_t *p_block = p_sys->p_out_chain;
+    while (p_block != NULL && i_requested != 0)
+    {
+        size_t i_tocopy = __MIN(i_requested, p_block->i_buffer);
+        memcpy(p_output, p_block->p_buffer, i_tocopy);
+        i_requested -= i_tocopy;
+        i_copied += i_tocopy;
+        p_output += i_tocopy;
+
+        if (i_tocopy == p_block->i_buffer)
+        {
+            block_t *p_release = p_block;
+            p_block = p_block->p_next;
+            block_Release(p_release);
+        }
+        else
+        {
+            assert(i_requested == 0);
+
+            p_block->p_buffer += i_tocopy;
+            p_block->i_buffer -= i_tocopy;
+        }
+    }
+    p_sys->p_out_chain = p_block;
+    if (!p_sys->p_out_chain)
+        p_sys->pp_out_last = &p_sys->p_out_chain;
+    p_sys->i_out_size -= i_copied;
 
     /* Pad with 0 */
-    if (i_requested > i_tocopy)
+    if (i_requested > 0)
     {
-        atomic_fetch_add(&p_sys->i_underrun_size, i_requested - i_tocopy);
-        memset(&p_output[i_tocopy], 0, i_requested - i_tocopy);
+        assert(p_sys->i_out_size == 0);
+        p_sys->i_underrun_size += i_requested;
+        memset(p_output, 0, i_requested);
     }
+
+    lock_unlock(p_sys);
+    return;
+
+drop:
+    memset(p_output, 0, i_requested);
+    lock_unlock(p_sys);
 }
 
-int
-ca_TimeGet(audio_output_t *p_aout, mtime_t *delay)
+static vlc_tick_t
+ca_GetLatencyLocked(audio_output_t *p_aout)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
-    int32_t i_bytes;
-    TPCircularBufferTail(&p_sys->circular_buffer, &i_bytes);
+    const int64_t i_out_frames = BytesToFrames(p_sys, p_sys->i_out_size);
+    return FramesToUs(p_sys, i_out_frames + p_sys->i_render_frames)
+           + p_sys->i_dev_latency_us;
+}
 
-    int64_t i_frames = BytesToFrames(p_sys, i_bytes);
-    *delay = FramesToUs(p_sys, i_frames) + p_sys->i_dev_latency_us;
+int
+ca_TimeGet(audio_output_t *p_aout, vlc_tick_t *delay)
+{
+    struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
+    lock_lock(p_sys);
+
+    if (p_sys->i_render_host_time == 0 || p_sys->i_first_render_host_time == 0)
+    {
+        /* Not yet started (or reached the first_render host time) */
+        lock_unlock(p_sys);
+        return -1;
+    }
+
+    int64_t i_render_delay_host_time = p_sys->i_render_host_time
+                                     - mach_absolute_time();
+    const vlc_tick_t i_render_delay =
+        HostTimeToTick(p_sys, i_render_delay_host_time);
+
+    *delay = ca_GetLatencyLocked(p_aout) + i_render_delay;
+    lock_unlock(p_sys);
     return 0;
 }
 
 void
-ca_Flush(audio_output_t *p_aout, bool wait)
+ca_Flush(audio_output_t *p_aout)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
-    if (wait)
-    {
-        int32_t i_bytes;
+    lock_lock(p_sys);
 
-        while (TPCircularBufferTail(&p_sys->circular_buffer, &i_bytes) != NULL)
-        {
-            if (atomic_load(&p_sys->b_paused))
-            {
-                TPCircularBufferClear(&p_sys->circular_buffer);
-                return;
-            }
-
-            /* Calculate the duration of the circular buffer, in order to wait
-             * for the render thread to play it all */
-            const mtime_t i_frame_us =
-                FramesToUs(p_sys, BytesToFrames(p_sys, i_bytes)) + 10000;
-
-            msleep(i_frame_us / 2);
-        }
-    }
+    assert(!p_sys->b_do_flush);
+    if (p_sys->b_paused)
+        ca_ClearOutBuffers(p_aout);
     else
     {
-        /* Request the renderer to flush, and wait for an ACK.
-         * b_do_flush and b_paused need to be locked together in order to not
-         * get stuck here when b_paused is being set after reading. This can
-         * happen when setAliveState() is called from any thread through an
-         * interrupt notification */
-
-        vlc_mutex_lock(&p_sys->lock);
-        assert(!atomic_load(&p_sys->b_do_flush));
-         if (atomic_load(&p_sys->b_paused))
-        {
-            vlc_mutex_unlock(&p_sys->lock);
-            TPCircularBufferClear(&p_sys->circular_buffer);
-            return;
-        }
-
-        atomic_store_explicit(&p_sys->b_do_flush, true, memory_order_release);
-        vlc_mutex_unlock(&p_sys->lock);
+        p_sys->b_do_flush = true;
+        lock_unlock(p_sys);
         vlc_sem_wait(&p_sys->flush_sem);
+        lock_lock(p_sys);
     }
+
+    p_sys->i_render_host_time = p_sys->i_first_render_host_time = 0;
+    p_sys->i_render_frames = 0;
+    lock_unlock(p_sys);
+
+    p_sys->b_played = false;
 }
 
 void
-ca_Pause(audio_output_t * p_aout, bool pause, mtime_t date)
+ca_Pause(audio_output_t * p_aout, bool pause, vlc_tick_t date)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
     VLC_UNUSED(date);
 
-    atomic_store_explicit(&p_sys->b_paused, pause, memory_order_relaxed);
+    lock_lock(p_sys);
+    p_sys->b_paused = pause;
+    lock_unlock(p_sys);
 }
 
 void
-ca_Play(audio_output_t * p_aout, block_t * p_block)
+ca_Play(audio_output_t * p_aout, block_t * p_block, vlc_tick_t date)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
@@ -193,67 +310,104 @@ ca_Play(audio_output_t * p_aout, block_t * p_block)
                            p_sys->chans_to_reorder, p_sys->chan_table,
                            VLC_CODEC_FL32);
 
-    /* move data to buffer */
-    while (!TPCircularBufferProduceBytes(&p_sys->circular_buffer,
-                                         p_block->p_buffer, p_block->i_buffer))
+    lock_lock(p_sys);
+
+    if (p_sys->i_render_host_time == 0)
     {
-        if (atomic_load_explicit(&p_sys->b_paused, memory_order_relaxed))
-        {
-            msg_Warn(p_aout, "dropping block because the circular buffer is "
-                     "full and paused");
-            break;
-        }
+        /* Setup the first render time, this date must be updated until the
+         * first (non-silence/zero) frame is rendered by the render callback.
+         * Once the rendering is truly started, the date can be ignored. */
 
-        /* Try to play what we can */
-        int32_t i_avalaible_bytes;
-        TPCircularBufferHead(&p_sys->circular_buffer, &i_avalaible_bytes);
-        assert(i_avalaible_bytes >= 0);
-        if (unlikely((size_t) i_avalaible_bytes >= p_block->i_buffer))
-            continue;
-
-        bool ret =
-            TPCircularBufferProduceBytes(&p_sys->circular_buffer,
-                                         p_block->p_buffer, i_avalaible_bytes);
-        assert(ret == true);
-        p_block->p_buffer += i_avalaible_bytes;
-        p_block->i_buffer -= i_avalaible_bytes;
-
-        /* Wait for the render buffer to play the remaining data */
-        const mtime_t i_frame_us =
-            FramesToUs(p_sys, BytesToFrames(p_sys, p_block->i_buffer));
-        msleep(i_frame_us / 2);
+        /* We can't convert date to host time directly since the clock source
+         * may be different (MONOTONIC vs continue during sleep). The solution
+         * is to convert it to a relative time and then add it to
+         * mach_absolute_time() */
+        const vlc_tick_t first_render_delay = date - vlc_tick_now()
+                                            - ca_GetLatencyLocked(p_aout);
+        p_sys->i_first_render_host_time
+            = mach_absolute_time() + TickToHostTime(p_sys, first_render_delay);
     }
 
-    unsigned i_underrun_size = atomic_exchange(&p_sys->i_underrun_size, 0);
-    if (i_underrun_size > 0)
-        msg_Warn(p_aout, "underrun of %u bytes", i_underrun_size);
+    do
+    {
+        const size_t i_avalaible_bytes =
+            __MIN(p_block->i_buffer, p_sys->i_out_max_size - p_sys->i_out_size);
 
-    block_Release(p_block);
+        if (unlikely(i_avalaible_bytes != p_block->i_buffer))
+        {
+            /* Not optimal but unlikely code path. */
+
+            lock_unlock(p_sys);
+
+            block_t *p_new = block_Alloc(i_avalaible_bytes);
+            if (!p_new)
+            {
+                block_Release(p_block);
+                return;
+            }
+
+            memcpy(p_new->p_buffer, p_block->p_buffer, i_avalaible_bytes);
+
+            p_block->p_buffer += i_avalaible_bytes;
+            p_block->i_buffer -= i_avalaible_bytes;
+
+            lock_lock(p_sys);
+
+            block_ChainLastAppend(&p_sys->pp_out_last, p_new);
+            p_sys->i_out_size += i_avalaible_bytes;
+
+            if (p_sys->b_paused)
+            {
+                lock_unlock(p_sys);
+                block_Release(p_block);
+                return;
+            }
+
+            const vlc_tick_t i_frame_us =
+                FramesToUs(p_sys, BytesToFrames(p_sys, p_block->i_buffer));
+
+            /* Wait for the render buffer to play the remaining data */
+            lock_unlock(p_sys);
+            vlc_tick_sleep(i_frame_us);
+            lock_lock(p_sys);
+        }
+        else
+        {
+            block_ChainLastAppend(&p_sys->pp_out_last, p_block);
+            p_sys->i_out_size += i_avalaible_bytes;
+            p_block = NULL;
+        }
+    } while (p_block != NULL);
+
+    size_t i_underrun_size = p_sys->i_underrun_size;
+    p_sys->i_underrun_size = 0;
+
+    lock_unlock(p_sys);
+
+    if (!p_sys->b_played)
+        p_sys->b_played = true;
+    else if (i_underrun_size > 0)
+        msg_Warn(p_aout, "underrun of %zu bytes", i_underrun_size);
+
+    (void) date;
 }
 
 int
 ca_Initialize(audio_output_t *p_aout, const audio_sample_format_t *fmt,
-              mtime_t i_dev_latency_us)
+              vlc_tick_t i_dev_latency_us)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
-    atomic_store(&p_sys->i_underrun_size, 0);
-    atomic_store(&p_sys->b_paused, false);
+    p_sys->i_underrun_size = 0;
+    p_sys->b_paused = false;
+    p_sys->i_render_host_time = p_sys->i_first_render_host_time = 0;
+    p_sys->i_render_frames = 0;
+
     p_sys->i_rate = fmt->i_rate;
     p_sys->i_bytes_per_frame = fmt->i_bytes_per_frame;
     p_sys->i_frame_length = fmt->i_frame_length;
     p_sys->chans_to_reorder = 0;
 
-    msg_Dbg(p_aout, "Current device has a latency of %lld us",
-            i_dev_latency_us);
-
-    /* TODO VLC can't handle latency higher than 1 seconds */
-    if (i_dev_latency_us > 1000000)
-    {
-        i_dev_latency_us = 1000000;
-        msg_Warn(p_aout, "VLC can't handle this device latency, lowering it to "
-                 "%lld", i_dev_latency_us);
-    }
     p_sys->i_dev_latency_us = i_dev_latency_us;
 
     /* setup circular buffer */
@@ -263,16 +417,16 @@ ca_Initialize(audio_output_t *p_aout, const audio_sample_format_t *fmt,
     {
         /* lower latency: 200 ms of buffering. XXX: Decrease when VLC's core
          * can handle lower audio latency */
-        i_audiobuffer_size = i_audiobuffer_size / 5;
+        p_sys->i_out_max_size = i_audiobuffer_size / 5;
     }
     else
     {
         /* 2 seconds of buffering */
-        i_audiobuffer_size = i_audiobuffer_size * AOUT_MAX_ADVANCE_TIME
-                           / CLOCK_FREQ;
+        p_sys->i_out_max_size = i_audiobuffer_size * 2;
     }
-    if (!TPCircularBufferInit(&p_sys->circular_buffer, i_audiobuffer_size))
-        return VLC_EGENERIC;
+
+    ca_ClearOutBuffers(p_aout);
+    p_sys->b_played = false;
 
     return VLC_SUCCESS;
 }
@@ -281,8 +435,8 @@ void
 ca_Uninitialize(audio_output_t *p_aout)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
-    /* clean-up circular buffer */
-    TPCircularBufferCleanup(&p_sys->circular_buffer);
+    ca_ClearOutBuffers(p_aout);
+    p_sys->i_out_max_size = 0;
 }
 
 void
@@ -290,17 +444,31 @@ ca_SetAliveState(audio_output_t *p_aout, bool alive)
 {
     struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
 
-    vlc_mutex_lock(&p_sys->lock);
-    atomic_store(&p_sys->b_paused, !alive);
+    lock_lock(p_sys);
 
-    bool expected = true;
-    if (!alive && atomic_compare_exchange_strong(&p_sys->b_do_flush, &expected, false))
+    bool b_sem_post = false;
+    p_sys->b_paused = !alive;
+    if (!alive && p_sys->b_do_flush)
     {
-        TPCircularBufferClear(&p_sys->circular_buffer);
-        /* Signal that the renderer is flushed */
-        vlc_sem_post(&p_sys->flush_sem);
+        ca_ClearOutBuffers(p_aout);
+        p_sys->b_played = false;
+        p_sys->b_do_flush = false;
+        b_sem_post = true;
     }
-    vlc_mutex_unlock(&p_sys->lock);
+
+    lock_unlock(p_sys);
+
+    if (b_sem_post)
+        vlc_sem_post(&p_sys->flush_sem);
+}
+
+void ca_SetDeviceLatency(audio_output_t *p_aout, vlc_tick_t i_dev_latency_us)
+{
+    struct aout_sys_common *p_sys = (struct aout_sys_common *) p_aout->sys;
+
+    lock_lock(p_sys);
+    p_sys->i_dev_latency_us = i_dev_latency_us;
+    lock_unlock(p_sys);
 }
 
 AudioUnit
@@ -346,9 +514,11 @@ RenderCallback(void *p_data, AudioUnitRenderActionFlags *ioActionFlags,
     VLC_UNUSED(ioActionFlags);
     VLC_UNUSED(inTimeStamp);
     VLC_UNUSED(inBusNumber);
-    VLC_UNUSED(inNumberFrames);
 
-    ca_Render(p_data, ioData->mBuffers[0].mData,
+    uint64_t i_host_time = (inTimeStamp->mFlags & kAudioTimeStampHostTimeValid)
+                         ? inTimeStamp->mHostTime : 0;
+
+    ca_Render(p_data, inNumberFrames, i_host_time, ioData->mBuffers[0].mData,
               ioData->mBuffers[0].mDataByteSize);
 
     return noErr;
@@ -398,7 +568,7 @@ GetLayoutDescription(audio_output_t *p_aout,
 
 static int
 MapOutputLayout(audio_output_t *p_aout, audio_sample_format_t *fmt,
-                const AudioChannelLayout *outlayout)
+                const AudioChannelLayout *outlayout, bool *warn_configuration)
 {
     /* Fill VLC physical_channels from output layout */
     fmt->i_physical_channels = 0;
@@ -476,36 +646,8 @@ MapOutputLayout(audio_output_t *p_aout, audio_sample_format_t *fmt,
         if (fmt->i_physical_channels == 0)
         {
             fmt->i_physical_channels = AOUT_CHANS_STEREO;
-            msg_Err(p_aout, "You should configure your speaker layout with "
-                    "Audio Midi Setup in /Applications/Utilities. VLC will "
-                    "output Stereo only.");
-#if !TARGET_OS_IPHONE
-            vlc_dialog_display_error(p_aout,
-                _("Audio device is not configured"), "%s",
-                _("You should configure your speaker layout with "
-                "\"Audio Midi Setup\" in /Applications/"
-                "Utilities. VLC will output Stereo only."));
-#endif
-        }
-
-        if (aout_FormatNbChannels(fmt) >= 8
-         && fmt->i_physical_channels != AOUT_CHANS_7_1)
-        {
-#if TARGET_OS_IPHONE
-            const bool b_8x_support = true;
-#else
-            SInt32 osx_min_version;
-            if (Gestalt(gestaltSystemVersionMinor, &osx_min_version) != noErr)
-                msg_Err(p_aout, "failed to check OSX version");
-            const bool b_8x_support = osx_min_version >= 7;
-#endif
-
-            if (!b_8x_support)
-            {
-                msg_Warn(p_aout, "8.0 audio output not supported on this "
-                         "device, layout will be incorrect");
-                fmt->i_physical_channels = AOUT_CHANS_7_1;
-            }
+            if (warn_configuration)
+                *warn_configuration = true;
         }
 
     }
@@ -701,10 +843,14 @@ SetupInputLayout(audio_output_t *p_aout, const audio_sample_format_t *fmt,
 
 int
 au_Initialize(audio_output_t *p_aout, AudioUnit au, audio_sample_format_t *fmt,
-              const AudioChannelLayout *outlayout, mtime_t i_dev_latency_us)
+              const AudioChannelLayout *outlayout, vlc_tick_t i_dev_latency_us,
+              bool *warn_configuration)
 {
     int ret;
     AudioChannelLayoutTag inlayout_tag;
+
+    if (warn_configuration)
+        *warn_configuration = false;
 
     /* Set the desired format */
     AudioStreamBasicDescription desc;
@@ -712,7 +858,7 @@ au_Initialize(audio_output_t *p_aout, AudioUnit au, audio_sample_format_t *fmt,
     {
         /* PCM */
         fmt->i_format = VLC_CODEC_FL32;
-        ret = MapOutputLayout(p_aout, fmt, outlayout);
+        ret = MapOutputLayout(p_aout, fmt, outlayout, warn_configuration);
         if (ret != VLC_SUCCESS)
             return ret;
 
