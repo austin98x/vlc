@@ -165,6 +165,12 @@ static const struct testcase
     { true, HTTP("ex.com/testing/good_path/ks_find_realm", "Realm"),
       { "user4", "pwd4", "Realm", "Basic" }, {}, {}, false },
 
+    { true, HTTP("ex.com/testing/good_path/ks_find_realm", NULL),
+      { "user4", "pwd4", "Realm", "Basic" }, {}, {}, false },
+
+    { false, HTTP("ex.com/testing/wrong_path/ks_find_realm", NULL),
+        {}, {}, {}, false },
+
     { true, HTTP("ex.com/testing/good_path/another_path/ks_find_realm", "Realm"),
       { "user4", "pwd4", "Realm", "Basic" }, {}, {}, false },
 
@@ -292,7 +298,7 @@ test(vlc_object_t *p_obj, unsigned int i_id, const struct testcase *p_test)
 
     bool b_found = false;
     while (vlc_credential_get(&credential, p_obj, psz_opt_user, psz_opt_pwd,
-                              "test authentication", "this a test"))
+                              "test authentication", "this a test") == 0)
     {
         bool realm_match = !p_test->result.psz_realm
             || (credential.psz_realm
@@ -353,7 +359,7 @@ main(void)
 
     libvlc_instance_t *p_libvlc = create_libvlc(i_vlc_argc, ppsz_vlc_argv);
 
-    for (unsigned int i = 0; i < sizeof(testcases)/sizeof(*testcases); ++i)
+    for (unsigned int i = 0; i < ARRAY_SIZE(testcases); ++i)
     {
         if (testcases[i].psz_url == NULL)
         {

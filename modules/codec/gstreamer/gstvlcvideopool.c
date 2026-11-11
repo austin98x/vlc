@@ -2,7 +2,6 @@
  * gstvlcvideopool.c: VLC pictures managed by GstBufferPool
  *****************************************************************************
  * Copyright (C) 2016 VLC authors and VideoLAN
- * $Id:
  *
  * Author: Vikram Fugro <vikram.fugro@gmail.com>
  *
@@ -33,7 +32,7 @@ static void gst_vlc_video_pool_finalize( GObject *p_object );
 
 #define gst_vlc_video_pool_parent_class parent_class
 G_DEFINE_TYPE (GstVlcVideoPool, gst_vlc_video_pool,
-    GST_TYPE_BUFFER_POOL);
+    GST_TYPE_BUFFER_POOL)
 
 static const gchar** gst_vlc_video_pool_get_options (GstBufferPool *p_pool)
 {
@@ -190,7 +189,7 @@ static void gst_vlc_video_pool_free_buffer( GstBufferPool *p_pool,
 
     gst_vlc_picture_plane_allocator_release( p_vpool->p_allocator, p_buffer );
 
-    msg_Dbg( p_vpool->p_dec, "freed buffer %p", p_buffer );
+    msg_Dbg( p_vpool->p_dec, "freed buffer %p", (void*)p_buffer );
 
     GST_BUFFER_POOL_CLASS( parent_class )->free_buffer( p_pool, p_buffer );
 
@@ -224,7 +223,7 @@ static GstFlowReturn gst_vlc_video_pool_alloc_buffer( GstBufferPool *p_pool,
                 p_info->offset, p_info->stride );
     }
 
-    msg_Dbg( p_vpool->p_dec, "allocated buffer %p", *p_buffer );
+    msg_Dbg( p_vpool->p_dec, "allocated buffer %p", (void*)*p_buffer );
 
     return GST_FLOW_OK;
 }
@@ -277,7 +276,7 @@ GstVlcVideoPool* gst_vlc_video_pool_new(
 
     if( !GST_IS_VLC_PICTURE_PLANE_ALLOCATOR( p_allocator ))
     {
-        msg_Err( p_dec, "unspported allocator for pool" );
+        msg_Err( p_dec, "unsupported allocator for pool" );
         return NULL;
     }
 

@@ -3,7 +3,6 @@
  * CapturePin, CaptureFilter, CaptureEnumPins implementations
  *****************************************************************************
  * Copyright (C) 2002-2004, 2008 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Gildas Bazin <gbazin@videolan.org>
  *
@@ -28,10 +27,12 @@
 
 #include <deque>
 
+namespace dshow {
+
 struct VLCMediaSample
 {
     ComPtr<IMediaSample> p_sample;
-    mtime_t i_timestamp;
+    vlc_tick_t i_timestamp;
 };
 
 /* */
@@ -39,7 +40,7 @@ void WINAPI FreeMediaType( AM_MEDIA_TYPE& mt );
 HRESULT WINAPI CopyMediaType( AM_MEDIA_TYPE *pmtTarget,
                               const AM_MEDIA_TYPE *pmtSource );
 
-int GetFourCCFromMediaType(const AM_MEDIA_TYPE &media_type);
+vlc_fourcc_t GetFourCCFromMediaType(const AM_MEDIA_TYPE &media_type);
 
 /****************************************************************************
  * Declaration of our dummy directshow filter pin class
@@ -226,3 +227,5 @@ public:
 private:
     virtual ~CaptureEnumMediaTypes();
 };
+
+} // namespace

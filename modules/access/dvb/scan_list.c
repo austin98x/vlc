@@ -27,7 +27,7 @@
 #include "scan.h"
 #include "scan_list.h"
 
-static scan_list_entry_t * scan_list_entry_New()
+static scan_list_entry_t * scan_list_entry_New( void )
 {
     scan_list_entry_t *p_entry = calloc(1, sizeof(scan_list_entry_t));
     if( likely(p_entry) )
@@ -322,7 +322,7 @@ scan_list_entry_t * scan_list_dvbv5_load( vlc_object_t *p_obj, const char *psz_s
                 }
                 else
                 {
-                    char *p_end = strstr( p, "]" );
+                    const char *p_end = strstr( p, "]" );
                     if( !p_end )
                         b_error = true;
                     else

@@ -2,7 +2,6 @@
  * meta.c: Get meta/artwork using lua scripts
  *****************************************************************************
  * Copyright (C) 2007-2008 the VideoLAN team
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *          Pierre d'Herbemont <pdherbemont # videolan.org>
@@ -39,8 +38,6 @@
 /*****************************************************************************
  * Init lua
  *****************************************************************************/
-static const luaL_Reg p_reg[] = { { NULL, NULL } };
-
 static lua_State * init( vlc_object_t *p_this, input_item_t * p_item, const char *psz_filename )
 {
     lua_State * L = luaL_newstate();
@@ -55,6 +52,7 @@ static lua_State * init( vlc_object_t *p_this, input_item_t * p_item, const char
     /* Load Lua libraries */
     luaL_openlibs( L ); /* XXX: Don't open all the libs? */
 
+    static const luaL_Reg p_reg[] = { { NULL, NULL } };
     luaL_register_namespace( L, "vlc", p_reg );
 
     luaopen_msg( L );
@@ -145,10 +143,8 @@ error:
  *****************************************************************************/
 static bool validate_scope( const luabatch_context_t *p_context, meta_fetcher_scope_t e_scope )
 {
-    if ( p_context->e_scope == FETCHER_SCOPE_ANY )
-        return true;
-    else
-        return ( p_context->e_scope == e_scope );
+    return p_context->e_scope == FETCHER_SCOPE_ANY
+        || p_context->e_scope == e_scope;
 }
 
 static int fetch_art( vlc_object_t *p_this, const char * psz_filename,
@@ -165,32 +161,31 @@ static int fetch_art( vlc_object_t *p_this, const char * psz_filename,
         return i_ret;
     }
 
-    if(lua_gettop( L ))
+    if(lua_gettop(L) == 0)
     {
-        const char * psz_value;
-
-        if( lua_isstring( L, -1 ) )
-        {
-            psz_value = lua_tostring( L, -1 );
-            if( psz_value && *psz_value != 0 )
-            {
-                lua_Dbg( p_this, "setting arturl: %s", psz_value );
-                input_item_SetArtURL ( p_context->p_item, psz_value );
-                lua_close( L );
-                return VLC_SUCCESS;
-            }
-        }
-        else if( !lua_isnoneornil( L, -1 ) )
-        {
-            msg_Err( p_this, "Lua art fetcher script %s: "
-                 "didn't return a string", psz_filename );
-        }
-    }
-    else
-    {
-        msg_Err( p_this, "Script went completely foobar" );
+        msg_Err(p_this, "Script went completely foobar");
+        goto error;
     }
 
+    if (!lua_isstring(L, -1))
+    {
+        if (!lua_isnoneornil(L, -1))
+            msg_Err(p_this, "Lua art fetcher script %s: "
+                 "didn't return a string", psz_filename);
+        goto error;
+    }
+
+    const char *psz_value = lua_tostring(L, -1);
+    if (psz_value && *psz_value != 0)
+    {
+        lua_Dbg(p_this, "setting arturl: %s", psz_value);
+        input_item_SetArtURL(p_context->p_item, psz_value);
+    }
+
+    lua_close(L);
+    return VLC_SUCCESS;
+
+error:
     lua_close( L );
     return VLC_EGENERIC;
 }
@@ -278,4 +273,3 @@ int FindArt( meta_fetcher_t *p_finder )
     return vlclua_scripts_batch_execute( VLC_OBJECT(p_finder), "meta"DIR_SEP"art",
                                          &fetch_art, (void*)&context );
 }
-

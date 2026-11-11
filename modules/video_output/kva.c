@@ -30,7 +30,7 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_vout_display.h>
-#include <vlc_picture_pool.h>
+#include <vlc_actions.h>
 
 #include <ctype.h>
 #include <float.h>
@@ -43,8 +43,9 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
+static int  Open ( vout_display_t *,
+                   video_format_t *, vlc_video_context * );
+static void Close( vout_display_t * );
 
 #define KVA_FIXT23_TEXT N_( \
     "Enable a workaround for T23" )
@@ -63,16 +64,14 @@ static const char *const ppsz_kva_video_mode_text[] = {
 
 vlc_module_begin ()
     set_shortname( "KVA" )
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VOUT )
     add_string( "kva-video-mode", ppsz_kva_video_mode[0], KVA_VIDEO_MODE_TEXT,
-                KVA_VIDEO_MODE_LONGTEXT, false )
+                KVA_VIDEO_MODE_LONGTEXT )
         change_string_list( ppsz_kva_video_mode, ppsz_kva_video_mode_text )
-    add_bool( "kva-fixt23", false, KVA_FIXT23_TEXT, KVA_FIXT23_LONGTEXT, true )
+    add_bool( "kva-fixt23", false, KVA_FIXT23_TEXT, KVA_FIXT23_LONGTEXT )
     set_description( N_("K Video Acceleration video output") )
-    set_capability( "vout display", 100 )
     add_shortcut( "kva" )
-    set_callbacks( Open, Close )
+    set_callback_display( Open, 100 )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -81,7 +80,7 @@ vlc_module_end ()
  * This structure is part of the video output thread descriptor.
  * It describes the module specific properties of an output thread.
  *****************************************************************************/
-struct vout_display_sys_t
+typedef struct vout_display_sys_t
 {
     TID                tid;
     HEV                ack_event;
@@ -97,31 +96,24 @@ struct vout_display_sys_t
     bool               b_fixt23;
     PFNWP              p_old_frame;
     RECTL              client_rect;
-    vout_window_t     *parent_window;
     HWND               parent;
-    picture_pool_t    *pool;
     unsigned           button_pressed;
     bool               is_mouse_hidden;
-    bool               is_on_top;
-};
+    ULONG              cursor_timeout;
 
-struct picture_sys_t
-{
-    int i_chroma_shift;
-};
+    int                i_chroma_shift;
+} vout_display_sys_t;
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static picture_pool_t *Pool   (vout_display_t *, unsigned);
-static void            Display(vout_display_t *, picture_t *, subpicture_t * );
-static int             Control(vout_display_t *, int, va_list);
-static void            Manage (vout_display_t *);
+static void            Display(vout_display_t *, picture_t *);
+static int             SetDisplaySize( vout_display_t *, unsigned width, unsigned height );
 
 static int  OpenDisplay ( vout_display_t *, video_format_t * );
 static void CloseDisplay( vout_display_t * );
 
-static int  KVALock( picture_t * );
+static int  KVALock( vout_display_sys_t *, picture_t * );
 static void KVAUnlock( picture_t * );
 
 static void             MorphToPM     ( void );
@@ -131,19 +123,84 @@ static MRESULT EXPENTRY WndProc       ( HWND, ULONG, MPARAM, MPARAM );
 
 #define WC_VLC_KVA "WC_VLC_KVA"
 
-#define COLOR_KEY 0x0F0F0F
+#define COLOR_KEY 0x000001
 
 #define WM_VLC_MANAGE               ( WM_USER + 1 )
-#define WM_VLC_FULLSCREEN_CHANGE    ( WM_USER + 2 )
-#define WM_VLC_SIZE_CHANGE          ( WM_USER + 3 )
+#define WM_VLC_SIZE_CHANGE          ( WM_USER + 2 )
+#define WM_VLC_SET_POS              ( WM_USER + 3 )
+
+#define TID_HIDE_MOUSE  0x1010
 
 static const char *psz_video_mode[ 4 ] = {"DIVE", "WarpOverlay!", "SNAP",
                                           "VMAN"};
 
+struct open_init
+{
+    vout_display_t *vd;
+    const vout_display_cfg_t *cfg;
+    video_format_t *fmtp;
+};
+
+static void Prepare(vout_display_t *vd, picture_t *pic,
+                    const struct vlc_render_subpicture *subpic, vlc_tick_t date)
+{
+    VLC_UNUSED(subpic);
+    VLC_UNUSED(date);
+    picture_t fake_pic = *pic;
+    if (KVALock(vd->sys, &fake_pic) == VLC_SUCCESS)
+    {
+        picture_CopyPixels(&fake_pic, pic);
+        KVAUnlock(&fake_pic);
+    }
+}
+
+static int PlacementChanged(vout_display_t *vd, const vout_display_place_t *place)
+{
+    vout_display_sys_t *sys = vd->sys;
+    sys->kvas.ulAspectWidth  = place->width;
+    sys->kvas.ulAspectHeight = place->height;
+    kvaSetup( &sys->kvas );
+    return VLC_SUCCESS;
+}
+
+static int AspectChanged(vout_display_t *vd, const video_format_t *source)
+{
+    VLC_UNUSED(source);
+    return PlacementChanged(vd, vd->place);
+}
+
+static int CropChanged(vout_display_t *vd, const video_format_t *source)
+{
+    vout_display_sys_t *sys = vd->sys;
+    video_format_t src_rot;
+    video_format_ApplyRotation(&src_rot, source);
+
+    sys->kvas.rclSrcRect.xLeft   = src_rot.i_x_offset;
+    sys->kvas.rclSrcRect.yTop    = src_rot.i_y_offset;
+    sys->kvas.rclSrcRect.xRight  = src_rot.i_x_offset +
+                                   src_rot.i_visible_width;
+    sys->kvas.rclSrcRect.yBottom = src_rot.i_y_offset +
+                                   src_rot.i_visible_height;
+    kvaSetup( &sys->kvas );
+    return VLC_SUCCESS;
+}
+
+static const struct vlc_display_operations ops = {
+    .close = Close,
+    .prepare = Prepare,
+    .display = Display,
+    .set_display_size = SetDisplaySize,
+    .video_place_changed = PlacementChanged,
+    .set_source_aspect = AspectChanged,
+    .set_source_crop = CropChanged,
+};
+
 static void PMThread( void *arg )
 {
-    vout_display_t *vd = ( vout_display_t * )arg;
+    struct open_init *init = ( struct open_init * )arg;
+    vout_display_t *vd = init->vd;
     vout_display_sys_t * sys = vd->sys;
+    video_format_t *fmtp = init->fmtp;
     ULONG i_frame_flags;
     QMSG qm;
     char *psz_mode;
@@ -151,15 +208,9 @@ static void PMThread( void *arg )
 
     /* */
     video_format_t fmt;
-    video_format_ApplyRotation(&fmt, &vd->fmt);
+    video_format_ApplyRotation(&fmt, vd->source);
 
     /* */
-    vout_display_info_t info = vd->info;
-    info.is_slow = false;
-    info.has_double_click = true;
-    info.needs_hide_mouse = true;
-    info.has_pictures_invalid = false;
-
     MorphToPM();
 
     sys->hab = WinInitialize( 0 );
@@ -171,16 +222,10 @@ static void PMThread( void *arg )
                       CS_SIZEREDRAW | CS_MOVENOTIFY,
                       sizeof( PVOID ));
 
-    sys->b_fixt23 = var_CreateGetBool( vd, "kva-fixt23");
-
     if( !sys->b_fixt23 )
-        /* If an external window was specified, we'll draw in it. */
-        sys->parent_window =
-            vout_display_NewWindow( vd, VOUT_WINDOW_TYPE_HWND );
-
-    if( sys->parent_window )
     {
-        sys->parent = ( HWND )sys->parent_window->handle.hwnd;
+        /* If an external window was specified, we'll draw in it. */
+        sys->parent = ( HWND )vd->cfg->window->handle.hwnd;
 
         ULONG i_style = WinQueryWindowULong( sys->parent, QWL_STYLE );
         WinSetWindowULong( sys->parent, QWL_STYLE,
@@ -216,7 +261,7 @@ static void PMThread( void *arg )
 
     WinSetWindowPtr( sys->client, 0, vd );
 
-    if( !sys->parent_window )
+    if( sys->b_fixt23 )
     {
         WinSetWindowPtr( sys->frame, 0, vd );
         sys->p_old_frame = WinSubclassWindow( sys->frame, MyFrameWndProc );
@@ -255,21 +300,12 @@ static void PMThread( void *arg )
         goto exit_open_display;
     }
 
-    if( vd->cfg->is_fullscreen && !sys->parent_window )
-        WinPostMsg( sys->client, WM_VLC_FULLSCREEN_CHANGE,
-                    MPFROMLONG( true ), 0 );
-
     kvaDisableScreenSaver();
 
     /* Setup vout_display now that everything is fine */
-    vd->fmt     = fmt;
-    vd->info    = info;
+    *fmtp       = fmt;
 
-    vd->pool    = Pool;
-    vd->prepare = NULL;
-    vd->display = Display;
-    vd->control = Control;
-    vd->manage  = Manage;
+    vd->ops = &ops;
 
     /* Prevent SIG_FPE */
     _control87(MCW_EM, MCW_EM);
@@ -277,14 +313,8 @@ static void PMThread( void *arg )
     sys->i_result = VLC_SUCCESS;
     DosPostEventSem( sys->ack_event );
 
-    if( !sys->parent_window )
-        WinSetVisibleRegionNotify( sys->frame, TRUE );
-
     while( WinGetMsg( sys->hab, &qm, NULLHANDLE, 0, 0 ))
         WinDispatchMsg( sys->hab, &qm );
-
-    if( !sys->parent_window )
-        WinSetVisibleRegionNotify( sys->frame, FALSE );
 
     kvaEnableScreenSaver();
 
@@ -296,14 +326,12 @@ exit_open_display :
     kvaDone();
 
 exit_kva_init :
-    if( !sys->parent_window )
+    if( sys->b_fixt23 )
         WinSubclassWindow( sys->frame, sys->p_old_frame );
 
     WinDestroyWindow( sys->frame );
 
 exit_frame :
-    vout_display_DeleteWindow( vd, sys->parent_window );
-
     if( sys->is_mouse_hidden )
         WinShowPointer( HWND_DESKTOP, TRUE );
 
@@ -317,18 +345,31 @@ exit_frame :
 /**
  * This function initializes KVA vout method.
  */
-static int Open ( vlc_object_t *object )
+static int Open ( vout_display_t *vd,
+                  video_format_t *fmtp, vlc_video_context *context )
 {
-    vout_display_t *vd = (vout_display_t *)object;
     vout_display_sys_t *sys;
+    struct open_init init = {
+        .vd   = vd,
+        .fmtp = fmtp,
+    };
+    VLC_UNUSED(context);
 
     vd->sys = sys = calloc( 1, sizeof( *sys ));
     if( !sys )
         return VLC_ENOMEM;
 
+    sys->b_fixt23 = var_CreateGetBool( vd, "kva-fixt23");
+
+    if( !sys->b_fixt23 && vd->cfg->window->type != VLC_WINDOW_TYPE_HWND )
+    {
+        free( sys );
+        return VLC_ENOTSUP;
+    }
+
     DosCreateEventSem( NULL, &sys->ack_event, 0, FALSE );
 
-    sys->tid = _beginthread( PMThread, NULL, 1024 * 1024, vd );
+    sys->tid = _beginthread( PMThread, NULL, 1024 * 1024, &init );
     DosWaitEventSem( sys->ack_event, SEM_INDEFINITE_WAIT );
 
     if( sys->i_result != VLC_SUCCESS )
@@ -340,6 +381,10 @@ static int Open ( vlc_object_t *object )
         return VLC_EGENERIC;
     }
 
+    /* Sometimes WinSetWindowPos() causes locking. To avoid this,
+     * post a message here */
+    WinPostMsg( sys->client, WM_VLC_SET_POS, 0, 0 );
+
     return VLC_SUCCESS;
 }
 
@@ -348,32 +393,17 @@ static int Open ( vlc_object_t *object )
  *****************************************************************************
  * Terminate an output method created by Open
  *****************************************************************************/
-static void Close ( vlc_object_t *object )
+static void Close ( vout_display_t *vd )
 {
-    vout_display_t * vd = (vout_display_t *)object;
     vout_display_sys_t * sys = vd->sys;
 
     WinPostQueueMsg( sys->hmq, WM_QUIT, 0, 0 );
 
     DosWaitThread( &sys->tid, DCWW_WAIT );
 
-    if( sys->pool )
-        picture_pool_Release( sys->pool );
-
     DosCloseEventSem( sys->ack_event );
 
     free( sys );
-}
-
-/**
- * Return a pool of direct buffers
- */
-static picture_pool_t *Pool(vout_display_t *vd, unsigned count)
-{
-    vout_display_sys_t *sys = vd->sys;
-    VLC_UNUSED(count);
-
-    return sys->pool;
 }
 
 /*****************************************************************************
@@ -381,24 +411,11 @@ static picture_pool_t *Pool(vout_display_t *vd, unsigned count)
  *****************************************************************************
  * This function sends the currently rendered image to the display.
  *****************************************************************************/
-static void Display( vout_display_t *vd, picture_t *picture,
-                     subpicture_t *subpicture )
-{
-    VLC_UNUSED( vd );
-    VLC_UNUSED( subpicture );
-
-    picture_Release( picture );
-}
-
-/*****************************************************************************
- * Manage: handle Sys events
- *****************************************************************************
- * This function should be called regularly by video output thread. It returns
- * a non null value if an error occurred.
- *****************************************************************************/
-static void Manage( vout_display_t *vd )
+static void Display( vout_display_t *vd, picture_t *picture )
 {
     vout_display_sys_t * sys = vd->sys;
+
+    VLC_UNUSED( picture );
 
     /* Let a window procedure manage instead because if resizing a frame window
      * here, WM_SIZE is not sent to its child window.
@@ -406,99 +423,13 @@ static void Manage( vout_display_t *vd )
     WinPostMsg( sys->client, WM_VLC_MANAGE, 0, 0 );
 }
 
-/*****************************************************************************
- * Control: control facility for the vout
- *****************************************************************************/
-static int Control( vout_display_t *vd, int query, va_list args )
+static int SetDisplaySize( vout_display_t *vd, unsigned width, unsigned height )
 {
     vout_display_sys_t *sys = vd->sys;
-
-    switch (query)
-    {
-    case VOUT_DISPLAY_HIDE_MOUSE:
-    {
-        POINTL ptl;
-
-        WinQueryPointerPos( HWND_DESKTOP, &ptl );
-        if( !sys->is_mouse_hidden &&
-            WinWindowFromPoint( HWND_DESKTOP, &ptl, TRUE ) == sys->client )
-        {
-            WinShowPointer( HWND_DESKTOP, FALSE );
-            sys->is_mouse_hidden = true;
-        }
-
-        return VLC_SUCCESS;
-    }
-
-    case VOUT_DISPLAY_CHANGE_FULLSCREEN:
-    {
-        bool fs = va_arg(args, int);
-
-        WinPostMsg( sys->client, WM_VLC_FULLSCREEN_CHANGE, MPFROMLONG(fs), 0 );
-        return VLC_SUCCESS;
-    }
-
-    case VOUT_DISPLAY_CHANGE_WINDOW_STATE:
-    {
-        const unsigned state = va_arg( args, unsigned );
-        const bool is_on_top = (state & VOUT_WINDOW_STATE_ABOVE) != 0;
-
-        if( is_on_top )
-            WinSetWindowPos( sys->frame, HWND_TOP, 0, 0, 0, 0, SWP_ZORDER );
-
-        sys->is_on_top = is_on_top;
-
-        return VLC_SUCCESS;
-    }
-
-    case VOUT_DISPLAY_CHANGE_DISPLAY_SIZE:
-    case VOUT_DISPLAY_CHANGE_ZOOM:
-    {
-        const vout_display_cfg_t *cfg = va_arg(args, const vout_display_cfg_t *);
-
-        WinPostMsg( sys->client, WM_VLC_SIZE_CHANGE,
-                    MPFROMLONG( cfg->display.width ),
-                    MPFROMLONG( cfg->display.height ));
-        return VLC_SUCCESS;
-    }
-
-    case VOUT_DISPLAY_CHANGE_SOURCE_ASPECT:
-    case VOUT_DISPLAY_CHANGE_SOURCE_CROP:
-    {
-        if( query == VOUT_DISPLAY_CHANGE_SOURCE_ASPECT )
-        {
-            vout_display_place_t place;
-            vout_display_PlacePicture(&place, &vd->source, vd->cfg, false);
-
-            sys->kvas.ulAspectWidth  = place.width;
-            sys->kvas.ulAspectHeight = place.height;
-        }
-        else
-        {
-            video_format_t src_rot;
-            video_format_ApplyRotation(&src_rot, &vd->source);
-
-            sys->kvas.rclSrcRect.xLeft   = src_rot.i_x_offset;
-            sys->kvas.rclSrcRect.yTop    = src_rot.i_y_offset;
-            sys->kvas.rclSrcRect.xRight  = src_rot.i_x_offset +
-                                           src_rot.i_visible_width;
-            sys->kvas.rclSrcRect.yBottom = src_rot.i_y_offset +
-                                           src_rot.i_visible_height;
-        }
-
-        kvaSetup( &sys->kvas );
-
-        return VLC_SUCCESS;
-    }
-
-    case VOUT_DISPLAY_RESET_PICTURES:
-    case VOUT_DISPLAY_CHANGE_DISPLAY_FILLED:
-        /* TODO */
-        break;
-    }
-
-    msg_Err(vd, "Unsupported query(=%d) in vout display KVA", query);
-    return VLC_EGENERIC;
+    WinPostMsg( sys->client, WM_VLC_SIZE_CHANGE,
+                MPFROMLONG( width ),
+                MPFROMLONG( height ));
+    return VLC_SUCCESS;
 }
 
 /* following functions are local */
@@ -512,12 +443,10 @@ static int Control( vout_display_t *vd, int query, va_list args )
 static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
 {
     vout_display_sys_t * sys = vd->sys;
-    const vlc_fourcc_t *fallback;
+    vlc_fourcc_t *fallback;
     bool b_hw_accel = 0;
     FOURCC i_kva_fourcc;
-    int i_chroma_shift;
-    char sz_title[ 256 ];
-    RECTL rcl;
+    int i_chroma_shift = 0;
     int w, h;
 
     msg_Dbg( vd, "render chroma = %4.4s", ( const char * )&fmt->i_chroma );
@@ -526,6 +455,8 @@ static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
     {
         fallback = ( pass == 0 ) ? vlc_fourcc_GetYUVFallback( fmt->i_chroma ) :
                                    vlc_fourcc_GetRGBFallback( fmt->i_chroma );
+        if( fallback == NULL )
+            continue;
 
         for( int i = 0; fallback[ i ]; i++ )
         {
@@ -540,37 +471,38 @@ static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
                 case VLC_CODEC_YUYV:
                     b_hw_accel = sys->kvac.ulInputFormatFlags & KVAF_YUY2;
                     i_kva_fourcc = FOURCC_Y422;
-                    i_chroma_shift = 0;
                     break;
 
-                case VLC_CODEC_YV9:
-                    b_hw_accel = sys->kvac.ulInputFormatFlags & KVAF_YVU9;
-                    i_kva_fourcc = FOURCC_YVU9;
-                    i_chroma_shift = 2;
+                case VLC_CODEC_RGB565:
+                    if (sys->kvac.ulInputFormatFlags & KVAF_BGR16)
+                    {
+                        b_hw_accel = true;
+                        i_kva_fourcc = FOURCC_R565;
+                    }
                     break;
 
-                case VLC_CODEC_RGB32:
-                    b_hw_accel = sys->kvac.ulInputFormatFlags & KVAF_BGR32;
-                    i_kva_fourcc = FOURCC_BGR4;
-                    i_chroma_shift = 0;
+                case VLC_CODEC_RGB555:
+                    if (sys->kvac.ulInputFormatFlags & KVAF_BGR15)
+                    {
+                        b_hw_accel = true;
+                        i_kva_fourcc = FOURCC_R555;
+                    }
                     break;
 
-                case VLC_CODEC_RGB24:
-                    b_hw_accel = sys->kvac.ulInputFormatFlags & KVAF_BGR24;
-                    i_kva_fourcc = FOURCC_BGR3;
-                    i_chroma_shift = 0;
+                case VLC_CODEC_BGRX:
+                    if (sys->kvac.ulInputFormatFlags & KVAF_BGR32)
+                    {
+                        b_hw_accel = true;
+                        i_kva_fourcc = FOURCC_BGR4;
+                    }
                     break;
 
-                case VLC_CODEC_RGB16:
-                    b_hw_accel = sys->kvac.ulInputFormatFlags & KVAF_BGR16;
-                    i_kva_fourcc = FOURCC_R565;
-                    i_chroma_shift = 0;
-                    break;
-
-                case VLC_CODEC_RGB15:
-                    b_hw_accel = sys->kvac.ulInputFormatFlags & KVAF_BGR15;
-                    i_kva_fourcc = FOURCC_R555;
-                    i_chroma_shift = 0;
+                case VLC_CODEC_BGR24:
+                    if (sys->kvac.ulInputFormatFlags & KVAF_BGR24)
+                    {
+                        b_hw_accel = true;
+                        i_kva_fourcc = FOURCC_BGR3;
+                    }
                     break;
             }
 
@@ -580,6 +512,7 @@ static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
                 break;
             }
         }
+        free( fallback );
     }
 
     if( !b_hw_accel )
@@ -588,11 +521,6 @@ static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
 
         return VLC_EGENERIC;
     }
-
-    /* Set the RGB masks */
-    fmt->i_rmask = sys->kvac.ulRMask;
-    fmt->i_gmask = sys->kvac.ulGMask;
-    fmt->i_bmask = sys->kvac.ulBMask;
 
     msg_Dbg( vd, "output chroma = %4.4s", ( const char * )&fmt->i_chroma );
     msg_Dbg( vd, "KVA chroma = %4.4s", ( const char * )&i_kva_fourcc );
@@ -620,50 +548,27 @@ static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
         return VLC_EGENERIC;
     }
 
-    /* Create the associated picture */
-    picture_sys_t *picsys = malloc( sizeof( *picsys ) );
-    if( picsys == NULL )
-        return VLC_ENOMEM;
-    picsys->i_chroma_shift = i_chroma_shift;
+    sys->i_chroma_shift = i_chroma_shift;
 
-    picture_resource_t resource = { .p_sys = picsys };
-    picture_t *picture = picture_NewFromResource( fmt, &resource );
-    if( !picture )
+    char *title = var_InheritString( vd, "video-title" );
+    if (title != NULL
+     || asprintf( &title, VOUT_TITLE " (%4.4s to %4.4s - %s mode KVA output)",
+                  (char *)&fmt->i_chroma, (char *)&sys->kvas.fccSrcColor,
+                  psz_video_mode[sys->kvac.ulMode - 1] ) >= 0)
     {
-        free( picsys );
-        return VLC_ENOMEM;
+        WinSetWindowText( sys->frame, title );
+        free( title );
     }
 
-    /* Wrap it into a picture pool */
-    picture_pool_configuration_t pool_cfg;
-    memset( &pool_cfg, 0, sizeof( pool_cfg ));
-    pool_cfg.picture_count = 1;
-    pool_cfg.picture       = &picture;
-    pool_cfg.lock          = KVALock;
-    pool_cfg.unlock        = KVAUnlock;
-
-    sys->pool = picture_pool_NewExtended( &pool_cfg );
-    if( !sys->pool )
-    {
-        picture_Release( picture );
-        return VLC_ENOMEM;
-    }
-
-    if (vd->cfg->display.title)
-        snprintf( sz_title, sizeof( sz_title ), "%s", vd->cfg->display.title );
-    else
-        snprintf( sz_title, sizeof( sz_title ),
-                  "%s (%4.4s to %4.4s - %s mode KVA output)",
-                  VOUT_TITLE,
-                  ( char * )&vd->fmt.i_chroma,
-                  ( char * )&sys->kvas.fccSrcColor,
-                  psz_video_mode[ sys->kvac.ulMode - 1 ]);
-    WinSetWindowText( sys->frame, sz_title );
+    sys->cursor_timeout =
+        ( ULONG )var_InheritInteger( vd, "mouse-hide-timeout" );
+    WinStartTimer( sys->hab, sys->client, TID_HIDE_MOUSE,
+                   sys->cursor_timeout );
 
     sys->i_screen_width  = WinQuerySysValue( HWND_DESKTOP, SV_CXSCREEN );
     sys->i_screen_height = WinQuerySysValue( HWND_DESKTOP, SV_CYSCREEN );
 
-    if( sys->parent_window )
+    if( !sys->b_fixt23 )
         WinQueryWindowRect( sys->parent, &sys->client_rect );
     else
     {
@@ -672,16 +577,6 @@ static int OpenDisplay( vout_display_t *vd, video_format_t *fmt )
         sys->client_rect.xRight  = sys->client_rect.xLeft   + w;
         sys->client_rect.yTop    = sys->client_rect.yBottom + h;
     }
-
-    rcl = sys->client_rect;
-
-    WinCalcFrameRect( sys->frame, &rcl, FALSE);
-
-    WinSetWindowPos( sys->frame, HWND_TOP,
-                     rcl.xLeft, rcl.yBottom,
-                     rcl.xRight - rcl.xLeft, rcl.yTop - rcl.yBottom,
-                     SWP_MOVE | SWP_SIZE | SWP_ZORDER | SWP_SHOW |
-                     SWP_ACTIVATE );
 
     return VLC_SUCCESS;
 }
@@ -697,9 +592,8 @@ static void CloseDisplay( vout_display_t *vd )
     VLC_UNUSED( vd );
 }
 
-static int KVALock( picture_t *picture )
+static int KVALock( vout_display_sys_t *sys, picture_t *picture )
 {
-    picture_sys_t *picsys = picture->p_sys;
     PVOID kva_buffer;
     ULONG kva_bpl;
 
@@ -718,8 +612,8 @@ static int KVALock( picture_t *picture )
         plane_t *p = &picture->p[n];
 
         p->p_pixels = o->p_pixels + o->i_lines * o->i_pitch;
-        p->i_pitch  = kva_bpl >> picsys->i_chroma_shift;
-        p->i_lines  = picture->format.i_height >> picsys->i_chroma_shift;
+        p->i_pitch  = kva_bpl >> sys->i_chroma_shift;
+        p->i_lines  = picture->format.i_height >> sys->i_chroma_shift;
     }
 
     return VLC_SUCCESS;
@@ -915,12 +809,6 @@ static MRESULT EXPENTRY MyFrameWndProc( HWND hwnd, ULONG msg, MPARAM mp1,
 
             break;
         }
-
-        //case WM_VRNDISABLED :
-        case WM_VRNENABLED :
-            if( !vd->cfg->is_fullscreen && sys->is_on_top )
-                WinSetWindowPos( hwnd, HWND_TOP, 0, 0, 0, 0, SWP_ZORDER );
-            break;
     }
 
     return sys->p_old_frame( hwnd, msg, mp1, mp2 );
@@ -928,24 +816,28 @@ static MRESULT EXPENTRY MyFrameWndProc( HWND hwnd, ULONG msg, MPARAM mp1,
 
 static void MousePressed( vout_display_t *vd, HWND hwnd, unsigned button )
 {
+    vout_display_sys_t *sys = vd->sys;
+
     if( WinQueryFocus( HWND_DESKTOP ) != hwnd )
         WinSetFocus( HWND_DESKTOP, hwnd );
 
-    if( !vd->sys->button_pressed )
+    if( !sys->button_pressed )
         WinSetCapture( HWND_DESKTOP, hwnd );
 
-    vd->sys->button_pressed |= 1 << button;
+    sys->button_pressed |= 1 << button;
 
-    vout_display_SendEventMousePressed( vd, button );
+    vlc_window_ReportMousePressed( vd->cfg->window, button );
 }
 
 static void MouseReleased( vout_display_t *vd, unsigned button )
 {
-    vd->sys->button_pressed &= ~(1 << button);
-    if( !vd->sys->button_pressed )
+    vout_display_sys_t *sys = vd->sys;
+
+    sys->button_pressed &= ~(1 << button);
+    if( !sys->button_pressed )
         WinSetCapture( HWND_DESKTOP, NULLHANDLE );
 
-    vout_display_SendEventMouseReleased( vd, button );
+    vlc_window_ReportMouseReleased( vd->cfg->window, button );
 }
 
 #define WM_MOUSELEAVE   0x41F
@@ -969,13 +861,16 @@ static MRESULT EXPENTRY WndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
     {
         WinShowPointer(HWND_DESKTOP, TRUE);
         sys->is_mouse_hidden = false;
+
+        WinStartTimer( sys->hab, sys->client, TID_HIDE_MOUSE,
+                       sys->cursor_timeout );
     }
 
     switch( msg )
     {
         /* the user wants to close the window */
         case WM_CLOSE:
-            vout_display_SendEventClose(vd);
+            vlc_window_ReportClose(vd->cfg->window);
             result = 0;
             break;
 
@@ -983,30 +878,14 @@ static MRESULT EXPENTRY WndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
         {
             SHORT i_mouse_x = SHORT1FROMMP( mp1 );
             SHORT i_mouse_y = SHORT2FROMMP( mp1 );
-            RECTL movie_rect;
-            int   i_movie_width, i_movie_height;
-            int   i_src_width, i_src_height;
 
-            /* Get a current movie area */
-            kvaAdjustDstRect( &sys->kvas.rclSrcRect, &movie_rect );
-            i_movie_width = movie_rect.xRight - movie_rect.xLeft;
-            i_movie_height = movie_rect.yTop - movie_rect.yBottom;
+            int x = i_mouse_x;
+            int y = i_mouse_y;
 
-            i_src_width =  sys->kvas.rclSrcRect.xRight -
-                           sys->kvas.rclSrcRect.xLeft;
-            i_src_height = sys->kvas.rclSrcRect.yBottom -
-                           sys->kvas.rclSrcRect.yTop;
+            /* Invert Y coordinate */
+            y = vd->cfg->display.height - y;
 
-            int x = ( i_mouse_x - movie_rect.xLeft ) *
-                    i_src_width / i_movie_width +
-                    sys->kvas.rclSrcRect.xLeft;
-            int y = ( i_mouse_y - movie_rect.yBottom ) *
-                    i_src_height / i_movie_height;
-
-            /* Invert Y coordinate and add y offset */
-            y = ( i_src_height - y ) + sys->kvas.rclSrcRect.yTop;;
-
-            vout_display_SendEventMouseMoved(vd, x, y);
+            vlc_window_ReportMouseMoved( vd->cfg->window, x, y );
 
             result = WinDefWindowProc( hwnd, msg, mp1,mp2 );
             break;
@@ -1037,7 +916,7 @@ static MRESULT EXPENTRY WndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
             break;
 
         case WM_BUTTON1DBLCLK :
-            vout_display_SendEventMouseDoubleClick(vd);
+            vlc_window_ReportMouseDoubleClick( vd->cfg->window, MOUSE_BUTTON_LEFT );
             break;
 
         case WM_TRANSLATEACCEL :
@@ -1053,7 +932,7 @@ static MRESULT EXPENTRY WndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
             int    i_key   = 0;
 
             /* If embedded window, let the parent process keys */
-            if( sys->parent_window )
+            if( !sys->b_fixt23 )
             {
                 WinPostMsg( sys->parent, msg, mp1, mp2 );
                 break;
@@ -1078,42 +957,32 @@ static MRESULT EXPENTRY WndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                     if( i_flags & KC_ALT )
                         i_key |= KEY_MODIFIER_ALT;
 
-                    vout_display_SendEventKey(vd, i_key);
+                    vlc_window_ReportKeyPress(vd->cfg->window, i_key);
                 }
             }
             break;
         }
 
-        /* Process Manage() call */
-        case WM_VLC_MANAGE :
+        case WM_TIMER :
+            if( !sys->is_mouse_hidden &&
+                SHORT1FROMMP( mp1 ) == TID_HIDE_MOUSE )
+            {
+                POINTL ptl;
+
+                WinQueryPointerPos( HWND_DESKTOP, &ptl );
+                if( WinWindowFromPoint( HWND_DESKTOP, &ptl, TRUE )
+                        == sys->client )
+                {
+                    WinShowPointer( HWND_DESKTOP, FALSE );
+                    sys->is_mouse_hidden = true;
+
+                    WinStopTimer( sys->hab, sys->client, TID_HIDE_MOUSE );
+                }
+            }
             break;
 
-        /* Fullscreen change */
-        case WM_VLC_FULLSCREEN_CHANGE :
-            if( LONGFROMMP( mp1 ))
-            {
-                WinQueryWindowPos( sys->frame, &swp );
-                sys->client_rect.xLeft   = swp.x;
-                sys->client_rect.yBottom = swp.y;
-                sys->client_rect.xRight  = sys->client_rect.xLeft   + swp.cx;
-                sys->client_rect.yTop    = sys->client_rect.yBottom + swp.cy;
-                WinCalcFrameRect( sys->frame, &sys->client_rect, TRUE );
-
-                rcl.xLeft   = 0;
-                rcl.yBottom = 0;
-                rcl.xRight  = sys->i_screen_width;
-                rcl.yTop    = sys->i_screen_height;
-            }
-            else
-                rcl = sys->client_rect;
-
-            WinCalcFrameRect( sys->frame, &rcl, FALSE );
-
-            WinSetWindowPos( sys->frame, HWND_TOP,
-                             rcl.xLeft, rcl.yBottom,
-                             rcl.xRight - rcl.xLeft, rcl.yTop - rcl.yBottom,
-                             SWP_MOVE | SWP_SIZE | SWP_ZORDER | SWP_SHOW |
-                             SWP_ACTIVATE );
+        /* Process Manage() call */
+        case WM_VLC_MANAGE :
             break;
 
         /* Size change */
@@ -1137,13 +1006,26 @@ static MRESULT EXPENTRY WndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
             WinCalcFrameRect( sys->frame, &sys->client_rect, TRUE );
             break;
 
+        /* Set position */
+        case WM_VLC_SET_POS :
+            rcl = sys->client_rect;
+
+            WinCalcFrameRect( sys->frame, &rcl, FALSE);
+
+            WinSetWindowPos( sys->frame, HWND_TOP,
+                             rcl.xLeft, rcl.yBottom,
+                             rcl.xRight - rcl.xLeft, rcl.yTop - rcl.yBottom,
+                             SWP_MOVE | SWP_SIZE | SWP_ZORDER | SWP_SHOW |
+                             SWP_ACTIVATE );
+            break;
+
         default :
             return WinDefWindowProc( hwnd, msg, mp1, mp2 );
     }
 
     /* If embedded window, we need to change our window size according to a
      * parent window size */
-    if( sys->parent_window )
+    if( !sys->b_fixt23 )
     {
         RECTL rect;
 

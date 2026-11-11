@@ -29,7 +29,7 @@
 # include "config.h"
 #endif
 
-#include "../adaptive/playlist/SegmentInfoCommon.h"
+#include "../../adaptive/playlist/SegmentBaseType.hpp"
 #include "Profile.hpp"
 
 #include <cstdlib>
@@ -41,7 +41,9 @@ namespace adaptive
     namespace playlist
     {
         class SegmentInformation;
-        class MediaSegmentTemplate;
+        class SegmentTemplate;
+        class BasePeriod;
+        class CommonAttributesElements;
     }
     namespace xml
     {
@@ -53,12 +55,13 @@ namespace dash
 {
     namespace mpd
     {
-        class Period;
         class AdaptationSet;
         class MPD;
 
         using namespace adaptive::playlist;
         using namespace adaptive;
+
+        static const std::string NS_DASH("urn:mpeg:dash:schema:mpd:2011");
 
         class IsoffMainParser
         {
@@ -70,18 +73,26 @@ namespace dash
 
             private:
                 mpd::Profile getProfile     () const;
+                const std::string & getDASHNamespace() const;
                 void    parseMPDBaseUrl     (MPD *, xml::Node *);
                 void    parseMPDAttributes  (MPD *, xml::Node *);
-                void    parseAdaptationSets (xml::Node *periodNode, Period *period);
-                void    parseRepresentations(xml::Node *adaptationSetNode, AdaptationSet *adaptationSet);
-                void    parseInitSegment    (xml::Node *, Initializable<Segment> *, SegmentInformation *);
-                void    parseTimeline       (xml::Node *, MediaSegmentTemplate *);
+                void    parseAdaptationSets (MPD *, xml::Node *periodNode, BasePeriod *period);
+                void    parseRepresentations(MPD *, xml::Node *adaptationSetNode, AdaptationSet *adaptationSet);
+                void    parseInitSegment    (xml::Node *, Initializable<InitSegment> *, SegmentInformation *);
+                void    parseTimeline       (xml::Node *, AbstractMultipleSegmentBaseType *);
                 void    parsePeriods        (MPD *, xml::Node *);
-                size_t  parseSegmentInformation(xml::Node *, SegmentInformation *, uint64_t *);
-                size_t  parseSegmentBase    (xml::Node *, SegmentInformation *);
-                size_t  parseSegmentList    (xml::Node *, SegmentInformation *);
-                size_t  parseSegmentTemplate(xml::Node *, SegmentInformation *);
+                size_t  parseSegmentInformation(MPD *, xml::Node *, SegmentInformation *, uint64_t *);
+                size_t  parseSegmentBase    (MPD *, xml::Node *, SegmentInformation *);
+                size_t  parseSegmentList    (MPD *, xml::Node *, SegmentInformation *);
+                size_t  parseSegmentTemplate(MPD *, xml::Node *, SegmentInformation *);
                 void    parseProgramInformation(xml::Node *, MPD *);
+                void    parseSegmentBaseType(MPD *mpd, xml::Node *node,
+                                             AbstractSegmentBaseType *base,
+                                             SegmentInformation *parent);
+                void    parseMultipleSegmentBaseType(MPD *mpd, xml::Node *node,
+                                             AbstractMultipleSegmentBaseType *base,
+                                             SegmentInformation *parent);
+                void    parseCommonAttributesElements(xml::Node *, CommonAttributesElements *);
 
                 xml::Node       *root;
                 vlc_object_t    *p_object;

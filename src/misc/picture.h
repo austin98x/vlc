@@ -19,16 +19,28 @@
  *****************************************************************************/
 
 #include <stdatomic.h>
+#include <stddef.h>
 
 #include <vlc_picture.h>
+#include <vlc_list.h>
+#include <vlc_ancillary.h>
 
 typedef struct
 {
     picture_t picture;
     struct
     {
-        atomic_uintptr_t refs;
         void (*destroy)(picture_t *);
         void *opaque;
     } gc;
+
+    void *pool; /* Only used by picture_pool.c */
+    struct vlc_list pool_node; /* Only used by picture_pool.c */
+
+    vlc_ancillary_array ancillaries;
 } picture_priv_t;
+
+void *picture_Allocate(int *, size_t);
+void picture_Deallocate(int, void *, size_t);
+
+picture_t * picture_InternalClone(picture_t *, void (*pf_destroy)(picture_t *), void *);

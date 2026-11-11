@@ -2,7 +2,6 @@
  * nsspeechsynthesizer.m: Simple text to Speech renderer for Mac OS X
  *****************************************************************************
  * Copyright (C) 2015 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Felix Paul Kühne <fkuehne # videolan # org>
  *
@@ -36,32 +35,32 @@
 
 #import <Cocoa/Cocoa.h>
 
-static int Create (vlc_object_t *);
-static void Destroy(vlc_object_t *);
-static int RenderText(filter_t *,
-                      subpicture_region_t *,
-                      subpicture_region_t *,
+static int Create (filter_t *);
+static void Destroy(filter_t *);
+static subpicture_region_t *RenderText(filter_t *,
+                      const subpicture_region_t *,
                       const vlc_fourcc_t *);
 
 vlc_module_begin ()
 set_description(N_("Speech synthesis for Mac OS X"))
-set_category(CAT_VIDEO)
 set_subcategory(SUBCAT_VIDEO_SUBPIC)
 
-set_capability("text renderer", 0)
-set_callbacks(Create, Destroy)
+set_callback_text_renderer(Create, 0)
 vlc_module_end ()
 
-struct filter_sys_t
+typedef struct filter_sys_t
 {
     NSSpeechSynthesizer *speechSynthesizer;
     NSString *currentLocale;
     NSString *lastString;
+} filter_sys_t;
+
+static const struct vlc_filter_operations filter_ops = {
+    .render = RenderText, .close = Destroy,
 };
 
-static int  Create (vlc_object_t *p_this)
+static int  Create (filter_t *p_filter)
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     p_filter->p_sys = p_sys = malloc(sizeof(filter_sys_t));
@@ -71,14 +70,13 @@ static int  Create (vlc_object_t *p_this)
     p_sys->currentLocale = p_sys->lastString = @"";
     p_sys->speechSynthesizer = [[NSSpeechSynthesizer alloc] init];
 
-    p_filter->pf_render = RenderText;
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 }
 
-static void Destroy(vlc_object_t *p_this)
+static void Destroy(filter_t *p_filter)
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     [p_sys->speechSynthesizer stopSpeaking];
@@ -98,17 +96,13 @@ static NSString * languageCodeForString(NSString *string) {
     return (NSString *)CFStringTokenizerCopyBestStringLanguage((CFStringRef)string, CFRangeMake(0, [string length]));
 }
 
-static int RenderText(filter_t *p_filter,
-                      subpicture_region_t *p_region_out,
-                      subpicture_region_t *p_region_in,
+static subpicture_region_t *RenderText(filter_t *p_filter,
+                      const subpicture_region_t *p_region_in,
                       const vlc_fourcc_t *p_chroma_list)
 {
     @autoreleasepool {
         filter_sys_t *p_sys = p_filter->p_sys;
-        text_segment_t *p_segment = p_region_in->p_text;
-
-        if (!p_segment)
-            return VLC_EGENERIC;
+        const text_segment_t *p_segment = p_region_in->p_text;
 
         for ( const text_segment_t *s = p_segment; s != NULL; s = s->p_next ) {
             if ( !s->psz_text )
@@ -156,6 +150,6 @@ static int RenderText(filter_t *p_filter,
             [p_sys->speechSynthesizer startSpeakingString:stringToSpeech];
         }
 
-        return VLC_SUCCESS;
+        return NULL;
     }
 }

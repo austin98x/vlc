@@ -41,7 +41,7 @@ vlc_h2_frame_alloc(uint_fast8_t type, uint_fast8_t flags,
 {
     assert((stream_id >> 31) == 0);
 
-    if (unlikely(length >= (1u << 24)))
+    if (unlikely(length > VLC_H2_MAX_MAX_FRAME))
     {
         errno = EINVAL;
         return NULL;
@@ -117,7 +117,7 @@ static const char *vlc_h2_type_name(uint_fast8_t type)
         [VLC_H2_FRAME_CONTINUATION]  = "CONTINUATION",
     };
 
-    if (type >= (sizeof (names) / sizeof (names[0])) || names[type][0] == '\0')
+    if (type >= ARRAY_SIZE(names) || names[type][0] == '\0')
         return "<unknown>";
     return names[type];
 }
@@ -232,7 +232,7 @@ vlc_h2_frame_data(uint_fast32_t stream_id, const void *buf, size_t len,
     uint8_t flags = eos ? VLC_H2_DATA_END_STREAM : 0;
 
     f = vlc_h2_frame_alloc(VLC_H2_FRAME_DATA, flags, stream_id, len);
-    if (likely(f != NULL))
+    if (len > 0 && likely(f != NULL))
         memcpy(vlc_h2_frame_payload(f), buf, len);
     return f;
 }
@@ -284,18 +284,16 @@ struct vlc_h2_frame *vlc_h2_frame_settings(void)
 #endif
 
 #if (VLC_H2_INIT_WINDOW != VLC_H2_DEFAULT_INIT_WINDOW)
-# if (VLC_H2_INIT_WINDOW > 2147483647)
-#  error Illegal initial window value
-# endif
+    static_assert (VLC_H2_INIT_WINDOW < 2147483648,
+                   "Illegal initial window value");
     SetWBE(p, VLC_H2_SETTING_INITIAL_WINDOW_SIZE);
     SetDWBE(p + 2, VLC_H2_INIT_WINDOW);
     p += 6;
 #endif
 
 #if (VLC_H2_MAX_FRAME != VLC_H2_DEFAULT_MAX_FRAME)
-# if (VLC_H2_MAX_FRAME < 16384 || VLC_H2_MAX_FRAME > 16777215)
-#  error Illegal maximum frame size
-# endif
+    static_assert (VLC_H2_MAX_FRAME >= 16384 && VLC_H2_MAX_FRAME < 16777216,
+                   "Illegal maximum frame size");
     SetWBE(p, VLC_H2_SETTING_MAX_FRAME_SIZE);
     SetDWBE(p + 2, VLC_H2_MAX_FRAME);
     p += 6;
@@ -328,7 +326,7 @@ const char *vlc_h2_setting_name(uint_fast16_t id)
         [VLC_H2_SETTING_MAX_HEADER_LIST_SIZE]   = "Header list size",
     };
 
-    if (id >= sizeof (names) / sizeof (names[0]) || names[id][0] == '\0')
+    if (id >= ARRAY_SIZE(names) || names[id][0] == '\0')
         id = 0;
     return names[id];
 }
@@ -399,7 +397,7 @@ const char *vlc_h2_strerror(uint_fast32_t code)
         [VLC_H2_HTTP_1_1_REQUIRED]   = "Required HTTP/1.1",
     };
 
-    if (code >= sizeof (names) / sizeof (names[0]) || names[code][0] == '\0')
+    if (code >= ARRAY_SIZE(names) || names[code][0] == '\0')
         return "Unknown error";
     return names[code];
 }
@@ -542,7 +540,7 @@ static int vlc_h2_parse_headers_end(struct vlc_h2_parser *p)
 
     if (s != NULL)
     {
-        const char *ch[n ? n : 1][2];
+        const char *ch[VLC_H2_MAX_HEADERS][2];
 
         for (int i = 0; i < n; i++)
             ch[i][0] = headers[i][0], ch[i][1] = headers[i][1];
@@ -854,16 +852,35 @@ static int vlc_h2_parse_frame_window_update(struct vlc_h2_parser *p,
                                             struct vlc_h2_frame *f, size_t len,
                                             uint_fast32_t id)
 {
-    free(f);
-
     if (len != 4)
     {
+        free(f);
+
         if (id == 0)
             return vlc_h2_parse_error(p, VLC_H2_FRAME_SIZE_ERROR);
         return vlc_h2_stream_error(p, id, VLC_H2_FRAME_SIZE_ERROR);
     }
 
-    /* Nothing to do as we do not send data for the time being. */
+    uint_fast32_t credit = GetDWBE(vlc_h2_frame_payload(f)) & 0x7fffffffu;
+
+    free(f);
+
+    if (credit == 0)
+    {
+        if (id == 0)
+            return vlc_h2_parse_error(p, VLC_H2_PROTOCOL_ERROR);
+        return vlc_h2_stream_error(p, id, VLC_H2_PROTOCOL_ERROR);
+    }
+
+    if (id == 0)
+        p->cbs->window_update(p->opaque, credit);
+    else
+    {
+        void *s = vlc_h2_stream_lookup(p, id);
+
+        if (s != NULL)
+            p->cbs->stream_window_update(s, credit);
+    }
     return 0;
 }
 
@@ -958,8 +975,7 @@ static int vlc_h2_parse_generic(struct vlc_h2_parser *p,
 
     assert(p->headers.sid == 0);
 
-    if (type < sizeof (vlc_h2_parsers) / sizeof (vlc_h2_parsers[0])
-     && vlc_h2_parsers[type] != NULL)
+    if (type < ARRAY_SIZE(vlc_h2_parsers) && vlc_h2_parsers[type] != NULL)
         func = vlc_h2_parsers[type];
 
     return func(p, f, len, id);

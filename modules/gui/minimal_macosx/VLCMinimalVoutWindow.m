@@ -2,7 +2,6 @@
  * VLCMinimalVoutWindow.m: macOS minimal vout window
  *****************************************************************************
  * Copyright (C) 2007-2017 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Pierre d'Herbemont <pdherbemont # videolan.org>
  *          Felix Paul Kühne <fkuehne at videolan dot org>
@@ -35,7 +34,7 @@
 - (id)initWithContentRect:(NSRect)contentRect
 {
     if( self = [super initWithContentRect:contentRect
-                                styleMask:NSBorderlessWindowMask
+                                styleMask:NSWindowStyleMaskBorderless
                                   backing:NSBackingStoreBuffered
                                     defer:NO])
     {

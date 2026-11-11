@@ -36,8 +36,13 @@ namespace adaptive
             static std::string combinePaths     (const std::string &path1, const std::string &path2);
             static std::string getDirectoryPath (const std::string &path);
             static std::string getFileExtension (const std::string &uri);
-            static bool        ifind            (std::string haystack, std::string needle);
+            static bool        icaseEquals     (std::string str1, std::string str2);
+            static bool        ifind            (const std::string & haystack, const std::string & needle);
             static std::list<std::string> tokenize(const std::string &, char);
+            static std::string & rtrim(std::string &, const std::string &);
+            static std::string & ltrim(std::string &, const std::string &);
+            static std::string & trim(std::string &, const std::string &);
+            static std::string unescape(const std::string &);
     };
 }
 

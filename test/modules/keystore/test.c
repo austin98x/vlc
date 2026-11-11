@@ -35,6 +35,8 @@
 #undef NDEBUG
 #include <assert.h>
 
+#include "libvlc/test.h"
+
 /*
  * Build and exec all keystore tests:
  * $ cd vlc/build-<name>/test
@@ -297,19 +299,19 @@ test_module(const char *psz_module, bool b_test_all, bool b_persistent,
 int
 main(int i_argc, char *ppsz_argv[])
 {
+    test_setup();
+
     /* If b_test_all is true, this test could pollute the developer´s keystores */
     bool b_test_all = i_argc > 1 && strcmp(ppsz_argv[1], "-a") == 0;
 
     if (!b_test_all)
         alarm(3);
 
-    setenv("VLC_PLUGIN_PATH", "../modules", 1);
-
     /* Create a dummy libvlc to initialize module bank, needed by module_exists */
     libvlc_instance_t *p_libvlc = libvlc_new(0, NULL);
     assert(p_libvlc != NULL);
 
-    for (unsigned int i = 0; i < sizeof(keystore_args)/sizeof(*keystore_args); ++i)
+    for (unsigned int i = 0; i < ARRAY_SIZE(keystore_args); ++i)
     {
         const char *psz_module = keystore_args[i].psz_module;
 

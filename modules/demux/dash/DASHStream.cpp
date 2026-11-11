@@ -30,55 +30,45 @@ DASHStream::DASHStream(demux_t *demux)
 {
 }
 
-block_t * DASHStream::checkBlock(block_t *p_block, bool)
+AbstractDemuxer *DASHStream::newDemux(vlc_object_t *p_obj, const StreamFormat &format,
+                                      es_out_t *out, AbstractSourceStream *source) const
 {
-    return p_block;
-}
-
-AbstractDemuxer * DASHStream::createDemux(const StreamFormat &format)
-{
-    AbstractDemuxer *ret = NULL;
-    switch((unsigned)format)
+    AbstractDemuxer *ret = nullptr;
+    switch(format)
     {
-        case StreamFormat::MP4:
-            ret = new Demuxer(p_realdemux, "mp4", fakeesout->getEsOut(), demuxersource);
+        case StreamFormat::Type::MP4:
+        case StreamFormat::Type::MPEG2TS:
+            ret = AbstractStream::newDemux(p_obj, format, out, source);
             break;
 
-        case StreamFormat::MPEG2TS:
-            ret = new Demuxer(p_realdemux, "ts", fakeesout->getEsOut(), demuxersource);
+        case StreamFormat::Type::WebM:
+            ret = new Demuxer(p_obj, "mkv_trusted", out, source);
             break;
 
-        case StreamFormat::WEBVTT:
-            ret = new SlaveDemuxer(p_realdemux, "webvtt", fakeesout->getEsOut(), demuxersource);
+        case StreamFormat::Type::WebVTT:
+            ret = new SlaveDemuxer(p_obj, "webvtt", out, source);
             break;
 
-        case StreamFormat::TTML:
-            ret = new SlaveDemuxer(p_realdemux, "ttml", fakeesout->getEsOut(), demuxersource);
+        case StreamFormat::Type::TTML:
+            ret = new SlaveDemuxer(p_obj, "ttml", out, source);
             break;
 
         default:
-        case StreamFormat::UNSUPPORTED:
+        case StreamFormat::Type::Unsupported:
             break;
     }
-
-    if(ret && !ret->create())
-    {
-        delete ret;
-        ret = NULL;
-    }
-    else commandsqueue->Commit();
 
     return ret;
 }
 
 AbstractStream * DASHStreamFactory::create(demux_t *realdemux, const StreamFormat &format,
-                                   SegmentTracker *tracker, AbstractConnectionManager *manager) const
+                                   SegmentTracker *tracker) const
 {
     AbstractStream *stream = new (std::nothrow) DASHStream(realdemux);
-    if(stream && !stream->init(format, tracker, manager))
+    if(stream && !stream->init(format, tracker))
     {
         delete stream;
-        return NULL;
+        return nullptr;
     }
     return stream;
 }

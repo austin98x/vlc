@@ -30,11 +30,11 @@
 #ifdef HAVE_FCNTL
 #include <fcntl.h>
 #endif
+#include <unistd.h>
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_fs.h>
-#include <vlc_memory.h>
 #include <vlc_keystore.h>
 #include <vlc_strings.h>
 
@@ -53,10 +53,9 @@ static void CloseCrypt(vlc_object_t *);
 vlc_module_begin()
     set_shortname(N_("File keystore (plaintext)"))
     set_description(N_("Secrets are stored on a file without any encryption"))
-    set_category(CAT_ADVANCED)
     set_subcategory(SUBCAT_ADVANCED_MISC)
     set_callbacks(Open, Close)
-    add_savefile("keystore-file", NULL, NULL, NULL, true)
+    add_savefile("keystore-file", NULL, NULL, NULL)
         change_private()
     set_capability("keystore", 0)
     add_shortcut("file_plaintext")
@@ -64,7 +63,6 @@ vlc_module_begin()
     add_submodule()
         set_shortname(N_("Crypt keystore"))
         set_description(N_("Secrets are stored encrypted on a file"))
-        set_category(CAT_ADVANCED)
         set_subcategory(SUBCAT_ADVANCED_MISC)
         set_callbacks(OpenCrypt, CloseCrypt)
         set_capability("keystore", 1)
@@ -266,7 +264,7 @@ end:
     }
     return VLC_SUCCESS;
 }
- 
+
 #if (!defined(HAVE_FLOCK) && defined (HAVE_FCNTL) && defined (F_SETLKW))
 static int
 posix_lock_fd(int fd)
@@ -365,10 +363,11 @@ Store(vlc_keystore *p_keystore, const char *const ppsz_values[KEY_MAX],
         if (i_enc_secret_len == 0)
             goto end;
 
-        if (vlc_keystore_entry_set_secret(p_entry, p_enc_secret,
-                                          i_enc_secret_len))
-            goto end;
+        int ret = vlc_keystore_entry_set_secret(p_entry, p_enc_secret,
+                                                  i_enc_secret_len);
         free(p_enc_secret);
+        if (ret)
+            goto end;
     }
     else
 #endif

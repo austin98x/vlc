@@ -20,7 +20,7 @@
 #ifndef MEMORYCHUNK_HPP
 #define MEMORYCHUNK_HPP
 
-#include "../adaptive/http/Chunk.h"
+#include "../../adaptive/http/Chunk.h"
 
 namespace smooth
 {
@@ -31,12 +31,14 @@ namespace smooth
         class MemoryChunkSource : public AbstractChunkSource
         {
             public:
-                MemoryChunkSource(block_t *);
+                MemoryChunkSource(ChunkType, block_t *);
                 virtual ~MemoryChunkSource();
 
-                virtual block_t * readBlock(); /* impl */
-                virtual block_t * read(size_t); /* impl */
-                virtual bool      hasMoreData() const; /* impl */
+                block_t * readBlock() override;
+                block_t * read(size_t) override;
+                bool      hasMoreData() const override;
+                size_t    getBytesRead() const  override;
+                void      recycle() override;
 
             private:
                 block_t *data;

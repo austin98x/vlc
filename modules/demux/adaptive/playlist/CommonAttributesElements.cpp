@@ -32,10 +32,11 @@
 
 using namespace adaptive::playlist;
 
-CommonAttributesElements::CommonAttributesElements() :
+CommonAttributesElements::CommonAttributesElements(CommonAttributesElements *p) :
     width( -1 ),
     height( -1 )
 {
+    parentCommonAttributes = p;
 }
 
 CommonAttributesElements::~CommonAttributesElements()
@@ -44,7 +45,9 @@ CommonAttributesElements::~CommonAttributesElements()
 
 const std::string& CommonAttributesElements::getMimeType() const
 {
-    return mimeType;
+    if(!mimeType.empty() || !parentCommonAttributes)
+        return mimeType;
+    return parentCommonAttributes->getMimeType();
 }
 
 void CommonAttributesElements::setMimeType( const std::string &mimeType )
@@ -54,7 +57,9 @@ void CommonAttributesElements::setMimeType( const std::string &mimeType )
 
 int     CommonAttributesElements::getWidth                () const
 {
-    return width;
+    if(width != -1 || !parentCommonAttributes)
+        return width;
+    return parentCommonAttributes->getWidth();
 }
 
 void    CommonAttributesElements::setWidth( int width )
@@ -65,7 +70,9 @@ void    CommonAttributesElements::setWidth( int width )
 
 int     CommonAttributesElements::getHeight               () const
 {
-    return height;
+    if(height != -1 || !parentCommonAttributes)
+        return height;
+    return parentCommonAttributes->getHeight();
 }
 
 void    CommonAttributesElements::setHeight( int height )
@@ -74,13 +81,38 @@ void    CommonAttributesElements::setHeight( int height )
         this->height = height;
 }
 
-const std::list<std::string>& CommonAttributesElements::getLang() const
+void CommonAttributesElements::setAspectRatio(const AspectRatio &r)
 {
-    return lang;
+    aspectRatio = r;
 }
 
-void    CommonAttributesElements::addLang( const std::string &lang )
+const AspectRatio & CommonAttributesElements::getAspectRatio() const
 {
-    if ( lang.empty() == false )
-        this->lang.push_back( lang );
+    if(aspectRatio.isValid() || !parentCommonAttributes)
+        return aspectRatio;
+    return parentCommonAttributes->getAspectRatio();
+}
+
+const Rate & CommonAttributesElements::getFrameRate() const
+{
+    if(frameRate.isValid() || !parentCommonAttributes)
+        return frameRate;
+    return parentCommonAttributes->getFrameRate();
+}
+
+void CommonAttributesElements::setFrameRate(const Rate &r)
+{
+    frameRate = r;
+}
+
+const Rate & CommonAttributesElements::getSampleRate() const
+{
+    if(sampleRate.isValid() || !parentCommonAttributes)
+        return sampleRate;
+    return parentCommonAttributes->getSampleRate();
+}
+
+void CommonAttributesElements::setSampleRate(const Rate &r)
+{
+    sampleRate = r;
 }

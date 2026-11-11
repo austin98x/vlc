@@ -45,11 +45,12 @@ using std::nothrow;
 #include "revmodel.hpp"
 #define SPAT_AMP 0.3
 
+#include <array>
+
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
 static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
 
 #define ROOMSIZE_TEXT N_("Room size")
 #define ROOMSIZE_LONGTEXT N_("Defines the virtual surface of the room" \
@@ -71,31 +72,35 @@ vlc_module_begin ()
     set_description( N_("Audio Spatializer") )
     set_shortname( N_("Spatializer" ) )
     set_capability( "audio filter", 0 )
-    set_category( CAT_AUDIO )
     set_subcategory( SUBCAT_AUDIO_AFILTER )
 
-    set_callbacks( Open, Close )
+    set_callback( Open )
     add_shortcut( "spatializer" )
     add_float_with_range( "spatializer-roomsize", 0.85, 0., 1.1,
-                            ROOMSIZE_TEXT, ROOMSIZE_LONGTEXT, false )
+                            ROOMSIZE_TEXT, ROOMSIZE_LONGTEXT )
     add_float_with_range( "spatializer-width", 1,     0.,  1.,
-                            WIDTH_TEXT,WIDTH_LONGTEXT, false )
+                            WIDTH_TEXT,WIDTH_LONGTEXT )
     add_float_with_range( "spatializer-wet",   0.4,   0.,  1.,
-                            WET_TEXT,WET_LONGTEXT, false )
+                            WET_TEXT,WET_LONGTEXT )
     add_float_with_range( "spatializer-dry",   0.5,   0.,  1.,
-                            DRY_TEXT,DRY_LONGTEXT, false )
+                            DRY_TEXT,DRY_LONGTEXT )
     add_float_with_range( "spatializer-damp",  0.5,   0.,  1.,
-                            DAMP_TEXT,DAMP_LONGTEXT, false )
+                            DAMP_TEXT,DAMP_LONGTEXT )
 vlc_module_end ()
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
+
+namespace {
+
 struct filter_sys_t
 {
     vlc_mutex_t lock;
     revmodel *p_reverbm;
 };
+
+} // namespace
 
 #define DECLARECB(fn) static int fn (vlc_object_t *,char const *, \
                                      vlc_value_t, vlc_value_t, void *)
@@ -107,6 +112,8 @@ DECLARECB( WidthCallback );
 
 #undef  DECLARECB
 
+namespace {
+
 struct callback_s {
   const char *psz_name;
   int (*fp_callback)(vlc_object_t *,const char *,
@@ -114,16 +121,36 @@ struct callback_s {
   void (revmodel::* fp_set)(float);
 };
 
-static const callback_s callbacks[] = {
+} // namespace
+
+static const std::array<callback_s, 5> callbacks = {{
     { "spatializer-roomsize", RoomCallback,  &revmodel::setroomsize },
     { "spatializer-width",    WidthCallback, &revmodel::setwidth },
     { "spatializer-wet",      WetCallback,   &revmodel::setwet },
     { "spatializer-dry",      DryCallback,   &revmodel::setdry },
     { "spatializer-damp",     DampCallback,  &revmodel::setdamp }
-};
-enum { num_callbacks=sizeof(callbacks)/sizeof(callback_s) };
+}};
 
 static block_t *DoWork( filter_t *, block_t * );
+
+/*****************************************************************************
+ * Close: close the filter
+ *****************************************************************************/
+static void Close( filter_t *p_filter )
+{
+    filter_sys_t *p_sys = reinterpret_cast<filter_sys_t *>( p_filter->p_sys );
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
+
+    /* Delete the callbacks */
+    for (const auto& cb : callbacks)
+    {
+        var_DelCallback(p_aout, cb.psz_name, cb.fp_callback, p_sys);
+    }
+
+    delete p_sys->p_reverbm;
+    free( p_sys );
+    msg_Dbg( &p_filter->obj, "Closing filter spatializer" );
+}
 
 /*****************************************************************************
  * Open:
@@ -132,10 +159,10 @@ static int Open( vlc_object_t *p_this )
 {
     filter_t     *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
 
      /* Allocate structure */
-    p_sys = p_filter->p_sys = (filter_sys_t*)malloc( sizeof( *p_sys ) );
+    p_filter->p_sys = p_sys = (filter_sys_t*)malloc( sizeof( *p_sys ) );
     if( !p_sys )
         return VLC_ENOMEM;
 
@@ -150,42 +177,27 @@ static int Open( vlc_object_t *p_this )
 
     vlc_mutex_init( &p_sys->lock );
 
-    for(unsigned i=0;i<num_callbacks;++i)
+    for (const auto& cb : callbacks)
     {
         /* NOTE: C++ pointer-to-member function call from table lookup. */
-        (p_sys->p_reverbm->*(callbacks[i].fp_set))
-            (var_CreateGetFloatCommand(p_aout,callbacks[i].psz_name));
-        var_AddCallback( p_aout, callbacks[i].psz_name,
-                         callbacks[i].fp_callback, p_sys );
+        float value = var_CreateGetFloatCommand(p_aout, cb.psz_name);
+        (p_sys->p_reverbm->*(cb.fp_set))(value);
+        var_AddCallback(p_aout, cb.psz_name, cb.fp_callback, p_sys);
     }
 
     p_filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
     aout_FormatPrepare(&p_filter->fmt_in.audio);
     p_filter->fmt_out.audio = p_filter->fmt_in.audio;
-    p_filter->pf_audio_filter = DoWork;
+
+    static const struct vlc_filter_operations filter_ops = []{
+        struct vlc_filter_operations ops {};
+        ops.filter_audio = DoWork;
+        ops.close = Close;
+        return ops;
+    }();
+
+    p_filter->ops = &filter_ops;
     return VLC_SUCCESS;
-}
-
-/*****************************************************************************
- * Close: close the plugin
- *****************************************************************************/
-static void Close( vlc_object_t *p_this )
-{
-    filter_t     *p_filter = (filter_t *)p_this;
-    filter_sys_t *p_sys = p_filter->p_sys;
-    vlc_object_t *p_aout = p_filter->obj.parent;
-
-    /* Delete the callbacks */
-    for(unsigned i=0;i<num_callbacks;++i)
-    {
-        var_DelCallback( p_aout, callbacks[i].psz_name,
-                         callbacks[i].fp_callback, p_sys );
-    }
-
-    delete p_sys->p_reverbm;
-    vlc_mutex_destroy( &p_sys->lock );
-    free( p_sys );
-    msg_Dbg( p_this, "Closing filter spatializer" );
 }
 
 /*****************************************************************************
@@ -196,7 +208,7 @@ static void Close( vlc_object_t *p_this )
 static void SpatFilter( filter_t *p_filter, float *out, float *in,
                         unsigned i_samples, unsigned i_channels )
 {
-    filter_sys_t *p_sys = p_filter->p_sys;
+    filter_sys_t *p_sys = reinterpret_cast<filter_sys_t *>( p_filter->p_sys );
     vlc_mutex_locker locker( &p_sys->lock );
 
     for( unsigned i = 0; i < i_samples; i++ )
@@ -278,4 +290,3 @@ static int DampCallback( vlc_object_t *p_this, char const *,
     msg_Dbg( p_this, "'damp' value is now %3.1f", newval.f_float );
     return VLC_SUCCESS;
 }
-

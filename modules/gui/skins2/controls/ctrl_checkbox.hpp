@@ -2,7 +2,6 @@
  * ctrl_checkbox.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -52,22 +51,25 @@ public:
                   VarBool &rVariable, const UString &rHelp,
                   VarBool *pVisible);
 
-    virtual ~CtrlCheckbox();
+    ~CtrlCheckbox() override;
 
     /// Handle an event
-    virtual void handleEvent( EvtGeneric &rEvent );
+    void handleEvent(EvtGeneric &rEvent) override;
 
     /// Check whether coordinates are inside the control
-    virtual bool mouseOver( int x, int y ) const;
+    bool mouseOver(int x, int y) const override;
 
     /// Draw the control on the given graphics
-    virtual void draw( OSGraphics &rImage, int xDest, int yDest, int w, int h );
+    void draw(OSGraphics &rImage, int xDest, int yDest, int w, int h) override;
 
     /// Get the text of the tooltip XXX
-    virtual UString getTooltipText() const { return *m_pTooltip; }
+    UString getTooltipText() const override { return *m_pTooltip; }
 
     /// Get the type of control (custom RTTI)
-    virtual std::string getType() const { return "checkbox"; }
+    std::string getType() const override { return "checkbox"; }
+
+protected:
+    using CtrlGeneric::onUpdate;
 
 private:
     /// Finite state machine of the control
@@ -87,7 +89,7 @@ private:
     AnimBitmap m_imgUp2, m_imgOver2, m_imgDown2;
     /// Current set of images (pointing to 1 or 2)
     /// In fact, we consider here that a checkbox acts like 2 buttons, in a
-    /// symetric way; this is a small trick to avoid multiplicating the
+    /// symmetric way; this is a small trick to avoid multiplicating the
     /// callbacks (and it could be extended easily to support 3 buttons or
     /// more...)
     AnimBitmap *m_pImgUp, *m_pImgOver, *m_pImgDown;
@@ -106,10 +108,10 @@ private:
     DEFINE_CALLBACK( CtrlCheckbox, HiddenUp )
 
     /// Method called when the observed variable is modified
-    virtual void onVarBoolUpdate( VarBool &rVariable );
+    void onVarBoolUpdate(VarBool &rVariable) override;
 
     /// Method called when an animated bitmap changes
-    virtual void onUpdate( Subject<AnimBitmap> &rBitmap, void* );
+    void onUpdate(Subject<AnimBitmap> &rBitmap, void*) override;
 
     /// Change the current image
     void setImage( AnimBitmap *pImg );

@@ -18,6 +18,7 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
 #include <vlc_image.h>
+#include <vlc_subpicture.h>
 
 #define RGB2YUV( R, G, B ) \
     ((0.257 * R) + (0.504 * G) + (0.098 * B) + 16), \
@@ -66,29 +67,25 @@ static inline subpicture_region_t *
 spuregion_CreateFromPicture( vlc_object_t *p_this, video_format_t *p_fmt,
                              const char *psz_uri )
 {
-    video_format_t fmt_in;
-    video_format_Init( &fmt_in, 0 );
-
     picture_t *p_pic = NULL;
-    int i_flags = p_this->obj.flags;
-    p_this->obj.flags |= OBJECT_FLAGS_NOINTERACT|OBJECT_FLAGS_QUIET;
+    struct vlc_logger *logger = p_this->logger;
+    bool no_interact = p_this->no_interact;
+    p_this->logger = NULL;
+    p_this->no_interact = true;
     image_handler_t *p_image = image_HandlerCreate( p_this );
     if( p_image )
     {
-        p_pic = image_ReadUrl( p_image, psz_uri, &fmt_in, p_fmt );
+        p_pic = image_ReadUrl( p_image, psz_uri, p_fmt );
         image_HandlerDelete( p_image );
     }
-    p_this->obj.flags = i_flags;
+    p_this->no_interact = no_interact;
+    p_this->logger = logger;
 
     if(!p_pic)
         return NULL;
 
-    subpicture_region_t *region = subpicture_region_New(p_fmt);
-    if (!region)
-        return NULL;
-
-    picture_Release( region->p_picture );
-    region->p_picture = p_pic;
+    subpicture_region_t *region = subpicture_region_ForPicture(p_pic);
+    picture_Release( p_pic );
 
     return region;
 }

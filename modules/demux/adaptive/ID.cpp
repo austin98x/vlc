@@ -39,6 +39,11 @@ ID::ID(uint64_t id_)
     id = ss.str();
 }
 
+bool ID::isValid() const
+{
+    return !id.empty();
+}
+
 bool ID::operator==(const ID &other) const
 {
     return (!id.empty() && id == other.id);
@@ -54,3 +59,39 @@ std::string ID::str() const
     return id;
 }
 
+unsigned SrcID::next = 0;
+
+SrcID::SrcID(unsigned n)
+{
+    id = n;
+}
+
+bool SrcID::operator==(const SrcID &other) const
+{
+    return this->id == other.id;
+}
+
+bool SrcID::operator!=(const SrcID &other) const
+{
+    return ! this->operator==(other);
+}
+
+const SrcID SrcID::make()
+{
+    return SrcID(++SrcID::next);
+}
+
+const SrcID SrcID::dummy()
+{
+    return SrcID(0);
+}
+
+const ID & Unique::getID() const
+{
+    return id;
+}
+
+void Unique::setID(const ID &id_)
+{
+    id = id_;
+}

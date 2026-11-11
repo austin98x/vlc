@@ -2,7 +2,6 @@
  * chapters.hpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -29,11 +28,17 @@
 
 #include "mkv.hpp"
 
+#include <optional>
+#include <limits>
+
+namespace mkv {
+
 class chapter_translation_c
 {
 public:
     chapter_translation_c()
-        :p_translated(NULL)
+        :p_translated(nullptr)
+        ,codec_id(std::numeric_limits<unsigned int>::max())
     {}
 
     ~chapter_translation_c()
@@ -41,47 +46,42 @@ public:
         delete p_translated;
     }
 
+    constexpr bool isValid() const {
+        return p_translated != nullptr &&
+               codec_id != std::numeric_limits<unsigned int>::max();
+    }
+
     KaxChapterTranslateID  *p_translated;
     unsigned int           codec_id;
     std::vector<uint64_t>  editions;
 };
 
-class chapter_codec_cmds_c;
 class chapter_item_c
 {
 public:
     chapter_item_c()
-    :i_start_time(0)
-    ,i_end_time(-1)
-    ,p_segment_uid(NULL)
-    ,p_segment_edition_uid(NULL)
-    ,b_display_seekpoint(true)
-    ,b_user_display(false)
-    ,p_parent(NULL)
-    ,b_is_leaving(false)
     {}
 
     virtual ~chapter_item_c();
     void Append( const chapter_item_c & edition );
-    chapter_item_c * FindChapter( int64_t i_find_uid );
-    virtual chapter_item_c *BrowseCodecPrivate( unsigned int codec_id,
-                                    bool (*match)(const chapter_codec_cmds_c &data, const void *p_cookie, size_t i_cookie_size ),
-                                    const void *p_cookie,
-                                    size_t i_cookie_size );
+    chapter_item_c * FindChapter( chapter_uid i_find_uid );
+    virtual chapter_item_c *BrowseCodecPrivate( chapter_codec_id codec_id,
+                                                chapter_cmd_match match );
     std::string                 GetCodecName( bool f_for_title = false ) const;
     bool                        ParentOf( const chapter_item_c & item ) const;
-    int16                       GetTitleNumber( ) const;
+    int16_t                     GetTitleNumber( ) const;
 
-    int64_t                     i_start_time, i_end_time;
+    vlc_tick_t                  i_start_time = 0;
+    std::optional<vlc_tick_t>   i_end_time;
     std::vector<chapter_item_c*> sub_chapters;
-    KaxChapterSegmentUID        *p_segment_uid;
-    KaxChapterSegmentEditionUID *p_segment_edition_uid;
-    int64_t                     i_uid;
-    bool                        b_display_seekpoint;
-    bool                        b_user_display;
-    std::string                 psz_name;
-    chapter_item_c              *p_parent;
-    bool                        b_is_leaving;
+    KaxChapterSegmentUID        *p_segment_uid = nullptr;
+    KaxChapterSegmentEditionUID *p_segment_edition_uid = nullptr;
+    chapter_uid                 i_uid = 0;
+    bool                        b_display_seekpoint = true;
+    bool                        b_user_display = true;
+    std::string                 str_name;
+    chapter_item_c              *p_parent = nullptr;
+    bool                        b_is_leaving = false;
 
     std::vector<chapter_codec_cmds_c*> codecs;
 
@@ -102,8 +102,9 @@ public:
     std::string GetMainName() const;
     bool                        b_ordered;
     bool                        b_default;
-    /* TODO handle hidden chapters */
     bool                        b_hidden;
 };
+
+} // namespace
 
 #endif

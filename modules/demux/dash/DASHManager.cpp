@@ -26,14 +26,14 @@
 # include "config.h"
 #endif
 
-#include <vlc_fixups.h>
 #include <cinttypes>
 
 #include "DASHManager.h"
 #include "mpd/ProgramInformation.h"
 #include "mpd/IsoffMainParser.h"
-#include "xml/DOMParser.h"
-#include "xml/Node.h"
+#include "../adaptive/xml/DOMParser.h"
+#include "../adaptive/xml/Node.h"
+#include "../adaptive/SharedResources.hpp"
 #include "../adaptive/tools/Helper.h"
 #include "../adaptive/http/HTTPConnectionManager.h"
 #include <vlc_stream.h>
@@ -50,11 +50,11 @@ using namespace dash::mpd;
 using namespace adaptive::logic;
 
 DASHManager::DASHManager(demux_t *demux_,
-                         AuthStorage *auth,
+                         SharedResources *res,
                          MPD *mpd,
                          AbstractStreamFactory *factory,
                          AbstractAdaptationLogic::LogicType type) :
-             PlaylistManager(demux_, auth, mpd, factory, type)
+             PlaylistManager(demux_, res, mpd, factory, type)
 {
 }
 
@@ -64,33 +64,23 @@ DASHManager::~DASHManager   ()
 
 void DASHManager::scheduleNextUpdate()
 {
-    time_t now = time(NULL);
+    time_t now = time(nullptr);
 
-    mtime_t minbuffer = 0;
-    std::vector<AbstractStream *>::const_iterator it;
-    for(it=streams.begin(); it!=streams.end(); ++it)
-    {
-        const AbstractStream *st = *it;
-        const mtime_t m = st->getMinAheadTime();
-        if(m > 0 && (m < minbuffer || minbuffer == 0))
-            minbuffer = m;
-    }
-    minbuffer /= 2;
+    vlc_tick_t minbuffer = getMinAheadTime() / 2;
 
-    if(playlist->minUpdatePeriod.Get() > minbuffer)
-        minbuffer = playlist->minUpdatePeriod.Get();
+    if(playlist->minUpdatePeriod > minbuffer)
+        minbuffer = playlist->minUpdatePeriod;
 
-    if(minbuffer < 5 * CLOCK_FREQ)
-        minbuffer = 5 * CLOCK_FREQ;
+    minbuffer = std::max(minbuffer, VLC_TICK_FROM_SEC(5));
 
-    nextPlaylistupdate = now + minbuffer / CLOCK_FREQ;
+    nextPlaylistupdate = now + SEC_FROM_VLC_TICK(minbuffer);
 
-    msg_Dbg(p_demux, "Updated MPD, next update in %" PRId64 "s", (mtime_t) nextPlaylistupdate - now );
+    msg_Dbg(p_demux, "Updated MPD, next update in %" PRId64 "s", (int64_t) nextPlaylistupdate - now );
 }
 
 bool DASHManager::needsUpdate() const
 {
-    if(nextPlaylistupdate && time(NULL) < nextPlaylistupdate)
+    if(nextPlaylistupdate && time(nullptr) < nextPlaylistupdate)
         return false;
 
     return PlaylistManager::needsUpdate();
@@ -103,7 +93,7 @@ bool DASHManager::updatePlaylist()
     {
         std::string url(p_demux->psz_url);
 
-        block_t *p_block = Retrieve::HTTP(VLC_OBJECT(p_demux), authStorage, url);
+        block_t *p_block = Retrieve::HTTP(resources, ChunkType::Playlist, url);
         if(!p_block)
             return false;
 
@@ -122,21 +112,12 @@ bool DASHManager::updatePlaylist()
             return false;
         }
 
-        mtime_t minsegmentTime = 0;
-        std::vector<AbstractStream *>::iterator it;
-        for(it=streams.begin(); it!=streams.end(); it++)
-        {
-            mtime_t segmentTime = (*it)->getPlaybackTime();
-            if(!minsegmentTime || segmentTime < minsegmentTime)
-                minsegmentTime = segmentTime;
-        }
-
         IsoffMainParser mpdparser(parser.getRootNode(), VLC_OBJECT(p_demux),
                                   mpdstream, Helper::getDirectoryPath(url).append("/"));
         MPD *newmpd = mpdparser.parse();
         if(newmpd)
         {
-            playlist->mergeWith(newmpd, minsegmentTime);
+            playlist->updateWith(newmpd);
             delete newmpd;
         }
         vlc_stream_Delete(mpdstream);
@@ -156,25 +137,25 @@ int DASHManager::doControl(int i_query, va_list args)
             if(!mpd)
                 return VLC_EGENERIC;
 
-            if(!mpd->programInfo.Get())
+            if(!mpd->programInfo)
                 break;
 
             vlc_meta_t *p_meta = va_arg (args, vlc_meta_t *);
             vlc_meta_t *meta = vlc_meta_New();
-            if (meta == NULL)
+            if (meta == nullptr)
                 return VLC_EGENERIC;
 
-            if(!mpd->programInfo.Get()->getTitle().empty())
-                vlc_meta_SetTitle(meta, mpd->programInfo.Get()->getTitle().c_str());
+            if(!mpd->programInfo->getTitle().empty())
+                vlc_meta_SetTitle(meta, mpd->programInfo->getTitle().c_str());
 
-            if(!mpd->programInfo.Get()->getSource().empty())
-                vlc_meta_SetPublisher(meta, mpd->programInfo.Get()->getSource().c_str());
+            if(!mpd->programInfo->getSource().empty())
+                vlc_meta_SetPublisher(meta, mpd->programInfo->getSource().c_str());
 
-            if(!mpd->programInfo.Get()->getCopyright().empty())
-                vlc_meta_SetCopyright(meta, mpd->programInfo.Get()->getCopyright().c_str());
+            if(!mpd->programInfo->getCopyright().empty())
+                vlc_meta_SetCopyright(meta, mpd->programInfo->getCopyright().c_str());
 
-            if(!mpd->programInfo.Get()->getMoreInformationUrl().empty())
-                vlc_meta_SetURL(meta, mpd->programInfo.Get()->getMoreInformationUrl().c_str());
+            if(!mpd->programInfo->getMoreInformationUrl().empty())
+                vlc_meta_SetURL(meta, mpd->programInfo->getMoreInformationUrl().c_str());
 
             vlc_meta_Merge(p_meta, meta);
             vlc_meta_Delete(meta);
@@ -186,24 +167,17 @@ int DASHManager::doControl(int i_query, va_list args)
 
 bool DASHManager::isDASH(xml::Node *root)
 {
-    const std::string namespaces[] = {
-        "urn:mpeg:mpegB:schema:DASH:MPD:DIS2011",
-        "urn:mpeg:schema:dash:mpd:2011",
+    static const std::string namespaces[] = {
+        "urn:mpeg:dash:schema:mpd:2011",
         "urn:mpeg:DASH:schema:MPD:2011",
-        "urn:mpeg:mpegB:schema:DASH:MPD:DIS2011",
         "urn:mpeg:schema:dash:mpd:2011",
-        "urn:mpeg:DASH:schema:MPD:2011",
+        "urn:mpeg:mpegB:schema:DASH:MPD:DIS2011",
     };
 
-    if(root->getName() != "MPD")
-        return false;
-
-    std::string ns = root->getAttributeValue("xmlns");
     for( size_t i=0; i<ARRAY_SIZE(namespaces); i++ )
-    {
-        if ( adaptive::Helper::ifind(ns, namespaces[i]) )
+        if(root->matches("MPD", namespaces[i]))
             return true;
-    }
+
     return false;
 }
 

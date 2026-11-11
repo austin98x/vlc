@@ -32,14 +32,19 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_opengl.h>
-#include <vlc_vout_window.h>
+#include <vlc_window.h>
 #include <vlc_xlib.h>
+
+#ifndef GLX_ARB_get_proc_address
+#error GLX_ARB_get_proc_address extension missing
+#endif
 
 typedef struct vlc_gl_sys_t
 {
     Display *display;
     GLXWindow win;
     GLXContext ctx;
+    Window x11_win;
 } vlc_gl_sys_t;
 
 static int MakeCurrent (vlc_gl_t *gl)
@@ -58,21 +63,57 @@ static void ReleaseCurrent (vlc_gl_t *gl)
     glXMakeContextCurrent (sys->display, None, None, NULL);
 }
 
+static void Resize (vlc_gl_t *gl, unsigned width, unsigned height)
+{
+    vlc_gl_sys_t *sys = gl->sys;
+
+    Display* old_display = glXGetCurrentDisplay();
+    GLXContext old_ctx = glXGetCurrentContext();
+    GLXDrawable old_draw = glXGetCurrentDrawable();
+    GLXDrawable old_read = glXGetCurrentReadDrawable();
+
+    Bool made_current = glXMakeContextCurrent (sys->display, sys->win, sys->win, sys->ctx);
+    if (made_current)
+        glXWaitGL();
+    unsigned long init_serial = LastKnownRequestProcessed(sys->display);
+    unsigned long resize_serial = NextRequest(sys->display);
+    XResizeWindow(sys->display, sys->x11_win, width, height);
+    if (made_current)
+    {
+        glXWaitX();
+        if (old_display)
+            glXMakeContextCurrent(old_display, old_draw, old_read, old_ctx);
+        else
+            glXMakeContextCurrent(sys->display, None, None, NULL);
+    }
+    if (LastKnownRequestProcessed(sys->display) - init_serial < resize_serial - init_serial)
+        XSync(sys->display, False);
+}
+
 static void SwapBuffers (vlc_gl_t *gl)
 {
     vlc_gl_sys_t *sys = gl->sys;
 
-    glXSwapBuffers (sys->display, sys->win);
+    Display *previous_display = glXGetCurrentDisplay();
+    GLXContext previous_context = glXGetCurrentContext();
+    if (previous_display != sys->display || previous_context != sys->ctx) {
+        GLXWindow s_read = glXGetCurrentReadDrawable();
+        GLXWindow s_draw = glXGetCurrentDrawable();
+        glXMakeContextCurrent(sys->display, sys->win, sys->win, sys->ctx);
+        glXSwapBuffers (sys->display, sys->win);
+        if (previous_display)
+            glXMakeContextCurrent(previous_display, s_draw, s_read, previous_context);
+        else
+            glXMakeContextCurrent(sys->display, None, None, NULL);
+    }
+    else
+        glXSwapBuffers (sys->display, sys->win);
 }
 
 static void *GetSymbol(vlc_gl_t *gl, const char *procname)
 {
     (void) gl;
-#ifdef GLX_ARB_get_proc_address
     return glXGetProcAddressARB ((const GLubyte *)procname);
-#else
-    return NULL;
-#endif
 }
 
 static bool CheckGLX (vlc_object_t *vd, Display *dpy)
@@ -113,11 +154,29 @@ static bool CheckGLXext (Display *dpy, unsigned snum, const char *ext)
     return false;
 }
 
-static int Open (vlc_object_t *obj)
+static void Close(vlc_gl_t *gl)
 {
-    vlc_gl_t *gl = (vlc_gl_t *)obj;
+    vlc_gl_sys_t *sys = gl->sys;
+    Display *dpy = sys->display;
 
-    if (gl->surface->type != VOUT_WINDOW_TYPE_XID || !vlc_xlib_init (obj))
+    glXDestroyContext(dpy, sys->ctx);
+    glXDestroyWindow(dpy, sys->win);
+    XCloseDisplay(dpy);
+    free(sys);
+}
+
+static int Open(vlc_gl_t *gl, unsigned width, unsigned height,
+                const struct vlc_gl_cfg *gl_cfg)
+{
+    vlc_object_t *obj = VLC_OBJECT(gl);
+
+    if (gl_cfg->need_alpha)
+    {
+        msg_Err(gl, "Cannot support alpha yet");
+        return VLC_ENOTSUP;
+    }
+
+    if (gl->surface->type != VLC_WINDOW_TYPE_XID || !vlc_xlib_init (obj))
         return VLC_EGENERIC;
 
     /* Initialize GLX display */
@@ -141,6 +200,22 @@ static int Open (vlc_object_t *obj)
     XWindowAttributes wa;
     if (!XGetWindowAttributes (dpy, gl->surface->handle.xid, &wa))
         goto error;
+
+    XSetWindowAttributes swa;
+    unsigned long mask =
+        CWBackPixel |
+        CWBorderPixel |
+        CWBitGravity |
+        CWColormap;
+    swa.background_pixel = BlackPixelOfScreen(wa.screen);
+    swa.border_pixel = BlackPixelOfScreen(wa.screen);
+    swa.bit_gravity = NorthWestGravity;
+    swa.colormap = DefaultColormapOfScreen(wa.screen);
+    sys->x11_win = XCreateWindow(dpy, gl->surface->handle.xid, 0, 0,
+                                 width, height, 0,
+                                 DefaultDepthOfScreen(wa.screen), InputOutput,
+                                 DefaultVisualOfScreen(wa.screen), mask, &swa);
+    XMapWindow(dpy, sys->x11_win);
 
     const int snum = XScreenNumberOfScreen (wa.screen);
     const VisualID visual = XVisualIDFromVisual (wa.visual);
@@ -185,7 +260,7 @@ static int Open (vlc_object_t *obj)
     }
 
     /* Create a drawing surface */
-    sys->win = glXCreateWindow (dpy, conf, gl->surface->handle.xid, NULL);
+    sys->win = glXCreateWindow (dpy, conf, sys->x11_win, NULL);
     if (sys->win == None)
     {
         msg_Err (obj, "cannot create GLX window");
@@ -202,14 +277,18 @@ static int Open (vlc_object_t *obj)
     }
 
     /* Initialize OpenGL callbacks */
+    static const struct vlc_gl_operations gl_ops =
+    {
+        .make_current = MakeCurrent,
+        .release_current = ReleaseCurrent,
+        .resize = Resize,
+        .swap = SwapBuffers,
+        .get_proc_address = GetSymbol,
+        .close = Close,
+    };
     gl->sys = sys;
-    gl->makeCurrent = MakeCurrent;
-    gl->releaseCurrent = ReleaseCurrent;
-    gl->resize = NULL;
-    gl->swap = SwapBuffers;
-    gl->getProcAddress = GetSymbol;
+    gl->ops = &gl_ops;
 
-#ifdef GLX_ARB_get_proc_address
     bool is_swap_interval_set = false;
 
     MakeCurrent (gl);
@@ -235,7 +314,16 @@ static int Open (vlc_object_t *obj)
     }
 # endif
     ReleaseCurrent (gl);
-#endif
+
+    /* XXX: Prevent other gl backends (like EGL) to be opened within the same
+     * X11 window instance. Indeed, using EGL after GLX on the same X11 window
+     * instance leads to an SEGFAULT in the libEGL_nvidia.so library. */
+    const char *vendor = glXGetClientString(dpy, GLX_VENDOR);
+    if (vendor && strncmp(vendor, "NVIDIA", sizeof("NVIDIA") - 1) == 0)
+    {
+        var_Create(gl->surface, "gl", VLC_VAR_STRING);
+        var_SetString(gl->surface, "gl", "glx");
+    }
 
     return VLC_SUCCESS;
 
@@ -245,23 +333,9 @@ error:
     return VLC_EGENERIC;
 }
 
-static void Close (vlc_object_t *obj)
-{
-    vlc_gl_t *gl = (vlc_gl_t *)obj;
-    vlc_gl_sys_t *sys = gl->sys;
-    Display *dpy = sys->display;
-
-    glXDestroyContext (dpy, sys->ctx);
-    glXDestroyWindow (dpy, sys->win);
-    XCloseDisplay (dpy);
-    free (sys);
-}
-
 vlc_module_begin ()
     set_shortname (N_("GLX"))
     set_description (N_("GLX extension for OpenGL"))
-    set_category (CAT_VIDEO)
     set_subcategory (SUBCAT_VIDEO_VOUT)
-    set_capability ("opengl", 20)
-    set_callbacks (Open, Close)
+    set_callback_opengl(Open, 20)
 vlc_module_end ()

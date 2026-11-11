@@ -2,7 +2,6 @@
  * update.c: VLC update checking and downloading
  *****************************************************************************
  * Copyright © 2005-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea -at- videolan -dot- org>
  *          Rémi Duraffort <ivoire at via.ecp.fr>
@@ -37,6 +36,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_update.h>
 
 #include <assert.h>
@@ -47,10 +47,12 @@
 #include <vlc_fs.h>
 #include <vlc_dialog.h>
 #include <vlc_interface.h>
+#include <vlc_charset.h>
 
 #include <gcrypt.h>
 #include <vlc_gcrypt.h>
 #ifdef _WIN32
+#include <windows.h>
 #include <shellapi.h>
 #endif
 #include "update.h"
@@ -72,18 +74,10 @@
  * Remaining text is a required description of the update
  */
 
-#if defined( _WIN64 )
-# define UPDATE_OS_SUFFIX "-win-x64"
-#elif defined( _WIN32 )
-# define UPDATE_OS_SUFFIX "-win-x86"
-#else
-# define UPDATE_OS_SUFFIX ""
-#endif
-
 #ifndef NDEBUG
-# define UPDATE_VLC_STATUS_URL "http://update-test.videolan.org/vlc/status-win-x86"
+# define UPDATE_VLC_STATUS_URL "https://update-test.videolan.org/vlc/status"
 #else
-# define UPDATE_VLC_STATUS_URL "http://update.videolan.org/vlc/status" UPDATE_OS_SUFFIX
+# define UPDATE_VLC_STATUS_URL "https://update.videolan.org/vlc/status"
 #endif
 
 #define dialog_FatalWait( p_obj, psz_title, psz_fmt, ... ) \
@@ -111,7 +105,7 @@ update_t *update_New( vlc_object_t *p_this )
 
     vlc_mutex_init( &p_update->lock );
 
-    p_update->p_libvlc = p_this->obj.libvlc;
+    p_update->p_libvlc = vlc_object_instance(p_this);
 
     p_update->release.psz_url = NULL;
     p_update->release.psz_desc = NULL;
@@ -129,7 +123,6 @@ update_t *update_New( vlc_object_t *p_this )
  * Delete an update_t struct
  *
  * \param p_update update_t* pointer
- * \return nothing
  */
 void update_Delete( update_t *p_update )
 {
@@ -145,10 +138,8 @@ void update_Delete( update_t *p_update )
     {
         atomic_store( &p_update->p_download->aborted, true );
         vlc_join( p_update->p_download->thread, NULL );
-        vlc_object_release( p_update->p_download );
+        vlc_object_delete(p_update->p_download);
     }
-
-    vlc_mutex_destroy( &p_update->lock );
 
     free( p_update->release.psz_url );
     free( p_update->release.psz_desc );
@@ -161,7 +152,6 @@ void update_Delete( update_t *p_update )
  * Empty the release struct
  *
  * \param p_update update_t* pointer
- * \return nothing
  */
 static void EmptyRelease( update_t *p_update )
 {
@@ -182,11 +172,28 @@ static void EmptyRelease( update_t *p_update )
  */
 static bool GetUpdateFile( update_t *p_update )
 {
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+    static const char url[] = UPDATE_VLC_STATUS_URL "-win-arm64";
+#elif defined(_WIN64)
+    static const char url[] = UPDATE_VLC_STATUS_URL "-win-x64";
+#elif defined(_WIN32)
+    static const char *urls[] = {
+        UPDATE_VLC_STATUS_URL "-win-x86", UPDATE_VLC_STATUS_URL "-win-x64"
+    };
+    BOOL sixtyfour;
+
+    if (!IsWow64Process(GetCurrentProcess(), &sixtyfour))
+        sixtyfour = FALSE; // not clear how this can fail but MSDN says so
+
+    const char *url = urls[sixtyfour != FALSE];
+#else
+    static const char url[] = UPDATE_VLC_STATUS_URL;
+#endif
     stream_t *p_stream = NULL;
     char *psz_version_line = NULL;
     char *psz_update_data = NULL;
 
-    p_stream = vlc_stream_NewURL( p_update->p_libvlc, UPDATE_VLC_STATUS_URL );
+    p_stream = vlc_stream_NewURL( p_update->p_libvlc, url );
     if( !p_stream )
     {
         msg_Err( p_update->p_libvlc, "Failed to open %s for reading",
@@ -388,8 +395,7 @@ static void* update_CheckReal( void * );
  *
  * \param p_update pointer to update struct
  * \param pf_callback pointer to a function to call when the update_check is finished
- * \param p_data pointer to some datas to give to the callback
- * \returns nothing
+ * \param p_data pointer to some data to give to the callback
  */
 void update_Check( update_t *p_update, void (*pf_callback)( void*, bool ), void *p_data )
 {
@@ -410,11 +416,13 @@ void update_Check( update_t *p_update, void (*pf_callback)( void*, bool ), void 
     p_uct->pf_callback = pf_callback;
     p_uct->p_data = p_data;
 
-    vlc_clone( &p_uct->thread, update_CheckReal, p_uct, VLC_THREAD_PRIORITY_LOW );
+    vlc_clone( &p_uct->thread, update_CheckReal, p_uct );
 }
 
 void* update_CheckReal( void *obj )
 {
+    vlc_thread_set_name("vlc-updater-chk");
+
     update_check_thread_t *p_uct = (update_check_thread_t *)obj;
     bool b_ret;
     int canc;
@@ -450,7 +458,7 @@ bool update_NeedUpgrade( update_t *p_update )
         p_update->release.i_extra
     };
 
-    for (unsigned i = 0; i < sizeof latest / sizeof *latest; i++) {
+    for (unsigned i = 0; i < ARRAY_SIZE( latest ); i++) {
         /* there is a new version available */
         if (latest[i] > current[i])
             return true;
@@ -496,8 +504,7 @@ static void* update_DownloadReal( void * );
  * Download the file given in the update_t
  *
  * \param p_update structure
- * \param dir to store the download file
- * \return nothing
+ * \param psz_destdir to store the download file
  */
 void update_Download( update_t *p_update, const char *psz_destdir )
 {
@@ -508,7 +515,7 @@ void update_Download( update_t *p_update, const char *psz_destdir )
     {
         atomic_store( &p_update->p_download->aborted, true );
         vlc_join( p_update->p_download->thread, NULL );
-        vlc_object_release( p_update->p_download );
+        vlc_object_delete(p_update->p_download);
     }
 
     update_download_thread_t *p_udt =
@@ -522,11 +529,13 @@ void update_Download( update_t *p_update, const char *psz_destdir )
     p_udt->psz_destdir = psz_destdir ? strdup( psz_destdir ) : NULL;
 
     atomic_store(&p_udt->aborted, false);
-    vlc_clone( &p_udt->thread, update_DownloadReal, p_udt, VLC_THREAD_PRIORITY_LOW );
+    vlc_clone( &p_udt->thread, update_DownloadReal, p_udt );
 }
 
 static void* update_DownloadReal( void *obj )
 {
+    vlc_thread_set_name("vlc-updater-dl");
+
     update_download_thread_t *p_udt = (update_download_thread_t *)obj;
     uint64_t l_size;
     uint64_t l_downloaded = 0;
@@ -571,7 +580,10 @@ static void* update_DownloadReal( void *obj )
     }
     psz_tmpdestfile++;
     if( asprintf( &psz_destfile, "%s%s", psz_destdir, psz_tmpdestfile ) == -1 )
+    {
+        psz_destfile = NULL;
         goto end;
+    }
 
     p_file = vlc_fopen( psz_destfile, "w" );
     if( !p_file )
@@ -728,11 +740,15 @@ static void* update_DownloadReal( void *obj )
                                            psz_msg );
     if(answer == 1)
     {
-        wchar_t psz_wdestfile[MAX_PATH];
-        MultiByteToWideChar( CP_UTF8, 0, psz_destfile, -1, psz_wdestfile, MAX_PATH );
-        answer = (int)ShellExecuteW( NULL, L"open", psz_wdestfile, NULL, NULL, SW_SHOW);
-        if(answer > 32)
-            libvlc_Quit(p_udt->obj.libvlc);
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+        wchar_t *psz_wdestfile = ToWide( psz_destfile );
+        if (likely(psz_wdestfile != NULL))
+        {
+            if((intptr_t)(void*)ShellExecuteW( NULL, L"open", psz_wdestfile, NULL, NULL, SW_SHOW) > 32)
+                libvlc_Quit(vlc_object_instance(p_udt));
+            free(psz_wdestfile);
+        }
+#endif
     }
 #endif
 end:

@@ -3,10 +3,9 @@
  *****************************************************************************
  * Copyright (C) 2001-2006 VLC authors and VideoLAN
  * Copyright © 2006 Rémi Denis-Courmont
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr> - original code
- *          Rémi Denis-Courmont <rem # videolan.org> - EPSV support
+ *          Rémi Denis-Courmont - EPSV support
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -33,12 +32,14 @@
 #include <assert.h>
 #include <stdint.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_access.h>
 #include <vlc_dialog.h>
 #include <vlc_input_item.h>
+#include <vlc_memstream.h>
 #include <vlc_network.h>
 #include <vlc_url.h>
 #include <vlc_tls.h>
@@ -46,6 +47,7 @@
 #include <vlc_charset.h>
 #include <vlc_interrupt.h>
 #include <vlc_keystore.h>
+#include <vlc_strings.h>
 
 #ifndef IPPORT_FTP
 # define IPPORT_FTP 21u
@@ -77,18 +79,17 @@ static void OutClose( vlc_object_t * );
 
 #define LOGIN_DIALOG_TITLE _("FTP authentication")
 #define LOGIN_DIALOG_TEXT _("Please enter a valid login and password for " \
-        "the ftp connexion to %s")
+        "the FTP connection to %s")
 
 vlc_module_begin ()
     set_shortname( "FTP" )
     set_description( N_("FTP input") )
     set_capability( "access", 0 )
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACCESS )
-    add_string( "ftp-user", NULL, USER_TEXT, USER_LONGTEXT, false )
-    add_string( "ftp-pwd", NULL, PASS_TEXT, PASS_LONGTEXT, false )
+    add_string( "ftp-user", NULL, USER_TEXT, USER_LONGTEXT )
+    add_password( "ftp-pwd", NULL, PASS_TEXT, PASS_LONGTEXT )
     add_string( "ftp-account", "anonymous", ACCOUNT_TEXT,
-                ACCOUNT_LONGTEXT, false )
+                ACCOUNT_LONGTEXT )
     add_shortcut( "ftp", "ftps", "ftpes" )
     set_callbacks( InOpen, InClose )
 
@@ -97,7 +98,6 @@ vlc_module_begin ()
         set_shortname( "FTP" )
         set_description( N_("FTP upload output") )
         set_capability( "sout access", 0 )
-        set_category( CAT_SOUT )
         set_subcategory( SUBCAT_SOUT_ACO )
         add_shortcut( "ftp", "ftps", "ftpes" )
         set_callbacks( OutOpen, OutClose )
@@ -107,12 +107,15 @@ vlc_module_end ()
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
+
+typedef struct access_sys_t access_sys_t;
+
 static ssize_t Read( stream_t *, void *, size_t );
 static int Seek( stream_t *, uint64_t );
 static int Control( stream_t *, int, va_list );
 static int DirRead( stream_t *, input_item_node_t * );
 #ifdef ENABLE_SOUT
-static int OutSeek( sout_access_out_t *, off_t );
+static int OutSeek( sout_access_out_t *, uint64_t );
 static ssize_t Write( sout_access_out_t *, block_t * );
 #endif
 
@@ -125,6 +128,7 @@ typedef struct ftp_features_t
     bool b_unicode;
     bool b_authtls;
     bool b_mlst;
+    bool b_list;
 } ftp_features_t;
 
 enum tls_mode_e
@@ -139,7 +143,7 @@ struct access_sys_t
     vlc_url_t  url;
 
     ftp_features_t   features;
-    vlc_tls_creds_t *p_creds;
+    vlc_tls_client_t *p_creds;
     enum tls_mode_e  tlsmode;
     vlc_tls_t *cmd;
     vlc_tls_t *data;
@@ -152,6 +156,7 @@ struct access_sys_t
 #define GET_OUT_SYS( p_this ) \
     ((access_sys_t *)(((sout_access_out_t *)(p_this))->p_sys))
 
+VLC_FORMAT(3, 4)
 static int ftp_SendCommand( vlc_object_t *obj, access_sys_t *sys,
                             const char *fmt, ... )
 {
@@ -356,7 +361,22 @@ static void clearCmd( access_sys_t *p_sys )
     }
 }
 
-static int Login( vlc_object_t *p_access, access_sys_t *p_sys )
+/* Sanitize for the protocol rfc1738. epscially \n\r */
+static bool HasControlChar( const char *p )
+{
+    if( p )
+    {
+        for( ; *p; p++ )
+        {
+            unsigned char c = (unsigned char)*p;
+            if( (c < 0x20 && c != '\t') || c == 0x7F || c == 0xFF /* IAC control byte */ )
+                return true;
+        }
+    }
+    return false;
+}
+
+static int Login( vlc_object_t *p_access, access_sys_t *p_sys, const char *path )
 {
     int i_answer;
 
@@ -443,7 +463,7 @@ static int Login( vlc_object_t *p_access, access_sys_t *p_sys )
 
     vlc_url_t url;
     vlc_credential credential;
-    if( vlc_UrlParseFixup( &url, ((stream_t *)p_access)->psz_url ) != 0 )
+    if( vlc_UrlParseFixup( &url, path ) != 0 )
     {
         vlc_UrlClean( &url );
         goto error;
@@ -452,27 +472,36 @@ static int Login( vlc_object_t *p_access, access_sys_t *p_sys )
     bool b_logged = false;
 
     /* First: try credentials from url / option */
-    vlc_credential_get( &credential, p_access, "ftp-user", "ftp-pwd",
-                        NULL, NULL );
+    if (vlc_credential_get( &credential, p_access, "ftp-user", "ftp-pwd",
+                            NULL, NULL ) == -EINTR )
+    {
+        vlc_credential_clean( &credential );
+        vlc_UrlClean( &url );
+        goto error;
+    }
+
     do
     {
-        if( credential.psz_username != NULL )
+        const char *psz_username = credential.psz_username;
+
+        if( HasControlChar( credential.psz_username ) ||
+            HasControlChar( credential.psz_password ) )
         {
-            if( LoginUserPwd( p_access, p_sys, credential.psz_username,
-                              credential.psz_password, &b_logged ) != 0
-             || b_logged )
-                break;
+            msg_Err( p_access, "Invalid chars in the username/password" );
+            break;
         }
-        else
-        {
-            /* No crendential specified: show the dialog with a "anonymous"
-             * user pre-filled */
-            credential.psz_username = "anonymous";
-        }
+
+        if( psz_username == NULL ) /* use anonymous by default */
+            psz_username = "anonymous";
+
+        if( LoginUserPwd( p_access, p_sys, psz_username,
+                          credential.psz_password, &b_logged ) != 0
+         || b_logged )
+            break;
     }
     while( vlc_credential_get( &credential, p_access, "ftp-user", "ftp-pwd",
                                LOGIN_DIALOG_TITLE, LOGIN_DIALOG_TEXT,
-                               url.psz_host ) );
+                               url.psz_host ) == 0 );
 
     if( b_logged )
     {
@@ -525,10 +554,14 @@ static int LoginUserPwd( vlc_object_t *p_access, access_sys_t *p_sys,
                     char *psz;
                     msg_Dbg( p_access, "account needed" );
                     psz = var_InheritString( p_access, "ftp-account" );
-                    if( ftp_SendCommand( p_access, p_sys, "ACCT %s",
+                    bool badchars = HasControlChar( psz );
+                    if( badchars ||
+                        ftp_SendCommand( p_access, p_sys, "ACCT %s",
                                          psz ) < 0 ||
                         ftp_RecvCommand( p_access, p_sys, &i_answer, NULL ) < 0 )
                     {
+                        if( badchars )
+                            msg_Err( p_access, "Invalid chars in the ftp-account" );
                         free( psz );
                         return -1;
                     }
@@ -576,18 +609,9 @@ static void FeaturesCheck( void *opaque, const char *feature )
         features->b_mlst = true;
 }
 
-static const char *IsASCII( const char *str )
+static int Connect( vlc_object_t *p_access, access_sys_t *p_sys, const char *path )
 {
-    int8_t c;
-    for( const char *p = str; (c = *p) != '\0'; p++ )
-        if( c < 0 )
-            return NULL;
-    return str;
-}
-
-static int Connect( vlc_object_t *p_access, access_sys_t *p_sys )
-{
-    if( Login( p_access, p_sys ) < 0 )
+    if( Login( p_access, p_sys, path ) < 0 )
         return -1;
 
     /* Extended passive mode */
@@ -613,7 +637,7 @@ static int Connect( vlc_object_t *p_access, access_sys_t *p_sys )
         msg_Info( p_access, "FTP Extended passive mode disabled" );
         clearCmd( p_sys );
 
-        if( Login( p_access, p_sys ) )
+        if( Login( p_access, p_sys, path ) )
             goto error;
     }
 
@@ -640,7 +664,7 @@ error:
 }
 
 
-static int parseURL( vlc_url_t *url, const char *path, enum tls_mode_e mode )
+static int parseURL( vlc_object_t *p_obj, vlc_url_t *url, const char *path, enum tls_mode_e mode )
 {
     if( path == NULL )
         return VLC_EGENERIC;
@@ -667,11 +691,8 @@ static int parseURL( vlc_url_t *url, const char *path, enum tls_mode_e mode )
     /* FTP URLs are relative to user's default directory (RFC1738 §3.2)
     For absolute path use ftp://foo.bar//usr/local/etc/filename */
     /* FIXME: we should issue a series of CWD, one per slash */
-    if( url->psz_path )
-    {
-        assert( url->psz_path[0] == '/' );
-        url->psz_path++;
-    }
+    assert( url->psz_path[0] == '/' );
+    url->psz_path++;
 
     char *type = strstr( url->psz_path, ";type=" );
     if( type )
@@ -681,6 +702,11 @@ static int parseURL( vlc_url_t *url, const char *path, enum tls_mode_e mode )
             return VLC_EGENERIC; /* ASCII and directory not supported */
     }
     vlc_uri_decode( url->psz_path );
+    if( HasControlChar( url->psz_path ) )
+    {
+        msg_Err( p_obj, "Invalid chars in the path" );
+        return VLC_EGENERIC;
+    }
     return VLC_SUCCESS;
 }
 
@@ -707,10 +733,10 @@ static int InOpen( vlc_object_t *p_this )
     if( readTLSMode( p_this, p_sys, p_access->psz_name ) )
         goto exit_error;
 
-    if( parseURL( &p_sys->url, p_access->psz_url, p_sys->tlsmode ) )
+    if( parseURL( p_this,&p_sys->url, p_access->psz_url, p_sys->tlsmode ) )
         goto exit_error;
 
-    if( Connect( p_this, p_sys ) )
+    if( Connect( p_this, p_sys, p_access->psz_url ) )
         goto exit_error;
 
     do {
@@ -772,7 +798,7 @@ error:
 
 exit_error:
     vlc_UrlClean( &p_sys->url );
-    vlc_tls_Delete( p_sys->p_creds );
+    vlc_tls_ClientDelete( p_sys->p_creds );
     return VLC_EGENERIC;
 }
 
@@ -793,7 +819,7 @@ static int OutOpen( vlc_object_t *p_this )
     if( readTLSMode( p_this, p_sys, p_access->psz_access ) )
         goto exit_error;
 
-    if( parseURL( &p_sys->url, p_access->psz_path, p_sys->tlsmode ) )
+    if( parseURL( p_this, &p_sys->url, p_access->psz_path, p_sys->tlsmode ) )
         goto exit_error;
     if( p_sys->url.psz_path == NULL )
     {
@@ -801,7 +827,7 @@ static int OutOpen( vlc_object_t *p_this )
         goto exit_error;
     }
 
-    if( Connect( p_this, p_sys ) )
+    if( Connect( p_this, p_sys, p_access->psz_path ) )
         goto exit_error;
 
     /* Start the 'stream' */
@@ -820,7 +846,7 @@ static int OutOpen( vlc_object_t *p_this )
 
 exit_error:
     vlc_UrlClean( &p_sys->url );
-    vlc_tls_Delete( p_sys->p_creds );
+    vlc_tls_ClientDelete( p_sys->p_creds );
     return VLC_EGENERIC;
 }
 #endif
@@ -846,7 +872,7 @@ static void Close( vlc_object_t *p_access, access_sys_t *p_sys )
 
     /* free memory */
     vlc_UrlClean( &p_sys->url );
-    vlc_tls_Delete( p_sys->p_creds );
+    vlc_tls_ClientDelete( p_sys->p_creds );
 }
 
 static void InClose( vlc_object_t *p_this )
@@ -881,7 +907,7 @@ static int Seek( stream_t *p_access, uint64_t i_pos )
 {
     access_sys_t *p_sys = p_access->p_sys;
 
-    int val = SeekCommon( (vlc_object_t *)p_access, p_sys, i_pos );
+    int val = SeekCommon( VLC_OBJECT(p_access), p_sys, i_pos );
     if( val )
         return val;
 
@@ -891,9 +917,9 @@ static int Seek( stream_t *p_access, uint64_t i_pos )
 }
 
 #ifdef ENABLE_SOUT
-static int OutSeek( sout_access_out_t *p_access, off_t i_pos )
+static int OutSeek( sout_access_out_t *p_access, uint64_t i_pos )
 {
-    return SeekCommon((vlc_object_t *)p_access, GET_OUT_SYS(p_access), i_pos);
+    return SeekCommon(VLC_OBJECT(p_access), GET_OUT_SYS(p_access), i_pos);
 }
 #endif
 
@@ -904,7 +930,8 @@ static ssize_t Read( stream_t *p_access, void *p_buffer, size_t i_len )
 {
     access_sys_t *p_sys = p_access->p_sys;
 
-    assert( p_sys->data != NULL );
+    if( p_sys->data == NULL )
+        return 0;
     assert( !p_sys->out );
 
     ssize_t i_read = vlc_tls_Read( p_sys->data, p_buffer, i_len, false );
@@ -917,6 +944,237 @@ static ssize_t Read( stream_t *p_access, void *p_buffer, size_t i_len )
     }
 
     return i_read;
+}
+
+/**
+ * Parse MLST facts list
+ *
+ * Parses a MLST facts list (without the trailing space/filename)
+ * pointed to by linep and fills the key/value variables.
+ * If a not properly formatted fact is encountered, the
+ * whole fact value will be in key and val will be NULL.
+ *
+ * \note This function modifies the linep pointer, so
+ *       the original value for it must be saved to free
+ *       it once done.
+ * \retval false if at the end of the list
+ * \retval true  if there are more list items to process
+ */
+static bool mlst_facts_iter(char **linep, const char **key, const char **val)
+{
+    // MLST format parsed here is 'key=val;key=val...;'
+    // Lack of trailing ; at the end is accepted too, even though
+    // not permitted by the standard.
+    char *fact = strsep(linep, ";");
+    *key = NULL;
+    *val = NULL;
+
+    if (fact == NULL || fact[0] == '\0')
+        return false;
+
+    // Separate key and value
+    char *sep = strchr(fact, '=');
+    if (sep) {
+        *sep++ = '\0';
+    }
+    *key = fact;
+    *val = sep;
+
+    return true;
+}
+
+/**
+ * Parse an RFC3659 Time value (Section 2.3)
+ * and return the seconds since UNIX epoch.
+ *
+ * \retval -1       The timeval could not be parsed
+ * \retval time_t   Time value in seconds since UNIX epoch
+ */
+static time_t ftp_mktime(const char *const timeval)
+{
+    #define RFC3659_TIMEVAL_MIN 14
+    // A time-val needs at least 14 digits to represent:
+    // - Year    (4)
+    // - Month   (2)
+    // - Day     (2)
+    // - Hour    (2)
+    // - Minutes (2)
+    // - Seconds (2)
+
+    char extra;
+    int len;
+    struct tm tm;
+    // The trailing char is used to check that there is
+    // no invalid trailing input after the parsed string
+    // or make sure that a potential 15th character is a dot
+    // for further parsing.
+    int ret = sscanf(timeval, "%4d%2d%2d%2d%2d%2d%n%c",
+                     &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+                     &tm.tm_hour, &tm.tm_min, &tm.tm_sec,
+                     &len, &extra);
+
+    // There are only two valid cases:
+    // - A time-val without any fraction of seconds, in which case
+    //   6 fields must be matched. There can be no trailing
+    //   characters and the length is explicitly required to be 14.
+    //   The last field is only present to make sure it does _not_ match-
+    //   anything as no other trailing characters are supposed to be found
+    //   after the time-val.
+    // - A time-val with fractions of seconds in which the string must be
+    //   strictly longer than 15 characters, all 7 fields must be set and the 7th
+    //   field must be a dot. There must be at least one digit afterward but
+    //   there is no other limitation to the number of digits after the dot.
+    //   After the dot the only valid characters are digits and nothing else.
+    if (len == RFC3659_TIMEVAL_MIN && (ret == 6 || (ret == 7 && extra == '.')))
+    {
+        
+        // The optional fractions of seconds are of no interest here
+        // as we can not represent them in time_t, but we still
+        // need to parse them to make sure that the time-val is valid.
+        if (ret == 7)
+        {
+            size_t i;
+            for (i = RFC3659_TIMEVAL_MIN + 1; timeval[i] != '\0'; i++)
+                if (!isdigit(timeval[i]))
+                    return (time_t) -1;
+
+            // We must have at least one digit
+            if (i == RFC3659_TIMEVAL_MIN + 1)
+                return (time_t) -1;
+        }
+
+        // Validate ranges according to RFC3659
+        if (tm.tm_year < 1000 || tm.tm_year > 9999 ||
+            tm.tm_mon  < 1    || tm.tm_mon  > 12   ||
+            tm.tm_mday < 1    || tm.tm_mday > 31   ||
+            tm.tm_hour < 0    || tm.tm_hour > 23   ||
+            tm.tm_min  < 0    || tm.tm_min  > 59   ||
+            tm.tm_sec  < 0    || tm.tm_sec  > 60)
+            return (time_t) -1;
+
+        // Year in tm starts from 1900
+        tm.tm_year -= 1900;
+        // Month in tm ranges from 0-11
+        tm.tm_mon -= 1;
+        // DST is unknown
+        tm.tm_isdst = -1;
+
+        return timegm(&tm);
+    }
+
+    return (time_t) -1;
+}
+
+/* Skip leading whitespace and the next whitespace-separated token. */
+static char *SkipToken( char *p )
+{
+    while( *p == ' ' || *p == '\t' ) p++;
+    while( *p && *p != ' ' && *p != '\t' ) p++;
+    return p;
+}
+
+/**
+ * Parse a Unix-style LIST entry (as emitted by `ls -l`)
+ *
+ * Handles the de-facto standard format used by vsftpd, proftpd,
+ * pure-ftpd and similar servers when MLST is unavailable. Example:
+ *   drwxr-xr-x  2 user group  4096 Apr 22 10:00 dirname
+ *   -rw-r--r--  1 user group  1234 Apr 22 10:00 filename
+ *   lrwxrwxrwx  1 user group    11 Apr 22 10:00 link -> target
+*/
+static int ParseListUnixEntry( char *line, int *type, long long *size,
+                               char **filename )
+{
+    if( strlen( line ) < 11 )
+        return -1;
+
+    bool is_link = false;
+    switch( line[0] )
+    {
+        case 'd': *type = ITEM_TYPE_DIRECTORY; break;
+        case '-': *type = ITEM_TYPE_FILE;      break;
+        case 'l': *type = ITEM_TYPE_UNKNOWN; is_link = true; break;
+        default:
+            return -1;
+    }
+
+    if( line[10] != ' ' && line[10] != '\t' )
+        return -1;
+
+    char *p = line + 10;
+
+    p = SkipToken( p ); /* link count */
+    p = SkipToken( p ); /* owner */
+    p = SkipToken( p ); /* group */
+
+    while( *p == ' ' || *p == '\t' ) p++;
+    if( !isdigit( (unsigned char)*p ) || sscanf( p, "%lld", size ) != 1 )
+        return -1;
+    p = SkipToken( p );
+
+    p = SkipToken( p ); /* month */
+    p = SkipToken( p ); /* day */
+    p = SkipToken( p ); /* time or year */
+
+    while( *p == ' ' || *p == '\t' ) p++;
+    if( !*p ) return -1;
+
+    *filename = p;
+
+    if( is_link )
+    {
+        char *arrow = NULL;
+        for( char *q = strstr( p, " -> " ); q != NULL;
+             q = strstr( q + 1, " -> " ) )
+            arrow = q;
+        if( arrow )
+            *arrow = '\0';
+    }
+
+    return 0;
+}
+
+/**
+ * Parse a DOS-style LIST entry (as emitted by Microsoft IIS in DOS mode)
+ *
+ * Example:
+ *   04-22-26  10:00AM       <DIR>          dirname
+ *   04-22-26  10:00AM                 1234 filename.ext
+ *
+ * The year may be 2 or 4 digits, and the AM/PM suffix is optional
+ * (some servers emit 24-hour time).
+ */
+static int ParseListDosEntry( char *line, int *type, long long *size,
+                              char **filename )
+{
+    unsigned mm, dd, yy, hh, mi;
+    int n = 0;
+    if( sscanf( line, "%2u-%2u-%4u %2u:%2u%n",
+                &mm, &dd, &yy, &hh, &mi, &n ) != 5 )
+        return -1;
+
+    char *p = line + n;
+    if( *p == 'A' || *p == 'P' )
+    {
+        if( p[1] != 'M' ) return -1;
+        p += 2;
+    }
+
+    while( *p == ' ' || *p == '\t' ) p++;
+
+    if( !strncmp( p, "<DIR>", 5 ) )
+        *type = ITEM_TYPE_DIRECTORY;
+    else if( isdigit( (unsigned char)*p ) && sscanf( p, "%lld", size ) == 1 )
+        *type = ITEM_TYPE_FILE;
+    else
+        return -1;
+
+    p = SkipToken( p );
+    while( *p == ' ' || *p == '\t' ) p++;
+    if( !*p ) return -1;
+
+    *filename = p;
+    return 0;
 }
 
 /*****************************************************************************
@@ -937,6 +1195,8 @@ static int DirRead (stream_t *p_access, input_item_node_t *p_current_node)
     {
         char *psz_file;
         int type = ITEM_TYPE_UNKNOWN;
+        long long size = 0;
+        time_t mtime = (time_t)-1;
 
         char *psz_line = vlc_tls_GetLine( p_sys->data );
         if( psz_line == NULL )
@@ -944,42 +1204,116 @@ static int DirRead (stream_t *p_access, input_item_node_t *p_current_node)
 
         if( p_sys->features.b_mlst )
         {
-            /* MLST Format is key=val;key=val...; FILENAME */
-            if( strstr( psz_line, "type=dir" ) )
-                type = ITEM_TYPE_DIRECTORY;
-            if( strstr( psz_line, "type=file" ) )
-                type = ITEM_TYPE_FILE;
+            const char *key, *val;
+            char *facts = psz_line;
 
-            /* Get the filename or fail */
-            psz_file = strchr( psz_line, ' ' );
-            if( psz_file )
-                psz_file++;
-            else
-            {
-                msg_Warn( p_access, "Empty filename in MLST list" );
+            // Separate MLST and filename
+            psz_file = strchr(psz_line, ' ');
+            if (likely(psz_file)) {
+                *psz_file++ = '\0';
+            } else {
+                msg_Warn( p_access, "No filename in MLST list found" );
                 free( psz_line );
                 continue;
             }
+
+            while (mlst_facts_iter( &facts, &key, &val )) {
+                if (val == NULL) {
+                    msg_Warn( p_access, "Skipping invalid MLST fact '%s'", key);
+                    continue;
+                }
+                if (!vlc_ascii_strcasecmp( key, "type" )) {
+                    if (!vlc_ascii_strcasecmp( val, "dir" ))
+                        type = ITEM_TYPE_DIRECTORY;
+                    else if (!vlc_ascii_strcasecmp( val, "file" ))
+                        type = ITEM_TYPE_FILE;
+                } else if (!vlc_ascii_strcasecmp( key, "size" )) {
+                    size = atoll(val);
+                } else if (!vlc_ascii_strcasecmp( key, "modify" )) {
+                    mtime = ftp_mktime(val);
+                }
+            }
+        }
+        else if( p_sys->features.b_list )
+        {
+            long long parsed_size = 0;
+            if( ParseListUnixEntry( psz_line, &type, &parsed_size,
+                                    &psz_file ) != 0 &&
+                ParseListDosEntry( psz_line, &type, &parsed_size,
+                                   &psz_file ) != 0 )
+            {
+                /* Unrecognized LIST format (or "total N" header): skip. */
+                free( psz_line );
+                continue;
+            }
+            size = parsed_size;
         }
         else
             psz_file = psz_line;
 
-        char *psz_uri;
-        char *psz_filename = vlc_uri_encode( psz_file );
-        if( psz_filename != NULL &&
-            asprintf( &psz_uri, "%s://%s:%d%s%s/%s",
-                      ( p_sys->tlsmode == NONE ) ? "ftp" :
-                      ( ( p_sys->tlsmode == IMPLICIT ) ? "ftps" : "ftpes" ),
-                      p_sys->url.psz_host, p_sys->url.i_port,
-                      p_sys->url.psz_path ? "/" : "",
-                      p_sys->url.psz_path ? p_sys->url.psz_path : "",
-                      psz_filename ) != -1 )
+        /* Exclude this and parent directory */
+        if (strcmp(psz_file, ".") == 0 || strcmp(psz_file, "..") == 0)
         {
-            i_ret = vlc_readdir_helper_additem( &rdh, psz_uri, NULL, psz_file,
-                                                type, ITEM_NET );
-            free( psz_uri );
+            free(psz_line);
+            continue;
         }
-        free( psz_filename );
+
+        char *psz_filename = vlc_uri_encode( psz_file );
+
+        if (unlikely(psz_filename == NULL))
+            continue;
+
+        struct vlc_memstream ms;
+
+        // Scheme
+        vlc_memstream_open(&ms);
+        vlc_memstream_puts(&ms, "ftp");
+        if (p_sys->tlsmode != NONE)
+        {
+            if (p_sys->tlsmode != IMPLICIT)
+                vlc_memstream_putc(&ms, 'e');
+            vlc_memstream_putc(&ms, 's');
+        }
+        vlc_memstream_puts(&ms, "://");
+
+        // Host
+        // In case of IPv6, enclose in []
+        if (strchr(p_sys->url.psz_host, ':') != NULL)
+            vlc_memstream_printf(&ms, "[%s]", p_sys->url.psz_host);
+        else
+            vlc_memstream_puts(&ms, p_sys->url.psz_host);
+
+        // Port
+        // Only print if not the default for the scheme
+        if (p_sys->url.i_port != ((p_sys->tlsmode != IMPLICIT) ? IPPORT_FTP
+                                                               : IPPORT_FTPS))
+            vlc_memstream_printf(&ms, ":%d", p_sys->url.i_port);
+
+        // Separating / after host[:port]
+        vlc_memstream_putc(&ms, '/');
+
+        // Path to the current location, if any
+        if (p_sys->url.psz_path != NULL)
+            vlc_memstream_puts(&ms, p_sys->url.psz_path);
+
+        // Filename
+        vlc_memstream_puts(&ms, psz_filename);
+        free(psz_filename);
+
+        if (likely(vlc_memstream_close(&ms) == 0))
+        {
+            input_item_t *p_item;
+            i_ret = vlc_readdir_helper_additem( &rdh, ms.ptr, NULL, psz_file,
+                                                type, ITEM_NET, &p_item );
+
+            if (i_ret == VLC_SUCCESS && p_item) {
+                if (size > 0)
+                    input_item_AddStat(p_item, "size", size);
+                if (mtime != (time_t)-1)
+                    input_item_AddStat(p_item, "mtime", mtime);
+            }
+            free(ms.ptr);
+        }
         free( psz_line );
     }
 
@@ -1020,7 +1354,6 @@ static int Control( stream_t *p_access, int i_query, va_list args )
 {
     access_sys_t *sys = p_access->p_sys;
     bool    *pb_bool;
-    int64_t *pi_64;
 
     switch( i_query )
     {
@@ -1037,6 +1370,7 @@ static int Control( stream_t *p_access, int i_query, va_list args )
             *pb_bool = true;    /* FIXME */
             break;
         case STREAM_CAN_CONTROL_PACE:
+        case STREAM_CAN_DOWNLOAD:
             pb_bool = va_arg( args, bool * );
             *pb_bool = true;    /* FIXME */
             break;
@@ -1047,14 +1381,12 @@ static int Control( stream_t *p_access, int i_query, va_list args )
             break;
 
         case STREAM_GET_PTS_DELAY:
-            pi_64 = va_arg( args, int64_t * );
-            *pi_64 = INT64_C(1000)
-                   * var_InheritInteger( p_access, "network-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS(var_InheritInteger( p_access, "network-caching" ));
             break;
 
         case STREAM_SET_PAUSE_STATE:
-            pb_bool = va_arg( args, bool * );
-            if ( !pb_bool )
+            if ( !va_arg( args, int ) )
                  return Seek( p_access, sys->offset );
             break;
 
@@ -1112,7 +1444,7 @@ static int ftp_StartStream( vlc_object_t *p_access, access_sys_t *p_sys,
             return VLC_EGENERIC;
         }
 
-        sprintf( psz_ipv4, "%u.%u.%u.%u", a1, a2, a3, a4 );
+        snprintf( psz_ipv4, ARRAY_SIZE(psz_ipv4), "%u.%u.%u.%u", a1, a2, a3, a4 );
         psz_ip = psz_ipv4;
         i_port = (p1 << 8) | p2;
     }
@@ -1156,11 +1488,25 @@ static int ftp_StartStream( vlc_object_t *p_access, access_sys_t *p_sys,
             msg_Dbg( p_access, "Using MLST extension to list" );
         }
         else
-        if( ftp_SendCommand( p_access, p_sys, "NLST" ) < 0 ||
+        if( ftp_SendCommand( p_access, p_sys, "LIST" ) >= 0 &&
             ftp_RecvCommandInit( p_access, p_sys ) == 1 )
+        {
+            p_sys->features.b_mlst = false;
+            p_sys->features.b_list = true;
+            msg_Dbg( p_access, "Using LIST command to list directory" );
+        }
+        else
+        if( ftp_SendCommand( p_access, p_sys, "NLST" ) < 0 ||
+            ftp_RecvCommandInit( p_access, p_sys ) != 1 )
         {
             msg_Err( p_access, "cannot list directory contents" );
             return VLC_EGENERIC;
+        }
+        else
+        {
+            p_sys->features.b_mlst = false;
+            p_sys->features.b_list = false;
+            msg_Dbg( p_access, "Falling back to NLST to list directory" );
         }
     }
     else

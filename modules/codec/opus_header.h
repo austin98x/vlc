@@ -29,6 +29,7 @@
 #define OPUS_HEADER_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct {
     int version;
@@ -36,15 +37,19 @@ typedef struct {
     int preskip;
     uint32_t input_sample_rate;
     int gain; /* in dB S7.8 should be zero whenever possible */
-    int channel_mapping;
+    uint8_t channel_mapping;
     /* The rest is only used if channel_mapping != 0 */
     int nb_streams;
     int nb_coupled;
     unsigned char stream_map[255];
+    size_t dmatrix_size;
+    unsigned char *dmatrix;
 } OpusHeader;
 
+void opus_header_init(OpusHeader *);
+void opus_header_clean(OpusHeader *);
 int opus_header_parse(const unsigned char *header, int len, OpusHeader *h);
 void opus_prepare_header(unsigned channels, unsigned rate, OpusHeader *header);
-int opus_write_header(uint8_t **p_extra, int *i_extra, OpusHeader *header, const char *vendor);
+int opus_write_header(uint8_t **p_extra, size_t *i_extra, OpusHeader *header, const char *vendor);
 
 #endif

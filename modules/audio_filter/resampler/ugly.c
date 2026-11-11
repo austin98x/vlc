@@ -2,7 +2,6 @@
  * ugly.c : zero-order hold "ugly" resampler
  *****************************************************************************
  * Copyright (C) 2002, 2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Samuel Hocevar <sam@zoy.org>
  *
@@ -48,13 +47,12 @@ static block_t *DoWork( filter_t *, block_t * );
 vlc_module_begin ()
     set_description( N_("Nearest-neighbor audio resampler") )
     set_capability( "audio converter", 2 )
-    set_category( CAT_AUDIO )
     set_subcategory( SUBCAT_AUDIO_RESAMPLER )
-    set_callbacks( Create, NULL )
+    set_callback( Create )
 
     add_submodule()
     set_capability( "audio resampler", 2 )
-    set_callbacks( CreateResampler, NULL )
+    set_callback( CreateResampler )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -78,7 +76,11 @@ static int CreateResampler( vlc_object_t *p_this )
      || !AOUT_FMT_LINEAR( &p_filter->fmt_in.audio ) )
         return VLC_EGENERIC;
 
-    p_filter->pf_audio_filter = DoWork;
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = DoWork,
+    };
+    p_filter->ops = &filter_ops;
     return VLC_SUCCESS;
 }
 
@@ -97,6 +99,13 @@ static block_t *DoWork( filter_t * p_filter, block_t * p_in_buf )
     const unsigned framesize = (p_filter->fmt_in.audio.i_bitspersample / 8)
         * aout_FormatNbChannels( &p_filter->fmt_in.audio );
 
+    /* Downsampling a block shorter than in_rate / out_rate frames */
+    if( i_out_nb == 0 )
+    {
+        block_Release( p_in_buf );
+        return NULL;
+    }
+
     if( p_filter->fmt_out.audio.i_rate > p_filter->fmt_in.audio.i_rate )
     {
         p_out_buf = block_Alloc( i_out_nb * framesize );
@@ -111,8 +120,7 @@ static block_t *DoWork( filter_t * p_filter, block_t * p_in_buf )
     p_out_buf->i_nb_samples = i_out_nb;
     p_out_buf->i_buffer = i_out_nb * framesize;
     p_out_buf->i_pts = p_in_buf->i_pts;
-    p_out_buf->i_length = p_out_buf->i_nb_samples *
-        1000000 / p_filter->fmt_out.audio.i_rate;
+    p_out_buf->i_length = vlc_tick_from_samples(p_out_buf->i_nb_samples, p_filter->fmt_out.audio.i_rate);
 
     while( i_out_nb )
     {

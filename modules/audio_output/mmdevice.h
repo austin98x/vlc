@@ -24,7 +24,7 @@
 #define MM_PASSTHROUGH_DISABLED 0
 #define MM_PASSTHROUGH_ENABLED 1
 #define MM_PASSTHROUGH_ENABLED_HD 2
-#define MM_PASSTHROUGH_DEFAULT MM_PASSTHROUGH_ENABLED_HD
+#define MM_PASSTHROUGH_DEFAULT MM_PASSTHROUGH_DISABLED
 
 typedef struct aout_stream aout_stream_t;
 
@@ -33,20 +33,41 @@ typedef struct aout_stream aout_stream_t;
  */
 struct aout_stream
 {
-    struct vlc_common_members obj;
+    struct vlc_object_t obj;
     void *sys;
 
-    HRESULT (*time_get)(aout_stream_t *, mtime_t *);
-    HRESULT (*play)(aout_stream_t *, block_t *);
+    void (*stop)(aout_stream_t *);
+    HRESULT (*play)(aout_stream_t *, block_t *, vlc_tick_t);
     HRESULT (*pause)(aout_stream_t *, bool);
     HRESULT (*flush)(aout_stream_t *);
-
-    struct
-    {
-        void *device;
-        HRESULT (*activate)(void *device, REFIID, PROPVARIANT *, void **);
-    } owner;
 };
+
+struct aout_stream_owner
+{
+    aout_stream_t s;
+    void *device;
+    HRESULT (*activate)(void *device, REFIID, PROPVARIANT *, void **);
+    HANDLE buffer_ready_event;
+    struct {
+        vlc_tick_t deadline;
+        void (*callback)(aout_stream_t *);
+    } timer;
+
+    block_t *chain;
+    block_t **last;
+
+    audio_output_t *aout;
+};
+
+/*
+ * "aout output" helpers
+ */
+
+static inline
+struct aout_stream_owner *aout_stream_owner(aout_stream_t *s)
+{
+    return container_of(s, struct aout_stream_owner, s);
+}
 
 /**
  * Creates an audio output stream on a given Windows multimedia device.
@@ -60,42 +81,182 @@ typedef HRESULT (*aout_stream_start_t)(aout_stream_t *s,
 /**
  * Destroys an audio output stream.
  */
-typedef HRESULT (*aout_stream_stop_t)(aout_stream_t *);
-
-static inline HRESULT aout_stream_TimeGet(aout_stream_t *s, mtime_t *delay)
+static inline
+void aout_stream_owner_Stop(struct aout_stream_owner *owner)
 {
-    return (s->time_get)(s, delay);
+    owner->s.stop(&owner->s);
 }
 
-static inline HRESULT aout_stream_Play(aout_stream_t *s, block_t *block)
+static inline
+HRESULT aout_stream_owner_Play(struct aout_stream_owner *owner,
+                               block_t *block, vlc_tick_t date)
 {
-    return (s->play)(s, block);
+    return owner->s.play(&owner->s, block, date);
 }
 
-static inline HRESULT aout_stream_Pause(aout_stream_t *s, bool paused)
+static inline
+HRESULT aout_stream_owner_Pause(struct aout_stream_owner *owner, bool paused)
 {
-    return (s->pause)(s, paused);
+    return owner->s.pause(&owner->s, paused);
 }
 
-static inline HRESULT aout_stream_Flush(aout_stream_t *s, bool wait)
+static inline
+HRESULT aout_stream_owner_Flush(struct aout_stream_owner *owner)
 {
-    if (wait)
-    {   /* Loosy drain emulation */
-        mtime_t delay;
+    block_ChainRelease(owner->chain);
+    owner->chain = NULL;
+    owner->last = &owner->chain;
 
-        if (SUCCEEDED(aout_stream_TimeGet(s, &delay))
-         && delay <= INT64_C(5000000))
-            Sleep((delay / (CLOCK_FREQ / 1000)) + 1);
-        return S_OK;
+    return owner->s.flush(&owner->s);
+}
+
+static inline
+void aout_stream_owner_AppendBlock(struct aout_stream_owner *owner,
+                                   block_t *block, vlc_tick_t date)
+{
+    block->i_dts = date;
+    block_ChainLastAppend(&owner->last, block);
+}
+
+static inline
+HRESULT aout_stream_owner_PlayAll(struct aout_stream_owner *owner)
+{
+    HRESULT hr;
+
+    block_t *block = owner->chain, *next;
+    while (block != NULL)
+    {
+        next = block->p_next;
+
+        vlc_tick_t date = block->i_dts;
+        block->i_dts = VLC_TICK_INVALID;
+
+        hr = aout_stream_owner_Play(owner, block, date);
+
+        if (hr == S_FALSE)
+            return hr;
+        else
+        {
+            block = owner->chain = next;
+            if (FAILED(hr))
+            {
+                if (block == NULL)
+                    owner->last = &owner->chain;
+                return hr;
+            }
+        }
     }
-    else
-        return (s->flush)(s);
+    owner->last = &owner->chain;
+
+    return S_OK;
+}
+
+static inline
+DWORD aout_stream_owner_ProcessTimer(struct aout_stream_owner *owner)
+{
+    if (owner->timer.deadline != VLC_TICK_INVALID)
+    {
+        vlc_tick_t now = vlc_tick_now();
+        /* Subtract 1 ms since WaitForMultipleObjects will likely sleep
+         * a little less than requested */
+        if (now >= owner->timer.deadline - VLC_TICK_FROM_MS(1))
+        {
+            assert(owner->timer.callback != NULL);
+            owner->timer.deadline = VLC_TICK_INVALID;
+            owner->timer.callback(&owner->s);
+
+            /* timer.deadline might be updated from timer.callback */
+            if (owner->timer.deadline != VLC_TICK_INVALID)
+            {
+                now = vlc_tick_now();
+                return MS_FROM_VLC_TICK(owner->timer.deadline - now);
+            }
+        }
+        else
+            return MS_FROM_VLC_TICK(owner->timer.deadline - now);
+    }
+
+    return INFINITE;
+}
+
+static inline
+void *aout_stream_owner_New(audio_output_t *aout, size_t size,
+                            HRESULT (*activate)(void *device, REFIID, PROPVARIANT *, void **))
+{
+    assert(size >= sizeof(struct aout_stream_owner));
+
+    void *obj = vlc_object_create(aout, size);
+    if (unlikely(obj == NULL))
+        return NULL;
+    struct aout_stream_owner *owner = obj;
+
+    owner->aout = aout;
+    owner->chain = NULL;
+    owner->last = &owner->chain;
+    owner->activate = activate;
+    owner->timer.deadline = VLC_TICK_INVALID;
+    owner->timer.callback = NULL;
+
+    owner->buffer_ready_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (unlikely(owner->buffer_ready_event == NULL))
+    {
+        vlc_object_delete(&owner->s);
+        return NULL;
+    }
+
+    return obj;
+}
+
+static inline
+void aout_stream_owner_Delete(struct aout_stream_owner *owner)
+{
+    CloseHandle(owner->buffer_ready_event);
+    vlc_object_delete(&owner->s);
+}
+
+/*
+ * "aout stream" helpers
+ */
+
+static inline
+void aout_stream_TimingReport(aout_stream_t *s, vlc_tick_t system_ts,
+                              vlc_tick_t audio_ts)
+{
+    struct aout_stream_owner *owner = aout_stream_owner(s);
+    aout_TimingReport(owner->aout, system_ts, audio_ts);
 }
 
 static inline
 HRESULT aout_stream_Activate(aout_stream_t *s, REFIID iid,
                              PROPVARIANT *actparms, void **pv)
 {
-    return s->owner.activate(s->owner.device, iid, actparms, pv);
+    struct aout_stream_owner *owner = aout_stream_owner(s);
+    return owner->activate(owner->device, iid, actparms, pv);
 }
+
+static inline
+HANDLE aout_stream_GetBufferReadyEvent(aout_stream_t *s)
+{
+    struct aout_stream_owner *owner = aout_stream_owner(s);
+    return owner->buffer_ready_event;
+}
+
+static inline
+void aout_stream_TriggerTimer(aout_stream_t *s,
+                              void (*callback)(aout_stream_t *),
+                              vlc_tick_t deadline)
+{
+    struct aout_stream_owner *owner = aout_stream_owner(s);
+    owner->timer.deadline = deadline;
+    owner->timer.callback = callback;
+}
+
+static inline
+void aout_stream_DisarmTimer(aout_stream_t *s)
+{
+    struct aout_stream_owner *owner = aout_stream_owner(s);
+    owner->timer.deadline = VLC_TICK_INVALID;
+    owner->timer.callback = NULL;
+}
+
 #endif

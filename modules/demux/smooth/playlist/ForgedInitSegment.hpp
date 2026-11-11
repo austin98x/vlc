@@ -20,8 +20,8 @@
 #ifndef FORGEDINITSEGMENT_HPP
 #define FORGEDINITSEGMENT_HPP
 
-#include "../adaptive/playlist/Segment.h"
-#include "../adaptive/playlist/Inheritables.hpp"
+#include "../../adaptive/playlist/Segment.h"
+#include "CodecParameters.hpp"
 
 #include <vlc_es.h>
 #include <vlc_codecs.h>
@@ -30,43 +30,31 @@ namespace smooth
 {
     namespace playlist
     {
+        using namespace adaptive;
         using namespace adaptive::playlist;
         using namespace adaptive::http;
 
-        class ForgedInitSegment : public InitSegment,
-                                  public TimescaleAble
+        class CodecParameters;
+
+        class ForgedInitSegment : public InitSegment
         {
             public:
                 ForgedInitSegment(ICanonicalUrl *parent, const std::string &,
-                                  uint64_t, uint64_t);
+                                  uint64_t, vlc_tick_t);
                 virtual ~ForgedInitSegment();
-                virtual SegmentChunk* toChunk(size_t, BaseRepresentation *, AbstractConnectionManager *); /* reimpl */
-                void setWaveFormatEx(const std::string &);
-                void setCodecPrivateData(const std::string &);
-                void setChannels(uint16_t);
-                void setPacketSize(uint16_t);
-                void setSamplingRate(uint32_t);
-                void setBitsPerSample(uint16_t);
+                SegmentChunk* toChunk(SharedResources *, size_t,
+                                      BaseRepresentation *) override;
                 void setVideoSize(unsigned w, unsigned h);
-                void setFourCC(const std::string &);
-                void setAudioTag(uint16_t);
                 void setTrackID(unsigned);
                 void setLanguage(const std::string &);
 
             private:
-                void fromWaveFormatEx(const uint8_t *p_data, size_t i_data);
-                void fromVideoInfoHeader(const uint8_t *p_data, size_t i_data);
-                block_t * buildMoovBox();
-                std::string data;
+                block_t * buildMoovBox(const CodecParameters &);
                 std::string type;
                 std::string language;
-                uint8_t *extradata;
-                size_t   i_extradata;
-                WAVEFORMATEX formatex;
                 unsigned width, height;
-                vlc_fourcc_t fourcc;
-                enum es_format_category_e es_type;
                 unsigned track_id;
+                Timescale timescale;
         };
     }
 }

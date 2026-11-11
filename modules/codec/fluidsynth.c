@@ -2,7 +2,6 @@
  * fluidsynth.c: Software MIDI synthesizer using libfluidsynth
  *****************************************************************************
  * Copyright © 2007 Rémi Denis-Courmont
- * $Id$
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -24,6 +23,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_codec.h>
 #include <vlc_dialog.h>
@@ -70,31 +70,29 @@ vlc_module_begin ()
     set_description (N_("FluidSynth MIDI synthesizer"))
     set_capability ("audio decoder", 100)
     set_shortname (N_("FluidSynth"))
-    set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_ACODEC)
     set_callbacks (Open, Close)
-    add_loadfile ("soundfont", "",
-                  SOUNDFONT_TEXT, SOUNDFONT_LONGTEXT, false)
-    add_bool ("synth-chorus", true, CHORUS_TEXT, CHORUS_TEXT, false)
-    add_float ("synth-gain", .5, GAIN_TEXT, GAIN_LONGTEXT, false)
+    add_loadfile("soundfont", "", SOUNDFONT_TEXT, SOUNDFONT_LONGTEXT)
+    add_bool ("synth-chorus", true, CHORUS_TEXT, NULL)
+    add_float ("synth-gain", .5, GAIN_TEXT, GAIN_LONGTEXT)
         change_float_range (0., 10.)
     add_integer ("synth-polyphony", 256,
-                 POLYPHONY_TEXT, POLYPHONY_LONGTEXT, false)
+                 POLYPHONY_TEXT, POLYPHONY_LONGTEXT)
         change_integer_range (1, 65535)
-    add_bool ("synth-reverb", true, REVERB_TEXT, REVERB_TEXT, true)
+    add_bool ("synth-reverb", true, REVERB_TEXT, NULL)
     add_integer ("synth-sample-rate", 44100,
-                 SAMPLE_RATE_TEXT, SAMPLE_RATE_TEXT, true)
+                 SAMPLE_RATE_TEXT, NULL)
         change_integer_range (22050, 96000)
 vlc_module_end ()
 
 
-struct decoder_sys_t
+typedef struct
 {
     fluid_settings_t *settings;
     fluid_synth_t    *synth;
     int               soundfont;
     date_t            end_date;
-};
+} decoder_sys_t;
 
 
 static int  DecodeBlock (decoder_t *p_dec, block_t *p_block);
@@ -104,7 +102,7 @@ static int Open (vlc_object_t *p_this)
 {
     decoder_t *p_dec = (decoder_t *)p_this;
 
-    if (p_dec->fmt_in.i_codec != VLC_CODEC_MIDI)
+    if (p_dec->fmt_in->i_codec != VLC_CODEC_MIDI)
         return VLC_EGENERIC;
 
     decoder_sys_t *p_sys = malloc (sizeof (*p_sys));
@@ -112,6 +110,11 @@ static int Open (vlc_object_t *p_this)
         return VLC_ENOMEM;
 
     p_sys->settings = new_fluid_settings ();
+
+    const int64_t i_samplerate =
+        var_InheritInteger (p_this, "synth-sample-rate");
+    fluid_settings_setnum (p_sys->settings, "synth.sample-rate", i_samplerate);
+
     p_sys->synth = new_fluid_synth (p_sys->settings);
     p_sys->soundfont = -1;
 
@@ -128,8 +131,35 @@ static int Open (vlc_object_t *p_this)
     else
     {
         glob_t gl;
+        int flags = GLOB_NOESCAPE;
 
-        glob ("/usr/share/sounds/sf2/*.sf2", GLOB_NOESCAPE, NULL, &gl);
+        char *udd = config_GetUserDir(VLC_USERDATA_DIR);
+        if (likely(udd != NULL))
+        {
+            char *path;
+            ptrdiff_t len;
+
+            if (asprintf(&path, "%s/sound%tns/sf2/*.sf2", udd, &len) >= 0)
+            {
+                glob(path, flags, NULL, &gl);
+                flags |= GLOB_APPEND;
+                memcpy(path + len, "fonts", 5); /* "s/sf2" -> "fonts" */
+                glob(path, flags, NULL, &gl);
+                free(path);
+            }
+            free(udd);
+        }
+
+        glob(DATADIR "/sounds/sf2/*.sf2", flags, NULL, &gl);
+        flags |= GLOB_APPEND;
+        glob(DATADIR "/soundfonts/*.sf2", flags, NULL, &gl);
+
+        if (strcmp("/usr/share", DATADIR) != 0)
+        {
+            glob("/usr/share/sounds/sf2/*.sf2", flags, NULL, &gl);
+            glob("/usr/share/soundfonts/*.sf2", flags, NULL, &gl);
+        }
+
         for (size_t i = 0; i < gl.gl_pathc; i++)
         {
             const char *path = gl.gl_pathv[i];
@@ -167,15 +197,12 @@ static int Open (vlc_object_t *p_this)
     fluid_synth_set_reverb_on (p_sys->synth,
                                var_InheritBool (p_this, "synth-reverb"));
 
-    p_dec->fmt_out.audio.i_rate =
-        var_InheritInteger (p_this, "synth-sample-rate");;
-    fluid_synth_set_sample_rate (p_sys->synth, p_dec->fmt_out.audio.i_rate);
+    p_dec->fmt_out.audio.i_rate = i_samplerate;
     p_dec->fmt_out.audio.i_channels = 2;
     p_dec->fmt_out.audio.i_physical_channels = AOUT_CHAN_LEFT | AOUT_CHAN_RIGHT;
     p_dec->fmt_out.i_codec = VLC_CODEC_FL32;
     p_dec->fmt_out.audio.i_bitspersample = 32;
     date_Init (&p_sys->end_date, p_dec->fmt_out.audio.i_rate, 1);
-    date_Set (&p_sys->end_date, 0);
 
     p_dec->p_sys = p_sys;
     p_dec->pf_decode = DecodeBlock;
@@ -198,7 +225,7 @@ static void Flush (decoder_t *p_dec)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    date_Set (&p_sys->end_date, VLC_TS_INVALID);
+    date_Set (&p_sys->end_date, VLC_TICK_INVALID);
     //fluid_synth_system_reset (p_sys->synth);
     fluid_synth_program_reset (p_sys->synth);
     for (unsigned channel = 0; channel < 16; channel++)
@@ -224,7 +251,8 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
         }
     }
 
-    if (p_block->i_pts > VLC_TS_INVALID && !date_Get (&p_sys->end_date))
+    if (p_block->i_pts != VLC_TICK_INVALID
+     && date_Get(&p_sys->end_date) == VLC_TICK_INVALID)
         date_Set (&p_sys->end_date, p_block->i_pts);
     else
     if (p_block->i_pts < date_Get (&p_sys->end_date))
@@ -269,7 +297,11 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
         case 0x90:
             fluid_synth_noteon (p_sys->synth, channel, p1, p2);
             break;
-        /*case 0xA0: note aftertouch not implemented */
+#if defined(FLUIDSYNTH_VERSION_MAJOR) && (FLUIDSYNTH_VERSION_MAJOR >= 2)
+        case 0xA0:
+            fluid_synth_key_pressure (p_sys->synth, channel, p1, p2);
+            break;
+#endif
         case 0xB0:
             fluid_synth_cc (p_sys->synth, channel, p1, p2);
             break;

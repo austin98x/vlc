@@ -2,7 +2,6 @@
  * gstvlcvideosink.c: VLC gstreamer video sink
  *****************************************************************************
  * Copyright (C) 2016 VLC authors and VideoLAN
- * $Id:
  *
  * Author: Vikram Fugro <vikram.fugro@gmail.com>
  *
@@ -26,6 +25,7 @@
  *****************************************************************************/
 #include "gstvlcvideopool.h"
 #include "gstvlcvideosink.h"
+#include "gstvlcpictureplaneallocator.h"
 
 #include <vlc_common.h>
 
@@ -40,7 +40,8 @@ enum
 {
     PROP_0,
     PROP_ALLOCATOR,
-    PROP_ID
+    PROP_ID,
+    PROP_USE_POOL
 };
 
 static guint gst_vlc_video_sink_signals[ LAST_SIGNAL ] = { 0 };
@@ -57,7 +58,9 @@ static GstStaticPadTemplate sink_template =
 static gboolean gst_vlc_video_sink_setcaps( GstBaseSink *p_bsink,
         GstCaps *p_caps );
 static gboolean gst_vlc_video_sink_propose_allocation( GstBaseSink *p_bsink,
-        GstQuery *p_query);
+        GstQuery *p_query );
+static gboolean gst_vlc_video_sink_query( GstBaseSink *p_bsink,
+        GstQuery *p_query );
 static GstFlowReturn gst_vlc_video_sink_chain( GstBaseSink *p_vsink,
         GstBuffer *p_buffer );
 
@@ -68,7 +71,7 @@ static void gst_vlc_video_sink_get_property( GObject *p_object, guint prop_id,
 static void gst_vlc_video_sink_finalize( GObject *p_obj );
 
 #define gst_vlc_video_sink_parent_class parent_class
-G_DEFINE_TYPE( GstVlcVideoSink, gst_vlc_video_sink, GST_TYPE_BASE_SINK );
+G_DEFINE_TYPE( GstVlcVideoSink, gst_vlc_video_sink, GST_TYPE_BASE_SINK )
 
 static void gst_vlc_video_sink_class_init( GstVlcVideoSinkClass *p_klass )
 {
@@ -83,6 +86,11 @@ static void gst_vlc_video_sink_class_init( GstVlcVideoSinkClass *p_klass )
     p_gobject_class->set_property = gst_vlc_video_sink_set_property;
     p_gobject_class->get_property = gst_vlc_video_sink_get_property;
     p_gobject_class->finalize = gst_vlc_video_sink_finalize;
+
+    g_object_class_install_property( G_OBJECT_CLASS( p_klass ), PROP_USE_POOL,
+            g_param_spec_boolean( "use-pool", "Use-Pool", "Use downstream VLC video output pool",
+                FALSE, G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY |
+                G_PARAM_STATIC_STRINGS ));
 
     g_object_class_install_property( G_OBJECT_CLASS( p_klass ), PROP_ALLOCATOR,
             g_param_spec_pointer( "allocator", "Allocator", "VlcPictureAllocator",
@@ -121,6 +129,8 @@ static void gst_vlc_video_sink_class_init( GstVlcVideoSinkClass *p_klass )
     p_gstbasesink_class->set_caps = gst_vlc_video_sink_setcaps;
     p_gstbasesink_class->propose_allocation =
         gst_vlc_video_sink_propose_allocation;
+
+    p_gstbasesink_class->query = gst_vlc_video_sink_query;
 
     p_gstbasesink_class->render = gst_vlc_video_sink_chain;
 }
@@ -162,6 +172,7 @@ static gboolean gst_vlc_video_sink_setcaps( GstBaseSink *p_basesink,
 
 static void gst_vlc_video_sink_init( GstVlcVideoSink *p_vlc_video_sink )
 {
+    p_vlc_video_sink->b_use_pool = FALSE;
     gst_base_sink_set_sync( GST_BASE_SINK( p_vlc_video_sink), FALSE );
 }
 
@@ -211,7 +222,7 @@ static gboolean gst_vlc_video_sink_propose_allocation( GstBaseSink* p_bsink,
     if( p_caps == NULL )
         goto no_caps;
 
-    if( b_need_pool )
+    if( p_vsink->b_use_pool && b_need_pool )
     {
         GstVideoInfo info;
 
@@ -256,6 +267,52 @@ invalid_caps:
     }
 }
 
+gboolean gst_vlc_video_sink_query_caps( GstQuery *p_query )
+{
+    GstCaps *p_query_caps;
+    gst_query_parse_caps( p_query, &p_query_caps );
+
+    if( p_query_caps == NULL )
+        return FALSE;
+
+    /* gst_caps_normalize takes ownership of the cap  */
+    gst_caps_ref( p_query_caps );
+    GstCaps *p_normalized = gst_caps_normalize( p_query_caps );
+    p_normalized = gst_caps_make_writable( p_normalized );
+
+    guint i = 0;
+    while( i < gst_caps_get_size( p_normalized ) )
+    {
+        GstStructure *p_str = gst_caps_get_structure( p_normalized, i );
+        const char* psz_fourcc = gst_structure_get_string( p_str, "format" );
+
+        if( ( psz_fourcc != NULL ) && gst_vlc_to_map_format( psz_fourcc ) ==
+                                          VLC_CODEC_UNKNOWN )
+        {
+            gst_caps_remove_structure( p_normalized, i );
+        }
+        else
+        {
+            i++;
+        }
+    }
+
+    gst_query_set_caps_result( p_query, p_normalized );
+
+    return TRUE;
+}
+
+static gboolean gst_vlc_video_sink_query( GstBaseSink *p_bsink,
+        GstQuery *p_query )
+{
+    if( GST_QUERY_TYPE( p_query ) == GST_QUERY_CAPS )
+    {
+        return gst_vlc_video_sink_query_caps( p_query );
+    }
+
+    return GST_BASE_SINK_CLASS( parent_class )->query( p_bsink, p_query );
+}
+
 static GstFlowReturn gst_vlc_video_sink_chain( GstBaseSink *p_bsink,
         GstBuffer *p_buffer )
 {
@@ -294,6 +351,12 @@ static void gst_vlc_video_sink_set_property( GObject *p_object, guint i_prop_id,
         }
         break;
 
+        case PROP_USE_POOL:
+        {
+            p_vsink->b_use_pool = g_value_get_boolean( p_value );
+        }
+        break;
+
         default:
         break;
     }
@@ -310,6 +373,10 @@ static void gst_vlc_video_sink_get_property( GObject *p_object, guint i_prop_id,
     {
         case PROP_ALLOCATOR:
             g_value_set_pointer( p_value, p_vsink->p_allocator );
+        break;
+
+        case PROP_USE_POOL:
+            g_value_set_boolean( p_value, p_vsink->b_use_pool );
         break;
 
         default:

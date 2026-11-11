@@ -2,7 +2,6 @@
  * dynamicoverlay.c : dynamic overlay plugin for vlc
  *****************************************************************************
  * Copyright (C) 2007 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Søren Bøg <avacore@videolan.org>
  *
@@ -29,6 +28,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_sout.h>
 #include <vlc_vout.h>
@@ -45,9 +45,9 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int Create( vlc_object_t * );
-static void Destroy( vlc_object_t * );
-static subpicture_t *Filter( filter_t *, mtime_t );
+static int Create( filter_t * );
+static void Destroy( filter_t * );
+static subpicture_t *Filter( filter_t *, vlc_tick_t );
 
 static int AdjustCallback( vlc_object_t *p_this, char const *psz_var,
                            vlc_value_t oldval, vlc_value_t newval,
@@ -66,22 +66,22 @@ static int AdjustCallback( vlc_object_t *p_this, char const *psz_var,
 vlc_module_begin ()
     set_description( N_("Dynamic video overlay") )
     set_shortname( N_("Overlay" ))
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
-    set_capability( "sub source", 0 )
 
-    add_loadfile( "overlay-input", NULL, INPUT_TEXT, INPUT_LONGTEXT,
-                  false )
+    add_loadfile("overlay-input", NULL, INPUT_TEXT, INPUT_LONGTEXT)
     /* Note: add_loadfile as O_WRONLY w/o O_CREAT, i.e. FIFO must exist */
-    add_loadfile( "overlay-output", NULL, OUTPUT_TEXT, OUTPUT_LONGTEXT,
-                  false )
+    add_loadfile("overlay-output", NULL, OUTPUT_TEXT, OUTPUT_LONGTEXT)
 
     add_shortcut( "overlay" )
-    set_callbacks( Create, Destroy )
+    set_callback_sub_source( Create, 0 )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
     "input", "output", NULL
+};
+
+static const struct vlc_filter_operations filter_ops = {
+    .source_sub = Filter, .close = Destroy,
 };
 
 /*****************************************************************************
@@ -89,9 +89,8 @@ static const char *const ppsz_filter_options[] = {
  *****************************************************************************
  * This function allocates and initializes a adjust vout method.
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     /* Allocate structure */
@@ -105,7 +104,7 @@ static int Create( vlc_object_t *p_this )
     QueueInit( &p_sys->atomic );
     QueueInit( &p_sys->pending );
     QueueInit( &p_sys->processed );
-    do_ListInit( &p_sys->overlays );
+    vlc_vector_init( &p_sys->overlays );
 
     p_sys->i_inputfd = -1;
     p_sys->i_outputfd = -1;
@@ -113,7 +112,7 @@ static int Create( vlc_object_t *p_this )
     p_sys->b_atomic = false;
     vlc_mutex_init( &p_sys->lock );
 
-    p_filter->pf_sub_source = Filter;
+    p_filter->ops = &filter_ops;
 
     config_ChainParse( p_filter, "overlay-", ppsz_filter_options,
                        p_filter->p_cfg );
@@ -135,9 +134,8 @@ static int Create( vlc_object_t *p_this )
  *****************************************************************************
  * Terminate an output method created by adjustCreateOutputMethod
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     BufferDestroy( &p_sys->input );
@@ -145,13 +143,17 @@ static void Destroy( vlc_object_t *p_this )
     QueueDestroy( &p_sys->atomic );
     QueueDestroy( &p_sys->pending );
     QueueDestroy( &p_sys->processed );
-    do_ListDestroy( &p_sys->overlays );
+    overlay_t *p_cur;
+    vlc_vector_foreach(p_cur, &p_sys->overlays)
+    {
+        OverlayDestroy( p_cur );
+    }
+    vlc_vector_destroy( &p_sys->overlays );
     UnregisterCommand( p_filter );
 
     var_DelCallback( p_filter, "overlay-input", AdjustCallback, p_sys );
     var_DelCallback( p_filter, "overlay-output", AdjustCallback, p_sys );
 
-    vlc_mutex_destroy( &p_sys->lock );
     free( p_sys->psz_inputfile );
     free( p_sys->psz_outputfile );
     free( p_sys );
@@ -164,7 +166,7 @@ static void Destroy( vlc_object_t *p_this )
  * waits until it is displayed and switch the two rendering buffers, preparing
  * next frame.
  *****************************************************************************/
-static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
+static subpicture_t *Filter( filter_t *p_filter, vlc_tick_t date )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
 
@@ -338,45 +340,49 @@ static subpicture_t *Filter( filter_t *p_filter, mtime_t date )
         return NULL;
 
     subpicture_t *p_spu = NULL;
-    overlay_t *p_overlay = NULL;
+    overlay_t *p_overlay;
 
     p_spu = filter_NewSubpicture( p_filter );
     if( !p_spu )
         return NULL;
 
-    p_spu->b_absolute = true;
     p_spu->i_start = date;
-    p_spu->i_stop = 0;
+    p_spu->i_stop = VLC_TICK_INVALID;
     p_spu->b_ephemer = true;
 
-    subpicture_region_t **pp_region = &p_spu->p_region;
-    while( (p_overlay = ListWalk( &p_sys->overlays )) )
+    vlc_vector_foreach(p_overlay, &p_sys->overlays)
     {
+        if (!p_overlay->b_active || p_overlay->type == OVERLAY_UNSET)
+            continue;
+
         subpicture_region_t *p_region;
 
-        *pp_region = p_region = subpicture_region_New( &p_overlay->format );
-        if( !p_region )
+        if( p_overlay->type == OVERLAY_IS_TEXT )
+            p_region = subpicture_region_NewText();
+        else
+            p_region = subpicture_region_ForPicture( p_overlay->data.p_pic );
+        if( unlikely(p_region == NULL) )
+        {
             break;
+        }
 
         msg_Dbg( p_filter, "Displaying overlay: %4.4s, %d, %d, %d",
-                 (char*)&p_overlay->format.i_chroma, p_overlay->i_x, p_overlay->i_y,
+                 p_overlay->type == OVERLAY_IS_TEXT ? "TEXT" : (char*)&p_overlay->data.p_pic->format.i_chroma,
+                 p_overlay->i_x, p_overlay->i_y,
                  p_overlay->i_alpha );
 
-        if( p_overlay->format.i_chroma == VLC_CODEC_TEXT )
+        if( p_overlay->type == OVERLAY_IS_TEXT )
         {
+            video_format_Setup( &p_region->fmt, 0, 0, 0, 0, 0, 0, 1 );
             p_region->p_text = text_segment_New( p_overlay->data.p_text );
             p_region->p_text->style = text_style_Duplicate( p_overlay->p_fontstyle );
         }
-        else
-        {
-            /* FIXME the copy is probably not needed anymore */
-            picture_Copy( p_region->p_picture, p_overlay->data.p_pic );
-        }
         p_region->i_x = p_overlay->i_x;
         p_region->i_y = p_overlay->i_y;
+        p_region->b_absolute = true; p_region->b_in_window = false;
         p_region->i_align = SUBPICTURE_ALIGN_LEFT | SUBPICTURE_ALIGN_TOP;
         p_region->i_alpha = p_overlay->i_alpha;
-        pp_region = &p_region->p_next;
+        vlc_spu_regions_push( &p_spu->regions, p_region );
     }
 
     p_sys->b_updated = false;
@@ -387,7 +393,7 @@ static int AdjustCallback( vlc_object_t *p_this, char const *psz_var,
                            vlc_value_t oldval, vlc_value_t newval,
                            void *p_data )
 {
-    filter_sys_t *p_sys = (filter_sys_t *)p_data;
+    filter_sys_t *p_sys = p_data;
     VLC_UNUSED(p_this); VLC_UNUSED(oldval);
 
     vlc_mutex_lock( &p_sys->lock );

@@ -31,6 +31,7 @@ static struct
     const char *psz;
 } const ID3_tag_to_metatype[] = {
     { VLC_FOURCC('T', 'A', 'L', 'B'), vlc_meta_Album,       NULL },
+    { VLC_FOURCC('T', 'C', 'M', 'P'), vlc_meta_Compilation, NULL },
     { VLC_FOURCC('T', 'D', 'R', 'C'), vlc_meta_Date,        NULL },
     { VLC_FOURCC('T', 'E', 'N', 'C'), vlc_meta_extra,       "Encoder" },
     { VLC_FOURCC('T', 'I', 'T', '2'), vlc_meta_Title,       NULL },
@@ -61,7 +62,7 @@ static bool ID3TextTagHandler( const uint8_t *p_buf, size_t i_buf,
             if( pb_updated )
                 *pb_updated = true;
             if( psz_extra )
-                vlc_meta_AddExtra( p_meta, psz_extra, psz );
+                vlc_meta_SetExtra( p_meta, psz_extra, psz );
             else
                 vlc_meta_Set( p_meta, type, psz );
         }
@@ -110,7 +111,11 @@ static bool ID3HandleTag( const uint8_t *p_buf, size_t i_buf,
         const char *psz_key = ID3TextConvert( p_buf, i_buf, &psz_key_alloc );
         if( psz_key )
         {
-            const size_t i_len = strlen( psz_key ) + 2;
+            /* The value follows the encoding byte and the key, whose size
+             * depends on the encoding, not on its UTF-8 conversion */
+            const ssize_t i_keylen = ID3TextLength( &p_buf[1], i_buf - 1, p_buf[0] );
+            const size_t i_len = i_keylen < 0 ? i_buf
+                               : 1 + (size_t) i_keylen + ID3TextTerminatorSize( p_buf[0] );
             if( i_len < i_buf )
             {
                 /* Only set those which are known as non binary */
@@ -121,7 +126,7 @@ static bool ID3HandleTag( const uint8_t *p_buf, size_t i_buf,
                                                        p_buf[0], &psz_val_alloc );
                     if( psz_val )
                     {
-                        vlc_meta_AddExtra( p_meta, psz_key, psz_val );
+                        vlc_meta_SetExtra( p_meta, psz_key, psz_val );
                         free( psz_val_alloc );
                     }
                 }

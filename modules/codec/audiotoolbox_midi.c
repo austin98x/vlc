@@ -2,7 +2,6 @@
  * audiotoolbox_midi.c: Software MIDI synthesizer using AudioToolbox
  *****************************************************************************
  * Copyright (C) 2017 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Marvin Scholz <epirat07 at gmail dot com>
  *
@@ -57,24 +56,28 @@ vlc_module_begin()
     set_description(N_("AudioToolbox MIDI synthesizer"))
     set_capability("audio decoder", 100)
     set_shortname(N_("AUMIDI"))
-    set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_ACODEC)
     set_callbacks(Open, Close)
-    add_loadfile("soundfont", "",
-                 SOUNDFONT_TEXT, SOUNDFONT_LONGTEXT, false)
+    add_loadfile(CFG_PREFIX "soundfont", "",
+                 SOUNDFONT_TEXT, SOUNDFONT_LONGTEXT)
 vlc_module_end()
 
 
-struct decoder_sys_t
+typedef struct
 {
     AUGraph     graph;
     AudioUnit   synthUnit;
     AudioUnit   outputUnit;
     date_t       end_date;
-};
+    bool         sysex_in_progress;
+    UInt32       max_frames_per_slice;
+    int64_t      sample_time;
+} decoder_sys_t;
 
 static int  DecodeBlock (decoder_t *p_dec, block_t *p_block);
 static void Flush (decoder_t *);
+
+static const UInt32 kAudioUnitDefaultMaxFrames = 1024;
 
 /* MIDI constants */
 enum
@@ -87,6 +90,7 @@ enum
     kMidiMessage_ChannelPressure    = 0xD0,
     kMidiMessage_PitchWheel         = 0xE0,
     kMidiMessage_SysEx              = 0xF0,
+    kMidiMessage_SysExEnd           = 0xF7,
 
     kMidiMessage_BankMSBControl     = 0,
     kMidiMessage_BankLSBControl     = 32,
@@ -163,6 +167,46 @@ bailout:
     return res;
 }
 
+static int RenderAudioUnit(decoder_t *p_dec, decoder_sys_t *p_sys, block_t *p_out,
+                           unsigned frames, int64_t base_sample_time)
+{
+    AudioTimeStamp timestamp = {};
+    timestamp.mFlags = kAudioTimeStampSampleTimeValid;
+
+    AudioBufferList bufferList;
+    bufferList.mNumberBuffers = 1;
+    bufferList.mBuffers[0].mNumberChannels = 2;
+
+    const size_t bytes_per_frame = sizeof(Float32) * 2;
+    const UInt32 max_frames = p_sys->max_frames_per_slice;
+    UInt32 rendered = 0;
+
+    while (rendered < frames) {
+        UInt32 chunk_frames = frames - rendered;
+        if (chunk_frames > max_frames)
+            chunk_frames = max_frames;
+
+        bufferList.mBuffers[0].mDataByteSize = chunk_frames * bytes_per_frame;
+        bufferList.mBuffers[0].mData =
+            (uint8_t *)p_out->p_buffer + (rendered * bytes_per_frame);
+
+        timestamp.mSampleTime = (Float64)(base_sample_time + rendered);
+
+        OSStatus status = AudioUnitRender(p_sys->outputUnit,
+                                          NULL,
+                                          &timestamp, 0,
+                                          chunk_frames, &bufferList);
+        if (status != noErr) {
+            msg_Warn(p_dec, "rendering audio unit failed: %i", (int)status);
+            return VLC_EGENERIC;
+        }
+
+        rendered += chunk_frames;
+    }
+
+    return VLC_SUCCESS;
+}
+
 static int SetSoundfont(decoder_t *p_dec, AudioUnit synthUnit, const char *sfPath) {
     if (!sfPath) {
         msg_Dbg(p_dec, "using default soundfont");
@@ -183,7 +227,7 @@ static int SetSoundfont(decoder_t *p_dec, AudioUnit synthUnit, const char *sfPat
     CFRelease(url);
 
     if (status != noErr) {
-        msg_Err(p_dec, "failed setting custom SoundFont for MIDI synthesis (%i)", status);
+        msg_Err(p_dec, "failed setting custom SoundFont for MIDI synthesis (%i)", (int)status);
         return VLC_EGENERIC;
     }
     return VLC_SUCCESS;
@@ -195,7 +239,7 @@ static int Open(vlc_object_t *p_this)
     OSStatus status = noErr;
     int ret = VLC_SUCCESS;
 
-    if (p_dec->fmt_in.i_codec != VLC_CODEC_MIDI)
+    if (p_dec->fmt_in->i_codec != VLC_CODEC_MIDI)
         return VLC_EGENERIC;
 
     decoder_sys_t *p_sys = malloc(sizeof (*p_sys));
@@ -203,9 +247,12 @@ static int Open(vlc_object_t *p_this)
         return VLC_ENOMEM;
 
     p_sys->graph = NULL;
+    p_sys->sysex_in_progress = false;
+    p_sys->max_frames_per_slice = 0;
+    p_sys->sample_time = 0;
     status = CreateAUGraph(&p_sys->graph, &p_sys->synthUnit, &p_sys->outputUnit);
     if (unlikely(status != noErr)) {
-        msg_Err(p_dec, "failed to create audiograph (%i)", status);
+        msg_Err(p_dec, "failed to create audiograph (%i)", (int)status);
         ret = VLC_EGENERIC;
         goto bailout;
     }
@@ -247,10 +294,22 @@ static int Open(vlc_object_t *p_this)
                                   kAudioUnitScope_Output, 0, &ASBD,
                                   sizeof(AudioStreamBasicDescription));
     if (unlikely(status != noErr)) {
-        msg_Err(p_dec, "failed setting output format for output unit (%i)", status);
+        msg_Err(p_dec, "failed setting output format for output unit (%i)", (int)status);
         ret = VLC_EGENERIC;
         goto bailout;
     }
+
+    UInt32 max_frames = 0;
+    UInt32 max_frames_size = sizeof(max_frames);
+    status = AudioUnitGetProperty(p_sys->outputUnit,
+                                  kAudioUnitProperty_MaximumFramesPerSlice,
+                                  kAudioUnitScope_Global, 0,
+                                  &max_frames, &max_frames_size);
+    if (status == noErr && max_frames > 0)
+        p_sys->max_frames_per_slice = max_frames;
+    else
+        // Use a conservative default if the AU doesn't report its limit.
+        p_sys->max_frames_per_slice = kAudioUnitDefaultMaxFrames;
 
     // Prepare the AU
     status = AUGraphInitialize (p_sys->graph);
@@ -258,7 +317,7 @@ static int Open(vlc_object_t *p_this)
         if (status == kAudioUnitErr_InvalidFile)
             msg_Err(p_dec, "failed initializing audiograph: invalid soundfont file");
         else
-            msg_Err(p_dec, "failed initializing audiograph (%i)", status);
+            msg_Err(p_dec, "failed initializing audiograph (%i)", (int)status);
         ret = VLC_EGENERIC;
         goto bailout;
     }
@@ -271,21 +330,20 @@ static int Open(vlc_object_t *p_this)
     // Start the AU
     status = AUGraphStart(p_sys->graph);
     if (unlikely(status != noErr)) {
-        msg_Err(p_dec, "failed starting audiograph (%i)", status);
+        msg_Err(p_dec, "failed starting audiograph (%i)", (int)status);
         ret = VLC_EGENERIC;
         goto bailout;
     }
 
     // Initialize date (for PTS)
     date_Init(&p_sys->end_date, p_dec->fmt_out.audio.i_rate, 1);
-    date_Set(&p_sys->end_date, 0);
 
     p_dec->p_sys = p_sys;
     p_dec->pf_decode = DecodeBlock;
     p_dec->pf_flush  = Flush;
 
 bailout:
-    // Cleanup if error occured
+    // Cleanup if error occurred
     if (ret != VLC_SUCCESS) {
         if (p_sys->graph)
             DisposeAUGraph(p_sys->graph);
@@ -310,7 +368,9 @@ static void Flush (decoder_t *p_dec)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    date_Set(&p_sys->end_date, VLC_TS_INVALID);
+    date_Set(&p_sys->end_date, VLC_TICK_INVALID);
+    p_sys->sysex_in_progress = false;
+    p_sys->sample_time = 0;
 
     // Turn all sound on all channels off
     // else 'old' notes could still be playing
@@ -336,8 +396,10 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
         }
     }
 
-    if (p_block->i_pts > VLC_TS_INVALID && !date_Get(&p_sys->end_date)) {
+    if ( p_block->i_pts != VLC_TICK_INVALID &&
+         date_Get(&p_sys->end_date) == VLC_TICK_INVALID ) {
         date_Set(&p_sys->end_date, p_block->i_pts);
+        p_sys->sample_time = 0;
     } else if (p_block->i_pts < date_Get(&p_sys->end_date)) {
         msg_Warn(p_dec, "MIDI message in the past?");
         goto drop;
@@ -349,6 +411,16 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
     uint8_t event = p_block->p_buffer[0];
     uint8_t data1 = (p_block->i_buffer > 1) ? (p_block->p_buffer[1]) : 0;
     uint8_t data2 = (p_block->i_buffer > 2) ? (p_block->p_buffer[2]) : 0;
+    const bool sysex_continue = p_sys->sysex_in_progress &&
+                                (event < 0x80 || event == kMidiMessage_SysExEnd);
+
+    if (event == kMidiMessage_SysEx || sysex_continue)
+    {
+        bool ends_here = (p_block->i_buffer >= 1 &&
+                          p_block->p_buffer[p_block->i_buffer - 1] == kMidiMessage_SysExEnd);
+        p_sys->sysex_in_progress = !ends_here;
+        goto drop;
+    }
 
     switch (event & 0xF0)
     {
@@ -359,15 +431,12 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
         case kMidiMessage_ProgramChange:
         case kMidiMessage_ChannelPressure:
         case kMidiMessage_PitchWheel:
+            p_sys->sysex_in_progress = false;
             MusicDeviceMIDIEvent(p_sys->synthUnit, event, data1, data2, 0);
         break;
 
-        case kMidiMessage_SysEx:
-            if (p_block->i_buffer < UINT32_MAX)
-                MusicDeviceSysEx(p_sys->synthUnit, p_block->p_buffer, (UInt32)p_block->i_buffer);
-        break;
-
         default:
+            p_sys->sysex_in_progress = false;
             msg_Warn(p_dec, "unhandled MIDI event: %x", event & 0xF0);
         break;
     }
@@ -386,28 +455,12 @@ static int DecodeBlock (decoder_t *p_dec, block_t *p_block)
         goto drop;
 
     p_out->i_pts = date_Get(&p_sys->end_date );
+    const int64_t base_sample_time = p_sys->sample_time;
     p_out->i_length = date_Increment(&p_sys->end_date, frames)
                       - p_out->i_pts;
+    p_sys->sample_time += frames;
 
-    // Prepare Timestamp for the AudioUnit render call
-    AudioTimeStamp timestamp = {};
-    timestamp.mFlags = kAudioTimeStampWordClockTimeValid;
-    timestamp.mWordClockTime = p_out->i_pts;
-
-    // Prepare Buffer for the AudioUnit render call
-    AudioBufferList bufferList;
-    bufferList.mNumberBuffers = 1;
-    bufferList.mBuffers[0].mNumberChannels = 2;
-    bufferList.mBuffers[0].mDataByteSize = frames * sizeof(Float32) * 2;
-    bufferList.mBuffers[0].mData = p_out->p_buffer;
-
-    status = AudioUnitRender(p_sys->outputUnit,
-                             NULL,
-                             &timestamp, 0,
-                             frames, &bufferList);
-
-    if (status != noErr) {
-        msg_Warn(p_dec, "rendering audio unit failed: %i", status);
+    if (RenderAudioUnit(p_dec, p_sys, p_out, frames, base_sample_time) != VLC_SUCCESS) {
         block_Release(p_out);
         p_out = NULL;
     }

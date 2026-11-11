@@ -3,7 +3,6 @@
  * manipulation. This is internal and used only by media_list_player.
  *****************************************************************************
  * Copyright (C) 2005 VLC authors and VideoLAN
- * $Id $
  *
  * Authors: Pierre d'Herbemont <pdherbemont # videolan.org>
  *
@@ -81,8 +80,8 @@ static inline void libvlc_media_list_path_append( libvlc_media_list_path_t * p_p
 {
     int old_depth = libvlc_media_list_path_depth( *p_path );
     *p_path = xrealloc( *p_path, sizeof(int)*(old_depth+2));
-    *p_path[old_depth] = index;
-    *p_path[old_depth+1] = -1;
+    (*p_path)[old_depth] = index;
+    (*p_path)[old_depth+1] = -1;
 }
 
 /**************************************************************************
@@ -124,7 +123,10 @@ get_path_rec( const libvlc_media_list_path_t path, libvlc_media_list_t * p_curre
         libvlc_media_t * p_md = libvlc_media_list_item_at_index( p_current_mlist, i );
 
         if( p_md == p_searched_md )
+        {
+            libvlc_media_release( p_md );
             return libvlc_media_list_path_copy_by_appending( path, i ); /* Found! */
+        }
 
         libvlc_media_list_t * p_subitems = libvlc_media_subitems( p_md );
         libvlc_media_release( p_md );

@@ -2,7 +2,6 @@
  * chain.c: test configuration chains
  *****************************************************************************
  * Copyright (C) 2010 VideoLAN and authors
- * $Id$
  *
  * Authors: Rémi Duraffort <ivoire@videolan.org>
  *
@@ -49,7 +48,7 @@ static const escape_sample_t escape_samples[] =
     { NULL,         NULL            }
 };
 
-static void test_config_StringEscape()
+static void test_config_StringEscape( void )
 {
     for( int i = 0; escape_samples[i].psz_string; i++ )
     {
@@ -59,7 +58,7 @@ static void test_config_StringEscape()
     }
 }
 
-static void test_config_StringUnEscape()
+static void test_config_StringUnEscape( void )
 {
     for( int i = 0; escape_samples[i].psz_string; i++ )
     {
@@ -111,7 +110,7 @@ static const chain_sample_t chain_samples[] =
     { NULL,                              NULL,      NULL, { { NULL, NULL } } }
 };
 
-static void test_config_ChainCreate()
+static void test_config_ChainCreate( void )
 {
     for( int i = 0; chain_samples[i].psz_string; i++ )
     {
@@ -160,7 +159,7 @@ static void check_config_equality( config_chain_t *p_cfg1, config_chain_t *p_cfg
     assert(!p_cfg1 && !p_cfg2);
 }
 
-static void test_config_ChainDuplicate()
+static void test_config_ChainDuplicate( void )
 {
     for( int i = 0; ppsz_string[i]; i++ )
     {
@@ -181,13 +180,13 @@ static void test_config_ChainDuplicate()
 
 int main( void )
 {
-    log( "Testing config chain escaping\n" );
+    test_log( "Testing config chain escaping\n" );
     test_config_StringEscape();
-    log( "Testing config chain un-escaping\n" );
+    test_log( "Testing config chain un-escaping\n" );
     test_config_StringUnEscape();
-    log( "Testing config_ChainCreate()\n" );
+    test_log( "Testing config_ChainCreate()\n" );
     test_config_ChainCreate();
-    log( "Testing config_ChainDuplicate()\n" );
+    test_log( "Testing config_ChainDuplicate()\n" );
     test_config_ChainDuplicate();
 
     return 0;

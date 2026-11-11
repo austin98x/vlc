@@ -29,7 +29,7 @@ namespace adaptive
     class MovingAverageSum
     {
         public:
-            MovingAverageSum<T>(T i): sum(0), prev(i) { }
+            MovingAverageSum(T i): sum(0), prev(i) { }
             void operator()(T n) {
                 sum += (n > prev) ? n - prev : prev - n;
                 prev = n;
@@ -57,7 +57,7 @@ namespace adaptive
     MovingAverage<T>::MovingAverage(unsigned nbobs) : avg(0)
     {
         if(nbobs < 1)
-            throw new std::exception();
+            throw std::exception();
         this->maxobs = nbobs;
         previous = 0;
     }

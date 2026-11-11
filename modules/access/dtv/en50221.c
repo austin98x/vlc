@@ -27,6 +27,10 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
+#include <vlc_tick.h>
+#include <vlc_threads.h>
+#include <vlc_poll.h>
 #include <vlc_charset.h>
 #include <vlc_fs.h>
 
@@ -47,9 +51,9 @@
 #   include <vlc_httpd.h>
 #endif
 
-#include "../demux/dvb-text.h"
-#include "dtv/en50221.h"
-#include "dtv/en50221_capmt.h"
+#include "../../demux/dvb-text.h"
+#include "en50221.h"
+#include "en50221_capmt.h"
 
 typedef struct en50221_session_t
 {
@@ -120,7 +124,7 @@ struct cam
     vlc_object_t *obj;
     int fd;
     int i_ca_type;
-    mtime_t i_timeout, i_next_event;
+    vlc_tick_t i_timeout, i_next_event;
 
     unsigned i_nb_slots;
     bool pb_active_slot[MAX_CI_SLOTS];
@@ -1265,11 +1269,11 @@ static void CAPMTAdd( cam_t * p_cam, int i_session_id,
         CAPMTFirst( p_cam, i_session_id, p_info );
         return;
     }
- 
+
 #ifdef CAPMT_WAIT
-    msleep( CAPMT_WAIT * 1000 );
+    vlc_tick_sleep( VLC_TICK_FROM_MS(CAPMT_WAIT) );
 #endif
- 
+
     msg_Dbg( p_cam->obj, "adding CAPMT for SID %d on session %d",
              p_info->i_program_number, i_session_id );
 
@@ -1404,7 +1408,7 @@ static void ConditionalAccessOpen( cam_t * p_cam, unsigned i_session_id )
 typedef struct
 {
     int i_interval;
-    mtime_t i_last;
+    vlc_tick_t i_last;
 } date_time_t;
 
 /*****************************************************************************
@@ -1439,7 +1443,7 @@ static void DateTimeSend( cam_t * p_cam, int i_session_id )
 
         APDUSend( p_cam, i_session_id, AOT_DATE_TIME, p_response, 7 );
 
-        p_date->i_last = mdate();
+        p_date->i_last = vlc_tick_now();
     }
 }
 
@@ -1488,7 +1492,7 @@ static void DateTimeManage( cam_t * p_cam, int i_session_id )
         (date_time_t *)p_cam->p_sessions[i_session_id - 1].p_sys;
 
     if ( p_date->i_interval
-          && mdate() > p_date->i_last + (mtime_t)p_date->i_interval * 1000000 )
+          && vlc_tick_now() > p_date->i_last + vlc_tick_from_sec( p_date->i_interval ) )
     {
         DateTimeSend( p_cam, i_session_id );
     }
@@ -1884,7 +1888,7 @@ static int InitSlot( cam_t * p_cam, int i_slot )
 
     if ( p_cam->pb_active_slot[i_slot] )
     {
-        p_cam->i_timeout = CLOCK_FREQ / 10;
+        p_cam->i_timeout = VLC_TICK_FROM_MS(100);
         return VLC_SUCCESS;
     }
 
@@ -1958,9 +1962,9 @@ cam_t *en50221_Init( vlc_object_t *obj, int fd )
             }
         }
 
-        p_cam->i_timeout = CLOCK_FREQ / 10;
+        p_cam->i_timeout = VLC_TICK_FROM_MS(100);
         /* Wait a bit otherwise it doesn't initialize properly... */
-        msleep( CLOCK_FREQ / 10 );
+        vlc_tick_sleep( VLC_TICK_FROM_MS(100) );
         p_cam->i_next_event = 0;
     }
     else
@@ -2030,7 +2034,7 @@ void en50221_Poll( cam_t * p_cam )
     switch( p_cam->i_ca_type )
     {
     case CA_CI_LINK:
-        if( mdate() > p_cam->i_next_event )
+        if( vlc_tick_now() > p_cam->i_next_event )
             break;
     case CA_CI:
         return;
@@ -2168,17 +2172,18 @@ void en50221_Poll( cam_t * p_cam )
         }
     }
 
-    p_cam->i_next_event = mdate() + p_cam->i_timeout;
+    p_cam->i_next_event = vlc_tick_now() + p_cam->i_timeout;
 }
 
 
 /*****************************************************************************
  * en50221_SetCAPMT :
  *****************************************************************************/
-int en50221_SetCAPMT( cam_t * p_cam, en50221_capmt_info_t *p_info )
+int en50221_SetCAPMT( cam_t * p_cam, const en50221_capmt_info_t *p_info )
 {
     bool b_update = false;
     bool b_needs_descrambling = CAPMTNeedsDescrambling( p_info );
+    en50221_capmt_info_t *p_oldinfo = NULL;
 
     for ( unsigned i = 0; i < MAX_PROGRAMS; i++ )
     {
@@ -2188,34 +2193,37 @@ int en50221_SetCAPMT( cam_t * p_cam, en50221_capmt_info_t *p_info )
         {
             b_update = true;
 
+            /* Existing scrambled program went clear now */
             if ( !b_needs_descrambling )
             {
-                en50221_capmt_Delete( p_info );
-                p_info = p_cam->pp_selected_programs[i];
+                p_oldinfo = p_cam->pp_selected_programs[i];
                 p_cam->pp_selected_programs[i] = NULL;
             }
+            /* Existing scrambled program has been updated */
             else if( p_info != p_cam->pp_selected_programs[i] )
             {
                 en50221_capmt_Delete( p_cam->pp_selected_programs[i] );
-                p_cam->pp_selected_programs[i] = p_info;
+                p_cam->pp_selected_programs[i] = en50221_capmt_Duplicate( p_info );
             }
 
             break;
         }
     }
 
+    /* New selection of scrambled program */
     if ( !b_update && b_needs_descrambling )
     {
         for ( unsigned i = 0; i < MAX_PROGRAMS; i++ )
         {
             if ( p_cam->pp_selected_programs[i] == NULL )
             {
-                p_cam->pp_selected_programs[i] = p_info;
+                p_cam->pp_selected_programs[i] = en50221_capmt_Duplicate( p_info );
                 break;
             }
         }
     }
 
+    /* Serialization of CAPMT commands to CI */
     if ( b_update || b_needs_descrambling )
     {
         for ( unsigned i = 1; i <= MAX_SESSIONS; i++ )
@@ -2226,17 +2234,15 @@ int en50221_SetCAPMT( cam_t * p_cam, en50221_capmt_info_t *p_info )
                 if ( b_update && b_needs_descrambling )
                     CAPMTUpdate( p_cam, i, p_info );
                 else if ( b_update )
-                    CAPMTDelete( p_cam, i, p_info );
+                    CAPMTDelete( p_cam, i, p_oldinfo );
                 else
                     CAPMTAdd( p_cam, i, p_info );
             }
         }
     }
 
-    if ( !b_needs_descrambling )
-    {
-        en50221_capmt_Delete( p_info );
-    }
+    if( p_oldinfo )
+        en50221_capmt_Delete( p_oldinfo );
 
     return VLC_SUCCESS;
 }

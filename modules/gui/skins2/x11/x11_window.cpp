@@ -2,7 +2,6 @@
  * x11_window.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -35,7 +34,7 @@
 #include "x11_dragdrop.hpp"
 #include "x11_factory.hpp"
 
-#include <assert.h>
+#include <cassert>
 #include <limits.h>
 
 #include <new>
@@ -43,7 +42,7 @@
 X11Window::X11Window( intf_thread_t *pIntf, GenericWindow &rWindow,
                       X11Display &rDisplay, bool dragDrop, bool playOnDrop,
                       X11Window *pParentWindow, GenericWindow::WindowType_t type ):
-    OSWindow( pIntf ), m_rDisplay( rDisplay ), m_pParent( pParentWindow ),
+    OSWindow( pIntf ), m_rDisplay( rDisplay ),
     m_dragDrop( dragDrop ), m_pDropTarget( NULL ), m_type ( type )
 {
     XSetWindowAttributes attr;
@@ -117,7 +116,7 @@ X11Window::X11Window( intf_thread_t *pIntf, GenericWindow &rWindow,
     // Select events received by the window
     long event_mask = ExposureMask|KeyPressMask|
                       PointerMotionMask|ButtonPressMask|ButtonReleaseMask|
-                      LeaveWindowMask|FocusChangeMask;
+                      LeaveWindowMask|FocusChangeMask|StructureNotifyMask;
     XSelectInput( XDISPLAY, m_wnd, event_mask );
 
     // Store a pointer on the generic window in a map
@@ -165,8 +164,9 @@ X11Window::X11Window( intf_thread_t *pIntf, GenericWindow &rWindow,
     {
         // Associate the fsc window to the fullscreen window
         VoutManager* pVoutManager = VoutManager::instance( getIntf() );
-        GenericWindow* pWin = pVoutManager->getVoutMainWindow();
-        Window wnd = (Window) pWin->getOSHandle();
+        GenericWindow* pGenericWin = pVoutManager->getVoutMainWindow();
+        X11Window *pWin = (X11Window*)pGenericWin->getOSWindow();
+        Window wnd = pWin->getDrawable();
         XSetTransientForHint( XDISPLAY, m_wnd, wnd );
     }
     else
@@ -242,11 +242,12 @@ X11Window::~X11Window()
     XSync( XDISPLAY, False );
 }
 
-void X11Window::reparent( uint32_t OSHandle, int x, int y, int w, int h )
+void X11Window::reparent( OSWindow *win, int x, int y, int w, int h )
 {
     // Reparent the window
+    X11Window *parent = (X11Window*)win;
     Window new_parent =
-           OSHandle ? (Window) OSHandle : DefaultRootWindow( XDISPLAY );
+           parent ? parent->m_wnd : DefaultRootWindow( XDISPLAY );
 
     XReparentWindow( XDISPLAY, m_wnd, new_parent, x, y);
     if( w && h )
@@ -334,7 +335,7 @@ void X11Window::setFullscreen( ) const
         event.format = 32;
         event.data.l[ 0 ] = 1;
         event.data.l[ 1 ] = NET_WM_STATE_FULLSCREEN;
- 
+
         XSendEvent( XDISPLAY,
                     DefaultRootWindow( XDISPLAY ),
                     False, SubstructureNotifyMask|SubstructureRedirectMask,

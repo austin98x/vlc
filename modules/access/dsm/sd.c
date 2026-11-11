@@ -33,6 +33,7 @@
 #include <stdatomic.h>
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_services_discovery.h>
 #include <bdsm/bdsm.h>
 
@@ -51,11 +52,11 @@ struct entry_item
     input_item_t *p_item;
 };
 
-struct services_discovery_sys_t
+typedef struct
 {
     netbios_ns      *p_ns;
     vlc_array_t      entry_item_list;
-};
+} services_discovery_sys_t;
 
 static void entry_item_append( services_discovery_t *p_sd,
                                netbios_ns_entry *p_entry,

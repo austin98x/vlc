@@ -21,6 +21,7 @@
 #define CONVERSIONS_HPP
 
 #include <vlc_common.h>
+#include <vlc_tick.h>
 #include <string>
 #include <sstream>
 
@@ -28,21 +29,20 @@ class IsoTime
 {
     public:
         IsoTime(const std::string&);
-        operator time_t() const;
+        operator vlc_tick_t() const;
 
     private:
-        time_t time;
+        vlc_tick_t time;
 };
 
 class UTCTime
 {
     public:
         UTCTime(const std::string&);
-        time_t  time() const;
-        mtime_t mtime() const;
+        operator vlc_tick_t() const;
 
     private:
-        mtime_t t;
+        vlc_tick_t t;
 };
 
 template<typename T> class Integer
@@ -50,14 +50,10 @@ template<typename T> class Integer
     public:
         Integer(const std::string &str)
         {
-            try
-            {
-                std::istringstream in(str);
-                in.imbue(std::locale("C"));
-                in >> value;
-            } catch (int) {
+            std::istringstream in(str);
+            in.imbue(std::locale("C"));
+            if(!(in >> value))
                 value = 0;
-            }
         }
 
         operator T() const

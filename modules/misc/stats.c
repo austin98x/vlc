@@ -52,27 +52,29 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     if( !p_pic )
         goto error;
 
+    vlc_tick_t tick;
     if( p_block->i_buffer == kBufferSize )
     {
+        memcpy(&tick, p_block->p_buffer, sizeof(vlc_tick_t));
         msg_Dbg( p_dec, "got %"PRIu64" ms",
-                 *(mtime_t *)p_block->p_buffer  / 1000 );
+                 MS_FROM_VLC_TICK(tick) );
         msg_Dbg( p_dec, "got %"PRIu64" ms offset",
-                 (mdate() - *(mtime_t *)p_block->p_buffer) / 1000 );
-        *(mtime_t *)(p_pic->p->p_pixels) = *(mtime_t *)p_block->p_buffer;
+                 MS_FROM_VLC_TICK(vlc_tick_now() - tick) );
     }
     else
     {
         msg_Dbg( p_dec, "got a packet not from stats demuxer" );
-        *(mtime_t *)(p_pic->p->p_pixels) = mdate();
+        tick = vlc_tick_now();
     }
+    memcpy(p_pic->p->p_pixels, &tick, sizeof(vlc_tick_t));
 
-    p_pic->date = p_block->i_pts > VLC_TS_INVALID ?
+    p_pic->date = p_block->i_pts != VLC_TICK_INVALID ?
             p_block->i_pts : p_block->i_dts;
-    p_pic->b_force = true;
 
 error:
     block_Release( p_block );
-    decoder_QueueVideo( p_dec, p_pic );
+    if ( p_pic )
+        decoder_QueueVideo( p_dec, p_pic );
     return VLCDEC_SUCCESS;
 }
 
@@ -101,14 +103,16 @@ static block_t *EncodeVideo( encoder_t *p_enc, picture_t *p_pict )
 {
     (void)p_pict;
     block_t * p_block = block_Alloc( kBufferSize );
-
-    *(mtime_t*)p_block->p_buffer = mdate();
+    if (unlikely(!p_block))
+      return NULL;
+    vlc_tick_t now = vlc_tick_now();
+    memcpy(p_block->p_buffer, &now, sizeof(vlc_tick_t));
     p_block->i_buffer = kBufferSize;
     p_block->i_length = kBufferSize;
     p_block->i_dts = p_pict->date;
 
     msg_Dbg( p_enc, "putting %"PRIu64"ms",
-             *(mtime_t*)p_block->p_buffer / 1000 );
+             MS_FROM_VLC_TICK(now) );
     return p_block;
 }
 
@@ -119,27 +123,41 @@ static block_t *EncodeAudio( encoder_t *p_enc, block_t *p_abuff )
     return NULL;
 }
 
-static int OpenEncoder ( vlc_object_t *p_this )
+static int OpenVideoEncoder ( vlc_object_t *p_this )
 {
     encoder_t *p_enc = (encoder_t *)p_this;
 
     msg_Dbg( p_this, "opening stats encoder" );
 
-    p_enc->pf_encode_video = EncodeVideo;
-    p_enc->pf_encode_audio = EncodeAudio;
+    static const struct vlc_encoder_operations video_ops =
+        { .encode_video = EncodeVideo };
 
+    p_enc->ops = &video_ops;
+    return VLC_SUCCESS;
+}
+
+static int OpenAudioEncoder ( vlc_object_t *p_this )
+{
+    encoder_t *p_enc = (encoder_t *)p_this;
+
+    msg_Dbg( p_this, "opening stats encoder" );
+
+    static const struct vlc_encoder_operations audio_ops =
+        { .encode_audio = EncodeAudio };
+
+    p_enc->ops = &audio_ops;
     return VLC_SUCCESS;
 }
 #endif
 
 /*** Demuxer ***/
-struct demux_sys_t
+typedef struct
 {
     es_format_t     fmt;
     es_out_id_t     *p_es;
 
     date_t          pts;
-};
+} demux_sys_t;
 
 static int Demux( demux_t *p_demux )
 {
@@ -149,11 +167,12 @@ static int Demux( demux_t *p_demux )
 
     if( !p_block ) return 1;
 
-    p_block->i_dts = p_block->i_pts =
-        date_Increment( &p_sys->pts, kBufferSize );
+    p_block->i_dts = p_block->i_pts = date_Increment( &p_sys->pts, kBufferSize );
 
+    vlc_tick_t tick;
+    memcpy(&tick, p_block->p_buffer, sizeof(vlc_tick_t));
     msg_Dbg( p_demux, "demux got %"PRId64" ms offset",
-             (mdate() - *(mtime_t *)p_block->p_buffer) / 1000 );
+             MS_FROM_VLC_TICK(vlc_tick_now() - tick) );
 
     //es_out_SetPCR( p_demux->out, p_block->i_pts );
 
@@ -190,7 +209,7 @@ static int OpenDemux ( vlc_object_t *p_this )
         return VLC_ENOMEM;
 
     date_Init( &p_sys->pts, 1, 1 );
-    date_Set( &p_sys->pts, 1 );
+    date_Set( &p_sys->pts, VLC_TICK_0 );
 
     es_format_Init( &p_sys->fmt, VIDEO_ES, VLC_FOURCC('s','t','a','t') );
     p_sys->fmt.video.i_width = 720;
@@ -214,28 +233,35 @@ vlc_module_begin ()
     set_shortname( N_("Stats"))
 #ifdef ENABLE_SOUT
     set_description( N_("Stats encoder function") )
-    set_capability( "encoder", 0 )
+    set_capability( "video encoder", 0 )
     add_shortcut( "stats" )
-    set_callbacks( OpenEncoder, NULL )
+    set_callback( OpenVideoEncoder )
+
+    add_submodule ()
+    set_description( N_("Stats encoder function") )
+    set_capability( "audio encoder", 0 )
+    add_shortcut( "stats" )
+    set_callback( OpenAudioEncoder )
+
     add_submodule ()
 #endif
         set_section( N_( "Stats decoder" ), NULL )
         set_description( N_("Stats decoder function") )
         set_capability( "video decoder", 0 )
         add_shortcut( "stats" )
-        set_callbacks( OpenDecoder, NULL )
+        set_callback( OpenDecoder )
     add_submodule()
         set_section( N_( "Stats decoder" ), NULL )
         set_description( N_("Stats decoder function") )
         set_capability( "audio decoder", 0 )
         add_shortcut( "stats" )
-        set_callbacks( OpenDecoder, NULL )
+        set_callback( OpenDecoder )
     add_submodule()
         set_section( N_( "Stats decoder" ), NULL )
         set_description( N_("Stats decoder function") )
         set_capability( "spu decoder", 0 )
         add_shortcut( "stats" )
-        set_callbacks( OpenDecoder, NULL )
+        set_callback( OpenDecoder )
     add_submodule ()
         set_section( N_( "Stats demux" ), NULL )
         set_description( N_("Stats demux function") )

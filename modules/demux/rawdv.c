@@ -2,7 +2,6 @@
  * rawdv.c : raw DV input module for vlc
  *****************************************************************************
  * Copyright (C) 2001-2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@netcourrier.com>
  *          Paul Corke <paul dot corke at datatote dot co dot uk>
@@ -49,12 +48,16 @@ static void Close( vlc_object_t * );
 vlc_module_begin ()
     set_shortname( "DV" )
     set_description( N_("DV (Digital Video) demuxer") )
-    set_capability( "demux", 3 )
-    set_category( CAT_INPUT )
+    set_capability( "demux", 0 )
     set_subcategory( SUBCAT_INPUT_DEMUX )
-    add_bool( "rawdv-hurry-up", false, HURRYUP_TEXT, HURRYUP_LONGTEXT, false )
+    add_bool( "rawdv-hurry-up", false, HURRYUP_TEXT, HURRYUP_LONGTEXT )
     set_callbacks( Open, Close )
+    /* It isn't easy to recognize a raw DV stream. The chances that we'll
+     * mistake a stream from another type for a raw DV stream are too high, so
+     * we'll rely on the file extension to trigger this demux. Alternatively,
+     * it is possible to force this demux. */
     add_shortcut( "rawdv" )
+    add_file_extension("dv")
 vlc_module_end ()
 
 
@@ -93,7 +96,7 @@ typedef struct {
     int8_t ap3;
 } dv_header_t;
 
-struct demux_sys_t
+typedef struct
 {
     int    frame_size;
 
@@ -108,9 +111,9 @@ struct demux_sys_t
     int    i_bitrate;
 
     /* program clock reference (in units of 90kHz) */
-    mtime_t i_pcr;
+    vlc_tick_t i_pcr;
     bool b_hurry_up;
-};
+} demux_sys_t;
 
 /*****************************************************************************
  * Local prototypes
@@ -132,22 +135,10 @@ static int Open( vlc_object_t * p_this )
     dv_header_t dv_header;
     dv_id_t     dv_id;
 
-    /* It isn't easy to recognize a raw DV stream. The chances that we'll
-     * mistake a stream from another type for a raw DV stream are too high, so
-     * we'll rely on the file extension to trigger this demux. Alternatively,
-     * it is possible to force this demux. */
-
-    /* Check for DV file extension */
-    if( !demux_IsPathExtension( p_demux, ".dv" ) && !p_demux->obj.force )
-        return VLC_EGENERIC;
-
     if( vlc_stream_Peek( p_demux->s, &p_peek, DV_PAL_FRAME_SIZE ) <
         DV_NTSC_FRAME_SIZE )
-    {
-        /* Stream too short ... */
-        msg_Err( p_demux, "cannot peek()" );
         return VLC_EGENERIC;
-    }
+
     p_peek_backup = p_peek;
 
     /* fill in the dv_id_t structure */
@@ -214,7 +205,7 @@ static int Open( vlc_object_t * p_this )
 
     es_format_Init( &p_sys->fmt_video, VIDEO_ES, VLC_CODEC_DV );
     p_sys->fmt_video.video.i_width = 720;
-    p_sys->fmt_video.video.i_height= dv_header.dsf ? 576 : 480;;
+    p_sys->fmt_video.video.i_height= dv_header.dsf ? 576 : 480;
     p_sys->fmt_video.video.i_visible_width = p_sys->fmt_video.video.i_width;
     p_sys->fmt_video.video.i_visible_height = p_sys->fmt_video.video.i_height;
 
@@ -254,47 +245,46 @@ static int Demux( demux_t *p_demux )
 {
     demux_sys_t *p_sys  = p_demux->p_sys;
     block_t     *p_block;
-    bool  b_audio = false;
 
     if( p_sys->b_hurry_up )
     {
          /* 3 frames */
-        p_sys->i_pcr = mdate() + (p_sys->i_dsf ? 120000 : 90000);
+        p_sys->i_pcr = vlc_tick_now() + (p_sys->i_dsf ? VLC_TICK_FROM_MS(120) : VLC_TICK_FROM_MS(90));
     }
 
     /* Call the pace control */
-    es_out_SetPCR( p_demux->out, VLC_TS_0 + p_sys->i_pcr );
+    es_out_SetPCR( p_demux->out, VLC_TICK_0 + p_sys->i_pcr );
     p_block = vlc_stream_Block( p_demux->s, p_sys->frame_size );
     if( p_block == NULL )
-    {
-        /* EOF */
-        return 0;
-    }
-
-    if( p_sys->p_es_audio )
-    {
-        es_out_Control( p_demux->out, ES_OUT_GET_ES_STATE,
-                        p_sys->p_es_audio, &b_audio );
-    }
+        return VLC_DEMUXER_EOF;
 
     p_block->i_dts =
-    p_block->i_pts = VLC_TS_0 + p_sys->i_pcr;
+    p_block->i_pts = VLC_TICK_0 + p_sys->i_pcr;
 
-    if( b_audio )
+    if( likely(p_sys->p_es_audio) )
     {
-        block_t *p_audio_block = dv_extract_audio( p_block );
-        if( p_audio_block )
-            es_out_Send( p_demux->out, p_sys->p_es_audio, p_audio_block );
+        bool b_audio = false;
+        es_out_Control( p_demux->out, ES_OUT_GET_ES_STATE,
+                        p_sys->p_es_audio, &b_audio );
+        if( b_audio )
+        {
+            block_t *p_audio_block = dv_extract_audio( p_block );
+            if( p_audio_block )
+                es_out_Send( p_demux->out, p_sys->p_es_audio, p_audio_block );
+        }
     }
 
-    es_out_Send( p_demux->out, p_sys->p_es_video, p_block );
+    if( likely(p_sys->p_es_video) )
+        es_out_Send( p_demux->out, p_sys->p_es_video, p_block );
+    else
+        block_Release( p_block );
 
     if( !p_sys->b_hurry_up )
     {
-        p_sys->i_pcr += ( INT64_C(1000000) / p_sys->f_rate );
+        p_sys->i_pcr += vlc_tick_rate_duration( p_sys->f_rate );
     }
 
-    return 1;
+    return VLC_DEMUXER_SUCCESS;
 }
 
 /*****************************************************************************

@@ -4,7 +4,9 @@ ARIBB25_VERSION := 0.2.7
 ARIBB25_URL := $(VIDEOLAN)/aribb25/$(ARIBB25_VERSION)/aribb25-$(ARIBB25_VERSION).tar.gz
 
 ifdef HAVE_WIN32
+ifndef HAVE_WINSTORE # winscard is not allowed
 PKGS += aribb25
+endif
 endif
 ifeq ($(call need_pkg,"pcslite"),)
 PKGS += aribb25
@@ -20,9 +22,15 @@ $(TARBALLS)/aribb25-$(ARIBB25_VERSION).tar.gz:
 
 aribb25: aribb25-$(ARIBB25_VERSION).tar.gz .sum-aribb25
 	$(UNPACK)
+	# $(call update_autoconfig,.)
+	$(APPLY) $(SRC)/aribb25/0001-fix-build-script.patch
+	$(APPLY) $(SRC)/aribb25/0002-fix-libs-include.patch
 	$(MOVE)
 
 .aribb25: aribb25
-	cd $< && $(HOSTVARS) ./configure $(HOSTCONF)
-	cd $< && $(MAKE) && $(MAKE) install
+	$(RECONF)
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE)
+	+$(MAKEBUILD) bin_PROGRAMS=
+	+$(MAKEBUILD) bin_PROGRAMS= install
 	touch $@

@@ -2,7 +2,6 @@
  * ctrl_button.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -64,6 +63,9 @@ public:
 
     /// Get the type of control (custom RTTI)
     virtual std::string getType() const { return "button"; }
+
+protected:
+    using CtrlGeneric::onUpdate;
 
 private:
     /// Finite state machine of the control

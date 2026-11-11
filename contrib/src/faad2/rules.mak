@@ -1,13 +1,16 @@
 # faad2
 
-FAAD2_VERSION := 2.7
-FAAD2_URL := $(SF)/faac/faad2-$(FAAD2_VERSION).tar.gz
+FAAD2_VERSION := 2.11.3
+FAAD2_URL := $(GITHUB)/knik0/faad2/archive/refs/tags/$(FAAD2_VERSION).tar.gz
 
 ifeq ($(findstring $(ARCH),arm),)
 # FAAD is a lot slower than lavc on ARM. Skip it.
 ifdef GPL
 PKGS += faad2
 endif
+endif
+ifeq ($(call need_pkg,"faad2"),)
+PKGS_FOUND += faad2
 endif
 
 $(TARBALLS)/faad2-$(FAAD2_VERSION).tar.gz:
@@ -20,17 +23,15 @@ faad2: faad2-$(FAAD2_VERSION).tar.gz .sum-faad2
 ifndef HAVE_FPU
 	$(APPLY) $(SRC)/faad2/faad2-fixed.patch
 endif
-	$(APPLY) $(SRC)/faad2/faad2-disable-drc.patch
-	$(APPLY) $(SRC)/faad2/faad2-fix-71wPCEmapping.patch
-	$(APPLY) $(SRC)/faad2/faad2-fix-cpe-reconstruction.patch
-	$(APPLY) $(SRC)/faad2/faad2-add-define.patch
-	cd $(UNPACK_DIR) && $(CC) -iquote . -E - </dev/null || sed -i 's/-iquote /-I/' libfaad/Makefile.am
+	$(call pkg_static,"libfaad/faad2.pc.in")
 	$(MOVE)
 
-.faad2: faad2
+FAAD2_CONF := -DFAAD_APPLY_DRC=OFF -DFAAD_BUILD_CLI=OFF
+
+.faad2: faad2 toolchain.cmake
 	$(REQUIRE_GPL)
-	$(RECONF)
-	cd $< && $(HOSTVARS) ./configure --without-drm $(HOSTCONF)
-	cd $< && sed -i.orig "s/shrext_cmds/shrext/g" libtool
-	cd $</libfaad && $(MAKE) install
+	$(CMAKECLEAN)
+	$(HOSTVARS_CMAKE) $(CMAKE) $(FAAD2_CONF)
+	+$(CMAKEBUILD)
+	$(CMAKEINSTALL)
 	touch $@

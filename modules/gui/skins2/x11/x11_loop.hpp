@@ -2,7 +2,6 @@
  * x11_loop.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -29,6 +28,7 @@
 #include "../src/os_loop.hpp"
 
 #include <map>
+#include <memory>
 
 class X11Display;
 class GenericWindow;
@@ -37,6 +37,8 @@ class GenericWindow;
 class X11Loop: public OSLoop
 {
 public:
+    X11Loop( intf_thread_t *pIntf, X11Display &rDisplay );
+
     /// Get the instance of X11Loop
     static OSLoop *instance( intf_thread_t *pIntf, X11Display &rDisplay );
 
@@ -55,7 +57,7 @@ private:
     /// Flag set on exit
     bool m_exit;
     /// Date and position of the last left-click
-    mtime_t m_lastClickTime;
+    vlc_tick_t m_lastClickTime;
     int m_lastClickPosX, m_lastClickPosY;
     /// Maximum interval between clicks for a double-click (in microsec)
     static int m_dblClickDelay;
@@ -70,10 +72,6 @@ private:
         return i!=m_keymap.end() ? (i->second) : keysym;
     }
     static int X11ModToMod( unsigned state );
-
-    // Private because it's a singleton
-    X11Loop( intf_thread_t *pIntf, X11Display &rDisplay );
-    virtual ~X11Loop();
 
     /// Handle the next X11 event
     void handleX11Event();

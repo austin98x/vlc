@@ -47,7 +47,6 @@ static void Close( vlc_object_t * );
 vlc_module_begin()
     set_shortname( N_("KWallet keystore") )
     set_description( N_("Secrets are stored via KWallet") )
-    set_category( CAT_ADVANCED )
     set_subcategory( SUBCAT_ADVANCED_MISC )
     set_capability( "keystore", 100 )
     set_callbacks( Open, Close )
@@ -58,7 +57,7 @@ vlc_module_end()
  * but we only use the "Password" category. *
  * It is juste a simple Entry name ( or key ) *
  * associated with a secret. *
- * Keys are urls formated with : *
+ * Keys are urls formatted with : *
  *     _ Protocol *
  *     _ User ( optional ) *
  *     _ Server *
@@ -109,7 +108,7 @@ typedef struct vlc_keystore_sys
 
 /* takes all values in the values of vlc_keystore_entry *
  * and formats them in a url key */
-static char*
+VLC_MALLOC static char*
 values2key( const char* const* ppsz_values, bool b_search )
 {
     char* psz_b64_realm = NULL;
@@ -160,10 +159,9 @@ values2key( const char* const* ppsz_values, bool b_search )
         vlc_memstream_printf( &ms, "*" );
 
     /* Realm and authtype section */
-    if ( ppsz_values[KEY_REALM] || ppsz_values[KEY_AUTHTYPE] || b_search )
+    if ( ppsz_values[KEY_REALM] || ppsz_values[KEY_AUTHTYPE] )
     {
-        vlc_memstream_printf( &ms, "?" );
-
+        vlc_memstream_printf( &ms, "\?" );
         /* Realm section */
         if ( ppsz_values[KEY_REALM] || b_search )
         {
@@ -199,14 +197,14 @@ values2key( const char* const* ppsz_values, bool b_search )
         }
 
     }
+    else if ( b_search )
+        vlc_memstream_printf( &ms, "*" );
 
     b_state = true;
 
 end:
     free( psz_b64_realm );
     free( psz_b64_auth );
-    if ( vlc_memstream_flush( &ms ) != 0 )
-        b_state = false;
     char *psz_key = vlc_memstream_close( &ms ) == 0 ? ms.ptr : NULL;
     if ( !b_state )
     {
@@ -239,7 +237,10 @@ key2values( char* psz_key, vlc_keystore_entry* p_entry )
         goto end;
     if ( url.i_port && asprintf( &p_entry->ppsz_values[KEY_PORT],
                                  "%d", url.i_port) == -1 )
+    {
+        p_entry->ppsz_values[KEY_PORT] = NULL;
         goto end;
+    }
     if ( url.psz_path && !( p_entry->ppsz_values[KEY_PATH] =
                             strdup( url.psz_path ) ) )
         goto end;
@@ -1181,7 +1182,8 @@ kwallet_read_password_list( vlc_keystore* p_keystore, char* psz_entry_name,
 error:
     free( p_secret_decoded );
     *pi_count = 0;
-    vlc_keystore_release_entries( p_entries, i );
+    if ( p_entries )
+        vlc_keystore_release_entries( p_entries, i );
     if ( msg )
         dbus_message_unref( msg );
     if ( repmsg )

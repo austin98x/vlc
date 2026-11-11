@@ -28,6 +28,7 @@
 #include <alsa/asoundlib.h>
 
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_demux.h>
 #include <vlc_aout.h>
 #include <vlc_plugin.h>
@@ -55,14 +56,12 @@ static const char *const rate_names[] = { N_("192000 Hz"), N_("176400 Hz"),
 vlc_module_begin ()
     set_shortname (N_("ALSA"))
     set_description (N_("ALSA audio capture"))
-    set_capability ("access_demux", 0)
-    set_category (CAT_INPUT)
+    set_capability ("access", 0)
     set_subcategory (SUBCAT_INPUT_ACCESS)
     set_help (HELP_TEXT)
 
-    add_obsolete_string ("alsa-format") /* since 2.1.0 */
-    add_bool ("alsa-stereo", true, STEREO_TEXT, STEREO_TEXT, true)
-    add_integer ("alsa-samplerate", 48000, RATE_TEXT, RATE_TEXT, true)
+    add_bool ("alsa-stereo", true, STEREO_TEXT, NULL)
+    add_integer ("alsa-samplerate", 48000, RATE_TEXT, NULL)
         change_integer_list (rate_values, rate_names)
 
     add_shortcut ("alsa")
@@ -122,17 +121,17 @@ static void DumpDeviceStatus (vlc_object_t *obj, snd_pcm_t *pcm)
 #define DumpDeviceStatus(o, p) DumpDeviceStatus(VLC_OBJECT(o), p)
 
 
-struct demux_sys_t
+typedef struct
 {
     snd_pcm_t *pcm;
     es_out_id_t *es;
     vlc_thread_t thread;
 
-    mtime_t start;
-    mtime_t caching;
+    vlc_tick_t start;
+    vlc_tick_t caching;
     snd_pcm_uframes_t period_size;
     unsigned rate;
-};
+} demux_sys_t;
 
 static void Poll (snd_pcm_t *pcm, int canc)
 {
@@ -159,6 +158,8 @@ static void *Thread (void *data)
     size_t bytes;
     int canc, val;
 
+    vlc_thread_set_name("vlc-alsa");
+
     canc = vlc_savecancel ();
     bytes = snd_pcm_frames_to_bytes (pcm, sys->period_size);
     val = snd_pcm_start (pcm);
@@ -179,10 +180,10 @@ static void *Thread (void *data)
 
         /* Read data */
         snd_pcm_sframes_t frames, delay;
-        mtime_t pts;
+        vlc_tick_t pts;
 
         frames = snd_pcm_readi (pcm, block->p_buffer, sys->period_size);
-        pts = mdate ();
+        pts = vlc_tick_now ();
         if (frames < 0)
         {
             block_Release (block);
@@ -222,12 +223,12 @@ static void *Thread (void *data)
         if (snd_pcm_delay (pcm, &delay))
             delay = 0;
         delay += frames;
-        pts -= (CLOCK_FREQ * delay) / sys->rate;
+        pts -= vlc_tick_from_samples(delay,  sys->rate);
 
         block->i_buffer = snd_pcm_frames_to_bytes (pcm, frames);
         block->i_nb_samples = frames;
         block->i_pts = pts;
-        block->i_length = (CLOCK_FREQ * frames) / sys->rate;
+        block->i_length = vlc_tick_from_samples(frames, sys->rate);
 
         es_out_SetPCR(demux->out, block->i_pts);
         es_out_Send (demux->out, sys->es, block);
@@ -242,11 +243,11 @@ static int Control (demux_t *demux, int query, va_list ap)
     switch (query)
     {
         case DEMUX_GET_TIME:
-            *va_arg (ap, int64_t *) = mdate () - sys->start;
+            *va_arg (ap, vlc_tick_t *) = vlc_tick_now () - sys->start;
             break;
 
         case DEMUX_GET_PTS_DELAY:
-            *va_arg (ap, int64_t *) = sys->caching;
+            *va_arg (ap, vlc_tick_t *) = sys->caching;
             break;
 
         //case DEMUX_SET_NEXT_DEMUX_TIME: still needed?
@@ -258,7 +259,7 @@ static int Control (demux_t *demux, int query, va_list ap)
         case DEMUX_CAN_CONTROL_RATE:
         case DEMUX_CAN_SEEK:
             *va_arg (ap, bool *) = false;
-            break;;
+            break;
 
         default:
             return VLC_EGENERIC;
@@ -284,8 +285,8 @@ static const vlc_fourcc_t formats[] = {
     [SND_PCM_FORMAT_U32_BE]             = VLC_CODEC_U32B,
     [SND_PCM_FORMAT_FLOAT_LE]           = VLC_CODEC_F32L,
     [SND_PCM_FORMAT_FLOAT_BE]           = VLC_CODEC_F32B,
-    [SND_PCM_FORMAT_FLOAT64_LE]         = VLC_CODEC_F32L,
-    [SND_PCM_FORMAT_FLOAT64_BE]         = VLC_CODEC_F32B,
+    [SND_PCM_FORMAT_FLOAT64_LE]         = VLC_CODEC_F64L,
+    [SND_PCM_FORMAT_FLOAT64_BE]         = VLC_CODEC_F64B,
   //[SND_PCM_FORMAT_IEC958_SUBFRAME_LE] = VLC_CODEC_SPDIFL,
   //[SND_PCM_FORMAT_IEC958_SUBFRAME_BE] = VLC_CODEC_SPDIFB,
     [SND_PCM_FORMAT_MU_LAW]             = VLC_CODEC_MULAW,
@@ -341,6 +342,10 @@ static uint16_t channel_maps[] = {
 static int Open (vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
+
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
+
     demux_sys_t *sys = vlc_obj_malloc(obj, sizeof (*sys));
     if (unlikely(sys == NULL))
         return VLC_ENOMEM;
@@ -392,7 +397,7 @@ static int Open (vlc_object_t *obj)
     }
 
     snd_pcm_format_t format = SND_PCM_FORMAT_UNKNOWN;
-    for (size_t i = 0; i < sizeof (choices) / sizeof (choices[0]); i++)
+    for (size_t i = 0; i < ARRAY_SIZE(choices); i++)
         if (snd_pcm_hw_params_test_format (pcm, hw, choices[i]) == 0)
         {
             val = snd_pcm_hw_params_set_format (pcm, hw, choices[i]);
@@ -412,7 +417,7 @@ static int Open (vlc_object_t *obj)
         goto error;
     }
 
-    assert ((size_t)format < (sizeof (formats) / sizeof (formats[0])));
+    assert ((size_t)format < ARRAY_SIZE(formats));
     es_format_Init (&fmt, AUDIO_ES, formats[format]);
     fmt.audio.i_format = fmt.i_codec;
 
@@ -431,7 +436,7 @@ static int Open (vlc_object_t *obj)
         goto error;
     }
     assert (param > 0);
-    assert (param < (sizeof (channel_maps) / sizeof (channel_maps[0])));
+    assert (param < ARRAY_SIZE(channel_maps));
     fmt.audio.i_channels = param;
     fmt.audio.i_physical_channels = channel_maps[param - 1];
 
@@ -454,8 +459,8 @@ static int Open (vlc_object_t *obj)
     fmt.audio.i_rate = param;
     sys->rate = param;
 
-    sys->start = mdate ();
-    sys->caching = INT64_C(1000) * var_InheritInteger (demux, "live-caching");
+    sys->start = vlc_tick_now ();
+    sys->caching = VLC_TICK_FROM_MS(var_InheritInteger (demux, "live-caching"));
     param = sys->caching;
     val = snd_pcm_hw_params_set_buffer_time_near (pcm, hw, &param, NULL);
     if (val)
@@ -496,7 +501,7 @@ static int Open (vlc_object_t *obj)
     sys->es = es_out_Add (demux->out, &fmt);
     demux->p_sys = sys;
 
-    if (vlc_clone (&sys->thread, Thread, demux, VLC_THREAD_PRIORITY_INPUT))
+    if (vlc_clone (&sys->thread, Thread, demux))
     {
         es_out_Del (demux->out, sys->es);
         goto error;

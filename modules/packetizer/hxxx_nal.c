@@ -49,7 +49,7 @@ block_t *hxxx_AnnexB_to_xVC( block_t *p_block, uint8_t i_nal_length_size )
     {
         const uint8_t *p; /* start of prefixed nal */
         uint8_t  prefix; /* startcode length */
-        off_t    move; /* move offset */
+        size_t   move; /* move offset */
     } *p_list = NULL;
 
     if(!p_block->i_buffer || p_block->p_buffer[0])
@@ -62,7 +62,7 @@ block_t *hxxx_AnnexB_to_xVC( block_t *p_block, uint8_t i_nal_length_size )
     const uint8_t *p_buf = p_block->p_buffer;
     const uint8_t *p_end = &p_block->p_buffer[p_block->i_buffer];
     unsigned i_bitflow = 0;
-    off_t i_move = 0;
+    size_t i_move = 0;
     while( p_buf != p_end )
     {
         i_bitflow <<= 1;
@@ -82,7 +82,7 @@ block_t *hxxx_AnnexB_to_xVC( block_t *p_block, uint8_t i_nal_length_size )
                 p_list[i_nalcount].p = &p_buf[-2];
                 p_list[i_nalcount].prefix = 3;
             }
-            i_move += (off_t) i_nal_length_size - p_list[i_nalcount].prefix;
+            i_move += (size_t) i_nal_length_size - p_list[i_nalcount].prefix;
             p_list[i_nalcount++].move = i_move;
 
             /* Check and realloc our list */
@@ -122,31 +122,16 @@ block_t *hxxx_AnnexB_to_xVC( block_t *p_block, uint8_t i_nal_length_size )
 
     if( p_list[i_nalcount - 1].move != 0 || i_nal_length_size != 4 )  /* We'll need to grow or shrink */
     {
-        /* If we grow in size, try using realloc to avoid memcpy */
-        if( p_list[i_nalcount - 1].move > 0 && block_WillRealloc( p_block, 0, i_dest ) )
-        {
-            uint32_t i_sizebackup = p_block->i_buffer;
-            block_t *p_newblock = block_Realloc( p_block, 0, i_dest );
-            if( unlikely(!p_newblock) )
-                goto error;
+        block_t *p_newblock = block_Alloc( i_dest );
+        if( unlikely(!p_newblock) )
+            goto error;
 
-            p_block = p_newblock;
-            p_sourceend = &p_block->p_buffer[i_sizebackup];
-            p_source = p_dest = p_block->p_buffer;
-        }
-        else
-        {
-            block_t *p_newblock = block_Alloc( i_dest );
-            if( unlikely(!p_newblock) )
-                goto error;
+        p_release = p_block; /* Will be released after use */
+        p_source = p_release->p_buffer;
+        p_sourceend = &p_release->p_buffer[p_release->i_buffer];
 
-            p_release = p_block; /* Will be released after use */
-            p_source = p_release->p_buffer;
-            p_sourceend = &p_release->p_buffer[p_release->i_buffer];
-
-            p_block = p_newblock;
-            p_dest = p_newblock->p_buffer;
-        }
+        p_block = p_newblock;
+        p_dest = p_newblock->p_buffer;
     }
     else
     {
@@ -162,7 +147,7 @@ block_t *hxxx_AnnexB_to_xVC( block_t *p_block, uint8_t i_nal_length_size )
     {
         const uint8_t *p_readstart = p_list[i - 1].p;
         uint32_t i_payload = p_sourceend - p_readstart - p_list[i - 1].prefix;
-        off_t offset = p_list[i - 1].p - p_source + p_list[i - 1].prefix + p_list[i - 1].move;
+        size_t offset = p_list[i - 1].p - p_source + p_list[i - 1].prefix + p_list[i - 1].move;
 //        printf(" move offset %ld, length = %ld  prefix %ld move %ld\n", p_readstart - p_source, i_payload, p_list[i - 1].prefix, p_list[i-1].move);
 
         /* move in same / copy between buffers */

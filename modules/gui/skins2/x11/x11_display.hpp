@@ -2,7 +2,6 @@
  * x11_display.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -91,6 +90,7 @@ public:
 
     Atom m_net_wm_window_type;
     Atom m_net_wm_window_type_normal;
+    Atom m_net_wm_window_type_utility;
 
     Atom m_net_wm_state;
     Atom m_net_wm_state_above;

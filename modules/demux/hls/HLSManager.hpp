@@ -32,15 +32,12 @@ namespace hls
     {
         public:
             HLSManager( demux_t *,
-                        AuthStorage *,
+                        SharedResources *,
                         playlist::M3U8 *,
                         AbstractStreamFactory *,
                         logic::AbstractAdaptationLogic::LogicType type );
             virtual ~HLSManager();
             static bool isHTTPLiveStreaming(stream_t *);
-
-        protected:
-            virtual mtime_t getFirstPlaybackTime() const;
     };
 
 }

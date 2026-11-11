@@ -2,7 +2,6 @@
  * top_window.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -87,6 +86,9 @@ public:
     /// Get the initial visibility status
     bool getInitialVisibility() const { return m_initialVisibility; }
 
+    /// When the window is killed by the window manager
+    virtual void onDestroyed();
+
 protected:
     /// Actually show the window
     virtual void innerShow();
@@ -119,8 +121,6 @@ private:
     CtrlGeneric *m_pFocusControl;
     /// Control over which drag&drop is hovering
     CtrlGeneric *m_pDragControl;
-    /// Current key modifier (also used for mouse)
-    int m_currModifier;
 
     /// Variable for the visibility of the window
     VarBoolImpl *m_pVarMaximized;

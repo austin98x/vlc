@@ -2,7 +2,6 @@
  * xiph_metadata.h: Vorbis Comment parser
  *****************************************************************************
  * Copyright © 2008-2013 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *          Jean-Baptiste Kempf <jb@videolan.org>
@@ -29,40 +28,17 @@
 #include <assert.h>
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_charset.h>
 #include <vlc_strings.h>
 #include <vlc_arrays.h>
 #include <vlc_input.h>
 #include "xiph_metadata.h"
+#include "../meta_engine/ID3Pictures.h"
 
 input_attachment_t* ParseFlacPicture( const uint8_t *p_data, size_t size,
     int i_attachments, int *i_cover_score, int *i_cover_idx )
 {
-    /* TODO: Merge with ID3v2 copy in modules/meta_engine/taglib.cpp. */
-    static const char pi_cover_score[] = {
-        0,  /* Other */
-        5,  /* 32x32 PNG image that should be used as the file icon */
-        4,  /* File icon of a different size or format. */
-        20, /* Front cover image of the album. */
-        19, /* Back cover image of the album. */
-        13, /* Inside leaflet page of the album. */
-        18, /* Image from the album itself. */
-        17, /* Picture of the lead artist or soloist. */
-        16, /* Picture of the artist or performer. */
-        14, /* Picture of the conductor. */
-        15, /* Picture of the band or orchestra. */
-        9,  /* Picture of the composer. */
-        8,  /* Picture of the lyricist or text writer. */
-        7,  /* Picture of the recording location or studio. */
-        10, /* Picture of the artists during recording. */
-        11, /* Picture of the artists during performance. */
-        6,  /* Picture from a movie or video related to the track. */
-        1,  /* Picture of a large, coloured fish. */
-        12, /* Illustration related to the track. */
-        3,  /* Logo of the band or performer. */
-        2   /* Logo of the publisher (record company). */
-    };
-
     uint32_t type, len;
 
     if( size < 8 )
@@ -136,11 +112,11 @@ input_attachment_t* ParseFlacPicture( const uint8_t *p_data, size_t size,
     p_attachment = vlc_input_attachment_New( name, mime, description, p_data,
                                              size /* XXX: len instead? */ );
 
-    if( type < ARRAY_SIZE(pi_cover_score) &&
-        *i_cover_score < pi_cover_score[type] )
+    if( type < ARRAY_SIZE(ID3v2_cover_scores) &&
+        *i_cover_score < ID3v2_cover_scores[type] )
     {
         *i_cover_idx = i_attachments;
-        *i_cover_score = pi_cover_score[type];
+        *i_cover_score = ID3v2_cover_scores[type];
     }
 
 error:
@@ -296,7 +272,7 @@ static void xiph_ParseCueSheetMeta( unsigned *pi_flags, vlc_meta_t *p_meta,
         unsigned m, s, f;
         if( sscanf( &psz_line[13], "%u:%u:%u", &m, &s, &f ) == 3 )
         {
-            p_seekpoint->i_time_offset = CLOCK_FREQ * (m * 60 + s) + f * CLOCK_FREQ/75;
+            p_seekpoint->i_time_offset = vlc_tick_from_sec(m * 60 + s) + vlc_tick_from_samples(f, 75);
             *pb_valid = true;
         }
     }
@@ -351,9 +327,7 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
         const uint8_t *p_data, size_t i_data,
         int *i_attachments, input_attachment_t ***attachments,
         int *i_cover_score, int *i_cover_idx,
-        int *i_seekpoint, seekpoint_t ***ppp_seekpoint,
-        float (* ppf_replay_gain)[AUDIO_REPLAY_GAIN_MAX],
-        float (* ppf_replay_peak)[AUDIO_REPLAY_GAIN_MAX] )
+        int *i_seekpoint, seekpoint_t ***ppp_seekpoint )
 {
     if( i_data < 8 )
         return;
@@ -404,41 +378,38 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
         memcpy( psz_comment, p_data, comment_size );
         psz_comment[comment_size] = '\0';
 
-        EnsureUTF8( psz_comment );
-
 #define IF_EXTRACT(txt,var) \
     if( !strncasecmp(psz_comment, txt, strlen(txt)) ) \
     { \
+        size_t key_length = strlen(txt); \
+        EnsureUTF8( psz_comment + key_length ); \
         const char *oldval = vlc_meta_Get( p_meta, vlc_meta_ ## var ); \
         if( oldval && (hasMetaFlags & XIPHMETA_##var)) \
         { \
             char * newval; \
-            if( asprintf( &newval, "%s,%s", oldval, &psz_comment[strlen(txt)] ) == -1 ) \
+            if( asprintf( &newval, "%s,%s", oldval, &psz_comment[key_length] ) == -1 ) \
                 newval = NULL; \
             vlc_meta_Set( p_meta, vlc_meta_ ## var, newval ); \
             free( newval ); \
         } \
         else \
-            vlc_meta_Set( p_meta, vlc_meta_ ## var, &psz_comment[strlen(txt)] ); \
+            vlc_meta_Set( p_meta, vlc_meta_ ## var, &psz_comment[key_length] ); \
         hasMetaFlags |= XIPHMETA_##var; \
     }
 
-#define IF_EXTRACT_ONCE(txt,var) \
+#define IF_EXTRACT_ONCE_NUMBER(txt,var) \
     if( !strncasecmp(psz_comment, txt, strlen(txt)) && !(hasMetaFlags & XIPHMETA_##var) ) \
     { \
-        vlc_meta_Set( p_meta, vlc_meta_ ## var, &psz_comment[strlen(txt)] ); \
-        hasMetaFlags |= XIPHMETA_##var; \
-    }
-
-#define IF_EXTRACT_FMT(txt,var,fmt,target) \
-    if( !strncasecmp(psz_comment, txt, strlen(txt)) ) \
-    { \
-        IF_EXTRACT(txt,var)\
-        if( fmt )\
-        {\
-            free( fmt->target );\
-            fmt->target = strdup(&psz_comment[strlen(txt)]);\
-        }\
+        bool isnum = true; \
+        const char *num_str = &psz_comment[strlen(txt)], *c; \
+        for (c = num_str; isnum && *c != '\0'; c++) { \
+            isnum = *c >= '0' && *c <= '9'; \
+        } \
+        if (isnum) \
+        { \
+            vlc_meta_Set( p_meta, vlc_meta_ ## var, num_str ); \
+            hasMetaFlags |= XIPHMETA_##var; \
+        } \
     }
 
         IF_EXTRACT("TITLE=", Title )
@@ -466,14 +437,22 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
                 }
             }
         }
-        else IF_EXTRACT_ONCE("TRACKTOTAL=", TrackTotal )
-        else IF_EXTRACT_ONCE("TOTALTRACKS=", TrackTotal )
+        else IF_EXTRACT_ONCE_NUMBER("TRACKTOTAL=", TrackTotal )
+        else IF_EXTRACT_ONCE_NUMBER("TOTALTRACKS=", TrackTotal )
         else IF_EXTRACT("DESCRIPTION=", Description )
         else IF_EXTRACT("COMMENT=", Description )
         else IF_EXTRACT("COMMENTS=", Description )
         else IF_EXTRACT("RATING=", Rating )
         else IF_EXTRACT("DATE=", Date )
-        else IF_EXTRACT_FMT("LANGUAGE=", Language, p_fmt, psz_language )
+        else if( !strncasecmp(psz_comment, "LANGUAGE=", strlen("LANGUAGE=") ) )
+        {
+            IF_EXTRACT("LANGUAGE=",Language)
+            if( p_fmt )
+            {
+                free( p_fmt->psz_language );
+                p_fmt->psz_language = strdup(&psz_comment[strlen("LANGUAGE=")]);
+            }
+        }
         else IF_EXTRACT("ORGANIZATION=", Publisher )
         else IF_EXTRACT("ENCODER=", EncodedBy )
         else if( !strncasecmp( psz_comment, "METADATA_BLOCK_PICTURE=", strlen("METADATA_BLOCK_PICTURE=")))
@@ -492,27 +471,6 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
                     *i_attachments, *attachments, p_attachment );
             }
         }
-        else if ( ppf_replay_gain && ppf_replay_peak && !strncmp(psz_comment, "REPLAYGAIN_", 11) )
-        {
-            char *p = strchr( psz_comment, '=' );
-            if (!p) goto next_comment;
-            if ( !strncasecmp(psz_comment, "REPLAYGAIN_TRACK_GAIN=", 22) )
-            {
-                (*ppf_replay_gain)[AUDIO_REPLAY_GAIN_TRACK] = us_atof( ++p );
-            }
-            else if ( !strncasecmp(psz_comment, "REPLAYGAIN_ALBUM_GAIN=", 22) )
-            {
-                (*ppf_replay_gain)[AUDIO_REPLAY_GAIN_ALBUM] = us_atof( ++p );
-            }
-            else if ( !strncasecmp(psz_comment, "REPLAYGAIN_ALBUM_PEAK=", 22) )
-            {
-                (*ppf_replay_peak)[AUDIO_REPLAY_GAIN_ALBUM] = us_atof( ++p );
-            }
-            else if ( !strncasecmp(psz_comment, "REPLAYGAIN_TRACK_PEAK=", 22) )
-            {
-                (*ppf_replay_peak)[AUDIO_REPLAY_GAIN_TRACK] = us_atof( ++p );
-            }
-        }
         else if( !strncasecmp(psz_comment, "CHAPTER", 7) )
         {
             unsigned int i_chapt;
@@ -528,8 +486,9 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
                 char *p = strchr( psz_comment, '=' );
                 p_seekpoint = getChapterEntry( i_chapt, &chapters_array );
                 if ( !p || ! p_seekpoint ) goto next_comment;
+                EnsureUTF8( ++p );
                 if ( ! p_seekpoint->psz_name )
-                    p_seekpoint->psz_name = strdup( ++p );
+                    p_seekpoint->psz_name = strdup( p );
             }
             else if( sscanf( psz_comment, "CHAPTER%u=", &i_chapt ) == 1 )
             {
@@ -539,13 +498,13 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
                 {
                     p_seekpoint = getChapterEntry( i_chapt, &chapters_array );
                     if ( ! p_seekpoint ) goto next_comment;
-                    p_seekpoint->i_time_offset =
-                      (((int64_t)h * 3600 + (int64_t)m * 60 + (int64_t)s) * 1000 + ms) * 1000;
+                    p_seekpoint->i_time_offset = vlc_tick_from_sec(h * 3600 + m * 60 + s) + VLC_TICK_FROM_MS(ms);
                 }
             }
         }
         else if( !strncasecmp(psz_comment, "cuesheet=", 9) )
         {
+            EnsureUTF8( &psz_comment[9] );
             xiph_ParseCueSheet( &hasMetaFlags, p_meta, &psz_comment[9], comment_size - 9,
                                 i_seekpoint, ppp_seekpoint );
         }
@@ -555,12 +514,13 @@ void vorbis_ParseComment( es_format_t *p_fmt, vlc_meta_t **pp_meta,
              * undocumented tags and replay gain ) */
             char *p = strchr( psz_comment, '=' );
             *p++ = '\0';
+            EnsureUTF8( p );
 
             for( int i = 0; psz_comment[i]; i++ )
                 if( psz_comment[i] >= 'a' && psz_comment[i] <= 'z' )
                     psz_comment[i] -= 'a' - 'A';
 
-            vlc_meta_AddExtra( p_meta, psz_comment, p );
+            vlc_meta_SetExtra( p_meta, psz_comment, p );
         }
 #undef IF_EXTRACT
 next_comment:
@@ -587,4 +547,3 @@ const char *FindKateCategoryName( const char *psz_tag )
     }
     return N_("Unknown category");
 }
-

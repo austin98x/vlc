@@ -2,7 +2,6 @@
  * scene.c : scene video filter (based on modules/video_output/image.c)
  *****************************************************************************
  * Copyright (C) 2004-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Jean-Paul Saman <jpsaman@videolan.org>
  *          Clément Stenac <zorglub@videolan.org>
@@ -34,6 +33,7 @@
 #include <errno.h>
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
@@ -45,8 +45,8 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  Create      ( vlc_object_t * );
-static void Destroy     ( vlc_object_t * );
+static int  Create      ( filter_t * );
+static void Destroy     ( filter_t * );
 
 static picture_t *Filter( filter_t *, picture_t * );
 
@@ -95,29 +95,27 @@ vlc_module_begin ()
     set_shortname( N_( "Scene filter" ) )
     set_description( N_( "Scene video filter" ) )
     set_help(SCENE_HELP)
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
-    set_capability( "video filter", 0 )
 
     /* General options */
     add_string(  CFG_PREFIX "format", "png",
-                 FORMAT_TEXT, FORMAT_LONGTEXT, false )
+                 FORMAT_TEXT, FORMAT_LONGTEXT )
     add_integer( CFG_PREFIX "width", -1,
-                 WIDTH_TEXT, WIDTH_LONGTEXT, true )
+                 WIDTH_TEXT, WIDTH_LONGTEXT )
     add_integer( CFG_PREFIX "height", -1,
-                 HEIGHT_TEXT, HEIGHT_LONGTEXT, true )
+                 HEIGHT_TEXT, HEIGHT_LONGTEXT )
     add_string(  CFG_PREFIX "prefix", "scene",
-                 PREFIX_TEXT, PREFIX_LONGTEXT, false )
+                 PREFIX_TEXT, PREFIX_LONGTEXT )
     add_string(  CFG_PREFIX "path", NULL,
-                 PATH_TEXT, PATH_LONGTEXT, false )
+                 PATH_TEXT, PATH_LONGTEXT )
     add_bool(    CFG_PREFIX "replace", false,
-                 REPLACE_TEXT, REPLACE_LONGTEXT, false )
+                 REPLACE_TEXT, REPLACE_LONGTEXT )
 
     /* Snapshot method */
     add_integer_with_range( CFG_PREFIX "ratio", 50, 1, INT_MAX,
-                            RATIO_TEXT, RATIO_LONGTEXT, false )
+                            RATIO_TEXT, RATIO_LONGTEXT )
 
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 static const char *const ppsz_vfilter_options[] = {
@@ -132,7 +130,7 @@ typedef struct scene_t {
 /*****************************************************************************
  * filter_sys_t: private data
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     image_handler_t *p_image;
     scene_t scene;
@@ -146,19 +144,19 @@ struct filter_sys_t
     int32_t i_ratio;  /* save every n-th frame */
     int32_t i_frames; /* frames count */
     bool  b_replace;
-};
+} filter_sys_t;
 
 /*****************************************************************************
- * Create: initialize and set pf_video_filter()
+ * Create: initialize and set ops
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     const vlc_chroma_description_t *p_chroma =
         vlc_fourcc_GetChromaDescription( p_filter->fmt_in.video.i_chroma );
-    if( p_chroma == NULL || p_chroma->plane_count == 0 )
+    assert( p_chroma != NULL );
+    if( p_chroma->plane_count == 0 )
         return VLC_EGENERIC;
 
     config_ChainParse( p_filter, CFG_PREFIX, ppsz_vfilter_options,
@@ -168,15 +166,15 @@ static int Create( vlc_object_t *p_this )
     if( p_filter->p_sys == NULL )
         return VLC_ENOMEM;
 
-    p_sys->p_image = image_HandlerCreate( p_this );
+    p_sys->p_image = image_HandlerCreate( p_filter );
     if( !p_sys->p_image )
     {
-        msg_Err( p_this, "Couldn't get handle to image conversion routines." );
+        msg_Err( p_filter, "Couldn't get handle to image conversion routines." );
         free( p_sys );
         return VLC_EGENERIC;
     }
 
-    p_sys->psz_format = var_CreateGetString( p_this, CFG_PREFIX "format" );
+    p_sys->psz_format = var_CreateGetString( p_filter, CFG_PREFIX "format" );
     p_sys->i_format = image_Type2Fourcc( p_sys->psz_format );
     if( !p_sys->i_format )
     {
@@ -187,18 +185,32 @@ static int Create( vlc_object_t *p_this )
         free( p_sys );
         return VLC_EGENERIC;
     }
-    p_sys->i_width = var_CreateGetInteger( p_this, CFG_PREFIX "width" );
-    p_sys->i_height = var_CreateGetInteger( p_this, CFG_PREFIX "height" );
-    p_sys->i_ratio = var_CreateGetInteger( p_this, CFG_PREFIX "ratio" );
+    p_sys->i_width = var_CreateGetInteger( p_filter, CFG_PREFIX "width" );
+    p_sys->i_height = var_CreateGetInteger( p_filter, CFG_PREFIX "height" );
+    p_sys->i_ratio = var_CreateGetInteger( p_filter, CFG_PREFIX "ratio" );
     if( p_sys->i_ratio <= 0)
         p_sys->i_ratio = 1;
-    p_sys->b_replace = var_CreateGetBool( p_this, CFG_PREFIX "replace" );
-    p_sys->psz_prefix = var_CreateGetString( p_this, CFG_PREFIX "prefix" );
-    p_sys->psz_path = var_GetNonEmptyString( p_this, CFG_PREFIX "path" );
+    p_sys->b_replace = var_CreateGetBool( p_filter, CFG_PREFIX "replace" );
+    p_sys->psz_prefix = var_CreateGetString( p_filter, CFG_PREFIX "prefix" );
+    p_sys->psz_path = var_GetNonEmptyString( p_filter, CFG_PREFIX "path" );
     if( p_sys->psz_path == NULL )
-        p_sys->psz_path = config_GetUserDir( VLC_PICTURES_DIR );
+        p_sys->psz_path = config_GetUserDir( VLC_SNAPSHOTS_DIR );
 
-    p_filter->pf_video_filter = Filter;
+    if (unlikely(p_sys->psz_path == NULL))
+    {
+        msg_Err( p_filter, "could not create snapshot: no directory" );
+        image_HandlerDelete( p_sys->p_image );
+        free( p_sys->psz_prefix );
+        free( p_sys->psz_format );
+        free( p_sys );
+        return VLC_EGENERIC;
+    }
+
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_video = Filter, .close = Destroy,
+    };
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 }
@@ -206,10 +218,9 @@ static int Create( vlc_object_t *p_this )
 /*****************************************************************************
  * Destroy: destroy video filter method
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-    filter_sys_t *p_sys = (filter_sys_t *) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     image_HandlerDelete( p_sys->p_image );
 
@@ -233,7 +244,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 
 static void SnapshotRatio( filter_t *p_filter, picture_t *p_pic )
 {
-    filter_sys_t *p_sys = (filter_sys_t *)p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     if( !p_pic ) return;
 
@@ -274,20 +285,19 @@ static void SnapshotRatio( filter_t *p_filter, picture_t *p_pic )
  *****************************************************************************/
 static void SavePicture( filter_t *p_filter, picture_t *p_pic )
 {
-    filter_sys_t *p_sys = (filter_sys_t *)p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     video_format_t fmt_in, fmt_out;
     char *psz_filename = NULL;
     char *psz_temp = NULL;
     int i_ret;
 
-    memset( &fmt_out, 0, sizeof(video_format_t) );
+    video_format_Init( &fmt_out, 0 );
 
     /* Save snapshot psz_format to a memory zone */
     fmt_in = p_pic->format;
     fmt_out.i_sar_num = fmt_out.i_sar_den = 1;
     fmt_out.i_width = p_sys->i_width;
     fmt_out.i_height = p_sys->i_height;
-    fmt_out.i_chroma = p_sys->i_format;
 
     /*
      * Save the snapshot to a temporary file and
@@ -316,7 +326,7 @@ static void SavePicture( filter_t *p_filter, picture_t *p_pic )
     }
 
     /* Save the image */
-    i_ret = image_WriteUrl( p_sys->p_image, p_pic, &fmt_in, &fmt_out,
+    i_ret = image_WriteUrl( p_sys->p_image, p_pic, &fmt_in, p_sys->i_format, &fmt_out,
                             psz_temp );
     if( i_ret != VLC_SUCCESS )
     {

@@ -25,8 +25,8 @@
 #ifndef MPD_H_
 #define MPD_H_
 
-#include "../adaptive/playlist/AbstractPlaylist.hpp"
-#include "../adaptive/StreamFormat.hpp"
+#include "../../adaptive/playlist/BasePlaylist.hpp"
+#include "../../adaptive/StreamFormat.hpp"
 #include "Profile.hpp"
 
 namespace dash
@@ -38,22 +38,25 @@ namespace dash
 
         class ProgramInformation;
 
-        class MPD : public AbstractPlaylist
+        class MPD : public BasePlaylist
         {
+            friend class IsoffMainParser;
+
             public:
                 MPD(vlc_object_t *, Profile);
                 virtual ~MPD();
 
                 Profile                         getProfile() const;
-                virtual bool                    isLive() const;
-                virtual void                    debug();
+                bool                            isLive() const override;
+                bool                            isLowLatency() const override;
+                void                            setLowLatency(bool);
+                void                            debug() const override;
 
-                static StreamFormat             mimeToFormat(const std::string &);
-
-                Property<ProgramInformation *>      programInfo;
+                ProgramInformation *            programInfo;
 
             private:
                 Profile                             profile;
+                bool                                lowLatency;
         };
     }
 }

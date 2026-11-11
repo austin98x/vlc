@@ -31,45 +31,34 @@
 
 #include <assert.h>
 
-static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_gesture, const GESTUREINFO* p_gi );
-static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *p_gesture, const GESTUREINFO* p_gi );
+enum {
+    GESTURE_ACTION_UNDEFINED = 0,
+    GESTURE_ACTION_VOLUME,
+    GESTURE_ACTION_JUMP,
+    GESTURE_ACTION_BRIGHTNESS
+};
 
-LRESULT DecodeGesture( vlc_object_t *p_this, win32_gesture_sys_t *p_gesture,
-                       HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam )
+
+struct win32_gesture_sys_t
 {
-    if( !p_gesture )
-        return DefWindowProc( hWnd, message, wParam, lParam );
+    DWORD       i_type;                 /* Gesture ID */
+    int         i_action;               /* GESTURE_ACTION */
 
-    GESTUREINFO gi;
-    ZeroMemory( &gi, sizeof( GESTUREINFO ) );
-    gi.cbSize = sizeof( GESTUREINFO );
+    int         i_beginx;               /* Start X position */
+    int         i_beginy;               /* Start Y position */
+    int         i_lasty;                /* Last known Y position for PAN */
+    double      f_lastzoom;             /* Last zoom factor */
 
-    BOOL bResult  = p_gesture->OurGetGestureInfo((HGESTUREINFO)lParam, &gi);
-    BOOL bHandled = FALSE; /* Needed to release the handle */
+    ULONGLONG   i_ullArguments;         /* Base values to compare between 2 zoom gestures */
+    bool        b_2fingers;             /* Did we detect 2 fingers? */
 
-    if( bResult )
-        bHandled = p_gesture->DecodeGestureImpl(p_this, p_gesture, &gi);
-    else
-    {
-        DWORD dwErr = GetLastError();
-        if( dwErr > 0 )
-            msg_Err( p_this, "Could not retrieve a valid GESTUREINFO structure" );
-    }
+    bool (*DecodeGestureImpl)( vlc_object_t *, struct win32_gesture_sys_t *, const GESTUREINFO* );
+};
 
-    if( bHandled )
-    {
-        /* Close the Handle, if we handled the gesture, a contrario
-         * from the doc example */
-        p_gesture->OurCloseGestureInfoHandle((HGESTUREINFO)lParam);
-        return 0;
-    }
-    else
-        return DefWindowProc( hWnd, message, wParam, lParam );
-}
 
-static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_gesture, const GESTUREINFO* p_gi )
+static bool DecodeGestureAction( vlc_object_t *p_this, struct win32_gesture_sys_t *p_gesture, const GESTUREINFO* p_gi )
 {
-    BOOL bHandled = FALSE; /* Needed to release the handle */
+    bool bHandled = false; /* Needed to release the handle */
     switch ( p_gi->dwID )
     {
         case GID_BEGIN:
@@ -98,7 +87,7 @@ static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_ge
                     else
                         action_id = ACTIONID_JUMP_FORWARD_SHORT;
                 }
-                var_SetInteger( p_this->obj.libvlc, "key-action", action_id );
+                var_SetInteger( vlc_object_instance(p_this), "key-action", action_id );
             }
             /* Reset the values */
             p_gesture->i_action = GESTURE_ACTION_UNDEFINED;
@@ -107,7 +96,7 @@ static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_ge
             break;
         case GID_PAN:
             p_gesture->i_type = GID_PAN;
-            bHandled = TRUE;
+            bHandled = true;
 
             if (p_gi->dwFlags & GF_BEGIN) {
                 p_gesture->i_beginx = p_gi->ptsLocation.x;
@@ -137,9 +126,9 @@ static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_ge
                 int offset = p_gesture->i_lasty - p_gi->ptsLocation.y;
 
                 if( offset > 100)
-                    var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_VOL_UP );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_VOL_UP );
                 else if( offset < -100)
-                    var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_VOL_DOWN );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_VOL_DOWN );
                 else
                     break;
 
@@ -153,20 +142,20 @@ static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_ge
 
                 if( p_gesture->i_lasty - p_gesture->i_beginy > 80 )
                 {
-                    var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_BRIGHTNESS_DOWN );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_BRIGHTNESS_DOWN );
                     p_gesture->i_lasty = p_gi->ptsLocation.y;
                 }
                 else if ( p_gesture->i_lasty - p_gesture->i_beginy < 80 )
                 {
-                    var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_BRIGHTNESS_UP );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_BRIGHTNESS_UP );
                     p_gesture->i_lasty = p_gi->ptsLocation.y;
                 } */
             }
             break;
         case GID_TWOFINGERTAP:
             p_gesture->i_type = GID_TWOFINGERTAP;
-            var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_PLAY_PAUSE );
-            bHandled = TRUE;
+            var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_PLAY_PAUSE );
+            bHandled = true;
             break;
         case GID_ZOOM:
             p_gesture->i_type = GID_ZOOM;
@@ -180,20 +169,20 @@ static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_ge
                         double k = (double)(p_gi->ullArguments) /
                                    (double)(p_gesture->i_ullArguments);
                         if( k > 1 )
-                            var_SetInteger( p_this->obj.libvlc, "key-action",
+                            var_SetInteger( vlc_object_instance(p_this), "key-action",
                                     ACTIONID_TOGGLE_FULLSCREEN );
                         else
-                            var_SetInteger( p_this->obj.libvlc, "key-action",
+                            var_SetInteger( vlc_object_instance(p_this), "key-action",
                                     ACTIONID_LEAVE_FULLSCREEN );
                     }
                     break;
                 default:
                     msg_Err( p_this, "Unmanaged dwFlag: %lx", p_gi->dwFlags );
             }
-            bHandled = TRUE;
+            bHandled = true;
             break;
         case WM_VSCROLL:
-            bHandled = TRUE;
+            bHandled = true;
             break;
         default:
             break;
@@ -202,11 +191,11 @@ static BOOL DecodeGestureAction( vlc_object_t *p_this, win32_gesture_sys_t *p_ge
 }
 
 
-static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *p_gesture, const GESTUREINFO* p_gi )
+static bool DecodeGestureProjection( vlc_object_t *p_this, struct win32_gesture_sys_t *p_gesture, const GESTUREINFO* p_gi )
 {
     //vout_display_t *vd = (vout_display_t *)p_this;
 
-    BOOL bHandled = FALSE; /* Needed to release the handle */
+    bool bHandled = false; /* Needed to release the handle */
     switch ( p_gi->dwID )
     {
         case GID_BEGIN:
@@ -227,7 +216,7 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
                         action_id = ACTIONID_JUMP_BACKWARD_SHORT;
                     else
                         action_id = ACTIONID_JUMP_FORWARD_SHORT;
-                    var_SetInteger( p_this->obj.libvlc, "key-action", action_id );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", action_id );
                 }
             }
             /* Reset the values */
@@ -238,7 +227,7 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
         case GID_PAN:
             //vd->cfg->display.width;
             p_gesture->i_type = GID_PAN;
-            bHandled = TRUE;
+            bHandled = true;
             if (p_gi->dwFlags & GF_BEGIN) {
                 p_gesture->i_beginx = p_gi->ptsLocation.x;
                 p_gesture->i_beginy = p_gi->ptsLocation.y;
@@ -265,9 +254,9 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
                 int offset = p_gesture->i_lasty - p_gi->ptsLocation.y;
 
                 if( offset > 100)
-                    var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_VOL_UP );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_VOL_UP );
                 else if( offset < -100)
-                    var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_VOL_DOWN );
+                    var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_VOL_DOWN );
                 else
                     break;
 
@@ -276,12 +265,12 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
             break;
         case GID_TWOFINGERTAP:
             p_gesture->i_type = GID_TWOFINGERTAP;
-            var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_PLAY_PAUSE );
-            bHandled = TRUE;
+            var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_PLAY_PAUSE );
+            bHandled = true;
             break;
         case GID_ZOOM:
             p_gesture->i_type = GID_ZOOM;
-            bHandled = TRUE;
+            bHandled = true;
             switch( p_gi->dwFlags )
             {
                 case GF_BEGIN:
@@ -295,12 +284,12 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
 
                     if (k > p_gesture->f_lastzoom * 1.01)
                     {
-                        var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_VIEWPOINT_FOV_IN );
+                        var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_VIEWPOINT_FOV_IN );
                         p_gesture->f_lastzoom = k;
                     }
                     else if (k < p_gesture->f_lastzoom * 0.99)
                     {
-                        var_SetInteger( p_this->obj.libvlc, "key-action", ACTIONID_VIEWPOINT_FOV_OUT );
+                        var_SetInteger( vlc_object_instance(p_this), "key-action", ACTIONID_VIEWPOINT_FOV_OUT );
                         p_gesture->f_lastzoom = k;
                     }
                     break;
@@ -308,7 +297,7 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
             }
             break;
         case WM_VSCROLL:
-            bHandled = TRUE;
+            bHandled = true;
             break;
         default:
             break;
@@ -316,7 +305,37 @@ static BOOL DecodeGestureProjection( vlc_object_t *p_this, win32_gesture_sys_t *
     return bHandled;
 }
 
-BOOL InitGestures( HWND hwnd, win32_gesture_sys_t **pp_gesture, bool b_isProjected )
+bool DecodeGesture( vlc_object_t *p_this, struct win32_gesture_sys_t *p_gesture,
+                    HGESTUREINFO hGestureInfo )
+{
+    if( !p_gesture )
+        return false;
+
+    GESTUREINFO gi;
+    ZeroMemory( &gi, sizeof( GESTUREINFO ) );
+    gi.cbSize = sizeof( GESTUREINFO );
+
+    if( GetGestureInfo(hGestureInfo, &gi) )
+    {
+        if( p_gesture->DecodeGestureImpl(p_this, p_gesture, &gi) )
+        {
+            /* Close the Handle, if we handled the gesture, a contrario
+             * from the doc example */
+            CloseGestureInfoHandle(hGestureInfo);
+            return true;
+        }
+    }
+    else
+    {
+        DWORD dwErr = GetLastError();
+        if( dwErr > 0 )
+            msg_Err( p_this, "Could not retrieve a valid GESTUREINFO structure" );
+    }
+
+    return false;
+}
+
+struct win32_gesture_sys_t *InitGestures( HWND hwnd, bool b_isProjected )
 {
     BOOL result = FALSE;
     GESTURECONFIG config = { 0, 0, 0 };
@@ -337,37 +356,21 @@ BOOL InitGestures( HWND hwnd, win32_gesture_sys_t **pp_gesture, bool b_isProject
         config.dwBlock = GC_PAN_WITH_INERTIA;
     }
 
-    win32_gesture_sys_t *p_gesture = malloc( sizeof(win32_gesture_sys_t) );
-    if( !p_gesture )
-    {
-        *pp_gesture = NULL;
-        return FALSE;
-    }
+    struct win32_gesture_sys_t *p_gesture = malloc( sizeof(*p_gesture) );
+    if( unlikely(!p_gesture) )
+        return NULL;
 
-    HINSTANCE h_user32_dll = LoadLibrary(TEXT("user32.dll"));
-    if( !h_user32_dll )
+    result = SetGestureConfig(
+            hwnd,
+            0,
+            1,
+            &config,
+            sizeof( GESTURECONFIG )
+            );
+    if (result == 0)
     {
-        *pp_gesture = NULL;
-        free( p_gesture );
-        return FALSE;
-    }
-
-    BOOL (WINAPI *OurSetGestureConfig) (HWND, DWORD, UINT, PGESTURECONFIG, UINT);
-    OurSetGestureConfig = (void *)GetProcAddress(h_user32_dll, "SetGestureConfig");
-
-    p_gesture->OurCloseGestureInfoHandle =
-        (void *)GetProcAddress(h_user32_dll, "CloseGestureInfoHandle" );
-    p_gesture->OurGetGestureInfo =
-        (void *)GetProcAddress(h_user32_dll, "GetGestureInfo");
-    if( OurSetGestureConfig )
-    {
-        result = OurSetGestureConfig(
-                hwnd,
-                0,
-                1,
-                &config,
-                sizeof( GESTURECONFIG )
-                );
+        free(p_gesture);
+        return NULL;
     }
     if (b_isProjected)
         p_gesture->DecodeGestureImpl = DecodeGestureProjection;
@@ -379,15 +382,11 @@ BOOL InitGestures( HWND hwnd, win32_gesture_sys_t **pp_gesture, bool b_isProject
     p_gesture->i_action   = GESTURE_ACTION_UNDEFINED;
     p_gesture->i_beginx   = p_gesture->i_beginy = -1;
     p_gesture->i_lasty    = -1;
-    p_gesture->huser_dll  = h_user32_dll;
 
-    *pp_gesture = p_gesture;
-    return result;
+    return p_gesture;
 }
 
-void CloseGestures( win32_gesture_sys_t *p_gesture )
+void CloseGestures( struct win32_gesture_sys_t *p_gesture )
 {
-    if (p_gesture && p_gesture->huser_dll )
-        FreeLibrary( p_gesture->huser_dll );
     free( p_gesture );
 }

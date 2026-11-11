@@ -1,6 +1,12 @@
+!include "StrFunc.nsh"
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; 1. File type associations ;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; "Initialize" string functions
+${StrRep}
+${StrCase}
 
 ;; Function that associates one extension with VLC
 Function AssociateExtension
@@ -15,7 +21,13 @@ FunctionEnd
 
 ;; Function that registers one extension for VLC
 Function RegisterExtension
-  WriteRegStr HKCR "VLC$R0" "" "VLC media file"
+  ; R0 contains the extension, R1 contains the type (Audio/Video)
+  ; Remove the leading dot from the filetype string
+  ${StrRep} $R2 $R0 "." ""
+  ; And capitalize the extension
+  ${StrCase} $R2 $R2 "U"
+  ; for instance: MKV Video File (VLC)
+  WriteRegStr HKCR "VLC$R0" "" "$R2 $R1 File (VLC)"
   WriteRegStr HKCR "VLC$R0\shell" "" "Open"
   WriteRegStr HKCR "VLC$R0\shell\Open" "" "$(ShellAssociation_Play)"
   WriteRegStr HKCR "VLC$R0\shell\Open" "MultiSelectModel" "Player"
@@ -92,7 +104,10 @@ FunctionEnd
 !macro RegisterExtensionMacro TYPE EXT
   Push $R0
   StrCpy $R0 ${EXT}
+  Push $R1
+  StrCpy $R1 ${TYPE}
   Call RegisterExtension
+  Pop $R1
   Pop $R0
 !macroend
 
@@ -126,18 +141,20 @@ FunctionEnd
   !insertmacro ${_action} Audio ".aif"
   !insertmacro ${_action} Audio ".aifc"
   !insertmacro ${_action} Audio ".aiff"
-  !insertmacro ${_action} Audio ".au"
+  !insertmacro ${_action} Audio ".alac"
   !insertmacro ${_action} Audio ".amr"
   !insertmacro ${_action} Audio ".aob"
+  !insertmacro ${_action} Audio ".au"
   !insertmacro ${_action} Audio ".ape"
   !insertmacro ${_action} Audio ".caf"
   !insertmacro ${_action} Audio ".cda"
   !insertmacro ${_action} Audio ".dts"
+  !insertmacro ${_action} Audio ".dsf"
+  !insertmacro ${_action} Audio ".dff"
   !insertmacro ${_action} Audio ".flac"
   !insertmacro ${_action} Audio ".it"
   !insertmacro ${_action} Audio ".m4a"
   !insertmacro ${_action} Audio ".m4p"
-  !insertmacro ${_action} Audio ".mid"
   !insertmacro ${_action} Audio ".mka"
   !insertmacro ${_action} Audio ".mlp"
   !insertmacro ${_action} Audio ".mod"
@@ -155,6 +172,7 @@ FunctionEnd
   !insertmacro ${_action} Audio ".snd"
   !insertmacro ${_action} Audio ".s3m"
   !insertmacro ${_action} Audio ".spx"
+  !insertmacro ${_action} Audio ".tak"
   !insertmacro ${_action} Audio ".tta"
   !insertmacro ${_action} Audio ".voc"
   !insertmacro ${_action} Audio ".vqf"
@@ -171,10 +189,12 @@ FunctionEnd
   !insertmacro ${_action} Video ".3gp"
   !insertmacro ${_action} Video ".3gp2"
   !insertmacro ${_action} Video ".3gpp"
+  !insertmacro ${_action} Video ".amrec"
   !insertmacro ${_action} Video ".amv"
   !insertmacro ${_action} Video ".asf"
   !insertmacro ${_action} Video ".avi"
   !insertmacro ${_action} Video ".bik"
+  !insertmacro ${_action} Video ".dav"
   !insertmacro ${_action} Video ".divx"
   !insertmacro ${_action} Video ".drc"
   !insertmacro ${_action} Video ".dv"
@@ -184,6 +204,7 @@ FunctionEnd
   !insertmacro ${_action} Video ".flv"
   !insertmacro ${_action} Video ".gvi"
   !insertmacro ${_action} Video ".gxf"
+  !insertmacro ${_action} Video ".k3g"
   !insertmacro ${_action} Video ".m1v"
   !insertmacro ${_action} Video ".m2t"
   !insertmacro ${_action} Video ".m2v"
@@ -211,16 +232,19 @@ FunctionEnd
   !insertmacro ${_action} Video ".ogm"
   !insertmacro ${_action} Video ".ogx"
   !insertmacro ${_action} Video ".ogv"
+  !insertmacro ${_action} Video ".qt"
   !insertmacro ${_action} Video ".rec"
   !insertmacro ${_action} Video ".rm"
   !insertmacro ${_action} Video ".rmvb"
   !insertmacro ${_action} Video ".rpl"
+  !insertmacro ${_action} Video ".skm"
   !insertmacro ${_action} Video ".thp"
   !insertmacro ${_action} Video ".tod"
   !insertmacro ${_action} Video ".tp"
   !insertmacro ${_action} Video ".ts"
   !insertmacro ${_action} Video ".tts"
   !insertmacro ${_action} Video ".vob"
+  !insertmacro ${_action} Video ".vp6"
   !insertmacro ${_action} Video ".vro"
   !insertmacro ${_action} Video ".webm"
   !insertmacro ${_action} Video ".wmv"
@@ -241,10 +265,13 @@ FunctionEnd
   !insertmacro ${_action} Other ".vlc"
   !insertmacro ${_action} Other ".wvx"
   !insertmacro ${_action} Other ".xspf"
+  !insertmacro ${_action} Other ".wpl"
+  !insertmacro ${_action} Other ".zpl"
 !macroend
 
 !macro MacroUnassociatedExtensions _action
   !insertmacro ${_action} Other ".iso"
+  !insertmacro ${_action} Audio ".mid"
   !insertmacro ${_action} Other ".zip"
   !insertmacro ${_action} Other ".rar"
 !macroend

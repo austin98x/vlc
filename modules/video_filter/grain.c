@@ -2,7 +2,6 @@
  * grain.c: add film grain
  *****************************************************************************
  * Copyright (C) 2010 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -41,8 +40,8 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Open (vlc_object_t *);
-static void Close(vlc_object_t *);
+static int  Open (filter_t *);
+VIDEO_FILTER_WRAPPER_CLOSE(Filter, Close)
 
 #define BANK_SIZE (64)
 
@@ -64,16 +63,14 @@ vlc_module_begin()
     set_description(N_("Grain video filter"))
     set_shortname( N_("Grain"))
     set_help(N_("Adds filtered gaussian noise"))
-    set_capability( "video filter", 0 )
-    set_category(CAT_VIDEO)
     set_subcategory(SUBCAT_VIDEO_VFILTER)
     add_float_with_range(CFG_PREFIX "variance", 2.0, VARIANCE_MIN, VARIANCE_MAX,
-                         VARIANCE_TEXT, VARIANCE_LONGTEXT, false)
+                         VARIANCE_TEXT, VARIANCE_LONGTEXT)
     add_integer_with_range(CFG_PREFIX "period-min", 1, PERIOD_MIN, PERIOD_MAX,
-                           PERIOD_MIN_TEXT, PERIOD_MIN_LONGTEXT, false)
+                           PERIOD_MIN_TEXT, PERIOD_MIN_LONGTEXT)
     add_integer_with_range(CFG_PREFIX "period-max", 3*PERIOD_MAX/4, PERIOD_MIN, PERIOD_MAX,
-                           PERIOD_MAX_TEXT, PERIOD_MAX_LONGTEXT, false)
-    set_callbacks(Open, Close)
+                           PERIOD_MAX_TEXT, PERIOD_MAX_LONGTEXT)
+    set_callback_video_filter(Open)
 vlc_module_end()
 
 /*****************************************************************************
@@ -81,7 +78,8 @@ vlc_module_end()
  *****************************************************************************/
 
 #define BLEND_SIZE (8)
-struct filter_sys_t {
+typedef struct
+{
     bool     is_uv_filtered;
     uint32_t seed;
 
@@ -93,13 +91,12 @@ struct filter_sys_t {
     void (*blend)(uint8_t *dst, size_t dst_pitch,
                   const uint8_t *src, size_t src_pitch,
                   const int16_t *noise);
-    void (*emms)(void);
 
     struct {
         vlc_mutex_t lock;
         double      variance;
     } cfg;
-};
+} filter_sys_t;
 
 /* Simple and *really fast* RNG (xorshift[13,17,5])*/
 #define URAND_SEED (2463534242)
@@ -193,10 +190,6 @@ static void BlockBlendSse2(uint8_t *dst, size_t dst_pitch,
 #   error "BLEND_SIZE unsupported"
 #endif
 }
-static void Emms(void)
-{
-    asm volatile ("emms");
-}
 #endif
 
 /**
@@ -245,19 +238,11 @@ static void PlaneFilter(filter_t *filter,
                            __MIN(w, BLEND_SIZE), __MIN(h, BLEND_SIZE));
         }
     }
-    if (sys->emms)
-        sys->emms();
 }
 
-static picture_t *Filter(filter_t *filter, picture_t *src)
+static void Filter(filter_t *filter, picture_t *src, picture_t *dst)
 {
     filter_sys_t *sys = filter->p_sys;
-
-    picture_t *dst = filter_NewPicture(filter);
-    if (!dst) {
-        picture_Release(src);
-        return NULL;
-    }
 
     vlc_mutex_lock(&sys->cfg.lock);
     const double variance = VLC_CLIP(sys->cfg.variance, VARIANCE_MIN, VARIANCE_MAX);
@@ -283,10 +268,6 @@ static picture_t *Filter(filter_t *filter, picture_t *src)
             plane_CopyPixels(dstp, srcp);
         }
     }
-
-    picture_CopyProperties(dst, src);
-    picture_Release(src);
-    return dst;
 }
 
 /**
@@ -334,7 +315,7 @@ static int Generate(int16_t *bank, int h_min, int h_max, int v_min, int v_max)
         }
     }
 
-    //mtime_t tmul_0 = mdate();
+    //vlc_tick_t tmul_0 = vlc_tick_now();
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             double v = 0.0;
@@ -357,7 +338,7 @@ static int Generate(int16_t *bank, int h_min, int h_max, int v_min, int v_max)
             bank[i * N + j] = VLC_CLIP(vq, INT16_MIN, INT16_MAX);
         }
     }
-    //mtime_t mul_duration = mdate() - tmul_0;
+    //vlc_tick_t mul_duration = vlc_tick_now() - tmul_0;
     //fprintf(stderr, "IDCT took %d ms\n", (int)(mul_duration / 1000));
 
     free(workspace);
@@ -378,15 +359,13 @@ static int Callback(vlc_object_t *object, char const *cmd,
     return VLC_SUCCESS;
 }
 
-static int Open(vlc_object_t *object)
+static int Open(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)object;
-
     const vlc_chroma_description_t *chroma =
         vlc_fourcc_GetChromaDescription(filter->fmt_in.video.i_chroma);
-    if (!chroma || chroma->plane_count < 3 || chroma->pixel_size != 1) {
-        msg_Err(filter, "Unsupported chroma (%4.4s)",
-                (char*)&(filter->fmt_in.video.i_chroma));
+    assert( chroma != NULL );
+    if (chroma->plane_count < 3 || chroma->pixel_size != 1) {
+        msg_Err(filter, "Unsupported chroma (%4.4s)", (char*)&chroma->fcc);
         return VLC_EGENERIC;
     }
 
@@ -407,11 +386,9 @@ static int Open(vlc_object_t *object)
     }
 
     sys->blend = BlockBlendC;
-    sys->emms  = NULL;
-#if defined(CAN_COMPILE_SSE2) && 1
+#if defined(CAN_COMPILE_SSE2)
     if (vlc_CPU_SSE2()) {
         sys->blend = BlockBlendSse2;
-        sys->emms  = Emms;
     }
 #endif
 
@@ -419,18 +396,15 @@ static int Open(vlc_object_t *object)
     sys->cfg.variance = var_CreateGetFloatCommand(filter, CFG_PREFIX "variance");
     var_AddCallback(filter, CFG_PREFIX "variance", Callback, NULL);
 
-    filter->p_sys           = sys;
-    filter->pf_video_filter = Filter;
+    filter->p_sys = sys;
+    filter->ops   = &Filter_ops;
     return VLC_SUCCESS;
 }
 
-static void Close(vlc_object_t *object)
+static void Close(filter_t *filter)
 {
-    filter_t     *filter = (filter_t *)object;
     filter_sys_t *sys    = filter->p_sys;
 
     var_DelCallback(filter, CFG_PREFIX "variance", Callback, NULL);
-    vlc_mutex_destroy(&sys->cfg.lock);
     free(sys);
 }
-

@@ -2,7 +2,6 @@
  * dynamicoverlay_commands.c : dynamic overlay plugin commands
  *****************************************************************************
  * Copyright (C) 2008 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Søren Bøg <avacore@videolan.org>
  *         Jean-Paul Saman <jpsaman@videolan.org>
@@ -31,6 +30,7 @@
 #include <vlc_vout.h>
 #include <vlc_filter.h>
 
+#include <limits.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -54,20 +54,21 @@ overlay_t *OverlayCreate( void )
     p_ovl->i_x = p_ovl->i_y = 0;
     p_ovl->i_alpha = 0xFF;
     p_ovl->b_active = false;
-    video_format_Setup( &p_ovl->format, VLC_FOURCC( '\0','\0','\0','\0') , 0, 0,
-                        0, 0, 1, 1 );
+    p_ovl->type = OVERLAY_UNSET;
     p_ovl->p_fontstyle = text_style_Create( STYLE_NO_DEFAULTS );
     p_ovl->data.p_text = NULL;
+    p_ovl->data.p_pic = NULL;
 
     return p_ovl;
 }
 
-int OverlayDestroy( overlay_t *p_ovl )
+void OverlayDestroy( overlay_t *p_ovl )
 {
+    if( p_ovl->data.p_pic != NULL )
+        picture_Release( p_ovl->data.p_pic );
     free( p_ovl->data.p_text );
     text_style_Delete( p_ovl->p_fontstyle );
-
-    return VLC_SUCCESS;
+    free( p_ovl );
 }
 
 /*****************************************************************************
@@ -92,12 +93,27 @@ static int skip_space( char **psz_command )
 static int parse_digit( char **psz_command, int32_t *value )
 {
     char *psz_temp;
-    *value = strtol( *psz_command, &psz_temp, 10 );
+    long l = strtol( *psz_command, &psz_temp, 10 );
+
     if( psz_temp == *psz_command )
     {
         return VLC_EGENERIC;
     }
+#if LONG_MAX > INT32_MAX
+    if( l > INT32_MAX || l < INT32_MIN )
+        return VLC_EGENERIC;
+#endif
+    *value = l;
     *psz_command = psz_temp;
+    return VLC_SUCCESS;
+}
+
+static int parse_param_id(char **psz_command, size_t *value)
+{
+    int32_t digit;
+    if (parse_digit(psz_command, &digit) == VLC_EGENERIC || digit < 0)
+        return VLC_EGENERIC;
+    *value = digit;
     return VLC_SUCCESS;
 }
 
@@ -121,7 +137,7 @@ static int parser_DataSharedMem( char *psz_command,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
@@ -159,7 +175,7 @@ static int parser_Id( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     return VLC_SUCCESS;
@@ -181,7 +197,7 @@ static int parser_SetAlpha( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC  )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
@@ -200,7 +216,7 @@ static int parser_SetPosition( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
@@ -225,14 +241,18 @@ static int parser_SetTextAlpha( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->fontstyle.i_font_alpha ) == VLC_EGENERIC )
+        int32_t value;
+
+        if( parse_digit( &psz_command, &value ) == VLC_EGENERIC )
             return VLC_EGENERIC;
+
+        p_params->fontstyle.i_font_alpha = value;
     }
     return VLC_SUCCESS;
 }
@@ -246,7 +266,7 @@ static int parser_SetTextColor( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
@@ -278,7 +298,7 @@ static int parser_SetTextSize( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
@@ -297,7 +317,7 @@ static int parser_SetVisibility( char *psz_command, char *psz_end,
     skip_space( &psz_command );
     if( isdigit( (unsigned char)*psz_command ) )
     {
-        if( parse_digit( &psz_command, &p_params->i_id ) == VLC_EGENERIC )
+        if (parse_param_id( &psz_command, &p_params->i_id) == VLC_EGENERIC)
             return VLC_EGENERIC;
     }
     skip_space( &psz_command );
@@ -326,7 +346,7 @@ static int unparse_default( const commandparams_t *p_results,
 static int unparse_GenImage( const commandparams_t *p_results,
                              buffer_t *p_output )
 {
-    int ret = BufferPrintf( p_output, " %d", p_results->i_id );
+    int ret = BufferPrintf( p_output, " %zu", p_results->i_id );
     if( ret != VLC_SUCCESS )
         return ret;
 
@@ -370,15 +390,15 @@ static int unparse_GetTextAlpha( const commandparams_t *p_results,
 static int unparse_GetTextColor( const commandparams_t *p_results,
                                  buffer_t *p_output )
 {
-    int ret = BufferPrintf( p_output, " %d", (p_results->fontstyle.i_font_color & 0xff0000)>>16 );
+    int ret = BufferPrintf( p_output, " %"PRIu32, (p_results->fontstyle.i_font_color & 0xff0000)>>16 );
     if( ret != VLC_SUCCESS )
         return ret;
 
-    ret = BufferPrintf( p_output, " %d", (p_results->fontstyle.i_font_color & 0x00ff00)>>8 );
+    ret = BufferPrintf( p_output, " %"PRIu32, (p_results->fontstyle.i_font_color & 0x00ff00)>>8 );
     if( ret != VLC_SUCCESS )
         return ret;
 
-    ret = BufferPrintf( p_output, " %d", (p_results->fontstyle.i_font_color & 0x0000ff) );
+    ret = BufferPrintf( p_output, " %"PRIu32, (p_results->fontstyle.i_font_color & 0x0000ff) );
     if( ret != VLC_SUCCESS )
         return ret;
 
@@ -405,6 +425,13 @@ static int unparse_GetVisibility( const commandparams_t *p_results,
     return VLC_SUCCESS;
 }
 
+static inline overlay_t *ListGet( list_t *p_list, size_t i_idx )
+{
+    if (i_idx >= p_list->size)
+        return NULL;
+    return p_list->data[i_idx];
+}
+
 /*****************************************************************************
  * Command functions
  *****************************************************************************/
@@ -413,7 +440,7 @@ static int exec_DataSharedMem( filter_t *p_filter,
                                commandparams_t *p_results )
 {
 #if defined(HAVE_SYS_SHM_H)
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     struct shmid_ds shminfo;
     overlay_t *p_ovl;
     size_t i_size;
@@ -423,7 +450,7 @@ static int exec_DataSharedMem( filter_t *p_filter,
     p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
     {
-        msg_Err( p_filter, "Invalid overlay: %d", p_params->i_id );
+        msg_Err( p_filter, "Invalid overlay: %zu", p_params->i_id );
         return VLC_EGENERIC;
     }
 
@@ -458,12 +485,10 @@ static int exec_DataSharedMem( filter_t *p_filter,
         p_ovl->data.p_text = malloc( p_params->i_width );
         if( p_ovl->data.p_text == NULL )
         {
-            msg_Err( p_filter, "Unable to allocate string storage" );
             return VLC_ENOMEM;
         }
 
-        video_format_Setup( &p_ovl->format, VLC_CODEC_TEXT,
-                            0, 0, 0, 0, 0, 1 );
+        p_ovl->type = OVERLAY_IS_TEXT;
 
         p_data = shmat( p_params->i_shmid, NULL, SHM_RDONLY );
         if( p_data == NULL )
@@ -482,13 +507,16 @@ static int exec_DataSharedMem( filter_t *p_filter,
         uint8_t *p_data, *p_in;
         size_t i_neededsize = 0;
 
+        if( p_ovl->data.p_pic != NULL )
+            picture_Release( p_ovl->data.p_pic );
+
         p_ovl->data.p_pic = picture_New( p_params->fourcc,
                                          p_params->i_width, p_params->i_height,
                                          1, 1 );
         if( p_ovl->data.p_pic == NULL )
             return VLC_ENOMEM;
 
-        p_ovl->format = p_ovl->data.p_pic->format;
+        p_ovl->type = OVERLAY_IS_PICTURE;
 
         for( size_t i_plane = 0; i_plane < (size_t)p_ovl->data.p_pic->i_planes;
              ++i_plane )
@@ -550,10 +578,16 @@ static int exec_DeleteImage( filter_t *p_filter,
                              commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     p_sys->b_updated = true;
 
-    return ListRemove( &p_sys->overlays, p_params->i_id );
+    if ( p_params->i_id >= p_sys->overlays.size)
+        return VLC_EINVAL;
+
+    overlay_t *p_del = p_sys->overlays.data[p_params->i_id];
+    vlc_vector_remove(&p_sys->overlays, p_params->i_id);
+    OverlayDestroy( p_del );
+    return VLC_SUCCESS;
 }
 
 static int exec_EndAtomic( filter_t *p_filter,
@@ -562,7 +596,7 @@ static int exec_EndAtomic( filter_t *p_filter,
 {
     VLC_UNUSED(p_params);
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     QueueTransfer( &p_sys->pending, &p_sys->atomic );
     p_sys->b_atomic = false;
     return VLC_SUCCESS;
@@ -573,17 +607,16 @@ static int exec_GenImage( filter_t *p_filter,
                           commandparams_t *p_results )
 {
     VLC_UNUSED(p_params);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = OverlayCreate();
     if( p_ovl == NULL )
         return VLC_ENOMEM;
 
-    ssize_t i_idx = ListAdd( &p_sys->overlays, p_ovl );
-    if( i_idx < 0 )
-        return i_idx;
+    if (!vlc_vector_push(&p_sys->overlays, p_ovl))
+        return VLC_ENOMEM;
 
-    p_results->i_id = i_idx;
+    p_results->i_id = p_sys->overlays.size - 1;
     return VLC_SUCCESS;
 }
 
@@ -591,7 +624,7 @@ static int exec_GetAlpha( filter_t *p_filter,
                           const commandparams_t *p_params,
                           commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
         return VLC_EGENERIC;
@@ -604,7 +637,7 @@ static int exec_GetPosition( filter_t *p_filter,
                              const commandparams_t *p_params,
                              commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
         return VLC_EGENERIC;
@@ -618,7 +651,7 @@ static int exec_GetTextAlpha( filter_t *p_filter,
                               const commandparams_t *p_params,
                               commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
         return VLC_EGENERIC;
@@ -632,7 +665,7 @@ static int exec_GetTextColor( filter_t *p_filter,
                               const commandparams_t *p_params,
                               commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
         return VLC_EGENERIC;
@@ -646,7 +679,7 @@ static int exec_GetTextSize( filter_t *p_filter,
                              const commandparams_t *p_params,
                              commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
         return VLC_EGENERIC;
@@ -659,7 +692,7 @@ static int exec_GetVisibility( filter_t *p_filter,
                                const commandparams_t *p_params,
                                commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -674,7 +707,7 @@ static int exec_SetAlpha( filter_t *p_filter,
                           commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -690,7 +723,7 @@ static int exec_SetPosition( filter_t *p_filter,
                              commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -708,7 +741,7 @@ static int exec_SetTextAlpha( filter_t *p_filter,
                               commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -725,7 +758,7 @@ static int exec_SetTextColor( filter_t *p_filter,
                               commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -742,7 +775,7 @@ static int exec_SetTextSize( filter_t *p_filter,
                               commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -758,7 +791,7 @@ static int exec_SetVisibility( filter_t *p_filter,
                                commandparams_t *p_results )
 {
     VLC_UNUSED(p_results);
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     overlay_t *p_ovl = ListGet( &p_sys->overlays, p_params->i_id );
     if( p_ovl == NULL )
@@ -773,7 +806,7 @@ static int exec_StartAtomic( filter_t *p_filter,
                              const commandparams_t *p_params,
                              commandparams_t *p_results )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     VLC_UNUSED(p_params);
     VLC_UNUSED(p_results);
 
@@ -892,13 +925,12 @@ static const commanddesc_static_t p_commands[] =
 
 void RegisterCommand( filter_t *p_filter )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
-    size_t i_index = 0;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     p_sys->i_commands = ARRAY_SIZE(p_commands);
     p_sys->pp_commands = (commanddesc_t **) calloc( p_sys->i_commands, sizeof(commanddesc_t*) );
     if( !p_sys->pp_commands ) return;
-    for( i_index = 0; i_index < p_sys->i_commands; i_index ++ )
+    for( size_t i_index = 0; i_index < p_sys->i_commands; i_index ++ )
     {
         p_sys->pp_commands[i_index] = (commanddesc_t *) malloc( sizeof(commanddesc_t) );
         if( !p_sys->pp_commands[i_index] ) return;
@@ -916,7 +948,7 @@ void RegisterCommand( filter_t *p_filter )
 
 void UnregisterCommand( filter_t *p_filter )
 {
-    filter_sys_t *p_sys = (filter_sys_t*) p_filter->p_sys;
+    filter_sys_t *p_sys = p_filter->p_sys;
     size_t i_index = 0;
 
     for( i_index = 0; i_index < p_sys->i_commands; i_index++ )

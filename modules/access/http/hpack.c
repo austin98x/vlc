@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "vlc_common.h"
 #include "hpack.h"
 
 /** Static Table header names */
@@ -334,10 +335,10 @@ static char *hpack_lookup_name(const struct hpack_decoder *dec,
     }
 
     idx--;
-    if (idx < sizeof (hpack_names) / sizeof (hpack_names[0]))
+    if (idx < ARRAY_SIZE(hpack_names))
         return strdup(hpack_names[idx]);
 
-    idx -= sizeof (hpack_names) / sizeof (hpack_names[0]);
+    idx -= ARRAY_SIZE(hpack_names);
     if (idx < dec->entries)
     {
         const char *entry = dec->table[dec->entries - (idx + 1)];
@@ -358,12 +359,12 @@ static char *hpack_lookup_value(const struct hpack_decoder *dec,
     }
 
     idx--;
-    if (idx < sizeof (hpack_values) / sizeof (hpack_values[0]))
+    if (idx < ARRAY_SIZE(hpack_values))
         return strdup(hpack_values[idx]);
-    if (idx < sizeof (hpack_names) / sizeof (hpack_names[0]))
+    if (idx < ARRAY_SIZE(hpack_names))
         return strdup("");
 
-    idx -= sizeof (hpack_names) / sizeof (hpack_names[0]);
+    idx -= ARRAY_SIZE(hpack_names);
     if (idx < dec->entries)
     {
         const char *entry = dec->table[dec->entries - (idx + 1)];
@@ -552,8 +553,8 @@ static int hpack_decode_hdr(struct hpack_decoder *dec,
                             char **restrict namep,
                             char **restrict valuep)
 {
-    int (*cb)(struct hpack_decoder *, const uint8_t **, size_t *,
-              char **, char **);
+    int (*cb)(struct hpack_decoder *, const uint8_t ** restrict, size_t * restrict,
+              char ** restrict, char ** restrict);
 
     assert(*lengthp >= 1);
 
@@ -630,7 +631,7 @@ static void test_integer(unsigned n, const uint8_t *buf, size_t len,
         assert(hpack_decode_int(n, &cutbuf, &cutlen) == -1);
     }
 
-    /* Check succesful decoding */
+    /* Check successful decoding */
     const uint8_t *end = buf + len;
     int_fast32_t v = hpack_decode_int(n, &buf, &len);
 
@@ -680,7 +681,7 @@ static void test_header(const char *str, size_t len,
         assert(hpack_decode_hdr(dec, &cutbuf, &cutlen, &n, &v) == -1);
     }
 
-    /* Check succesful decoding */
+    /* Check successful decoding */
     int ret = hpack_decode_hdr(dec, &buf, &len, &n, &v);
     assert(ret == 0);
     assert(!strcmp(name, n));

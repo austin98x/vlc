@@ -2,7 +2,6 @@
  * adummy.c : dummy audio output plugin
  *****************************************************************************
  * Copyright (C) 2002 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
  *
@@ -30,27 +29,73 @@
 #include <vlc_aout.h>
 #include <vlc_cpu.h>
 
-static int Open( vlc_object_t * p_this );
+static int Open(vlc_object_t *);
+static void Close(vlc_object_t *);
 
 vlc_module_begin ()
     set_shortname( N_("Dummy") )
     set_description( N_("Dummy audio output") )
     set_capability( "audio output", 0 )
-    set_callbacks( Open, NULL )
+    set_callbacks( Open, Close )
     add_shortcut( "dummy" )
 vlc_module_end ()
 
-#define A52_FRAME_NB 1536
-
-static void Play(audio_output_t *aout, block_t *block)
+struct aout_sys
 {
+    vlc_tick_t first_pts;
+    vlc_tick_t first_play_date;
+    vlc_tick_t last_timing_date;
+    vlc_tick_t paused_date;
+};
+
+static void Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
+{
+    struct aout_sys *sys = aout->sys;
+
+    if (unlikely(sys->first_play_date == VLC_TICK_INVALID))
+    {
+        assert(sys->first_pts == VLC_TICK_INVALID);
+        sys->first_play_date = date;
+        sys->first_pts = block->i_pts;
+    }
+
     block_Release( block );
-    (void) aout;
+
+    vlc_tick_t now = vlc_tick_now();
+
+    if (now < sys->first_play_date)
+        return;
+
+    if (sys->last_timing_date == VLC_TICK_INVALID ||
+        now - sys->last_timing_date >= VLC_TICK_FROM_SEC(1))
+    {
+        sys->last_timing_date = now;
+        aout_TimingReport(aout, now,
+                          now - sys->first_play_date + sys->first_pts);
+    }
 }
 
-static void Flush(audio_output_t *aout, bool wait)
+static void Pause(audio_output_t *aout, bool paused, vlc_tick_t date)
 {
-    (void) aout; (void) wait;
+    struct aout_sys *sys = aout->sys;
+    if (paused)
+        sys->paused_date = date;
+    else
+    {
+        if (sys->first_play_date != VLC_TICK_INVALID
+         && sys->paused_date != VLC_TICK_INVALID)
+            sys->first_play_date -= sys->paused_date - date;
+        sys->paused_date = VLC_TICK_INVALID;
+    }
+}
+
+static void Flush(audio_output_t *aout)
+{
+    struct aout_sys *sys = aout->sys;
+
+    sys->first_play_date = sys->last_timing_date = VLC_TICK_INVALID;
+    sys->first_pts = VLC_TICK_INVALID;
+    sys->paused_date = VLC_TICK_INVALID;
 }
 
 static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
@@ -66,6 +111,7 @@ static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
             fmt->i_frame_length = 1;
             break;
         case VLC_CODEC_DTS:
+        case VLC_CODEC_DTSHD:
         case VLC_CODEC_TRUEHD:
         case VLC_CODEC_MLP:
             fmt->i_format = VLC_CODEC_SPDIFL;
@@ -84,16 +130,28 @@ static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
     return VLC_SUCCESS;
 }
 
+static void Close(vlc_object_t *obj)
+{
+    audio_output_t *aout = (audio_output_t *)obj;
+    free(aout->sys);
+}
+
 static int Open(vlc_object_t *obj)
 {
     audio_output_t *aout = (audio_output_t *)obj;
 
+    struct aout_sys *sys = aout->sys = malloc(sizeof(*sys));
+    if (!sys)
+        return VLC_ENOMEM;
+    sys->first_play_date = sys->last_timing_date = VLC_TICK_INVALID;
+    sys->first_pts = VLC_TICK_INVALID;
+    sys->paused_date = VLC_TICK_INVALID;
+
     aout->start = Start;
-    aout->time_get = NULL;
     aout->play = Play;
-    aout->pause = NULL;
+    aout->pause = Pause;
     aout->flush = Flush;
-    aout->stop = NULL;
+    aout->stop = Flush;
     aout->volume_set = NULL;
     aout->mute_set = NULL;
     return VLC_SUCCESS;

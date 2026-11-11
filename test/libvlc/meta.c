@@ -1,7 +1,6 @@
 /*
  * meta.c - libvlc smoke test
  *
- * $Id$
  */
 
 /**********************************************************************
@@ -25,29 +24,38 @@
 #include <string.h>
 
 #include "test.h"
+#include "media_utils.h"
 
-static void test_meta (const char ** argv, int argc)
+#include <vlc_modules.h>
+
+static int test_meta (const char ** argv, int argc)
 {
     libvlc_instance_t *vlc;
     libvlc_media_t *media;
     char * artist;
 
-    log ("Testing meta\n");
+    test_log ("Testing meta\n");
 
     vlc = libvlc_new (argc, argv);
     assert (vlc != NULL);
 
-    media = libvlc_media_new_path (vlc, "samples/meta.sample");
+    if (!module_exists("taglib"))
+    {
+        libvlc_release (vlc);
+        return 77;
+    }
+
+    media = libvlc_media_new_path(SRCDIR "/samples/meta.mp3");
     assert( media );
 
-    libvlc_media_parse (media);
+    libvlc_media_parse_sync(vlc, media, libvlc_media_parse, -1);
 
     artist = libvlc_media_get_meta (media, libvlc_meta_Artist);
 
     const char *expected_artist = "mike";
 
     assert (artist);
-    log ("+ got '%s' as Artist, expecting %s\n", artist, expected_artist);
+    test_log ("+ got '%s' as Artist, expecting %s\n", artist, expected_artist);
 
     int string_compare = strcmp (artist, expected_artist);
     assert (!string_compare);
@@ -55,6 +63,8 @@ static void test_meta (const char ** argv, int argc)
     free (artist);
     libvlc_media_release (media);
     libvlc_release (vlc);
+
+    return 0;
 }
 
 
@@ -62,7 +72,5 @@ int main (void)
 {
     test_init();
 
-    test_meta (test_defaults_args, test_defaults_nargs);
-
-    return 0;
+    return test_meta (test_defaults_args, test_defaults_nargs);
 }

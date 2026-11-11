@@ -2,7 +2,6 @@
  * faad.c: AAC decoder using libfaad2
  *****************************************************************************
  * Copyright (C) 2001, 2003 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -34,12 +33,20 @@
 # include "config.h"
 #endif
 
+#include <assert.h>
+#include <stdbit.h>
+
 #include <vlc_common.h>
 #include <vlc_plugin.h>
-#include <vlc_input.h>
+#include <vlc_input_item.h>
 #include <vlc_codec.h>
 #include <vlc_cpu.h>
 #include <vlc_aout.h>
+
+#include <faad.h>
+#if !defined(FAAD2_VERSION) // FAAD2_VERSION added in 2.10.1
+# define PATCH_PCA
+#endif
 
 #include <neaacdec.h>
 #include "../packetizer/mpeg4audio.h"
@@ -53,7 +60,6 @@ static void Close( vlc_object_t * );
 vlc_module_begin ()
     set_description( N_("AAC audio decoder (using libfaad2)") )
     set_capability( "audio decoder", 100 )
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACODEC )
     set_callbacks( Open, Close )
 vlc_module_end ()
@@ -65,13 +71,14 @@ static int DecodeBlock( decoder_t *, block_t * );
 static void Flush( decoder_t * );
 static void DoReordering( uint32_t *, uint32_t *, int, int, uint8_t * );
 
-struct decoder_sys_t
+typedef struct
 {
     /* faad handler */
     NeAACDecHandle *hfaad;
 
     /* samples */
     date_t date;
+    vlc_tick_t i_last_length;
 
     /* temporary buffer */
     block_t *p_block;
@@ -80,11 +87,9 @@ struct decoder_sys_t
     uint32_t pi_channel_positions[MPEG4_ASC_MAX_INDEXEDPOS];
 
     bool b_sbr, b_ps, b_discontinuity;
-};
+} decoder_sys_t;
 
-#if MPEG4_ASC_MAX_INDEXEDPOS != LFE_CHANNEL
-    #error MPEG4_ASC_MAX_INDEXEDPOS != LFE_CHANNEL
-#endif
+static_assert (MPEG4_ASC_MAX_INDEXEDPOS == LFE_CHANNEL, "Mismatch");
 
 #define FAAD_CHANNEL_ID_COUNT (LFE_CHANNEL + 1)
 static const uint32_t pi_tovlcmapping[FAAD_CHANNEL_ID_COUNT] =
@@ -110,7 +115,10 @@ static int Open( vlc_object_t *p_this )
     decoder_sys_t *p_sys;
     NeAACDecConfiguration *cfg;
 
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_MP4A )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_MP4A ||
+        p_dec->fmt_in->i_profile >= AAC_PROFILE_ELD ||
+        (p_dec->fmt_in->i_extra > 1 &&
+         (GetWBE(p_dec->fmt_in->p_extra) & 0xffe0) >= 0xf8e0)) /* ELD AOT */
     {
         return VLC_EGENERIC;
     }
@@ -127,20 +135,28 @@ static int Open( vlc_object_t *p_this )
         return VLC_EGENERIC;
     }
 
+    char * vinfo[2];
+    if( NeAACDecGetVersion( &vinfo[0], &vinfo[1] ) == 0 )
+        msg_Dbg( p_dec, "using version " FAAD2_VERSION " - %s", vinfo[0] );
+
     /* Misc init */
-    date_Set( &p_sys->date, 0 );
+    p_dec->fmt_out.audio.channel_type = p_dec->fmt_in->audio.channel_type;
 
-    p_dec->fmt_out.audio.channel_type = p_dec->fmt_in.audio.channel_type;
-
-    if( p_dec->fmt_in.i_extra > 0 )
+    if( p_dec->fmt_in->i_extra > 0 )
     {
         /* We have a decoder config so init the handle */
-        unsigned long i_rate;
+        unsigned long i_rate = 0;
         unsigned char i_channels;
 
-        if( NeAACDecInit2( p_sys->hfaad, p_dec->fmt_in.p_extra,
-                           p_dec->fmt_in.i_extra,
-                           &i_rate, &i_channels ) < 0 )
+        mp4AudioSpecificConfig mp4Conf;
+        if( NeAACDecAudioSpecificConfig( p_dec->fmt_in->p_extra,
+                                         p_dec->fmt_in->i_extra,
+                                         &mp4Conf ) >= 0 &&
+            mp4Conf.samplingFrequency != 0 &&
+            ( NeAACDecInit2( p_sys->hfaad, p_dec->fmt_in->p_extra,
+                             p_dec->fmt_in->i_extra,
+                             &i_rate, &i_channels ) < 0 ||
+                i_channels >= MPEG4_ASC_MAX_INDEXEDPOS ) )
         {
             msg_Err( p_dec, "Failed to initialize faad using extra data" );
             NeAACDecClose( p_sys->hfaad );
@@ -148,29 +164,41 @@ static int Open( vlc_object_t *p_this )
             return VLC_EGENERIC;
         }
 
-        p_dec->fmt_out.audio.i_rate = i_rate;
-        p_dec->fmt_out.audio.i_channels = i_channels;
-        p_dec->fmt_out.audio.i_physical_channels
-            = mpeg4_asc_channelsbyindex[i_channels];
-        date_Init( &p_sys->date, i_rate, 1 );
+        if( i_rate != 0 )
+        {
+            p_dec->fmt_out.audio.i_rate = i_rate;
+            p_dec->fmt_out.audio.i_channels = i_channels;
+            p_dec->fmt_out.audio.i_physical_channels
+                = MPEG4_asc_channelsbyindex[i_channels];
+            date_Init( &p_sys->date, i_rate, 1 );
+        }
     }
     else
     {
         p_dec->fmt_out.audio.i_physical_channels = 0;
-        /* Will be initalised from first frame */
+        /* Will be initialised from first frame */
         p_dec->fmt_out.audio.i_rate = 0;
         p_dec->fmt_out.audio.i_channels = 0;
+        date_Set( &p_sys->date, VLC_TICK_INVALID );
     }
 
     p_dec->fmt_out.i_codec = HAVE_FPU ? VLC_CODEC_FL32 : VLC_CODEC_S16N;
-    p_dec->fmt_out.audio.i_chan_mode = p_dec->fmt_in.audio.i_chan_mode;
+    p_dec->fmt_out.audio.i_chan_mode = p_dec->fmt_in->audio.i_chan_mode;
 
     /* Set the faad config */
     cfg = NeAACDecGetCurrentConfiguration( p_sys->hfaad );
-    if( p_dec->fmt_in.audio.i_rate )
-        cfg->defSampleRate = p_dec->fmt_in.audio.i_rate;
+    if( p_dec->fmt_in->audio.i_rate )
+        cfg->defSampleRate = p_dec->fmt_in->audio.i_rate;
     cfg->outputFormat = HAVE_FPU ? FAAD_FMT_FLOAT : FAAD_FMT_16BIT;
-    NeAACDecSetConfiguration( p_sys->hfaad, cfg );
+    if( !NeAACDecSetConfiguration( p_sys->hfaad, cfg ) )
+    {
+        msg_Err( p_dec, "Failed to set faad configuration" );
+        NeAACDecClose( p_sys->hfaad );
+        free( p_sys );
+        return VLC_EGENERIC;
+    }
+
+    p_sys->i_last_length = 0;
 
     /* buffer */
     p_sys->p_block = NULL;
@@ -217,7 +245,7 @@ static void Flush( decoder_t *p_dec )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    date_Set( &p_sys->date, VLC_TS_INVALID );
+    date_Set( &p_sys->date, VLC_TICK_INVALID );
     FlushBuffer( p_sys, SIZE_MAX );
 }
 
@@ -242,7 +270,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     }
 
     /* Remove ADTS header if we have decoder specific config */
-    if( p_dec->fmt_in.i_extra && p_block->i_buffer > 7 )
+    if( p_dec->fmt_in->i_extra && p_block->i_buffer > 7 )
     {
         if( p_block->p_buffer[0] == 0xff &&
             ( p_block->p_buffer[1] & 0xf0 ) == 0xf0 ) /* syncword */
@@ -258,7 +286,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
         }
     }
 
-    const mtime_t i_pts = p_block->i_pts;
+    const vlc_tick_t i_pts = p_block->i_pts;
 
     /* Append block as temporary buffer */
     if( p_sys->p_block == NULL )
@@ -280,11 +308,16 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     {
         unsigned long i_rate = 0;
         unsigned char i_channels;
+        mp4AudioSpecificConfig mp4Conf;
 
         /* Init from DecoderConfig */
-        if( p_dec->fmt_in.i_extra > 0 &&
-            NeAACDecInit2( p_sys->hfaad, p_dec->fmt_in.p_extra,
-                           p_dec->fmt_in.i_extra, &i_rate, &i_channels ) != 0 )
+        if( p_dec->fmt_in->i_extra > 0 &&
+            ( NeAACDecAudioSpecificConfig( p_dec->fmt_in->p_extra,
+                                           p_dec->fmt_in->i_extra,
+                                           &mp4Conf ) < 0 ||
+              mp4Conf.samplingFrequency == 0 ||
+              NeAACDecInit2( p_sys->hfaad, p_dec->fmt_in->p_extra,
+                             p_dec->fmt_in->i_extra, &i_rate, &i_channels ) != 0 ) )
         {
             /* Failed, will try from data */
             i_rate = 0;
@@ -302,7 +335,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
                 FlushBuffer( p_sys, i_read );
         }
 
-        if( i_rate == 0 )
+        if( i_rate == 0 || i_channels >= MPEG4_ASC_MAX_INDEXEDPOS )
         {
             /* Can not init decoder at all for now */
             FlushBuffer( p_sys, SIZE_MAX );
@@ -313,15 +346,18 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
         p_dec->fmt_out.audio.i_rate = i_rate;
         p_dec->fmt_out.audio.i_channels = i_channels;
         p_dec->fmt_out.audio.i_physical_channels
-            = mpeg4_asc_channelsbyindex[i_channels];
+            = MPEG4_asc_channelsbyindex[i_channels];
         date_Init( &p_sys->date, i_rate, 1 );
     }
 
-    if( i_pts > VLC_TS_INVALID && i_pts != date_Get( &p_sys->date ) )
+    if( i_pts != VLC_TICK_INVALID && i_pts != date_Get( &p_sys->date ) )
     {
-        date_Set( &p_sys->date, i_pts );
+        if( p_sys->i_last_length == 0 ||
+            /* We need to be permissive and rebase dts when it's really way off */
+            llabs( i_pts - date_Get( &p_sys->date ) ) > p_sys->i_last_length * 3 / 2  )
+            date_Set( &p_sys->date, i_pts );
     }
-    else if( !date_Get( &p_sys->date ) )
+    else if( date_Get( &p_sys->date ) == VLC_TICK_INVALID )
     {
         /* We've just started the stream, wait for the first PTS. */
         FlushBuffer( p_sys, SIZE_MAX );
@@ -368,7 +404,8 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
                 if( NeAACDecInit( hfaad,
                                   p_sys->p_block->p_buffer,
                                   p_sys->p_block->i_buffer,
-                                  &i_rate,&i_channels ) < 0 )
+                                  &i_rate,&i_channels ) < 0 ||
+                    i_channels >= MPEG4_ASC_MAX_INDEXEDPOS )
                 {
                     /* reinitialization failed */
                     NeAACDecClose( hfaad );
@@ -381,7 +418,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
                     p_dec->fmt_out.audio.i_rate = i_rate;
                     p_dec->fmt_out.audio.i_channels = i_channels;
                     p_dec->fmt_out.audio.i_physical_channels
-                        = mpeg4_asc_channelsbyindex[i_channels];
+                        = MPEG4_asc_channelsbyindex[i_channels];
                     date_Init( &p_sys->date, i_rate, 1 );
                 }
             }
@@ -430,13 +467,13 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
             if( !p_dec->p_description )
                 p_dec->p_description = vlc_meta_New();
             if( p_dec->p_description )
-                vlc_meta_AddExtra( p_dec->p_description, _("AAC extension"), psz_ext );
+                vlc_meta_SetExtra( p_dec->p_description, _("AAC extension"), psz_ext );
 
             p_sys->b_sbr = b_sbr;
             p_sys->b_ps = frame.ps;
         }
 
-#ifndef FAAD2_VIDEOLAN_PATCHED
+#ifdef PATCH_PCA
         /* PS Enabled FAAD PCA bug hotfix (contribs has patch) */
         if( frame.channels == 8 )
         {
@@ -513,8 +550,8 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
         /* Convert frame.channel_position to our own channel values */
         p_dec->fmt_out.audio.i_physical_channels = 0;
 
-        uint8_t  pi_neworder_table[AOUT_CHAN_MAX];
-        uint32_t pi_faad_channels_positions[FAAD_CHANNEL_ID_COUNT] = {0};
+        uint8_t  pi_neworder_table[64] = {0};
+        uint32_t pi_faad_channels_positions[64 + 1] = {0};
 
         bool b_reorder = false;
         if (p_dec->fmt_out.audio.channel_type == AUDIO_CHANNEL_TYPE_BITMAP)
@@ -529,12 +566,23 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
                 }
                 else pi_faad_channels_positions[i] = 0;
             }
-
-            b_reorder = aout_CheckChannelReorder( pi_faad_channels_positions, NULL,
-                p_dec->fmt_out.audio.i_physical_channels, pi_neworder_table );
-
-            p_dec->fmt_out.audio.i_channels = popcount(p_dec->fmt_out.audio.i_physical_channels);
         }
+        else if (p_dec->fmt_out.audio.channel_type == AUDIO_CHANNEL_TYPE_AMBISONICS
+            && frame.channels == 4)
+        {
+            pi_faad_channels_positions[0] = AOUT_CHAN_REARCENTER;
+            pi_faad_channels_positions[1] = AOUT_CHAN_LEFT;
+            pi_faad_channels_positions[2] = AOUT_CHAN_RIGHT;
+            pi_faad_channels_positions[3] = AOUT_CHAN_CENTER;
+            p_dec->fmt_out.audio.i_physical_channels =
+                AOUT_CHAN_CENTER | AOUT_CHAN_LEFT
+                | AOUT_CHAN_RIGHT | AOUT_CHAN_REARCENTER;
+        }
+
+        b_reorder = aout_CheckChannelReorder( pi_faad_channels_positions, NULL,
+            p_dec->fmt_out.audio.i_physical_channels, pi_neworder_table );
+
+        p_dec->fmt_out.audio.i_channels = stdc_count_ones(p_dec->fmt_out.audio.i_physical_channels);
 
         if( !decoder_UpdateAudioFormat( p_dec ) && p_dec->fmt_out.audio.i_channels > 0 )
             p_out = decoder_NewAudioBuffer( p_dec, frame.samples / p_dec->fmt_out.audio.i_channels );
@@ -545,11 +593,11 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
             p_out->i_length = date_Increment( &p_sys->date,
                                               frame.samples / frame.channels )
                               - p_out->i_pts;
-
+            p_sys->i_last_length = p_out->i_length;
             if ( p_dec->fmt_out.audio.channel_type == AUDIO_CHANNEL_TYPE_BITMAP )
             {
                 /* Don't kill speakers if some weird mapping does not gets 1:1 */
-                if( popcount(p_dec->fmt_out.audio.i_physical_channels) != frame.channels )
+                if( stdc_count_ones(p_dec->fmt_out.audio.i_physical_channels) != frame.channels )
                     memset( p_out->p_buffer, 0, p_out->i_buffer );
             }
 
@@ -581,8 +629,6 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
             /* Drop byte of padding */
             FlushBuffer( p_sys, 0 );
         }
-
-        continue;
     }
 
     return VLCDEC_SUCCESS;
@@ -623,4 +669,3 @@ static void DoReordering( uint32_t *p_out, uint32_t *p_in, int i_samples,
         }
     }
 }
-

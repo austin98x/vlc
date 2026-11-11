@@ -2,7 +2,6 @@
  * g711.c: G.711 µ-law and A-law codec
  *****************************************************************************
  * Copyright (C) 2001, 2003 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -33,7 +32,6 @@
 #include <vlc_aout.h>
 
 static int  DecoderOpen ( vlc_object_t * );
-static void DecoderClose( vlc_object_t * );
 static int DecodeBlock( decoder_t *, block_t * );
 static void Flush( decoder_t * );
 
@@ -45,23 +43,22 @@ static block_t *EncoderEncode( encoder_t *, block_t * );
 vlc_module_begin ()
     set_description( N_("G.711 decoder") )
     set_capability( "audio decoder", 100 )
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACODEC )
-    set_callbacks( DecoderOpen, DecoderClose )
+    set_callback( DecoderOpen )
 
 #ifdef ENABLE_SOUT
     add_submodule ()
     set_description( N_("G.711 encoder") )
-    set_capability( "encoder", 150 )
-    set_callbacks( EncoderOpen, NULL )
+    set_capability( "audio encoder", 150 )
+    set_callback( EncoderOpen )
 #endif
 vlc_module_end ()
 
-struct decoder_sys_t
+typedef struct
 {
     const int16_t *table;
     date_t end_date;
-};
+} decoder_sys_t;
 
 static const uint16_t pi_channels_maps[] =
 {
@@ -148,7 +145,7 @@ static int DecoderOpen( vlc_object_t *p_this )
     decoder_t *p_dec = (decoder_t*)p_this;
     const int16_t *table;
 
-    switch( p_dec->fmt_in.i_codec )
+    switch( p_dec->fmt_in->i_codec )
     {
         case VLC_CODEC_ALAW:
             table = alawtos16;
@@ -160,26 +157,26 @@ static int DecoderOpen( vlc_object_t *p_this )
             return VLC_EGENERIC;
     }
 
-    if( p_dec->fmt_in.audio.i_channels == 0 ||
-        p_dec->fmt_in.audio.i_channels > AOUT_CHAN_MAX )
+    if( p_dec->fmt_in->audio.i_channels == 0 ||
+        p_dec->fmt_in->audio.i_channels > AOUT_CHAN_MAX )
     {
         msg_Err( p_dec, "bad channels count (1-%i): %i",
-                 AOUT_CHAN_MAX, p_dec->fmt_in.audio.i_channels );
+                 AOUT_CHAN_MAX, p_dec->fmt_in->audio.i_channels );
         return VLC_EGENERIC;
     }
 
-    if( p_dec->fmt_in.audio.i_rate == 0 )
+    if( p_dec->fmt_in->audio.i_rate == 0 )
     {
-        msg_Err( p_dec, "bad samplerate: %d Hz", p_dec->fmt_in.audio.i_rate );
+        msg_Err( p_dec, "bad samplerate: %d Hz", p_dec->fmt_in->audio.i_rate );
         return VLC_EGENERIC;
     }
 
     msg_Dbg( p_dec, "samplerate:%dHz channels:%d",
-             p_dec->fmt_in.audio.i_rate, p_dec->fmt_in.audio.i_channels );
+             p_dec->fmt_in->audio.i_rate, p_dec->fmt_in->audio.i_channels );
 
 
     /* Allocate the memory needed to store the decoder's structure */
-    decoder_sys_t *p_sys = malloc(sizeof(*p_sys));
+    decoder_sys_t *p_sys = vlc_obj_malloc(p_this, sizeof(*p_sys));
     if( unlikely(p_sys == NULL) )
         return VLC_ENOMEM;
 
@@ -190,19 +187,18 @@ static int DecoderOpen( vlc_object_t *p_this )
 
     p_dec->fmt_out.i_codec = VLC_CODEC_S16N;
     p_dec->fmt_out.audio.i_format = VLC_CODEC_S16N;
-    p_dec->fmt_out.audio.i_rate = p_dec->fmt_in.audio.i_rate;
-    if( p_dec->fmt_in.audio.i_physical_channels )
+    p_dec->fmt_out.audio.i_rate = p_dec->fmt_in->audio.i_rate;
+    if( p_dec->fmt_in->audio.i_physical_channels )
         p_dec->fmt_out.audio.i_physical_channels =
-                                       p_dec->fmt_in.audio.i_physical_channels;
+                                       p_dec->fmt_in->audio.i_physical_channels;
     else
         p_dec->fmt_out.audio.i_physical_channels =
-                              pi_channels_maps[p_dec->fmt_in.audio.i_channels];
+                              pi_channels_maps[p_dec->fmt_in->audio.i_channels];
     aout_FormatPrepare( &p_dec->fmt_out.audio );
 
     p_sys->table = table;
 
     date_Init( &p_sys->end_date, p_dec->fmt_out.audio.i_rate, 1 );
-    date_Set( &p_sys->end_date, 0 );
 
     return VLC_SUCCESS;
 }
@@ -211,7 +207,7 @@ static void Flush( decoder_t *p_dec )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    date_Set( &p_sys->end_date, 0 );
+    date_Set( &p_sys->end_date, VLC_TICK_INVALID );
 }
 
 static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
@@ -231,12 +227,12 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
         }
     }
 
-    if( p_block->i_pts > VLC_TS_INVALID &&
+    if( p_block->i_pts != VLC_TICK_INVALID &&
         p_block->i_pts != date_Get( &p_sys->end_date ) )
     {
         date_Set( &p_sys->end_date, p_block->i_pts );
     }
-    else if( !date_Get( &p_sys->end_date ) )
+    else if( date_Get( &p_sys->end_date ) == VLC_TICK_INVALID )
     {
         /* We've just started the stream, wait for the first PTS. */
         block_Release( p_block );
@@ -244,9 +240,9 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     }
 
     /* Don't re-use the same pts twice */
-    p_block->i_pts = VLC_TS_INVALID;
+    p_block->i_pts = VLC_TICK_INVALID;
 
-    unsigned samples = p_block->i_buffer / p_dec->fmt_in.audio.i_channels;
+    unsigned samples = p_block->i_buffer / p_dec->fmt_in->audio.i_channels;
     if( samples == 0 )
     {
         block_Release( p_block );
@@ -266,7 +262,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     }
 
     assert( p_out->i_nb_samples == samples );
-    assert( p_out->i_buffer == samples * 2 * p_dec->fmt_in.audio.i_channels );
+    assert( p_out->i_buffer == samples * 2 * p_dec->fmt_in->audio.i_channels );
 
     p_out->i_pts = date_Get( &p_sys->end_date );
     p_out->i_length = date_Increment( &p_sys->end_date, samples )
@@ -275,7 +271,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     const uint8_t *src = p_block->p_buffer;
     int16_t *dst = (int16_t *)p_out->p_buffer;
 
-    samples *= p_dec->fmt_in.audio.i_channels;
+    samples *= p_dec->fmt_in->audio.i_channels;
 
     for( unsigned i = 0; i < samples; i++ )
        *(dst++) = p_sys->table[*(src++)];
@@ -283,13 +279,6 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     block_Release( p_block );
     decoder_QueueAudio( p_dec, p_out );
     return VLCDEC_SUCCESS;
-}
-
-static void DecoderClose( vlc_object_t *p_this )
-{
-    decoder_t *p_dec = (decoder_t *)p_this;
-
-    free( p_dec->p_sys );
 }
 
 #ifdef ENABLE_SOUT
@@ -1168,7 +1157,10 @@ static int EncoderOpen( vlc_object_t *p_this )
     p_enc->fmt_out.audio.i_bitspersample = 8;
     p_enc->fmt_out.i_bitrate = 8 * p_enc->fmt_in.audio.i_channels
                                  * p_enc->fmt_in.audio.i_rate;
-    p_enc->pf_encode_audio = EncoderEncode;
+
+    static const struct vlc_encoder_operations ops =
+        { .encode_audio = EncoderEncode };
+    p_enc->ops = &ops;
 
     msg_Dbg( p_enc, "samplerate:%dHz channels:%d",
              p_enc->fmt_out.audio.i_rate, p_enc->fmt_out.audio.i_channels );
@@ -1210,8 +1202,8 @@ static block_t *EncoderEncode( encoder_t *p_enc, block_t *p_aout_buf )
     }
 
     p_block->i_dts = p_block->i_pts = p_aout_buf->i_pts;
-    p_block->i_length = (int64_t)p_aout_buf->i_nb_samples *
-                        CLOCK_FREQ / p_enc->fmt_in.audio.i_rate;
+    p_block->i_length = vlc_tick_from_samples(p_aout_buf->i_nb_samples,
+                                              p_enc->fmt_in.audio.i_rate);
     return p_block;
 }
 #endif /* ENABLE_SOUT */

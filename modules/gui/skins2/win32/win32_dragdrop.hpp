@@ -2,7 +2,6 @@
  * win32_dragdrop.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -40,7 +39,7 @@
 class Win32DragDrop: public SkinObject, public IDropTarget
 {
 public:
-   Win32DragDrop( intf_thread_t *pIntf, bool playOnDrop, GenericWindow* pWin );
+   Win32DragDrop( intf_thread_t *pIntf, GenericWindow* pWin );
    virtual ~Win32DragDrop() { }
 
 protected:
@@ -60,8 +59,6 @@ protected:
 private:
     /// Internal reference counter
     LONG m_references;
-    /// Indicates whether the file(s) must be played immediately
-    bool m_playOnDrop;
     /// Window associated
     GenericWindow* m_pWin;
     /// format used for DrapNDrop

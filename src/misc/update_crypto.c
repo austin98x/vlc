@@ -2,7 +2,6 @@
  * update_crypto.c: OpenPGP related functions used for updating
  *****************************************************************************
  * Copyright © 2008-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Rafaël Carré <funman@videolanorg>
  *
@@ -54,7 +53,7 @@
 #define packet_header_len( c ) ( ( c & 0x03 ) + 1 ) /* number of bytes in a packet header */
 
 
-static inline int scalar_number( const uint8_t *p, int header_len )
+static inline uint32_t scalar_number( const uint8_t *p, size_t header_len )
 {
     assert( header_len == 1 || header_len == 2 || header_len == 4 );
 
@@ -63,14 +62,14 @@ static inline int scalar_number( const uint8_t *p, int header_len )
     else if( header_len == 2 )
         return( (p[0] << 8) + p[1] );
     else if( header_len == 4 )
-        return( (p[0] << 24) + (p[1] << 16) + (p[2] << 8) + p[3] );
+        return( ((uint32_t)p[0] << 24) + (p[1] << 16) + (p[2] << 8) + p[3] );
     else
         abort();
 }
 
 
 /* number of data bytes in a MPI */
-static int mpi_len(const uint8_t *mpi)
+static uint32_t mpi_len(const uint8_t *mpi)
 {
     return (scalar_number(mpi, 2) + 7) / 8;
 }
@@ -235,34 +234,37 @@ static size_t parse_signature_v4_packet( signature_packet_t *p_sig,
 
     for( ;; )
     {
-        if( p > max_pos )
+        if( p >= max_pos )
             return 0;
 
         size_t i_subpacket_len;
         if( *p < 192 )
         {
-            if( p + 1 > max_pos )
-                return 0;
             i_subpacket_len = *p++;
         }
         else if( *p < 255 )
         {
-            if( p + 2 > max_pos )
+            if( 2 > (size_t)( max_pos - p ) )
                 return 0;
             i_subpacket_len = (*p++ - 192) << 8;
             i_subpacket_len += *p++ + 192;
         }
         else
         {
-            if( ++p + 4 > max_pos )
+            if( 5 > (size_t)( max_pos - p ) )
                 return 0;
+            p++;
             i_subpacket_len = U32_AT(p);
             p += 4;
         }
 
+        if( i_subpacket_len == 0 ||
+            i_subpacket_len > (size_t)( max_pos - p ) )
+            return 0;
+
         if( *p == ISSUER_SUBPACKET )
         {
-            if( p + 9 > max_pos )
+            if( i_subpacket_len < 9 )
                 return 0;
 
             memcpy( &p_sig->issuer_longid, p+1, 8 );
@@ -340,6 +342,8 @@ error:
     {
         free( p_sig->specific.v4.hashed_data );
         free( p_sig->specific.v4.unhashed_data );
+        p_sig->specific.v4.hashed_data = NULL;
+        p_sig->specific.v4.unhashed_data = NULL;
     }
 
     return VLC_EGENERIC;
@@ -482,15 +486,15 @@ static int verify_signature_rsa( signature_packet_t *sign, public_key_packet_t *
     gcry_sexp_t key_sexp, hash_sexp, sig_sexp;
     key_sexp = hash_sexp = sig_sexp = NULL;
 
-    int i_n_len = mpi_len( p_key->sig.rsa.n );
-    int i_e_len = mpi_len( p_key->sig.rsa.e );
+    size_t i_e_len = mpi_len( p_key->sig.rsa.e );
+    size_t i_n_len = mpi_len( p_key->sig.rsa.n );
     if( gcry_mpi_scan( &n, GCRYMPI_FMT_USG, p_key->sig.rsa.n + 2, i_n_len, NULL ) ||
         gcry_mpi_scan( &e, GCRYMPI_FMT_USG, p_key->sig.rsa.e + 2, i_e_len, NULL ) ||
         gcry_sexp_build( &key_sexp, &erroff, key_sexp_s, n, e ) )
         goto out;
 
     uint8_t *p_s = sign->algo_specific.rsa.s;
-    int i_s_len = mpi_len( p_s );
+    size_t i_s_len = mpi_len( p_s );
     if( gcry_mpi_scan( &s, GCRYMPI_FMT_USG, p_s + 2, i_s_len, NULL ) ||
         gcry_sexp_build( &sig_sexp, &erroff, sig_sexp_s, s ) )
         goto out;
@@ -536,10 +540,10 @@ static int verify_signature_dsa( signature_packet_t *sign, public_key_packet_t *
     gcry_sexp_t key_sexp, hash_sexp, sig_sexp;
     key_sexp = hash_sexp = sig_sexp = NULL;
 
-    int i_p_len = mpi_len( p_key->sig.dsa.p );
-    int i_q_len = mpi_len( p_key->sig.dsa.q );
-    int i_g_len = mpi_len( p_key->sig.dsa.g );
-    int i_y_len = mpi_len( p_key->sig.dsa.y );
+    size_t i_p_len = mpi_len( p_key->sig.dsa.p );
+    size_t i_q_len = mpi_len( p_key->sig.dsa.q );
+    size_t i_g_len = mpi_len( p_key->sig.dsa.g );
+    size_t i_y_len = mpi_len( p_key->sig.dsa.y );
     if( gcry_mpi_scan( &p, GCRYMPI_FMT_USG, p_key->sig.dsa.p + 2, i_p_len, NULL ) ||
         gcry_mpi_scan( &q, GCRYMPI_FMT_USG, p_key->sig.dsa.q + 2, i_q_len, NULL ) ||
         gcry_mpi_scan( &g, GCRYMPI_FMT_USG, p_key->sig.dsa.g + 2, i_g_len, NULL ) ||
@@ -549,14 +553,14 @@ static int verify_signature_dsa( signature_packet_t *sign, public_key_packet_t *
 
     uint8_t *p_r = sign->algo_specific.dsa.r;
     uint8_t *p_s = sign->algo_specific.dsa.s;
-    int i_r_len = mpi_len( p_r );
-    int i_s_len = mpi_len( p_s );
+    size_t i_r_len = mpi_len( p_r );
+    size_t i_s_len = mpi_len( p_s );
     if( gcry_mpi_scan( &r, GCRYMPI_FMT_USG, p_r + 2, i_r_len, NULL ) ||
         gcry_mpi_scan( &s, GCRYMPI_FMT_USG, p_s + 2, i_s_len, NULL ) ||
         gcry_sexp_build( &sig_sexp, &erroff, sig_sexp_s, r, s ) )
         goto out;
 
-    int i_hash_len = gcry_md_get_algo_dlen (sign->digest_algo);
+    unsigned int i_hash_len = gcry_md_get_algo_dlen (sign->digest_algo);
     if (i_hash_len > i_q_len)
         i_hash_len = i_q_len;
     if( gcry_mpi_scan( &hash, GCRYMPI_FMT_USG, p_hash, i_hash_len, NULL ) ||
@@ -589,6 +593,9 @@ out:
 int verify_signature( signature_packet_t *sign, public_key_packet_t *p_key,
                       uint8_t *p_hash )
 {
+    if( sign->public_key_algo != p_key->algo )
+        return VLC_EGENERIC;
+
     if (sign->public_key_algo == GCRY_PK_DSA)
         return verify_signature_dsa(sign, p_key, p_hash);
     else if (sign->public_key_algo == GCRY_PK_RSA)
@@ -643,15 +650,15 @@ int parse_public_key( const uint8_t *p_key_data, size_t i_key_len,
 
         int i_type = packet_type( *pos );
 
-        int i_header_len = packet_header_len( *pos++ );
-        if( pos + i_header_len > max_pos ||
+        size_t i_header_len = packet_header_len( *pos++ );
+        if( i_header_len > (size_t)( max_pos - pos ) ||
             ( i_header_len != 1 && i_header_len != 2 && i_header_len != 4 ) )
             goto error;
 
-        int i_packet_len = scalar_number( pos, i_header_len );
+        size_t i_packet_len = scalar_number( pos, i_header_len );
         pos += i_header_len;
 
-        if( pos + i_packet_len > max_pos )
+        if( i_packet_len > (size_t)( max_pos - pos ) )
             goto error;
 
         switch( i_type )
@@ -715,6 +722,8 @@ error:
     {
         free( p_key->sig.specific.v4.hashed_data );
         free( p_key->sig.specific.v4.unhashed_data );
+        p_key->sig.specific.v4.hashed_data = NULL;
+        p_key->sig.specific.v4.unhashed_data = NULL;
     }
     free( p_key->psz_username );
     free( p_key_unarmored );
@@ -858,6 +867,9 @@ uint8_t *hash_from_public_key( public_key_t *p_pkey )
         p_pkey->sig.type > POSITIVE_KEY_SIGNATURE )
         return NULL;
 
+    if( p_pkey->psz_username == NULL )
+        return NULL;
+
     gcry_error_t error = 0;
     gcry_md_hd_t hd;
 
@@ -930,7 +942,7 @@ public_key_t *download_key( vlc_object_t *p_this,
                     const uint8_t *p_longid, const uint8_t *p_signature_issuer )
 {
     char *psz_url;
-    if( asprintf( &psz_url, "http://download.videolan.org/pub/keys/%.2X%.2X%.2X%.2X%.2X%.2X%.2X%.2X.asc",
+    if( asprintf( &psz_url, "https://download.videolan.org/pub/keys/%.2X%.2X%.2X%.2X%.2X%.2X%.2X%.2X.asc",
                     p_longid[0], p_longid[1], p_longid[2], p_longid[3],
                     p_longid[4], p_longid[5], p_longid[6], p_longid[7] ) == -1 )
         return NULL;
@@ -947,7 +959,7 @@ public_key_t *download_key( vlc_object_t *p_this,
         return NULL;
     }
 
-    uint8_t *p_buf = (uint8_t*)malloc( i_size );
+    uint8_t *p_buf = (uint8_t*)malloc( i_size + 1 );
     if( !p_buf )
     {
         vlc_stream_Delete( p_stream );
@@ -963,6 +975,8 @@ public_key_t *download_key( vlc_object_t *p_this,
         free( p_buf );
         return NULL;
     }
+
+    p_buf[i_size] = '\0';
 
     public_key_t *p_pkey = (public_key_t*) malloc( sizeof( public_key_t ) );
     if( !p_pkey )
@@ -1015,7 +1029,7 @@ int download_signature( vlc_object_t *p_this, signature_packet_t *p_sig,
     }
 
     msg_Dbg( p_this, "Downloading signature (%"PRIu64" bytes)", i_size );
-    uint8_t *p_buf = (uint8_t*)malloc( i_size );
+    uint8_t *p_buf = (uint8_t*)malloc( i_size + 1 );
     if( !p_buf )
     {
         vlc_stream_Delete( p_stream );
@@ -1033,6 +1047,8 @@ int download_signature( vlc_object_t *p_this, signature_packet_t *p_sig,
         free( p_buf );
         return VLC_EGENERIC;
     }
+
+    p_buf[i_size] = '\0';
 
     if( (uint8_t)*p_buf < 0x80 ) /* ASCII */
     {

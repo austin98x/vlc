@@ -2,7 +2,6 @@
  * var_manager.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -70,9 +69,9 @@ private:
     VarText *m_pHelpText;
     /// Map of named registered variables
     std::map<std::string, VariablePtr> m_varMap;
-    /// List of named registed variables
+    /// List of named registered variables
     std::list<std::string> m_varList;
-    /// List of anonymous registed variables
+    /// List of anonymous registered variables
     std::list<VariablePtr> m_anonVarList;
     /// Map of constant values
     std::map<std::string, std::string> m_constMap;

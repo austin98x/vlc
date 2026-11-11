@@ -2,7 +2,6 @@
  * algo_basic.c : Basic algorithms for the VLC deinterlacer
  *****************************************************************************
  * Copyright (C) 2000-2011 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Sam Hocevar <sam@zoy.org>
  *         Damien Lucas <nitrox@videolan.org>  (Bob, Blend)
@@ -133,9 +132,10 @@ int RenderBob( filter_t *p_filter, picture_t *p_outpic, picture_t *p_pic,
 int RenderLinear( filter_t *p_filter,
                   picture_t *p_outpic, picture_t *p_pic, int order, int i_field )
 {
-    VLC_UNUSED(p_filter);
     VLC_UNUSED(order);
     int i_plane;
+
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     /* Copy image and skip lines */
     for( i_plane = 0 ; i_plane < p_pic->i_planes ; i_plane++ )
@@ -180,7 +180,6 @@ int RenderLinear( filter_t *p_filter,
             memcpy( p_out, p_in, p_pic->p[i_plane].i_pitch );
         }
     }
-    EndMerge();
     return VLC_SUCCESS;
 }
 
@@ -190,8 +189,9 @@ int RenderLinear( filter_t *p_filter,
 
 int RenderMean( filter_t *p_filter, picture_t *p_outpic, picture_t *p_pic )
 {
-    VLC_UNUSED(p_filter);
     int i_plane;
+
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     /* Copy image and skip lines */
     for( i_plane = 0 ; i_plane < p_pic->i_planes ; i_plane++ )
@@ -214,7 +214,6 @@ int RenderMean( filter_t *p_filter, picture_t *p_outpic, picture_t *p_pic )
             p_in += 2 * p_pic->p[i_plane].i_pitch;
         }
     }
-    EndMerge();
     return VLC_SUCCESS;
 }
 
@@ -224,8 +223,9 @@ int RenderMean( filter_t *p_filter, picture_t *p_outpic, picture_t *p_pic )
 
 int RenderBlend( filter_t *p_filter, picture_t *p_outpic, picture_t *p_pic )
 {
-    VLC_UNUSED(p_filter);
     int i_plane;
+
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     /* Copy image and skip lines */
     for( i_plane = 0 ; i_plane < p_pic->i_planes ; i_plane++ )
@@ -252,6 +252,5 @@ int RenderBlend( filter_t *p_filter, picture_t *p_outpic, picture_t *p_pic )
             p_in  += p_pic->p[i_plane].i_pitch;
         }
     }
-    EndMerge();
     return VLC_SUCCESS;
 }

@@ -33,14 +33,18 @@
 #ifdef HAVE_CONFIG_H
 # include "config.h"
 #endif
+#include <assert.h>
+#include <limits.h>
 
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_plugin.h>
 #include <vlc_demux.h>
 #include <vlc_url.h>
 #include <vlc_meta.h>
 #include <vlc_fourcc.h>
 
+#include <rfb/rfbconfig.h>
 #include <rfb/rfbclient.h>
 
 #define RFB_USER N_("Username")
@@ -77,53 +81,54 @@ static void Close( vlc_object_t * );
 vlc_module_begin()
     set_shortname( N_("VNC") )
     add_shortcut( "vnc" )
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACCESS )
     set_description( N_("VNC client access") )
-    set_capability( "access_demux", 0 )
+    set_capability( "access", 0 )
 
-    add_string( CFG_PREFIX "user", NULL, RFB_USER, RFB_USER, false )
+    add_string( CFG_PREFIX "user", NULL, RFB_USER, NULL )
         change_safe()
-    add_password( CFG_PREFIX "password", NULL, RFB_PASSWORD, RFB_PASSWORD, false )
+    add_password(CFG_PREFIX "password", NULL, RFB_PASSWORD, NULL)
         change_safe()
-    add_loadfile( CFG_PREFIX "x509-ca", NULL, RFB_CA_TEXT, RFB_CA_LONGTEXT, true )
+    add_loadfile(CFG_PREFIX "x509-ca", NULL, RFB_CA_TEXT, RFB_CA_LONGTEXT)
         change_safe()
-    add_loadfile( CFG_PREFIX "x509-crl", NULL, RFB_CRL_TEXT, RFB_CRL_LONGTEXT, true )
+    add_loadfile(CFG_PREFIX "x509-crl", NULL, RFB_CRL_TEXT, RFB_CRL_LONGTEXT)
         change_safe()
-    add_loadfile( CFG_PREFIX "x509-client-cert", NULL, RFB_CERT_TEXT, RFB_CERT_LONGTEXT, true )
+    add_loadfile(CFG_PREFIX "x509-client-cert", NULL,
+                 RFB_CERT_TEXT, RFB_CERT_LONGTEXT)
         change_safe()
-    add_loadfile( CFG_PREFIX "x509-client-key", NULL, RFB_KEY_TEXT, RFB_KEY_LONGTEXT, true )
+    add_loadfile(CFG_PREFIX "x509-client-key", NULL,
+                 RFB_KEY_TEXT, RFB_KEY_LONGTEXT)
         change_safe()
 
-    add_float( CFG_PREFIX "fps", 5, RFB_FPS, RFB_FPS_LONGTEXT, true )
-    add_string( CFG_PREFIX "chroma", rgb_chromas_v[0], RFB_CHROMA, RFB_CHROMA_LONGTEXT, false )
+    add_float( CFG_PREFIX "fps", 5, RFB_FPS, RFB_FPS_LONGTEXT )
+    add_string( CFG_PREFIX "chroma", rgb_chromas_v[0], RFB_CHROMA, RFB_CHROMA_LONGTEXT )
         change_string_list (rgb_chromas_v, rgb_chromas)
         change_safe()
-    add_integer( CFG_PREFIX "compress-level", 0, RFB_COMPRESS, RFB_COMPRESS_LONGTEXT, true )
+    add_integer( CFG_PREFIX "compress-level", 0, RFB_COMPRESS, RFB_COMPRESS_LONGTEXT )
         change_integer_range (0, 9)
         change_safe()
-    add_integer( CFG_PREFIX "quality-level", 9, RFB_QUALITY, RFB_QUALITY_LONGTEXT, true )
+    add_integer( CFG_PREFIX "quality-level", 9, RFB_QUALITY, RFB_QUALITY_LONGTEXT )
         change_integer_range (1, 9)
         change_safe()
 
     set_callbacks( Open, Close )
 vlc_module_end()
 
-struct demux_sys_t
+typedef struct
 {
     vlc_thread_t thread;
-    int i_cancel_state;
+    vlc_sem_t closing;
 
     rfbClient* p_client;
-    int i_framebuffersize;
+    size_t i_framebuffersize;
     block_t *p_block;
 
     float f_fps;
     int i_frame_interval;
-    mtime_t i_starttime;
+    vlc_tick_t i_starttime;
 
     es_out_id_t *es;
-};
+} demux_sys_t;
 
 static void *DemuxThread( void *p_data );
 
@@ -143,44 +148,64 @@ static rfbBool mallocFrameBufferHandler( rfbClient* p_client )
         p_sys->es = NULL;
     }
 
-    int i_width = p_client->width;
-    int i_height = p_client->height;
-    int i_depth = p_client->format.bitsPerPixel;
-
-    switch( i_depth )
+    if ( p_client->width > UINT16_MAX || p_client->height > UINT16_MAX )
     {
-        case 8:
-            i_chroma = VLC_CODEC_RGB8;
-            break;
-        default:
-        case 16:
-            i_chroma = VLC_CODEC_RGB16;
-            break;
-        case 24:
-            i_chroma = VLC_CODEC_RGB24;
-            break;
-        case 32:
-            i_chroma = VLC_CODEC_RGB32;
-            break;
+        assert(p_client->width <= UINT16_MAX); // fits in 16 bits
+        assert(p_client->height <= UINT16_MAX); // fits in 16 bits
+        return FALSE;
     }
+    unsigned int i_width = p_client->width;
+    unsigned int i_height = p_client->height;
 
-    if ( i_chroma != VLC_CODEC_RGB8 ) /* Palette based, no mask */
+    if (p_client->format.depth <= 8 &&
+            !strstr(p_client->appData.encodingsString, "tight")) // libvnc does not support tight at 8 bpp
+        i_chroma = VLC_CODEC_BGR233;
+    else if (p_client->format.depth <= 16)
+        i_chroma = VLC_CODEC_RGB565LE;
+    else // skip 24 bpp pixfmt since rfb protocol forbids 24 bpp pixfmts
+        i_chroma = VLC_CODEC_BGRX;
+
+    p_client->format.bigEndian = 0; // we expect LE byte order regardless of native endianness
+    p_client->format.trueColour = 1; // we do not support color maps
+
+    switch( i_chroma )
     {
-        video_format_t videofmt;
-        video_format_Init( &videofmt, i_chroma );
-        video_format_FixRgb( &videofmt );
-
-        p_client->format.redShift = videofmt.i_lrshift;
-        p_client->format.greenShift = videofmt.i_lgshift;
-        p_client->format.blueShift = videofmt.i_lbshift;
-        p_client->format.redMax = videofmt.i_rmask >> videofmt.i_lrshift;
-        p_client->format.greenMax = videofmt.i_gmask >> videofmt.i_lgshift;
-        p_client->format.blueMax = videofmt.i_bmask >> videofmt.i_lbshift;
-        video_format_Clean( &videofmt );
+        case VLC_CODEC_BGR233:
+            p_client->format.depth = p_client->format.bitsPerPixel = 8;
+            p_client->format.redShift   =  0;
+            p_client->format.greenShift =  3;
+            p_client->format.blueShift  =  6;
+            p_client->format.redMax     = 0x7;
+            p_client->format.greenMax   = 0x7;
+            p_client->format.blueMax    = 0x3;
+            break;
+        case VLC_CODEC_RGB565LE:
+            p_client->format.depth = p_client->format.bitsPerPixel = 16;
+            p_client->format.redShift   = 11;
+            p_client->format.greenShift =  5;
+            p_client->format.blueShift  =  0;
+            p_client->format.redMax     = 0x1f;
+            p_client->format.greenMax   = 0x3f;
+            p_client->format.blueMax    = 0x1f;
+            break;
+        case VLC_CODEC_BGRX:
+            p_client->format.depth = 24;
+            p_client->format.bitsPerPixel = 32;
+            p_client->format.redShift   = 16;
+            p_client->format.greenShift =  8;
+            p_client->format.blueShift  =  0;
+            p_client->format.redMax     = 0xff;
+            p_client->format.greenMax   = 0xff;
+            p_client->format.blueMax    = 0xff;
+            break;
     }
 
     /* Set up framebuffer */
-    p_sys->i_framebuffersize = i_width * i_height * i_depth / 8;
+    if (mul_overflow(i_height, p_client->format.bitsPerPixel / 8, &p_sys->i_framebuffersize) ||
+        mul_overflow(i_width, p_sys->i_framebuffersize, &p_sys->i_framebuffersize)) {
+        msg_Err(p_demux, "VNC framebuffersize overflow");
+        return FALSE;
+    }
 
     /* Reuse unsent block */
     if ( p_sys->p_block )
@@ -202,6 +227,7 @@ static rfbBool mallocFrameBufferHandler( rfbClient* p_client )
 
     /* Fill input format */
     fmt.video.i_chroma = i_chroma;
+
     fmt.video.i_visible_width =
             fmt.video.i_width = i_width;
 
@@ -210,11 +236,6 @@ static rfbBool mallocFrameBufferHandler( rfbClient* p_client )
 
     fmt.video.i_frame_rate_base = 1000;
     fmt.video.i_frame_rate = 1000 * p_sys->f_fps;
-
-    fmt.video.i_bits_per_pixel = i_depth;
-    fmt.video.i_rmask = p_client->format.redMax << p_client->format.redShift;
-    fmt.video.i_gmask = p_client->format.greenMax << p_client->format.greenShift;
-    fmt.video.i_bmask = p_client->format.blueMax << p_client->format.blueShift;
 
     fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
 
@@ -276,7 +297,6 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
 {
     demux_sys_t *p_sys = p_demux->p_sys;
     bool *pb;
-    int64_t *pi64;
     double *p_dbl;
     vlc_meta_t *p_meta;
 
@@ -297,19 +317,16 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = INT64_C(1000)
-                  * var_InheritInteger( p_demux, "network-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS(var_InheritInteger( p_demux, "network-caching" ));
             return VLC_SUCCESS;
 
         case DEMUX_GET_TIME:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = mdate() - p_sys->i_starttime;
+            *va_arg( args, vlc_tick_t * ) = vlc_tick_now() - p_sys->i_starttime;
             return VLC_SUCCESS;
 
         case DEMUX_GET_LENGTH:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = 0;
+            *va_arg( args, vlc_tick_t * ) = 0;
             return VLC_SUCCESS;
 
         case DEMUX_GET_FPS:
@@ -335,30 +352,31 @@ static void *DemuxThread( void *p_data )
 {
     demux_t *p_demux = (demux_t *) p_data;
     demux_sys_t  *p_sys = p_demux->p_sys;
-    mtime_t i_next_frame_date = mdate() + p_sys->i_frame_interval;
+    vlc_tick_t i_next_frame_date = vlc_tick_now() + p_sys->i_frame_interval;
     int i_status;
+
+    vlc_thread_set_name("vlc-vnc");
 
     for(;;)
     {
-        p_sys->i_cancel_state = vlc_savecancel();
         i_status = WaitForMessage( p_sys->p_client, p_sys->i_frame_interval );
-        vlc_restorecancel( p_sys->i_cancel_state );
 
         /* Ensure we're not building frames too fast */
         /* as WaitForMessage takes only a maximum wait */
-        mwait( i_next_frame_date );
+        if( vlc_sem_timedwait( &p_sys->closing, i_next_frame_date ) == 0 )
+            break;
+
         i_next_frame_date += p_sys->i_frame_interval;
 
         if ( i_status > 0 )
         {
             p_sys->p_client->frameBuffer = p_sys->p_block->p_buffer;
-            p_sys->i_cancel_state = vlc_savecancel();
             i_status = HandleRFBServerMessage( p_sys->p_client );
-            vlc_restorecancel( p_sys->i_cancel_state );
             if ( ! i_status )
             {
                 msg_Warn( p_demux, "Cannot get announced data. Server closed ?" );
-                es_out_Del( p_demux->out, p_sys->es );
+                if ( p_sys->es )
+                    es_out_Del( p_demux->out, p_sys->es );
                 p_sys->es = NULL;
                 return NULL;
             }
@@ -367,9 +385,12 @@ static void *DemuxThread( void *p_data )
                 block_t *p_block = block_Duplicate( p_sys->p_block );
                 if ( p_block ) /* drop frame/content if no next block */
                 {
-                    p_sys->p_block->i_dts = p_sys->p_block->i_pts = mdate();
+                    p_sys->p_block->i_dts = p_sys->p_block->i_pts = vlc_tick_now();
                     es_out_SetPCR( p_demux->out, p_sys->p_block->i_pts );
-                    es_out_Send( p_demux->out, p_sys->es, p_sys->p_block );
+                    if ( p_sys->es )
+                        es_out_Send( p_demux->out, p_sys->es, p_sys->p_block );
+                    else
+                        block_Release( p_sys->p_block );
                     p_sys->p_block = p_block;
                 }
             }
@@ -386,12 +407,15 @@ static int Open( vlc_object_t *p_this )
     demux_t      *p_demux = (demux_t*)p_this;
     demux_sys_t  *p_sys;
 
+    if (p_demux->out == NULL)
+        return VLC_EGENERIC;
+
     p_sys = vlc_obj_calloc( p_this, 1, sizeof(demux_sys_t) );
     if( !p_sys ) return VLC_ENOMEM;
 
     p_sys->f_fps = var_InheritFloat( p_demux, CFG_PREFIX "fps" );
     if ( p_sys->f_fps <= 0 ) p_sys->f_fps = 1.0;
-    p_sys->i_frame_interval = 1000000 / p_sys->f_fps ;
+    p_sys->i_frame_interval = vlc_tick_rate_duration( p_sys->f_fps );
 
     char *psz_chroma = var_InheritString( p_demux, CFG_PREFIX "chroma" );
     vlc_fourcc_t i_chroma = vlc_fourcc_GetCodecFromString( VIDEO_ES, psz_chroma );
@@ -440,7 +464,7 @@ static int Open( vlc_object_t *p_this )
 
     /* Parse uri params */
     vlc_url_t url;
-    vlc_UrlParse( &url, p_demux->psz_location );
+    vlc_UrlParse( &url, p_demux->psz_url );
 
     if ( !EMPTY_STR(url.psz_host) )
         p_sys->p_client->serverHost = strdup( url.psz_host );
@@ -467,9 +491,10 @@ static int Open( vlc_object_t *p_this )
         return VLC_EGENERIC;
     }
 
-    p_sys->i_starttime = mdate();
+    p_sys->i_starttime = vlc_tick_now();
+    vlc_sem_init( &p_sys->closing, 0 );
 
-    if ( vlc_clone( &p_sys->thread, DemuxThread, p_demux, VLC_THREAD_PRIORITY_INPUT ) != VLC_SUCCESS )
+    if ( vlc_clone( &p_sys->thread, DemuxThread, p_demux ) != VLC_SUCCESS )
     {
         msg_Err( p_demux, "can't spawn thread" );
         return VLC_EGENERIC;
@@ -489,7 +514,7 @@ static void Close( vlc_object_t *p_this )
     demux_t     *p_demux = (demux_t*)p_this;
     demux_sys_t *p_sys = p_demux->p_sys;
 
-    vlc_cancel( p_sys->thread );
+    vlc_sem_post( &p_sys->closing );
     vlc_join( p_sys->thread, NULL );
 
     if ( p_sys->es )

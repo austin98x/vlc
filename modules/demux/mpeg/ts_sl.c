@@ -32,7 +32,7 @@
 
 const es_mpeg4_descriptor_t * GetMPEG4DescByEsId( const ts_pmt_t *pmt, uint16_t i_es_id )
 {
-    for( int i = 0; i < ES_DESCRIPTOR_COUNT; i++ )
+    for( int i = 0; pmt->iod && i < ES_DESCRIPTOR_COUNT; i++ )
     {
         const es_mpeg4_descriptor_t *es_descr = &pmt->iod->es_descr[i];
         if( es_descr->i_es_id == i_es_id && es_descr->b_ok )
@@ -177,9 +177,14 @@ void SLPackets_Section_Handler( demux_t *p_demux,
                     p_es->fmt = fmt;
 
                     if( p_es->id )
+                    {
                         es_out_Del( p_demux->out, p_es->id );
+                        p_sys->i_pmt_es--;
+                    }
                     p_es->fmt.b_packetized = true; /* Split by access unit, no sync code */
                     p_es->id = es_out_Add( p_demux->out, &p_es->fmt );
+                    if( p_es->id )
+                        p_sys->i_pmt_es++;
                     b_changed = true;
                 }
                 else

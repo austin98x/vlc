@@ -23,23 +23,24 @@
 # include "config.h"
 #endif
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <math.h>
 
 #include <vlc_common.h>
-#include <libvlc.h>
+#include "../libvlc.h"
 #include <vlc_modules.h>
 #include <vlc_aout.h>
 #include <vlc_aout_volume.h>
-#include <vlc_atomic.h>
+#include <vlc_replay_gain.h>
 #include "aout_internal.h"
 
 struct aout_volume
 {
     audio_volume_t object;
     audio_replay_gain_t replay_gain;
-    vlc_atomic_float gain_factor;
-    float output_factor;
+    _Atomic float gain_factor;
+    _Atomic float output_factor;
     module_t *module;
 };
 
@@ -58,7 +59,8 @@ aout_volume_t *aout_volume_New(vlc_object_t *parent,
     if (unlikely(vol == NULL))
         return NULL;
     vol->module = NULL;
-    vol->output_factor = 1.f;
+    atomic_init(&vol->gain_factor, 1.f);
+    atomic_init(&vol->output_factor, 1.f);
 
     //audio_volume_t *obj = &vol->object;
 
@@ -80,9 +82,6 @@ aout_volume_t *aout_volume_New(vlc_object_t *parent,
  */
 int aout_volume_SetFormat(aout_volume_t *vol, vlc_fourcc_t format)
 {
-    if (unlikely(vol == NULL))
-        return -1;
-
     audio_volume_t *obj = &vol->object;
     if (vol->module != NULL)
     {
@@ -107,24 +106,18 @@ int aout_volume_SetFormat(aout_volume_t *vol, vlc_fourcc_t format)
  */
 void aout_volume_Delete(aout_volume_t *vol)
 {
-    if (vol == NULL)
-        return;
-
     audio_volume_t *obj = &vol->object;
 
     if (vol->module != NULL)
         module_unneed(obj, vol->module);
-    var_DelCallback(obj->obj.parent, "audio-replay-gain-mode",
+    var_DelCallback(vlc_object_parent(obj), "audio-replay-gain-mode",
                     ReplayGainCallback, vol);
-    vlc_object_release(obj);
+    vlc_object_delete(obj);
 }
 
 void aout_volume_SetVolume(aout_volume_t *vol, float factor)
 {
-    if (unlikely(vol == NULL))
-        return;
-
-    vol->output_factor = factor;
+    atomic_store_explicit(&vol->output_factor, factor, memory_order_relaxed);
 }
 
 /**
@@ -132,73 +125,22 @@ void aout_volume_SetVolume(aout_volume_t *vol, float factor)
  */
 int aout_volume_Amplify(aout_volume_t *vol, block_t *block)
 {
-    if (unlikely(vol == NULL) || vol->module == NULL)
+    if (vol->module == NULL)
         return -1;
 
-    float amp = vol->output_factor
-              * vlc_atomic_load_float (&vol->gain_factor);
+    float amp = atomic_load_explicit(&vol->output_factor, memory_order_relaxed)
+              * atomic_load_explicit(&vol->gain_factor, memory_order_relaxed);
 
     vol->object.amplify(&vol->object, block, amp);
     return 0;
-}
-
-/*** Replay gain ***/
-static float aout_ReplayGainSelect(vlc_object_t *obj, const char *str,
-                                   const audio_replay_gain_t *replay_gain)
-{
-    unsigned mode = AUDIO_REPLAY_GAIN_MAX;
-
-    if (likely(str != NULL))
-    {   /* Find selectrf mode */
-        if (!strcmp (str, "track"))
-            mode = AUDIO_REPLAY_GAIN_TRACK;
-        else
-        if (!strcmp (str, "album"))
-            mode = AUDIO_REPLAY_GAIN_ALBUM;
-    }
-
-    /* */
-    float multiplier;
-
-    if (mode == AUDIO_REPLAY_GAIN_MAX)
-    {
-        multiplier = 1.f;
-    }
-    else
-    {
-        float gain;
-
-        /* If the selectrf mode is not available, prefer the other one */
-        if (!replay_gain->pb_gain[mode] && replay_gain->pb_gain[!mode])
-            mode = !mode;
-
-        if (replay_gain->pb_gain[mode])
-            gain = replay_gain->pf_gain[mode]
-                 + var_InheritFloat (obj, "audio-replay-gain-preamp");
-        else
-            gain = var_InheritFloat (obj, "audio-replay-gain-default");
-
-        multiplier = powf (10.f, gain / 20.f);
-
-        if (var_InheritBool (obj, "audio-replay-gain-peak-protection"))
-            multiplier = fminf (multiplier, replay_gain->pb_peak[mode]
-                                            ? 1.f / replay_gain->pf_peak[mode]
-                                            : 1.f);
-    }
-
-    /* Command line / configuration gain */
-    multiplier *= var_InheritFloat (obj, "gain");
-
-    return multiplier;
 }
 
 static int ReplayGainCallback (vlc_object_t *obj, char const *var,
                                vlc_value_t oldval, vlc_value_t val, void *data)
 {
     aout_volume_t *vol = data;
-    float multiplier = aout_ReplayGainSelect(obj, val.psz_string,
-                                             &vol->replay_gain);
-    vlc_atomic_store_float (&vol->gain_factor, multiplier);
-    VLC_UNUSED(var); VLC_UNUSED(oldval);
+    float multiplier = replay_gain_CalcMultiplier(obj, &vol->replay_gain);
+    atomic_store_explicit(&vol->gain_factor, multiplier, memory_order_relaxed);
+    VLC_UNUSED(var); VLC_UNUSED(oldval); VLC_UNUSED(val);
     return VLC_SUCCESS;
 }

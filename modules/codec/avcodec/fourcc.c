@@ -2,7 +2,6 @@
  * fourcc.c: libavcodec <-> libvlc conversion routines
  *****************************************************************************
  * Copyright (C) 1999-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -39,7 +38,7 @@
 struct vlc_avcodec_fourcc
 {
     vlc_fourcc_t i_fourcc;
-    unsigned i_codec;
+    enum AVCodecID i_codec;
 };
 
 /*
@@ -62,7 +61,22 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     { VLC_CODEC_SP5X, AV_CODEC_ID_SP5X },
     { VLC_CODEC_JPEGLS, AV_CODEC_ID_JPEGLS },
     { VLC_CODEC_MP4V, AV_CODEC_ID_MPEG4 },
-    /* AV_CODEC_ID_RAWVIDEO */
+    { VLC_CODEC_RGB24, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_BGR24, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_RGB332, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_RGB233, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_BGR233, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_RGBA, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_ARGB, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_ABGR, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_RGBX, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_XRGB, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_XBGR, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_BGRX, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_RGB565BE, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_RGB565LE, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_BGR565BE, AV_CODEC_ID_RAWVIDEO },
+    { VLC_CODEC_BGR565LE, AV_CODEC_ID_RAWVIDEO },
     { VLC_CODEC_DIV1, AV_CODEC_ID_MSMPEG4V1 },
     { VLC_CODEC_DIV2, AV_CODEC_ID_MSMPEG4V2 },
     { VLC_CODEC_DIV3, AV_CODEC_ID_MSMPEG4V3 },
@@ -108,12 +122,16 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     { VLC_CODEC_LCL_MSZH, AV_CODEC_ID_MSZH },
     { VLC_CODEC_LCL_ZLIB, AV_CODEC_ID_ZLIB },
     { VLC_CODEC_QTRLE, AV_CODEC_ID_QTRLE },
+#if LIBAVCODEC_VERSION_CHECK(59, 33, 100)
+    { VLC_CODEC_QOI, AV_CODEC_ID_QOI },
+#endif
     { VLC_CODEC_TSCC, AV_CODEC_ID_TSCC },
     { VLC_CODEC_ULTI, AV_CODEC_ID_ULTI },
     { VLC_CODEC_QDRAW, AV_CODEC_ID_QDRAW },
     { VLC_CODEC_VIXL, AV_CODEC_ID_VIXL },
     { VLC_CODEC_QPEG, AV_CODEC_ID_QPEG },
     { VLC_CODEC_PNG, AV_CODEC_ID_PNG },
+    { VLC_CODEC_PNM, AV_CODEC_ID_PPM },
     { VLC_CODEC_PPM, AV_CODEC_ID_PPM },
     /* AV_CODEC_ID_PBM */
     { VLC_CODEC_PGM, AV_CODEC_ID_PGM },
@@ -142,6 +160,8 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     { VLC_CODEC_KMVC, AV_CODEC_ID_KMVC },
     { VLC_CODEC_FLASHSV, AV_CODEC_ID_FLASHSV },
     { VLC_CODEC_CAVS, AV_CODEC_ID_CAVS },
+    { VLC_CODEC_CAVS2, AV_CODEC_ID_AVS2 },
+    { VLC_CODEC_CAVS3, AV_CODEC_ID_AVS3 },
     { VLC_CODEC_JPEG2000, AV_CODEC_ID_JPEG2000 },
     { VLC_CODEC_VMNC, AV_CODEC_ID_VMNC },
     { VLC_CODEC_VP5, AV_CODEC_ID_VP5 },
@@ -182,6 +202,11 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     /* AV_CODEC_ID_V210X */
     { VLC_CODEC_TMV, AV_CODEC_ID_TMV },
     { VLC_CODEC_V210, AV_CODEC_ID_V210 },
+#if LIBAVCODEC_VERSION_CHECK( 59, 42, 102 )
+    { VLC_CODEC_VUYA, AV_CODEC_ID_RAWVIDEO },
+#else
+    { VLC_CODEC_VUYA, AV_CODEC_ID_AYUV },
+#endif
     /* AV_CODEC_ID_DPX */
     { VLC_CODEC_MAD, AV_CODEC_ID_MAD },
     { VLC_CODEC_FRWU, AV_CODEC_ID_FRWU },
@@ -194,6 +219,7 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     /* AV_CODEC_ID_IFF_BYTERUN1 */
     { VLC_CODEC_KGV1, AV_CODEC_ID_KGV1 },
     { VLC_CODEC_YOP, AV_CODEC_ID_YOP },
+    { VLC_CODEC_VP4, AV_CODEC_ID_VP4 },
     { VLC_CODEC_VP8, AV_CODEC_ID_VP8 },
     /* AV_CODEC_ID_PICTOR */
     /* AV_CODEC_ID_ANSI */
@@ -211,7 +237,9 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     { VLC_CODEC_BMVVIDEO, AV_CODEC_ID_BMV_VIDEO },
     { VLC_CODEC_VBLE, AV_CODEC_ID_VBLE },
     { VLC_CODEC_DXTORY, AV_CODEC_ID_DXTORY },
-    /* AV_CODEC_ID_V410 */
+#if FF_API_V408_CODECID
+    { VLC_CODEC_V410, AV_CODEC_ID_V410 },
+#endif
     /* AV_CODEC_ID_XWD */
     { VLC_CODEC_CDXL, AV_CODEC_ID_CDXL },
     /* AV_CODEC_ID_XBM */
@@ -223,9 +251,8 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     { VLC_CODEC_CLLC, AV_CODEC_ID_CLLC },
     { VLC_CODEC_MSS2, AV_CODEC_ID_MSS2 },
     { VLC_CODEC_VP9, AV_CODEC_ID_VP9 },
-#if LIBAVCODEC_VERSION_CHECK( 57, 26, 0, 83, 101 )
+    { VLC_CODEC_VP9ALPHA_ES, AV_CODEC_ID_VP9 },
     { VLC_CODEC_AV1, AV_CODEC_ID_AV1 },
-#endif
     { VLC_CODEC_ICOD, AV_CODEC_ID_AIC },
     /* AV_CODEC_ID_ESCAPE130 */
     { VLC_CODEC_G2M4, AV_CODEC_ID_G2M },
@@ -257,17 +284,23 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
 
     { VLC_CODEC_DXV, AV_CODEC_ID_DXV },
 
+#if LIBAVCODEC_VERSION_CHECK( 61, 03, 100 )
+    { VLC_CODEC_VVC, AV_CODEC_ID_VVC },
+#endif
     /* ffmpeg only: AV_CODEC_ID_BRENDER_PIX */
     /* ffmpeg only: AV_CODEC_ID_Y41P */
     /* ffmpeg only: AV_CODEC_ID_EXR */
     /* ffmpeg only: AV_CODEC_ID_AVRP */
     /* ffmpeg only: AV_CODEC_ID_012V */
     /* ffmpeg only: AV_CODEC_ID_AVUI */
-    /* ffmpeg only: AV_CODEC_ID_AYUV */
     /* ffmpeg only: AV_CODEC_ID_TARGA_Y216 */
-    /* ffmpeg only: AV_CODEC_ID_V308 */
-    /* ffmpeg only: AV_CODEC_ID_V408 */
-    /* ffmpeg only: AV_CODEC_ID_YUV4 */
+
+#if FF_API_V408_CODECID
+    { VLC_CODEC_V308, AV_CODEC_ID_V308 },
+    { VLC_CODEC_V408, AV_CODEC_ID_V408 },
+#endif
+    { VLC_CODEC_YUV4, AV_CODEC_ID_YUV4 },
+
     /* ffmpeg only: AV_CODEC_ID_SANM */
     /* ffmpeg only: AV_CODEC_ID_PAF_VIDEO */
     /* ffmpeg only: AV_CODEC_ID_AVRN */
@@ -279,17 +312,28 @@ static const struct vlc_avcodec_fourcc video_codecs[] =
     /* ffmpeg only: AV_CODEC_ID_SNOW */
     /* ffmpeg only: AV_CODEC_ID_SMVJPEG */
 
-#if LIBAVCODEC_VERSION_CHECK( 57, 999, 999, 70, 100 )
+    { VLC_CODEC_MAGICYUV, AV_CODEC_ID_MAGICYUV },
+
+    { VLC_CODEC_CINEFORM, AV_CODEC_ID_CFHD },
+
     { VLC_CODEC_PIXLET, AV_CODEC_ID_PIXLET },
-#endif
 
-#if LIBAVCODEC_VERSION_CHECK( 57, 999, 999, 71, 101 )
     { VLC_CODEC_SPEEDHQ, AV_CODEC_ID_SPEEDHQ },
+
+    { VLC_CODEC_FMVC, AV_CODEC_ID_FMVC },
+
+    { VLC_CODEC_IMM4, AV_CODEC_ID_IMM4 },
+
+    { VLC_CODEC_AGM, AV_CODEC_ID_AGM },
+
+    { VLC_CODEC_IMM5, AV_CODEC_ID_IMM5 },
+
+    { VLC_CODEC_NOTCHLC, AV_CODEC_ID_NOTCHLC },
+
+#if LIBAVCODEC_VERSION_CHECK( 62, 1, 100 )
+    { VLC_CODEC_APV, AV_CODEC_ID_APV },
 #endif
 
-#if LIBAVCODEC_VERSION_CHECK( 57, 999, 999, 79, 100 )
-    { VLC_CODEC_FMVC, AV_CODEC_ID_FMVC },
-#endif
 };
 
 /*
@@ -343,6 +387,7 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
     { VLC_CODEC_ADPCM_ADX, AV_CODEC_ID_ADPCM_ADX },
     { VLC_CODEC_ADPCM_EA, AV_CODEC_ID_ADPCM_EA },
     { VLC_CODEC_ADPCM_G726, AV_CODEC_ID_ADPCM_G726 },
+    { VLC_CODEC_ADPCM_G726_LE, AV_CODEC_ID_ADPCM_G726LE },
     { VLC_CODEC_ADPCM_CREATIVE, AV_CODEC_ID_ADPCM_CT },
     { VLC_CODEC_ADPCM_SWF, AV_CODEC_ID_ADPCM_SWF },
     { VLC_CODEC_ADPCM_YAMAHA, AV_CODEC_ID_ADPCM_YAMAHA },
@@ -352,7 +397,7 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
     { VLC_CODEC_ADPCM_THP, AV_CODEC_ID_ADPCM_THP },
     { VLC_CODEC_ADPCM_IMA_AMV, AV_CODEC_ID_ADPCM_IMA_AMV },
     { VLC_CODEC_ADPCM_EA_R1, AV_CODEC_ID_ADPCM_EA_R1 },
-    /* AV_CODEC_ID_ADPCM_EA_R3 */
+    { VLC_CODEC_ADPCM_EA_R3, AV_CODEC_ID_ADPCM_EA_R3 },
     /* AV_CODEC_ID_ADPCM_EA_R2 */
     { VLC_CODEC_ADPCM_IMA_EA_SEAD, AV_CODEC_ID_ADPCM_IMA_EA_SEAD },
     /* AV_CODEC_ID_ADPCM_IMA_EA_EACS */
@@ -404,8 +449,9 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
     /* AV_CODEC_ID_WESTWOOD_SND1 */
     { VLC_CODEC_GSM, AV_CODEC_ID_GSM },
     { VLC_CODEC_QDM2, AV_CODEC_ID_QDM2 },
-#if LIBAVCODEC_VERSION_CHECK( 57, 999, 999, 71, 100 )
     { VLC_CODEC_QDMC, AV_CODEC_ID_QDMC },
+#if LIBAVCODEC_VERSION_CHECK(60, 35, 100)
+    { VLC_CODEC_QOA, AV_CODEC_ID_QOA },
 #endif
     { VLC_CODEC_COOK, AV_CODEC_ID_COOK },
     { VLC_CODEC_TRUESPEECH, AV_CODEC_ID_TRUESPEECH },
@@ -423,6 +469,7 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
     { VLC_CODEC_NELLYMOSER, AV_CODEC_ID_NELLYMOSER },
     { VLC_CODEC_MUSEPACK8, AV_CODEC_ID_MUSEPACK8 },
     { VLC_CODEC_SPEEX, AV_CODEC_ID_SPEEX },
+    { VLC_CODEC_CODEC2, AV_CODEC_ID_CODEC2 },
     { VLC_CODEC_WMAS, AV_CODEC_ID_WMAVOICE },
     { VLC_CODEC_WMAP, AV_CODEC_ID_WMAPRO },
     { VLC_CODEC_WMAL, AV_CODEC_ID_WMALOSSLESS },
@@ -434,6 +481,9 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
     { VLC_CODEC_TRUEHD, AV_CODEC_ID_TRUEHD },
     { VLC_CODEC_ALS, AV_CODEC_ID_MP4ALS },
     { VLC_CODEC_ATRAC1, AV_CODEC_ID_ATRAC1 },
+    { VLC_CODEC_ATRAC3AL, AV_CODEC_ID_ATRAC3AL },
+    { VLC_CODEC_ATRAC3PAL, AV_CODEC_ID_ATRAC3PAL },
+    { VLC_CODEC_ATRAC9, AV_CODEC_ID_ATRAC9 },
     { VLC_CODEC_BINKAUDIO_RDFT, AV_CODEC_ID_BINKAUDIO_RDFT },
     { VLC_CODEC_BINKAUDIO_DCT, AV_CODEC_ID_BINKAUDIO_DCT },
     { VLC_CODEC_MP4A, AV_CODEC_ID_AAC_LATM },
@@ -453,6 +503,15 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
     { VLC_CODEC_METASOUND, AV_CODEC_ID_METASOUND },
     /* AV_CODEC_ID_PAF_AUDIO */
     { VLC_CODEC_ON2AVC, AV_CODEC_ID_ON2AVC },
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT( 59, 23, 100 )
+    { VLC_CODEC_DFPWM, AV_CODEC_ID_DFPWM },
+#endif
+
+    /* DSD */
+    { VLC_CODEC_DSD_LSBF, AV_CODEC_ID_DSD_LSBF },
+    { VLC_CODEC_DSD_MSBF, AV_CODEC_ID_DSD_MSBF },
+    { VLC_CODEC_DSD_LSBF_PLANAR, AV_CODEC_ID_DSD_LSBF_PLANAR },
+    { VLC_CODEC_DSD_MSBF_PLANAR, AV_CODEC_ID_DSD_MSBF_PLANAR },
 
     /* ffmpeg only: AV_CODEC_ID_FFWAVESYNTH */
     /* ffmpeg only: AV_CODEC_ID_SONIC */
@@ -472,9 +531,7 @@ static const struct vlc_avcodec_fourcc spu_codecs[] =
     { VLC_CODEC_SSA, AV_CODEC_ID_SSA },
     { VLC_CODEC_TX3G, AV_CODEC_ID_MOV_TEXT },
     { VLC_CODEC_BD_PG, AV_CODEC_ID_HDMV_PGS_SUBTITLE },
-#if LIBAVCODEC_VERSION_CHECK( 57, 999, 999, 71, 100 )
     { VLC_CODEC_BD_TEXT, AV_CODEC_ID_HDMV_TEXT_SUBTITLE },
-#endif
     { VLC_CODEC_TELETEXT, AV_CODEC_ID_DVB_TELETEXT },
     /* AV_CODEC_ID_SRT */
     /* ffmpeg only: AV_CODEC_ID_MICRODVD */
@@ -492,13 +549,18 @@ static const struct vlc_avcodec_fourcc spu_codecs[] =
     /* ffmpeg only: AV_CODEC_ID_ASS */
 };
 
-bool GetFfmpegCodec( enum es_format_category_e cat, vlc_fourcc_t i_fourcc,
-                     unsigned *pi_ffmpeg_codec, const char **ppsz_name )
+bool GetFfmpegCodec( const es_format_t *es,
+                     enum AVCodecID *pi_ffmpeg_codec, const char **ppsz_name )
 {
     const struct vlc_avcodec_fourcc *base;
     size_t count;
 
-    switch( cat )
+    if (es->i_codec == VLC_CODEC_VP8 && es_format_HasVpxAlpha(es)) // contains alpha extradata
+        return false;
+    if (es->i_codec == VLC_CODEC_VP9 && es_format_HasVpxAlpha(es)) // contains alpha extradata
+        return false;
+
+    switch( es->i_cat )
     {
         case VIDEO_ES:
             base = video_codecs;
@@ -517,7 +579,7 @@ bool GetFfmpegCodec( enum es_format_category_e cat, vlc_fourcc_t i_fourcc,
             count = 0;
     }
 
-    i_fourcc = vlc_fourcc_GetCodec( cat, i_fourcc );
+    vlc_fourcc_t i_fourcc = vlc_fourcc_GetCodec( es->i_cat, es->i_codec );
 
     for( size_t i = 0; i < count; i++ )
     {
@@ -526,15 +588,17 @@ bool GetFfmpegCodec( enum es_format_category_e cat, vlc_fourcc_t i_fourcc,
             if( pi_ffmpeg_codec != NULL )
                 *pi_ffmpeg_codec = base[i].i_codec;
             if( ppsz_name )
-                *ppsz_name = vlc_fourcc_GetDescription( cat, i_fourcc );
+                *ppsz_name = vlc_fourcc_GetDescription( es->i_cat, i_fourcc );
             return true;
         }
     }
     return false;
 }
 
-vlc_fourcc_t GetVlcFourcc( unsigned i_ffmpeg_codec )
+vlc_fourcc_t GetVlcFourcc( enum AVCodecID i_ffmpeg_codec )
 {
+    if( i_ffmpeg_codec == AV_CODEC_ID_RAWVIDEO )
+        return VLC_CODEC_UNKNOWN;
     for( size_t i = 0; i < ARRAY_SIZE(video_codecs); i++ )
     {
         if( video_codecs[i].i_codec == i_ffmpeg_codec )

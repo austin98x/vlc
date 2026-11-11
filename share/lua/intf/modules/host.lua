@@ -2,7 +2,6 @@
  host.lua: VLC Lua interface command line host module
 --[==========================================================================[
  Copyright (C) 2007-2012 the VideoLAN team
- $Id$
 
  Authors: Antoine Cellerier <dionoea at videolan dot org>
 
@@ -24,7 +23,7 @@
 --[==========================================================================[
 Example use:
 
-    require "host"
+    local host = require "host"
     h = host.host()
 
     -- Bypass any authentication
@@ -61,8 +60,6 @@ Example use:
 
 For complete examples see existing VLC Lua interface modules (ie cli.lua)
 --]==========================================================================]
-
-module("host",package.seeall)
 
 status = { init = 0, read = 1, write = 2, password = 3 }
 client_type = { net = 1, stdio = 2, fifo = 3, telnet = 4 }
@@ -124,7 +121,7 @@ function host()
     local function write_console( client, data )
         -- FIXME: this method shouldn't be needed. vlc.net.write should
         -- just work
-        io.write(data or client.buffer)
+        vlc.win.console_write(data or client.buffer)
         return string.len(data or client.buffer)
     end
 
@@ -254,6 +251,9 @@ function host()
                 h:listen_stdio()
             else
                 u = vlc.strings.url_parse( url )
+                if u.host == nil then
+                    u = vlc.strings.url_parse( "//" .. url )
+                end
                 h:listen_tcp( u.host, u.port, (u.protocol == "telnet") )
             end
         end
@@ -363,3 +363,13 @@ function host()
               })
     return h
 end
+
+local hostfuncs = {
+    host = host,
+    status = status,
+    client_type = client_type,
+    is_flag_set = is_flag_set,
+}
+
+_G.host = hostfuncs
+return hostfuncs

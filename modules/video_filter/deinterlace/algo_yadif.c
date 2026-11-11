@@ -2,7 +2,6 @@
  * algo_yadif.c : Wrapper for FFmpeg's Yadif algorithm
  *****************************************************************************
  * Copyright (C) 2000-2011 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Laurent Aimar <fenrir@videolan.org>
  *         Juha Jeronen  <juha.jeronen@jyu.fi> (soft field repeat hack)
@@ -113,19 +112,12 @@ int RenderYadif( filter_t *p_filter, picture_t *p_dst, picture_t *p_src,
         void (*filter)(uint8_t *dst, uint8_t *prev, uint8_t *cur, uint8_t *next,
                        int w, int prefs, int mrefs, int parity, int mode);
 
-#if defined(HAVE_YADIF_SSSE3)
+#if defined(HAVE_X86ASM)
         if( vlc_CPU_SSSE3() )
-            filter = yadif_filter_line_ssse3;
+            filter = vlcpriv_yadif_filter_line_ssse3;
         else
-#endif
-#if defined(HAVE_YADIF_SSE2)
         if( vlc_CPU_SSE2() )
-            filter = yadif_filter_line_sse2;
-        else
-#endif
-#if defined(HAVE_YADIF_MMX)
-        if( vlc_CPU_MMX() )
-            filter = yadif_filter_line_mmx;
+            filter = vlcpriv_yadif_filter_line_sse2;
         else
 #endif
             filter = yadif_filter_line_c;
@@ -158,7 +150,7 @@ int RenderYadif( filter_t *p_filter, picture_t *p_dst, picture_t *p_src,
                             &prevp->p_pixels[y * prevp->i_pitch],
                             &curp->p_pixels[y * curp->i_pitch],
                             &nextp->p_pixels[y * nextp->i_pitch],
-                            dstp->i_visible_pitch,
+                            dstp->i_visible_pitch / dstp->i_pixel_pitch,
                             y < dstp->i_visible_lines - 2  ? curp->i_pitch : -curp->i_pitch,
                             y  - 1  ?  -curp->i_pitch : curp->i_pitch,
                             yadif_parity,

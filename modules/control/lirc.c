@@ -2,7 +2,6 @@
  * lirc.c : lirc module for vlc
  *****************************************************************************
  * Copyright (C) 2003-2005 the VideoLAN team
- * $Id$
  *
  * Author: Sigmund Augdal Helberg <dnumgis@videolan.org>
  *
@@ -34,11 +33,13 @@
 
 #define VLC_MODULE_LICENSE VLC_LICENSE_GPL_2_PLUS
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_plugin.h>
 #include <vlc_interface.h>
 #include <vlc_actions.h>
+#include <vlc_poll.h>
 
-#ifdef HAVE_POLL
+#ifdef HAVE_POLL_H
 # include <poll.h>
 #endif
 
@@ -57,14 +58,13 @@ static void Close   ( vlc_object_t * );
 
 vlc_module_begin ()
     set_shortname( N_("Infrared") )
-    set_category( CAT_INTERFACE )
     set_subcategory( SUBCAT_INTERFACE_CONTROL )
     set_description( N_("Infrared remote control interface") )
     set_capability( "interface", 0 )
     set_callbacks( Open, Close )
 
     add_string( "lirc-file", NULL,
-                LIRC_TEXT, LIRC_LONGTEXT, true )
+                LIRC_TEXT, LIRC_LONGTEXT )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -118,7 +118,7 @@ static int Open( vlc_object_t *p_this )
         goto error;
     }
 
-    if( vlc_clone( &p_sys->thread, Run, p_intf, VLC_THREAD_PRIORITY_LOW ) )
+    if( vlc_clone( &p_sys->thread, Run, p_intf ) )
     {
         lirc_freeconfig( p_sys->config );
         lirc_deinit();
@@ -156,6 +156,8 @@ static void *Run( void *data )
 {
     intf_thread_t *p_intf = data;
     intf_sys_t *p_sys = p_intf->p_sys;
+
+    vlc_thread_set_name("vlc-lirc");
 
     struct pollfd ufd;
     ufd.fd = p_sys->i_fd;
@@ -197,7 +199,7 @@ static void Process( intf_thread_t *p_intf )
             {
                 vlc_action_id_t i_key = vlc_actions_get_id( c );
                 if( i_key )
-                    var_SetInteger( p_intf->obj.libvlc, "key-action", i_key );
+                    var_SetInteger( vlc_object_instance(p_intf), "key-action", i_key );
                 else
                     msg_Err( p_intf, "Unknown hotkey '%s'", c );
             }

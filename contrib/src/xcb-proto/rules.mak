@@ -1,23 +1,25 @@
 # X protocol C Proto
 
-XCB_PROTO_VERSION := 1.12
-XCB_PROTO_URL := https://www.x.org/archive/individual/xcb/xcb-proto-$(XCB_PROTO_VERSION).tar.bz2
+XCB_PROTO_VERSION := 1.17.0
+XCB_PROTO_URL := $(XORG)/proto/xcb-proto-$(XCB_PROTO_VERSION).tar.xz
 
 ifeq ($(call need_pkg,"xcb-proto"),)
 PKGS_FOUND += xcb-proto
 endif
 
-$(TARBALLS)/xcb-proto-$(XCB_PROTO_VERSION).tar.bz2:
-	$(call download,$(XCB_PROTO_URL))
+$(TARBALLS)/xcb-proto-$(XCB_PROTO_VERSION).tar.xz:
+	$(call download_pkg,$(XCB_PROTO_URL),xcb)
 
-.sum-xcb-proto: xcb-proto-$(XCB_PROTO_VERSION).tar.bz2
+.sum-xcb-proto: xcb-proto-$(XCB_PROTO_VERSION).tar.xz
 
-xcb-proto: xcb-proto-$(XCB_PROTO_VERSION).tar.bz2 .sum-xcb-proto
+xcb-proto: xcb-proto-$(XCB_PROTO_VERSION).tar.xz .sum-xcb-proto
 	$(UNPACK)
+	$(call update_autoconfig,.)
 	$(MOVE)
 
 .xcb-proto: xcb-proto
-	$(RECONF)
-	cd $< && $(HOSTVARS) ./configure $(HOSTCONF)
-	cd $< && $(MAKE) install
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE)
+	+$(MAKEBUILD)
+	+$(MAKEBUILD) install
 	touch $@

@@ -2,7 +2,6 @@
 dumpmeta.lua: dump a file's meta data on stdout/stderr
 --[==========================================================================[
  Copyright (C) 2010 the VideoLAN team
- $Id$
 
  Authors: Antoine Cellerier <dionoea at videolan dot org>
 
@@ -29,7 +28,7 @@ dumpmeta.lua: dump a file's meta data on stdout/stderr
 
 local item
 repeat
-    item = vlc.input.item()
+    item = vlc.player.item()
 until (item and item:is_preparsed())
 
 -- preparsing doesn't always provide all the information we want (like duration)

@@ -27,6 +27,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_plugin.h>
 #include <vlc_tls.h>
 #include <vlc_dialog.h>
@@ -35,27 +36,67 @@
 #include <Security/SecureTransport.h>
 #include <TargetConditionals.h>
 
+#include <vlc_charset.h>
+
 /* From MacErrors.h (cannot be included because it isn't present in iOS: */
 #ifndef ioErr
 # define ioErr -36
 #endif
 
 /*****************************************************************************
+ * ALPN helper functions
+ *****************************************************************************/
+
+/* Converts the VLC ALPN C array (null-terminated) to a ALPN
+ * CFMutableArray as expected by the Secure Transport API
+ * Returns CFMutableArrayRef on success, else NULL.
+ */
+static CFMutableArrayRef alpnToCFArray(const char *const *alpn)
+{
+    CFMutableArrayRef alpnValues =
+            CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+
+    for (size_t i = 0; alpn[i] != NULL; i++) {
+        CFStringRef alpnVal =
+                CFStringCreateWithCString(kCFAllocatorDefault, alpn[i], kCFStringEncodingASCII);
+        if (alpnVal == NULL) {
+            // Failed to convert the ALPN value to CFString, error out.
+            CFRelease(alpnValues);
+            return NULL;
+        }
+        CFArrayAppendValue(alpnValues, alpnVal);
+        CFRelease(alpnVal);
+    }
+    return alpnValues;
+}
+
+/* Returns the first entry copy of the ALPN array as char*
+ * or NULL on failure.
+ */
+static char* CFArrayALPNCopyFirst(CFArrayRef alpnArray)
+{
+    CFIndex count = CFArrayGetCount(alpnArray);
+
+    if (count <= 0)
+        return NULL;
+
+    CFStringRef alpnVal = CFArrayGetValueAtIndex(alpnArray, 0);
+    return FromCFString(alpnVal, kCFStringEncodingASCII);
+}
+
+/*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  OpenClient  (vlc_tls_creds_t *);
-static void CloseClient (vlc_tls_creds_t *);
+static int  OpenClient  (vlc_tls_client_t *);
 
 #if !TARGET_OS_IPHONE
-    static int  OpenServer  (vlc_tls_creds_t *crd, const char *cert, const char *key);
-    static void CloseServer (vlc_tls_creds_t *);
+    static int  OpenServer  (vlc_tls_server_t *crd, const char *cert, const char *key);
 #endif
 
 vlc_module_begin ()
     set_description(N_("TLS support for OS X and iOS"))
     set_capability("tls client", 2)
-    set_callbacks(OpenClient, CloseClient)
-    set_category(CAT_ADVANCED)
+    set_callback(OpenClient)
     set_subcategory(SUBCAT_ADVANCED_NETWORK)
 
     /*
@@ -67,8 +108,7 @@ vlc_module_begin ()
     add_submodule()
         set_description(N_("TLS server support for OS X"))
         set_capability("tls server", 2)
-        set_callbacks(OpenServer, CloseServer)
-        set_category(CAT_ADVANCED)
+        set_callback(OpenServer)
         set_subcategory(SUBCAT_ADVANCED_NETWORK)
 #endif /* !TARGET_OS_IPHONE */
 
@@ -96,6 +136,8 @@ typedef struct {
     bool b_blocking_send;
     bool b_handshaked;
     bool b_server_mode;
+
+    vlc_mutex_t lock;
 } vlc_tls_st_t;
 
 static int st_Error (vlc_tls_t *obj, int val)
@@ -138,7 +180,7 @@ static OSStatus st_SocketReadFunc (SSLConnectionRef connection,
     OSStatus retValue = noErr;
 
     while (iov.iov_len > 0) {
-        ssize_t val = sys->sock->readv(sys->sock, &iov, 1);
+        ssize_t val = sys->sock->ops->readv(sys->sock, &iov, 1);
         if (val <= 0) {
             if (val == 0) {
                 msg_Dbg(sys->obj, "found eof");
@@ -192,7 +234,7 @@ static OSStatus st_SocketWriteFunc (SSLConnectionRef connection,
     OSStatus retValue = noErr;
 
     while (iov.iov_len > 0) {
-        ssize_t val = sys->sock->writev(sys->sock, &iov, 1);
+        ssize_t val = sys->sock->ops->writev(sys->sock, &iov, 1);
         if (val < 0) {
             switch (errno) {
                 case EAGAIN:
@@ -271,25 +313,6 @@ static int st_validateServerCertificate (vlc_tls_t *session, const char *hostnam
 
     /* get leaf certificate */
     /* SSLCopyPeerCertificates is only available on OSX 10.5 or later */
-#if !TARGET_OS_IPHONE
-    CFArrayRef cert_chain = NULL;
-    ret = SSLCopyPeerCertificates(sys->p_context, &cert_chain);
-    if (ret != noErr || !cert_chain) {
-        result = -1;
-        goto out;
-    }
-
-    if (CFArrayGetCount(cert_chain) == 0) {
-        CFRelease(cert_chain);
-        result = -1;
-        goto out;
-    }
-
-    leaf_cert = (SecCertificateRef)CFArrayGetValueAtIndex(cert_chain, 0);
-    CFRetain(leaf_cert);
-    CFRelease(cert_chain);
-#else
-    /* SecTrustGetCertificateAtIndex is only available on 10.7 or iOS */
     if (SecTrustGetCertificateCount(trust) == 0) {
         result = -1;
         goto out;
@@ -297,8 +320,6 @@ static int st_validateServerCertificate (vlc_tls_t *session, const char *hostnam
 
     leaf_cert = SecTrustGetCertificateAtIndex(trust, 0);
     CFRetain(leaf_cert);
-#endif
-
 
     /* check if leaf already accepted */
     CFIndex max = CFArrayGetCount(sys->p_cred->whitelist);
@@ -382,7 +403,7 @@ out:
  * 1 if more would-be blocking recv is needed,
  * 2 if more would-be blocking send is required.
  */
-static int st_Handshake (vlc_tls_creds_t *crd, vlc_tls_t *session,
+static int st_Handshake (vlc_tls_t *session,
                          const char *host, const char *service,
                          char **restrict alp) {
 
@@ -391,12 +412,44 @@ static int st_Handshake (vlc_tls_creds_t *crd, vlc_tls_t *session,
     VLC_UNUSED(service);
 
     OSStatus retValue = SSLHandshake(sys->p_context);
+
+// Only try to use ALPN on recent enough SDKs
+// macOS 10.13.2, iOS 11, tvOS 11, watchOS 4
+#if (TARGET_OS_OSX    && MAC_OS_X_VERSION_MAX_ALLOWED     >= 101302) || \
+    (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MAX_ALLOWED  >= 110000) || \
+    (TARGET_OS_TV     && __TV_OS_VERSION_MAX_ALLOWED      >= 110000) || \
+    (TARGET_OS_WATCH  && __WATCH_OS_VERSION_MAX_ALLOWED   >= 40000)
+
+    /* Handle ALPN data */
+    if (alp != NULL) {
+        if (__builtin_available(iOS 11, macOS 10.13.4, tvOS 11, watchOS 4, *))
+        {
+            CFArrayRef alpnArray = NULL;
+            OSStatus res = SSLCopyALPNProtocols(sys->p_context, &alpnArray);
+            if (res == noErr && alpnArray) {
+                *alp = CFArrayALPNCopyFirst(alpnArray);
+                CFRelease(alpnArray);
+                if (unlikely(*alp == NULL))
+                    return -1;
+            } else {
+                *alp = NULL;
+            }
+        } else {
+            *alp = NULL;
+        }
+    }
+
+#else
+
+    /* No ALPN support */
     if (alp != NULL) {
         *alp = NULL;
     }
 
+#endif
+
     if (retValue == errSSLWouldBlock) {
-        msg_Dbg(crd, "handshake is blocked, try again later");
+        msg_Dbg(sys->obj, "handshake is blocked, try again later");
         return 1 + (sys->b_blocking_send ? 1 : 0);
     }
 
@@ -405,36 +458,36 @@ static int st_Handshake (vlc_tls_creds_t *crd, vlc_tls_t *session,
             if (sys->b_server_mode == false && st_validateServerCertificate(session, host) != 0) {
                 return -1;
             }
-            msg_Dbg(crd, "handshake completed successfully");
+            msg_Dbg(sys->obj, "handshake completed successfully");
             sys->b_handshaked = true;
             return 0;
 
         case errSSLServerAuthCompleted:
-            msg_Dbg(crd, "SSLHandshake returned errSSLServerAuthCompleted, continuing handshake");
-            return st_Handshake(crd, session, host, service, alp);
+            msg_Dbg(sys->obj, "SSLHandshake returned errSSLServerAuthCompleted, continuing handshake");
+            return st_Handshake(session, host, service, alp);
 
         case errSSLConnectionRefused:
-            msg_Err(crd, "connection was refused");
+            msg_Err(sys->obj, "connection was refused");
             return -1;
         case errSSLNegotiation:
-            msg_Err(crd, "cipher suite negotiation failed");
+            msg_Err(sys->obj, "cipher suite negotiation failed");
             return -1;
         case errSSLFatalAlert:
-            msg_Err(crd, "fatal error occurred during handshake");
+            msg_Err(sys->obj, "fatal error occurred during handshake");
             return -1;
 
         default:
-            msg_Err(crd, "handshake returned error %d", (int)retValue);
+            msg_Err(sys->obj, "handshake returned error %d", (int)retValue);
             return -1;
     }
 }
 
-static int st_GetFD (vlc_tls_t *session)
+static int st_GetFD (vlc_tls_t *session, short *restrict events)
 {
     vlc_tls_st_t *sys = (vlc_tls_st_t *)session;
     vlc_tls_t *sock = sys->sock;
 
-    return vlc_tls_GetFD(sock);
+    return vlc_tls_GetPollFD(sock, events);
 }
 
 /**
@@ -448,6 +501,8 @@ static ssize_t st_Send (vlc_tls_t *session, const struct iovec *iov,
 
     if (unlikely(count == 0))
         return 0;
+
+    vlc_mutex_lock(&sys->lock);
 
     /*
      * SSLWrite does not return the number of bytes actually written to
@@ -477,6 +532,7 @@ static ssize_t st_Send (vlc_tls_t *session, const struct iovec *iov,
             sys->i_send_buffered_bytes = 0;
 
         } else if (ret == errSSLWouldBlock) {
+            vlc_mutex_unlock(&sys->lock);
             errno = againErr;
             return -1;
         }
@@ -488,10 +544,12 @@ static ssize_t st_Send (vlc_tls_t *session, const struct iovec *iov,
         if (ret == errSSLWouldBlock) {
             sys->i_send_buffered_bytes = iov->iov_len;
             errno = againErr;
+            vlc_mutex_unlock(&sys->lock);
             return -1;
         }
     }
 
+    vlc_mutex_unlock(&sys->lock);
     return ret != noErr ? st_Error(session, ret) : actualSize;
 }
 
@@ -505,19 +563,25 @@ static ssize_t st_Recv (vlc_tls_t *session, struct iovec *iov, unsigned count)
     if (unlikely(count == 0))
         return 0;
 
+    vlc_mutex_lock(&sys->lock);
+
     size_t actualSize;
     OSStatus ret = SSLRead(sys->p_context, iov->iov_base, iov->iov_len,
                            &actualSize);
 
-    if (ret == errSSLWouldBlock && actualSize)
+    if (ret == errSSLWouldBlock && actualSize) {
+        vlc_mutex_unlock(&sys->lock);
         return actualSize;
+    }
 
     /* peer performed shutdown */
     if (ret == errSSLClosedNoNotify || ret == errSSLClosedGraceful) {
         msg_Dbg(sys->obj, "Got close notification with code %i", (int)ret);
+        vlc_mutex_unlock(&sys->lock);
         return 0;
     }
 
+    vlc_mutex_unlock(&sys->lock);
     return ret != noErr ? st_Error(session, ret) : actualSize;
 }
 
@@ -552,102 +616,128 @@ static void st_SessionClose (vlc_tls_t *session) {
     msg_Dbg(sys->obj, "close TLS session");
 
     if (sys->p_context) {
-#if TARGET_OS_IPHONE
         CFRelease(sys->p_context);
-#else
-        if (SSLDisposeContext(sys->p_context) != noErr) {
-            msg_Err(sys->obj, "error deleting context");
-        }
-#endif
     }
     free(sys);
 }
+
+static const struct vlc_tls_operations st_ops =
+{
+    st_GetFD,
+    st_Recv,
+    st_Send,
+    st_SessionShutdown,
+    st_SessionClose,
+};
 
 /**
  * Initializes a client-side TLS session.
  */
 
-static vlc_tls_t *st_SessionOpenCommon(vlc_tls_creds_t *crd, vlc_tls_t *sock,
-                                       bool b_server)
+static vlc_tls_st_t *st_SessionOpenCommon(vlc_object_t *obj,
+                                          vlc_tls_creds_sys_t *crd,
+                                          vlc_tls_t *sock, bool b_server)
 {
     vlc_tls_st_t *sys = malloc(sizeof (*sys));
     if (unlikely(sys == NULL))
         return NULL;
 
-    sys->p_cred = crd->sys;
+    sys->p_cred = crd;
     sys->b_handshaked = false;
     sys->b_blocking_send = false;
     sys->i_send_buffered_bytes = 0;
     sys->p_context = NULL;
     sys->sock = sock;
     sys->b_server_mode = b_server;
-    sys->obj = VLC_OBJECT(crd);
+    vlc_mutex_init(&sys->lock);
+    sys->obj = obj;
 
     vlc_tls_t *tls = &sys->tls;
 
-    tls->get_fd = st_GetFD;
-    tls->readv = st_Recv;
-    tls->writev = st_Send;
-    tls->shutdown = st_SessionShutdown;
-    tls->close = st_SessionClose;
-    crd->handshake = st_Handshake;
+    tls->ops = &st_ops;
 
     SSLContextRef p_context = NULL;
-#if TARGET_OS_IPHONE
     p_context = SSLCreateContext(NULL, b_server ? kSSLServerSide : kSSLClientSide, kSSLStreamType);
     if (p_context == NULL) {
-        msg_Err(crd, "cannot create ssl context");
+        msg_Err(obj, "cannot create ssl context");
         goto error;
     }
-#else
-    if (SSLNewContext(b_server, &p_context) != noErr) {
-        msg_Err(crd, "error calling SSLNewContext");
-        goto error;
-    }
-#endif
 
     sys->p_context = p_context;
 
     OSStatus ret = SSLSetIOFuncs(p_context, st_SocketReadFunc, st_SocketWriteFunc);
     if (ret != noErr) {
-        msg_Err(crd, "cannot set io functions");
+        msg_Err(obj, "cannot set io functions");
         goto error;
     }
 
     ret = SSLSetConnection(p_context, tls);
     if (ret != noErr) {
-        msg_Err(crd, "cannot set connection");
+        msg_Err(obj, "cannot set connection");
         goto error;
     }
 
-    return tls;
+    return sys;
 
 error:
     st_SessionClose(tls);
     return NULL;
 }
 
-static vlc_tls_t *st_ClientSessionOpen(vlc_tls_creds_t *crd, vlc_tls_t *sock,
+static vlc_tls_t *st_ClientSessionOpen(vlc_tls_client_t *crd, vlc_tls_t *sock,
                                  const char *hostname, const char *const *alpn)
 {
-    if (alpn != NULL) {
-        msg_Warn(crd, "Ignoring ALPN request due to lack of support in the backend. Proxy behavior potentially undefined.");
-#warning ALPN support missing, proxy behavior potentially undefined (rdar://29127318, #17721)
-    }
-
     msg_Dbg(crd, "open TLS session for %s", hostname);
 
-    vlc_tls_t *tls = st_SessionOpenCommon(crd, sock, false);
-    if (tls == NULL)
+    vlc_tls_st_t *sys = st_SessionOpenCommon(VLC_OBJECT(crd), crd->sys, sock,
+                                             false);
+    if (sys == NULL)
         return NULL;
-
-    vlc_tls_st_t *sys = (vlc_tls_st_t *)tls;
 
     OSStatus ret = SSLSetPeerDomainName(sys->p_context, hostname, strlen(hostname));
     if (ret != noErr) {
         msg_Err(crd, "cannot set peer domain name");
         goto error;
     }
+
+// Only try to use ALPN on recent enough SDKs
+// macOS 10.13.2, iOS 11, tvOS 11, watchOS 4
+#if (TARGET_OS_OSX    && MAC_OS_X_VERSION_MAX_ALLOWED     >= 101302) || \
+    (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MAX_ALLOWED  >= 110000) || \
+    (TARGET_OS_TV     && __TV_OS_VERSION_MAX_ALLOWED      >= 110000) || \
+    (TARGET_OS_WATCH  && __WATCH_OS_VERSION_MAX_ALLOWED   >= 40000)
+
+    /* Handle ALPN */
+    if (alpn != NULL) {
+        if (__builtin_available(iOS 11, macOS 10.13.4, tvOS 11, watchOS 4, *))
+        {
+            CFMutableArrayRef alpnValues = alpnToCFArray(alpn);
+
+            if (alpnValues == NULL) {
+                msg_Err(crd, "cannot create CFMutableArray for ALPN values");
+                goto error;
+            }
+
+            OSStatus ret = SSLSetALPNProtocols(sys->p_context, alpnValues);
+            if (ret != noErr){
+                msg_Err(crd, "failed setting ALPN protocols (%i)", (int)ret);
+            }
+            CFRelease(alpnValues);
+        } else {
+            msg_Warn(crd, "Ignoring ALPN request due to lack of support in the backend. Proxy behavior potentially undefined.");
+        }
+    }
+
+#else
+
+    /* No ALPN support */
+    if (alpn != NULL) {
+        // Fallback if SDK does not has SSLSetALPNProtocols
+        msg_Warn(crd, "Compiled in SDK without ALPN support. Proxy behavior potentially undefined.");
+        #warning ALPN support in your SDK version missing (need 10.13.2), proxy behavior potentially undefined (rdar://29127318, #17721)
+    }
+
+#endif
 
     /* disable automatic validation. We do so manually to also handle invalid
        certificates */
@@ -667,35 +757,15 @@ static vlc_tls_t *st_ClientSessionOpen(vlc_tls_creds_t *crd, vlc_tls_t *sock,
     }
 #endif
 
-    return tls;
+    return &sys->tls;
 
 error:
-    st_SessionShutdown(tls, true);
-    st_SessionClose(tls);
+    st_SessionShutdown(&sys->tls, true);
+    st_SessionClose(&sys->tls);
     return NULL;
 }
 
-/**
- * Initializes a client-side TLS credentials.
- */
-static int OpenClient (vlc_tls_creds_t *crd) {
-
-    msg_Dbg(crd, "open st client");
-
-    vlc_tls_creds_sys_t *sys = malloc (sizeof (*sys));
-    if (unlikely(sys == NULL))
-        return VLC_ENOMEM;
-
-    sys->whitelist = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-    sys->server_cert_chain = NULL;
-
-    crd->sys = sys;
-    crd->open = st_ClientSessionOpen;
-
-    return VLC_SUCCESS;
-}
-
-static void CloseClient (vlc_tls_creds_t *crd) {
+static void st_ClientDestroy (vlc_tls_client_t *crd) {
     msg_Dbg(crd, "close secure transport client");
 
     vlc_tls_creds_sys_t *sys = crd->sys;
@@ -706,24 +776,49 @@ static void CloseClient (vlc_tls_creds_t *crd) {
     free(sys);
 }
 
+static const struct vlc_tls_client_operations st_ClientOps =
+{
+    .open = st_ClientSessionOpen,
+    .handshake = st_Handshake,
+    .destroy = st_ClientDestroy,
+};
+
+/**
+ * Initializes a client-side TLS credentials.
+ */
+static int OpenClient (vlc_tls_client_t *crd) {
+
+    msg_Dbg(crd, "open st client");
+
+    vlc_tls_creds_sys_t *sys = malloc (sizeof (*sys));
+    if (unlikely(sys == NULL))
+        return VLC_ENOMEM;
+
+    sys->whitelist = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+    sys->server_cert_chain = NULL;
+
+    crd->ops = &st_ClientOps;
+    crd->sys = sys;
+    return VLC_SUCCESS;
+}
+
 /* Begin of server-side methods */
 #if !TARGET_OS_IPHONE
 
 /**
  * Initializes a server-side TLS session.
  */
-static vlc_tls_t *st_ServerSessionOpen (vlc_tls_creds_t *crd, vlc_tls_t *sock,
-                               const char *hostname, const char *const *alpn) {
+static vlc_tls_t *st_ServerSessionOpen (vlc_tls_server_t *crd, vlc_tls_t *sock,
+                                        const char *const *alpn) {
 
-    VLC_UNUSED(hostname);
     VLC_UNUSED(alpn);
     msg_Dbg(crd, "open TLS server session");
 
-    vlc_tls_t *tls = st_SessionOpenCommon(crd, sock, true);
-    if (tls != NULL)
+    vlc_tls_st_t *sys = st_SessionOpenCommon(VLC_OBJECT(crd), crd->sys, sock,
+                                             true);
+    if (sys == NULL)
         return NULL;
 
-    vlc_tls_st_t *sys = (vlc_tls_st_t *)tls;
     vlc_tls_creds_sys_t *p_cred_sys = crd->sys;
 
     OSStatus ret = SSLSetCertificate(sys->p_context, p_cred_sys->server_cert_chain);
@@ -732,18 +827,41 @@ static vlc_tls_t *st_ServerSessionOpen (vlc_tls_creds_t *crd, vlc_tls_t *sock,
         goto error;
     }
 
-    return tls;
+    return &sys->tls;
 
 error:
-    st_SessionShutdown(tls, true);
-    st_SessionClose(tls);
+    st_SessionShutdown(&sys->tls, true);
+    st_SessionClose(&sys->tls);
     return NULL;
 }
+
+static int st_ServerHandshake (vlc_tls_t *session, char **restrict alp) {
+
+    return st_Handshake(session, NULL, NULL, alp);
+}
+
+static void st_ServerDestroy (vlc_tls_server_t *crd) {
+    msg_Dbg(crd, "close secure transport server");
+
+    vlc_tls_creds_sys_t *sys = crd->sys;
+
+    if (sys->server_cert_chain)
+        CFRelease(sys->server_cert_chain);
+
+    free(sys);
+}
+
+static const struct vlc_tls_server_operations st_ServerOps =
+{
+    .open = st_ServerSessionOpen,
+    .handshake = st_ServerHandshake,
+    .destroy = st_ServerDestroy,
+};
 
 /**
  * Initializes server-side TLS credentials.
  */
-static int OpenServer (vlc_tls_creds_t *crd, const char *cert, const char *key) {
+static int OpenServer (vlc_tls_server_t *crd, const char *cert, const char *key) {
 
     /*
      * This function expects the label of the certificate in "cert", stored
@@ -844,8 +962,8 @@ static int OpenServer (vlc_tls_creds_t *crd, const char *cert, const char *key) 
     sys->server_cert_chain = server_cert_chain;
     sys->whitelist = NULL;
 
+    crd->ops = &st_ServerOps;
     crd->sys = sys;
-    crd->open = st_ServerSessionOpen;
 
 out:
     if (policy)
@@ -859,17 +977,6 @@ out:
         CFRelease(cert_identity);
 
     return result;
-}
-
-static void CloseServer (vlc_tls_creds_t *crd) {
-    msg_Dbg(crd, "close secure transport server");
-
-    vlc_tls_creds_sys_t *sys = crd->sys;
-
-    if (sys->server_cert_chain)
-        CFRelease(sys->server_cert_chain);
-
-    free(sys);
 }
 
 #endif /* !TARGET_OS_IPHONE */

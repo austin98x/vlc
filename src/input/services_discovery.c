@@ -2,7 +2,6 @@
  * services_discovery.c : Manage playlist services_discovery modules
  *****************************************************************************
  * Copyright (C) 1999-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Clément Stenac <zorglub@videolan.org>
  *
@@ -26,6 +25,7 @@
 #include <assert.h>
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_services_discovery.h>
 #include <vlc_probe.h>
 #include <vlc_modules.h>
@@ -100,9 +100,10 @@ char **vlc_sd_GetNames (vlc_object_t *obj, char ***pppsz_longnames, int **pp_cat
  * Services discovery
  * Basically you just listen to Service discovery event through the
  * sd's event manager.
- * That's how the playlist get's Service Discovery information
+ * That's how the playlist gets Service Discovery information
  */
 
+#undef vlc_sd_Create
 services_discovery_t *vlc_sd_Create(vlc_object_t *parent, const char *cfg,
     const struct services_discovery_owner_t *restrict owner)
 {
@@ -133,5 +134,5 @@ void vlc_sd_Destroy(services_discovery_t *sd)
         module_unneed(sd, sd->p_module);
     config_ChainDestroy(sd->p_cfg);
     free(sd->psz_name);
-    vlc_object_release(sd);
+    vlc_object_delete(sd);
 }

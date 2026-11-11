@@ -2,7 +2,6 @@
  http.lua: HTTP interface module for VLC
 --[==========================================================================[
  Copyright (C) 2007-2009 the VideoLAN team
- $Id$
 
  Authors: Antoine Cellerier <dionoea at videolan dot org>
 
@@ -30,7 +29,7 @@ Configuration options:
 --]==========================================================================]
 
 
-require "common"
+local common = require "common"
 
 vlc.msg.info("Lua HTTP interface")
 
@@ -73,11 +72,8 @@ function process_raw(filename)
     end
     str=string.rep("=",#str-1)
 
-    --[[ FIXME:
-    <?xml version="1.0" encoding="charset" standalone="yes" ?> is still a problem. The closing '?>' needs to be printed using '?<?vlc print ">" ?>' to prevent a parse error.
-    --]]
-    local code0 = string.gsub(input,escape(close_tag)," print(["..str.."[")
-    local code1 = string.gsub(code0,escape(open_tag),"]"..str.."]) ")
+    local code0 = string.gsub(input,escape(open_tag),"]"..str.."]) ")
+    local code1 = string.gsub(code0,"(%]"..str.."%]%) "..".-)("..escape(close_tag)..")","%1 print(["..str.."[")
     local code = "print(["..str.."["..code1.."]"..str.."])"
     --[[ Uncomment to debug
     if string.match(filename,"vlm_cmd.xml$") then
@@ -93,9 +89,9 @@ function process(filename)
     local func = false -- process_raw(filename)
     return function(...)
         local new_mtime = vlc.net.stat(filename).modification_time
-        if new_mtime ~= mtime then
+        if func == false or new_mtime ~= mtime then
             -- Re-read the file if it changed
-            if mtime == 0 then
+            if func == false then
                 vlc.msg.dbg("Loading `"..filename.."'")
             else
                 vlc.msg.dbg("Reloading `"..filename.."'")
@@ -108,6 +104,15 @@ function process(filename)
 end
 
 
+-- TODO: print localized error message
+-- For now this relies on lua bindings inappropriately doing so
+local function callback_nopassword()
+    return [[Status: 403
+Content-Length: 0
+
+]]
+end
+
 function callback_error(path,url,msg)
     local url = url or "&lt;page unknown&gt;"
     return  [[<html xmlns="http://www.w3.org/1999/xhtml">
@@ -118,8 +123,8 @@ function callback_error(path,url,msg)
 <h1>Error loading ]]..url..[[</h1><pre>]]..(config.no_error_detail and "Remove configuration option `no_error_detail' on the server to get more information."
 or vlc.strings.convert_xml_special_chars(tostring(msg)))..[[</pre>
 <p>
-<a href="http://www.videolan.org/">VideoLAN</a><br/>
-<a href="http://www.lua.org/manual/5.1/">Lua 5.1 Reference Manual</a>
+<a href="https://www.videolan.org/">VideoLAN</a><br/>
+<a href="https://www.lua.org/manual/5.1/">Lua 5.1 Reference Manual</a>
 </p>
 </body>
 </html>]]
@@ -156,22 +161,19 @@ function callback_art(data, request, args)
                 num = num()
             end
         end
-        local item
-        if num == nil then
-            item = vlc.input.item()
+        local pl_item
+        if num then
+            pl_item = vlc.playlist.get(num)
         else
-            item = vlc.playlist.get(num).item
+            pl_item = vlc.playlist.current_item()
         end
+        local item = pl_item.item
         local metas = item:metas()
-        local filename = vlc.strings.decode_uri(string.gsub(metas["artwork_url"],"file://",""))
-        local windowsdrive = string.match(filename, "^/%a:/.+$")  --match windows drive letter
-        if windowsdrive then
-            filename = string.sub(filename, 2)  --remove starting forward slash before the drive letter
-        end
+        local filename = vlc.strings.make_path(metas["artwork_url"])
         local size = vlc.net.stat(filename).size
         local ext = string.match(filename,"%.([^%.]-)$")
         local raw = io.open(filename, 'rb'):read("*a")
-        local content = [[Content-Type: ]]..mimes[ext]..[[
+        local content = [[Content-Type: ]]..(mimes[ext] or "application/octet-stream")..[[
 
 Content-Length: ]]..size..[[
 
@@ -229,9 +231,9 @@ function rawfile(h,path,url)
     local page = false -- io.open(filename):read("*a")
     local callback = function(data,request)
         local new_mtime = vlc.net.stat(filename).modification_time
-        if mtime ~= new_mtime then
+        if page == false or new_mtime ~= mtime then
             -- Re-read the file if it changed
-            if mtime == 0 then
+            if page == false then
                 vlc.msg.dbg("Loading `"..filename.."'")
             else
                 vlc.msg.dbg("Reloading `"..filename.."'")
@@ -334,5 +336,11 @@ end
 password = vlc.var.inherit(nil,"http-password")
 
 h = vlc.httpd()
-load_dir( http_dir )
-a = h:handler("/art",nil,password,callback_art,nil)
+if password == "" then
+    vlc.msg.err("Password unset, insecure web interface disabled")
+    vlc.msg.info("Set --http-password on the command line if you want to enable the web interface.")
+    p = h:handler("/",nil,nil,callback_nopassword,nil)
+else
+    load_dir( http_dir )
+    a = h:handler("/art",nil,password,callback_art,nil)
+end

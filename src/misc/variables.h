@@ -23,8 +23,7 @@
 #ifndef LIBVLC_VARIABLES_H
 # define LIBVLC_VARIABLES_H 1
 
-# include <stdalign.h>
-# include <stdatomic.h>
+# include <vlc_list.h>
 
 struct vlc_res;
 
@@ -35,32 +34,19 @@ typedef struct vlc_object_internals vlc_object_internals_t;
 
 struct vlc_object_internals
 {
-    alignas (max_align_t) /* ensure vlc_externals() is maximally aligned */
-    char           *psz_name; /* given name */
+    vlc_object_t *parent; /**< Parent object (or NULL) */
+    const char *typename; /**< Object type human-readable name */
 
     /* Object variables */
     void           *var_root;
     vlc_mutex_t     var_lock;
-    vlc_cond_t      var_wait;
-
-    /* Objects management */
-    atomic_uint     refs;
-    vlc_destructor_t pf_destructor;
-
-    /* Objects tree structure */
-    vlc_object_internals_t *next;  /* next sibling */
-    vlc_object_internals_t *prev;  /* previous sibling */
-    vlc_object_internals_t *first; /* first child */
-    vlc_mutex_t tree_lock;
 
     /* Object resources */
     struct vlc_res *resources;
 };
 
-# define vlc_internals( obj ) (((vlc_object_internals_t*)(VLC_OBJECT(obj)))-1)
-# define vlc_externals( priv ) ((vlc_object_t *)((priv) + 1))
-
-void DumpVariables(vlc_object_t *obj);
+# define vlc_internals(o) ((o)->priv)
+# define vlc_externals(priv) (abort(), (void *)(priv))
 
 extern void var_DestroyAll( vlc_object_t * );
 

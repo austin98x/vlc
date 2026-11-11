@@ -2,7 +2,6 @@
  * mmstu.h: MMS access plug-in
  *****************************************************************************
  * Copyright (C) 2001, 2002 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -34,7 +33,7 @@
 
 #define MMS_BUFFER_SIZE 100000
 
-struct access_sys_t
+typedef struct
 {
     int         i_proto;        /* MMS_PROTO_TCP, MMS_PROTO_UDP */
     int         i_handle_tcp;   /* TCP socket for communication with server */
@@ -51,14 +50,14 @@ struct access_sys_t
     unsigned    i_timeout;
 
     /* */
-    uint8_t     buffer_tcp[MMS_BUFFER_SIZE];
+    char        buffer_tcp[MMS_BUFFER_SIZE];
     size_t      i_buffer_tcp;
 
-    uint8_t     buffer_udp[MMS_BUFFER_SIZE];
+    char        buffer_udp[MMS_BUFFER_SIZE];
     size_t      i_buffer_udp;
 
     /* data necessary to send data to server */
-    guid_t      guid;
+    vlc_guid_t  guid;
     int         i_command_level;
     int         i_seq_num;
     uint32_t    i_header_packet_id_type;
@@ -67,7 +66,7 @@ struct access_sys_t
     int         i_packet_seq_num;
 
     uint8_t     *p_cmd;     /* latest command read */
-    size_t      i_cmd;      /* allocated at the begining */
+    size_t      i_cmd;      /* allocated at the beginning */
 
     uint8_t     *p_header;  /* allocated by mms_ReadPacket */
     size_t      i_header;
@@ -78,12 +77,6 @@ struct access_sys_t
 
     /* extracted information */
     int         i_command;
-
-    /* from 0x01 answer (not yet set) */
-    char        *psz_server_version;
-    char        *psz_tool_version;
-    char        *psz_update_player_url;
-    char        *psz_encryption_type;
 
     /* from 0x06 answer */
     uint32_t    i_flags_broadcast;
@@ -99,7 +92,10 @@ struct access_sys_t
 
     vlc_mutex_t  lock_netwrite;
     bool         b_keep_alive;
-    vlc_thread_t keep_alive;
-};
+    struct {
+         vlc_thread_t thread;
+         vlc_sem_t    sem;
+    } keep_alive;
+} access_sys_t;
 
 #endif

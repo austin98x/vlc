@@ -23,6 +23,8 @@
 #endif
 
 #include <inttypes.h>
+#include <stdckdint.h>
+#include <limits.h>
 
 #include <vlc_common.h>
 #include <vlc_aout.h>
@@ -36,22 +38,21 @@
 
 static int Open (vlc_object_t *);
 static int OpenResampler (vlc_object_t *);
-static void Close (vlc_object_t *);
+static void Close (filter_t *);
 
 vlc_module_begin ()
     set_shortname (N_("Speex resampler"))
     set_description (N_("Speex resampler") )
-    set_category (CAT_AUDIO)
     set_subcategory (SUBCAT_AUDIO_RESAMPLER)
     add_integer ("speex-resampler-quality", 4,
-                 QUALITY_TEXT, QUALITY_LONGTEXT, true)
+                 QUALITY_TEXT, QUALITY_LONGTEXT)
         change_integer_range (0, 10)
     set_capability ("audio converter", 0)
-    set_callbacks (Open, Close)
+    set_callback (Open)
 
     add_submodule ()
     set_capability ("audio resampler", 0)
-    set_callbacks (OpenResampler, Close)
+    set_callback (OpenResampler)
     add_shortcut ("speex")
 vlc_module_end ()
 
@@ -92,8 +93,12 @@ static int OpenResampler (vlc_object_t *obj)
         return VLC_ENOMEM;
     }
 
-    filter->p_sys = (filter_sys_t *)st;
-    filter->pf_audio_filter = Resample;
+    static const struct vlc_filter_operations filter_ops =
+        { .filter_audio = Resample, .close = Close };
+
+    filter->p_sys = st;
+    filter->ops = &filter_ops;
+
     return VLC_SUCCESS;
 }
 
@@ -107,31 +112,46 @@ static int Open (vlc_object_t *obj)
     return OpenResampler (obj);
 }
 
-static void Close (vlc_object_t *obj)
+static void Close (filter_t *filter)
 {
-    filter_t *filter = (filter_t *)obj;
-    SpeexResamplerState *st = (SpeexResamplerState *)filter->p_sys;
+    SpeexResamplerState *st = filter->p_sys;
 
     speex_resampler_destroy (st);
 }
 
 static block_t *Resample (filter_t *filter, block_t *in)
 {
-    SpeexResamplerState *st = (SpeexResamplerState *)filter->p_sys;
+    SpeexResamplerState *st = filter->p_sys;
+    block_t *out = NULL;
 
     const size_t framesize = filter->fmt_out.audio.i_bytes_per_frame;
     const unsigned irate = filter->fmt_in.audio.i_rate;
     const unsigned orate = filter->fmt_out.audio.i_rate;
 
-    spx_uint32_t ilen = in->i_nb_samples;
-    spx_uint32_t olen = ((ilen + 2) * orate * UINT64_C(11))
-                      / (irate * UINT64_C(10));
-
-    block_t *out = block_Alloc (olen * framesize);
-    if (unlikely(out == NULL))
+    if( speex_resampler_set_rate (st, irate, orate) != RESAMPLER_ERR_SUCCESS )
         goto error;
 
-    speex_resampler_set_rate (st, irate, orate);
+    unsigned ilen = in->i_nb_samples;
+    unsigned olen;
+
+    // spx_uint32_t olen = ((ilen + 2) * orate * UINT64_C(11))
+    //                   / (irate * UINT64_C(10));
+    uint64_t num, den;
+    if( ckd_add(&olen, ilen, 2U) ||
+        ckd_mul(&num, (uint64_t)orate, UINT64_C(11)) ||
+        ckd_mul(&den, (uint64_t)irate, UINT64_C(10)) ||
+        ckd_mul(&num, (uint64_t)olen, num) ||
+        num / UINT_MAX >= den )
+        goto error;
+
+    olen = num / den;
+
+    if(SIZE_MAX / framesize < olen)
+        goto error;
+
+    out = block_Alloc (olen * framesize);
+    if (unlikely(out == NULL))
+        goto error;
 
     int err;
     if (filter->fmt_in.audio.i_format == VLC_CODEC_FL32)
@@ -153,10 +173,19 @@ static block_t *Resample (filter_t *filter, block_t *in)
         msg_Err (filter, "lost %"PRIu32" of %u input frames",
                  in->i_nb_samples - ilen, in->i_nb_samples);
 
+    /* The resampler can keep all the input frames: never return an empty
+     * block */
+    if (olen == 0)
+    {
+        block_Release (out);
+        out = NULL;
+        goto error;
+    }
+
     out->i_buffer = olen * framesize;
     out->i_nb_samples = olen;
     out->i_pts = in->i_pts;
-    out->i_length = olen * CLOCK_FREQ / filter->fmt_out.audio.i_rate;
+    out->i_length = vlc_tick_from_samples(olen, filter->fmt_out.audio.i_rate);
 error:
     block_Release (in);
     return out;

@@ -2,7 +2,6 @@
  * httpcookies.c: HTTP cookie utilities
  *****************************************************************************
  * Copyright (C) 2014 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antti Ajanki <antti.ajanki@iki.fi>
  *
@@ -31,9 +30,11 @@
 #include <assert.h>
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_messages.h>
 #include <vlc_strings.h>
 #include <vlc_http.h>
+#include <vlc_threads.h>
 
 typedef struct http_cookie_t
 {
@@ -290,7 +291,6 @@ void vlc_http_cookies_destroy( vlc_http_cookie_jar_t * p_jar )
         cookie_destroy( vlc_array_item_at_index( &p_jar->cookies, i ) );
 
     vlc_array_clear( &p_jar->cookies );
-    vlc_mutex_destroy( &p_jar->lock );
 
     free( p_jar );
 }

@@ -2,7 +2,6 @@
  * utf8.c: Test for UTF-8 encoding/decoding stuff
  *****************************************************************************
  * Copyright (C) 2006 Rémi Denis-Courmont
- * $Id$
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -30,13 +29,13 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
-static void test_towc(const char *in, size_t want_len, uint32_t want_cp)
+static void test_towc(const char *in, ssize_t want_len, uint32_t want_cp)
 {
     uint32_t cp;
-    size_t len;
+    ssize_t len;
 
-    if (want_len != (size_t)-1)
-        printf("\"%s\" is U+%04"PRIX32" (%zu bytes)\n", in, want_cp, want_len);
+    if (want_len != -1)
+        printf("\"%s\" is U+%04"PRIX32" (%zd bytes)\n", in, want_cp, want_len);
     else
         printf("Invalid sequence of %zu bytes\n", strlen(in));
 
@@ -48,7 +47,7 @@ static void test_towc(const char *in, size_t want_len, uint32_t want_cp)
         exit(1);
     }
 
-    if (len != (size_t)-1 && want_cp != cp)
+    if (len != -1 && want_cp != cp)
     {
         printf(" ERROR: code point mismatch: %04"PRIX32"\n", cp);
         exit(1);
@@ -154,6 +153,9 @@ int main (void)
     test_towc("\xED\xA0\x80", -1, 0xD800);
     test_towc("\xED\xBF\xBF", -1, 0xDFFF);
     test_towc("\xEE\x80\x80", 3, 0xE000);
+    /* Overlong surrogates */
+    test_towc("\xF0\x8D\x88\x80", -1, 0xD800);
+    test_towc("\xF0\x8D\xBF\xBF", -1, 0xDFFF);
     /* Spurious continuation byte */
     test_towc("\x80", -1, 0);
     test_towc("\xBF", -1, 0);

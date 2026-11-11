@@ -23,7 +23,7 @@ function VlcSyntax()
   syn keyword cConstant VLC_ESTATUS VLC_EEXIT VLC_EMODULE VLC_EOBJECT
   syn keyword cConstant VLC_ENOOBJ VLC_ENOMOD VLC_VAR_ADDRESS
   " custom types
-  syn keyword cType vlc_fixed_t mtime_t byte_t dctelem_t ssize_t off_t
+  syn keyword cType vlc_fixed_t vlc_tick_t byte_t dctelem_t ssize_t off_t
   syn keyword cType vlc_bool_t vlc_fourcc_t vlc_value_t
   " Core custom structures
   syn keyword cType vlc_t libvlc_t vlc_object_t vlc_error_t vlc_status_t 
@@ -66,7 +66,6 @@ function VlcSyntax()
   " Images
   syn keyword cType image_handler_t
   " Sout
-  syn keyword cType sout_instance_t sout_cfg_t
   syn keyword cType sout_input_t sout_packetizer_input_t
   syn keyword cType sout_access_out_t sout_access_out_sys_t 
   syn keyword cType sout_mux_t sout_mux_sys_t

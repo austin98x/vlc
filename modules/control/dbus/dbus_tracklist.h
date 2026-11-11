@@ -4,7 +4,6 @@
  * Copyright © 2006-2008 Rafaël Carré
  * Copyright © 2007-2010 Mirsal Ennaime
  * Copyright © 2009-2010 The VideoLAN team
- * $Id$
  *
  * Authors:    Mirsal Ennaime <mirsal at mirsal fr>
  *             Rafaël Carré <funman at videolanorg>
@@ -28,6 +27,7 @@
 #define VLC_DBUS_DBUS_TRACKLIST_H_
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_interface.h>
 #include "dbus_common.h"
 
@@ -36,6 +36,64 @@
 
 #define DBUS_MPRIS_NOTRACK   "/org/mpris/MediaPlayer2/TrackList/NoTrack"
 #define DBUS_MPRIS_APPEND    "/org/mpris/MediaPlayer2/TrackList/Append"
+
+struct tracklist_change_event {
+    size_t count;
+    struct tracklist_change_event *next;
+};
+
+struct tracklist_append_event {
+    struct tracklist_change_event change_ev;
+    bool has_previous;    // false when items are inserted at the start of the tracklist
+    uint64_t after_track; // track id, only valid when has_previous is true
+    vlc_playlist_item_t *items[];
+};
+
+struct tracklist_remove_event {
+    struct tracklist_change_event change_ev;
+    uint64_t removed_tracks[];
+};
+
+typedef struct tracklist_append_event tracklist_append_event_t;
+typedef struct tracklist_remove_event tracklist_remove_event_t;
+
+/* Creates an event holding what items have been appended to a tracklist.
+ * The event data will be used to generate TrackAdded DBus signals later on.
+ */
+tracklist_append_event_t *
+tracklist_append_event_create( vlc_playlist_item_t *after_track,
+                               vlc_playlist_item_t *const items[],
+                               size_t count );
+
+/* Creates an event holding what items have been removed from a tracklist.
+ * The event data will be used to generate TrackRemoved DBus signals later on.
+ * Assumes playlist is locked.
+ */
+tracklist_remove_event_t *
+tracklist_remove_event_create( vlc_playlist_t *playlist, size_t first_index, size_t count );
+
+/* Releases any resources reserved for this event */
+void tracklist_append_event_destroy( tracklist_append_event_t *event );
+void tracklist_remove_event_destroy( tracklist_remove_event_t *event );
+
+/* Gets next event in the list */
+static inline tracklist_append_event_t *
+tracklist_append_event_next( tracklist_append_event_t *event ) {
+    if( !event )
+        return NULL;
+    char *p = (char *) event->change_ev.next;
+    return (tracklist_append_event_t *)
+        (p - offsetof(struct tracklist_append_event, change_ev));
+}
+
+static inline tracklist_remove_event_t *
+tracklist_remove_event_next( tracklist_remove_event_t *event ) {
+    if( !event )
+        return NULL;
+    char *p = (char *) event->change_ev.next;
+    return (tracklist_remove_event_t *)
+        (p - offsetof(struct tracklist_remove_event, change_ev));
+}
 
 /* Handle incoming dbus messages */
 DBusHandlerResult handle_tracklist ( DBusConnection *p_conn,

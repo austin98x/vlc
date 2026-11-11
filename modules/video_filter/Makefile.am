@@ -1,4 +1,13 @@
 video_filterdir = $(pluginsdir)/video_filter
+video_filter_RPATH =
+video_filter_PLUGINS =
+video_filter_LTLIBRARIES =
+if HAVE_PARTIAL_LINKING
+noinst_LTLIBRARIES += $(video_filter_PLUGINS)
+else
+video_filter_LTLIBRARIES += $(video_filter_PLUGINS)
+video_filter_RPATH += -rpath '$(video_filterdir)'
+endif
 
 noinst_HEADERS += video_filter/filter_picture.h
 
@@ -34,6 +43,7 @@ libhqdn3d_plugin_la_SOURCES = video_filter/hqdn3d.c video_filter/hqdn3d.h
 libhqdn3d_plugin_la_LIBADD = $(LIBM)
 libinvert_plugin_la_SOURCES = video_filter/invert.c
 libmagnify_plugin_la_SOURCES = video_filter/magnify.c
+libformatcrop_plugin_la_SOURCES = video_filter/formatcrop.c
 libmirror_plugin_la_SOURCES = video_filter/mirror.c
 libmotionblur_plugin_la_SOURCES = video_filter/motionblur.c
 libmotiondetect_plugin_la_SOURCES = video_filter/motiondetect.c
@@ -43,19 +53,23 @@ libposterize_plugin_la_SOURCES = video_filter/posterize.c
 libpsychedelic_plugin_la_SOURCES = video_filter/psychedelic.c
 libpsychedelic_plugin_la_LIBADD = $(LIBM)
 libpuzzle_plugin_la_SOURCES = \
-	video_filter/puzzle.c video_filter/puzzle.h \
-	video_filter/puzzle_bezier.c video_filter/puzzle_bezier.h \
-	video_filter/puzzle_lib.c video_filter/puzzle_lib.h \
-	video_filter/puzzle_mgt.c video_filter/puzzle_mgt.h \
-	video_filter/puzzle_pce.c video_filter/puzzle_pce.h
+	video_filter/puzzle/puzzle.c video_filter/puzzle/puzzle.h \
+	video_filter/puzzle/puzzle_bezier.c video_filter/puzzle/puzzle_bezier.h \
+	video_filter/puzzle/puzzle_lib.c video_filter/puzzle/puzzle_lib.h \
+	video_filter/puzzle/puzzle_mgt.c video_filter/puzzle/puzzle_mgt.h \
+	video_filter/puzzle/puzzle_pce.c video_filter/puzzle/puzzle_pce.h
 libpuzzle_plugin_la_LIBADD = $(LIBM)
 libripple_plugin_la_SOURCES = video_filter/ripple.c
 libripple_plugin_la_LIBADD = $(LIBM)
 librotate_plugin_la_SOURCES = video_filter/rotate.c
 librotate_plugin_la_LIBADD = libvlc_motion.la $(LIBM)
-librotate_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(video_filterdir)'
+librotate_plugin_la_LDFLAGS = $(AM_LDFLAGS) $(video_filter_RPATH)
 if HAVE_DARWIN
+if !HAVE_TVOS
+if !HAVE_WATCHOS
 librotate_plugin_la_LDFLAGS += -Wl,-framework,IOKit,-framework,CoreFoundation
+endif
+endif
 endif
 libscale_plugin_la_SOURCES = video_filter/scale.c
 libscene_plugin_la_SOURCES = video_filter/scene.c
@@ -66,8 +80,9 @@ libtransform_plugin_la_SOURCES = video_filter/transform.c
 libvhs_plugin_la_SOURCES = video_filter/vhs.c
 libwave_plugin_la_SOURCES = video_filter/wave.c
 libwave_plugin_la_LIBADD = $(LIBM)
-
-video_filter_LTLIBRARIES = \
+libdither_plugin_la_SOURCES = video_filter/dither.c
+libdither_plugin_la_LIBADD = $(LIBM)
+video_filter_PLUGINS += \
 	libadjust_plugin.la \
 	libalphamask_plugin.la \
 	libball_plugin.la \
@@ -84,6 +99,7 @@ video_filter_LTLIBRARIES = \
 	libgaussianblur_plugin.la \
 	libinvert_plugin.la \
 	libmagnify_plugin.la \
+	libformatcrop_plugin.la \
 	libmirror_plugin.la \
 	libmotionblur_plugin.la \
 	libmotiondetect_plugin.la \
@@ -105,18 +121,39 @@ video_filter_LTLIBRARIES = \
 	libfps_plugin.la \
 	libfreeze_plugin.la \
 	libpuzzle_plugin.la \
-	librotate_plugin.la
+	librotate_plugin.la \
+	libdither_plugin.la
+
+libsam3_plugin_la_SOURCES = video_filter/sam3.cpp
+libsam3_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(OPENCV4_CFLAGS)
+libsam3_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) -fexceptions
+libsam3_plugin_la_LDFLAGS = $(AM_LDFLAGS) $(GC_SECTIONS_LDFLAGS) $(video_filter_RPATH)
+libsam3_plugin_la_LIBADD = $(LIBM) $(OPENCV4_LIBS)
+EXTRA_LTLIBRARIES += libsam3_plugin.la
+video_filter_PLUGINS += $(LTLIBsam3)
 
 # macOS / iOS hardware video filters
 libci_filters_plugin_la_SOURCES = video_filter/ci_filters.m codec/vt_utils.c codec/vt_utils.h
+libci_filters_plugin_la_OBJCFLAGS = $(AM_OBJCFLAGS) -DGL_SILENCE_DEPRECATION -DCI_SILENCE_GL_DEPRECATION
+libci_filters_plugin_la_LDFLAGS = $(AM_LDFLAGS) $(video_filter_RPATH) \
+	-Wl,-framework,Foundation -Wl,-framework,CoreGraphics -Wl,-framework,CoreImage \
+	-Wl,-framework,CoreVideo
+
 if HAVE_OSX
-libci_filters_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(video_filterdir)' \
-	-Wl,-framework,Foundation -Wl,-framework,CoreGraphics -Wl,-framework,CoreImage -Wl,-framework,CoreVideo
-video_filter_LTLIBRARIES += libci_filters_plugin.la
+libci_filters_plugin_la_LDFLAGS += -Wl,-framework,OpenGL
+video_filter_PLUGINS += libci_filters_plugin.la
 endif
 
-if HAVE_IOS
-video_filter_LTLIBRARIES += libci_filters_plugin.la
+if HAVE_IOS_OR_TVOS
+libci_filters_plugin_la_LDFLAGS += -Wl,-framework,OpenGLES
+video_filter_PLUGINS += libci_filters_plugin.la
+endif
+
+libopengl_filter_plugin_la_SOURCES = video_filter/opengl.c
+libopengl_filter_plugin_la_LIBADD = $(GL_PLUGIN_LIBADD)
+libopengl_filter_plugin_la_CFLAGS = $(AM_CFLAGS) $(GL_PLUGIN_CFLAGS) $(OPENGL_COMMONCFLAGS)
+if HAVE_GL_OR_GLES2
+video_filter_PLUGINS += libopengl_filter_plugin.la
 endif
 
 libdeinterlace_common_la_SOURCES = video_filter/deinterlace/common.c video_filter/deinterlace/common.h
@@ -125,49 +162,76 @@ noinst_LTLIBRARIES += libdeinterlace_common.la
 
 libdeinterlace_plugin_la_SOURCES = \
 	video_filter/deinterlace/deinterlace.c video_filter/deinterlace/deinterlace.h \
-        video_filter/deinterlace/mmx.h \
 	video_filter/deinterlace/merge.c video_filter/deinterlace/merge.h \
 	video_filter/deinterlace/helpers.c video_filter/deinterlace/helpers.h \
 	video_filter/deinterlace/algo_basic.c video_filter/deinterlace/algo_basic.h \
 	video_filter/deinterlace/algo_x.c video_filter/deinterlace/algo_x.h \
 	video_filter/deinterlace/algo_yadif.c video_filter/deinterlace/algo_yadif.h \
-	video_filter/deinterlace/yadif.h video_filter/deinterlace/yadif_template.h \
+	video_filter/deinterlace/yadif.h \
 	video_filter/deinterlace/algo_phosphor.c video_filter/deinterlace/algo_phosphor.h \
 	video_filter/deinterlace/algo_ivtc.c video_filter/deinterlace/algo_ivtc.h
-# inline ASM doesn't build with -O0
-libdeinterlace_plugin_la_CFLAGS = $(AM_CFLAGS) -O2
-if HAVE_NEON
-libdeinterlace_plugin_la_SOURCES += video_filter/deinterlace/merge_arm.S
-libdeinterlace_plugin_la_CFLAGS += -DCAN_COMPILE_ARM
+libdeinterlace_plugin_la_CPPFLAGS = $(AM_CPPFLAGS)
+libdeinterlace_plugin_la_CFLAGS = $(AM_CFLAGS)
+if HAVE_X86ASM
+libdeinterlace_plugin_la_SOURCES += video_filter/deinterlace/yadif_x86.asm
 endif
-if HAVE_ARM64
-libdeinterlace_plugin_la_SOURCES += video_filter/deinterlace/merge_arm64.S
-libdeinterlace_plugin_la_CFLAGS += -DCAN_COMPILE_ARM64
-endif
-libdeinterlace_plugin_la_LIBADD = libdeinterlace_common.la
-video_filter_LTLIBRARIES += libdeinterlace_plugin.la
 
-libopencv_wrapper_plugin_la_SOURCES = video_filter/opencv_wrapper.c
+libdeinterlace_plugin_la_LIBADD = libdeinterlace_common.la
+video_filter_PLUGINS += libdeinterlace_plugin.la
+
+libglblend_plugin_la_SOURCES = video_filter/deinterlace/glblend.c
+libglblend_plugin_la_CFLAGS = $(AM_CFLAGS) $(GL_PLUGIN_CFLAGS)
+libglblend_plugin_la_LIBADD = $(GL_PLUGIN_LIBADD)
+if HAVE_GL_OR_GLES2
+video_filter_PLUGINS += libglblend_plugin.la
+endif
+
+libopencv_wrapper_plugin_la_SOURCES = video_filter/opencv_wrapper.cpp
 libopencv_wrapper_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(OPENCV_CFLAGS)
 libopencv_wrapper_plugin_la_LIBADD = $(OPENCV_LIBS)
-libopencv_wrapper_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(video_filterdir)'
-video_filter_LTLIBRARIES += $(LTLIBopencv_wrapper)
+libopencv_wrapper_plugin_la_LDFLAGS = $(AM_LDFLAGS) $(GC_SECTIONS_LDFLAGS) $(video_filter_RPATH)
+video_filter_PLUGINS += $(LTLIBopencv_wrapper)
 EXTRA_LTLIBRARIES += libopencv_wrapper_plugin.la
 
 libpostproc_plugin_la_SOURCES = video_filter/postproc.c
 libpostproc_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(POSTPROC_CFLAGS) $(AVUTIL_CFLAGS)
 libpostproc_plugin_la_LIBADD = $(LIBM) $(POSTPROC_LIBS) $(AVUTIL_LIBS)
-libpostproc_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(video_filterdir)'
-video_filter_LTLIBRARIES += $(LTLIBpostproc)
+libpostproc_plugin_la_LDFLAGS = $(AM_LDFLAGS) $(video_filter_RPATH)
+video_filter_PLUGINS += $(LTLIBpostproc)
 EXTRA_LTLIBRARIES += libpostproc_plugin.la
+
+if HAVE_AMF_ENHANCER
+libamf_vqenhancer_plugin_la_SOURCES = video_filter/amf_vqenhancer.c \
+    hw/amf/amf_helper.c hw/amf/amf_helper.h
+if HAVE_WIN32
+libamf_vqenhancer_plugin_la_LIBADD = $(LIBCOM) libd3d11_common.la -ld3d11
+video_filter_PLUGINS += libamf_vqenhancer_plugin.la
+endif
+endif
+
+if HAVE_AMF_FRC
+libamf_frc_plugin_la_SOURCES = video_filter/amf_frc.c \
+    hw/amf/amf_helper.c hw/amf/amf_helper.h
+if HAVE_WIN32
+libamf_frc_plugin_la_LIBADD = $(LIBCOM) libd3d11_common.la -ld3d11
+video_filter_PLUGINS += libamf_frc_plugin.la
+endif
+endif
 
 # misc
 libblend_plugin_la_SOURCES = video_filter/blend.cpp
-video_filter_LTLIBRARIES += libblend_plugin.la
+video_filter_PLUGINS += libblend_plugin.la
 
 libopencv_example_plugin_la_SOURCES = video_filter/opencv_example.cpp video_filter/filter_event_info.h
 libopencv_example_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(OPENCV_CFLAGS)
 libopencv_example_plugin_la_LIBADD = $(OPENCV_LIBS)
-libopencv_example_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(video_filterdir)'
-video_filter_LTLIBRARIES += $(LTLIBopencv_example)
+libopencv_example_plugin_la_LDFLAGS = $(AM_LDFLAGS) $(GC_SECTIONS_LDFLAGS) $(video_filter_RPATH)
+video_filter_PLUGINS += $(LTLIBopencv_example)
 EXTRA_LTLIBRARIES += libopencv_example_plugin.la
+
+libgladjust_plugin_la_SOURCES = video_filter/gladjust.c
+libgladjust_plugin_la_CFLAGS = $(AM_CFLAGS) $(GL_PLUGIN_CFLAGS)
+libgladjust_plugin_la_LIBADD = $(GL_PLUGIN_LIBADD)
+if HAVE_GL_OR_GLES2
+video_filter_PLUGINS += libgladjust_plugin.la
+endif

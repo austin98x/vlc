@@ -1,12 +1,14 @@
 # TagLib
 
-TAGLIB_VERSION := 1.11
-TAGLIB_URL := http://taglib.github.io/releases/taglib-$(TAGLIB_VERSION).tar.gz
+TAGLIB_VERSION := 2.3.2
+TAGLIB_URL := $(GITHUB)/taglib/taglib/releases/download/v$(TAGLIB_VERSION)/taglib-$(TAGLIB_VERSION).tar.gz
 
 PKGS += taglib
 ifeq ($(call need_pkg,"taglib >= 1.9"),)
 PKGS_FOUND += taglib
 endif
+
+DEPS_taglib := utfcpp $(DEPS_utfcpp)
 
 $(TARBALLS)/taglib-$(TAGLIB_VERSION).tar.gz:
 	$(call download_pkg,$(TAGLIB_URL),taglib)
@@ -15,14 +17,17 @@ $(TARBALLS)/taglib-$(TAGLIB_VERSION).tar.gz:
 
 taglib: taglib-$(TAGLIB_VERSION).tar.gz .sum-taglib
 	$(UNPACK)
-ifdef HAVE_WINSTORE
-	$(APPLY) $(SRC)/taglib/unicode.patch
-endif
 	$(MOVE)
 
+TAGLIB_CONF := -DBUILD_BINDINGS=OFF
+ifdef HAVE_WINSTORE
+TAGLIB_CONF += -DPLATFORM_WINRT=ON
+endif
+
+
 .taglib: taglib toolchain.cmake
-	cd $< && $(HOSTVARS_PIC) $(CMAKE) \
-		-DBUILD_SHARED_LIBS:BOOL=OFF \
-		.
-	cd $< && $(MAKE) install
+	$(CMAKECLEAN)
+	$(HOSTVARS_CMAKE) $(CMAKE) $(TAGLIB_CONF)
+	+$(CMAKEBUILD)
+	$(CMAKEINSTALL)
 	touch $@

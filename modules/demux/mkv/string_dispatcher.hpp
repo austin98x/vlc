@@ -2,7 +2,6 @@
  * string_dispatcher.hpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2016 VLC authors, VideoLAN, Videolabs SAS
- * $Id$
  *
  * Authors: Filip Roseen <filip@videolabs.io>
  *
@@ -58,7 +57,6 @@ namespace {
       void insert_glob (ProcessorEntry const& data) {
         std::istringstream iss (data.first);
         std::vector<std::string> parts;
-        std::string s1;
 
         for (std::string s1; std::getline (iss, s1, '*'); )
           parts.push_back (s1);

@@ -26,10 +26,13 @@
 #define HTTPCONNECTIONMANAGER_H_
 
 #include "../logic/IDownloadRateObserver.h"
+#include "BytesRange.hpp"
 
 #include <vlc_common.h>
+#include <vlc_threads.h>
 
 #include <vector>
+#include <list>
 #include <string>
 
 namespace adaptive
@@ -37,26 +40,37 @@ namespace adaptive
     namespace http
     {
         class ConnectionParams;
-        class ConnectionFactory;
+        class AbstractConnectionFactory;
         class AbstractConnection;
-        class AuthStorage;
         class Downloader;
         class AbstractChunkSource;
+        class HTTPChunkBufferedSource;
+        enum class ChunkType;
 
         class AbstractConnectionManager : public IDownloadRateObserver
         {
             public:
                 AbstractConnectionManager(vlc_object_t *);
                 ~AbstractConnectionManager();
+                AbstractConnectionManager(AbstractConnectionManager&&) = delete;
+                AbstractConnectionManager& operator=(const AbstractConnectionManager&) = delete;
+                AbstractConnectionManager& operator=(AbstractConnectionManager&&) = delete;
                 virtual void    closeAllConnections () = 0;
                 virtual AbstractConnection * getConnection(ConnectionParams &) = 0;
+                virtual AbstractChunkSource *makeSource(const std::string &,
+                                                        const ID &, ChunkType,
+                                                        const BytesRange &) = 0;
+                virtual void recycleSource(AbstractChunkSource *) = 0;
+
                 virtual void start(AbstractChunkSource *) = 0;
                 virtual void cancel(AbstractChunkSource *) = 0;
 
-                virtual void updateDownloadRate(const ID &, size_t, mtime_t); /* impl */
+                virtual void updateDownloadRate(const ID &, size_t,
+                                                vlc_tick_t, vlc_tick_t) override;
                 void setDownloadRateObserver(IDownloadRateObserver *);
 
             protected:
+                void deleteSource(AbstractChunkSource *);
                 vlc_object_t                                       *p_object;
 
             private:
@@ -66,23 +80,34 @@ namespace adaptive
         class HTTPConnectionManager : public AbstractConnectionManager
         {
             public:
-                HTTPConnectionManager           (vlc_object_t *p_object, ConnectionFactory *);
-                HTTPConnectionManager           (vlc_object_t *p_object, AuthStorage *);
+                HTTPConnectionManager           (vlc_object_t *p_object);
                 virtual ~HTTPConnectionManager  ();
 
-                virtual void    closeAllConnections () /* impl */;
-                virtual AbstractConnection * getConnection(ConnectionParams &) /* impl */;
+                void    closeAllConnections ()  override;
+                AbstractConnection * getConnection(ConnectionParams &)  override;
+                AbstractChunkSource *makeSource(const std::string &,
+                                                const ID &, ChunkType,
+                                                const BytesRange &) override;
+                void recycleSource(AbstractChunkSource *) override;
 
-                virtual void start(AbstractChunkSource *) /* impl */;
-                virtual void cancel(AbstractChunkSource *) /* impl */;
+                void start(AbstractChunkSource *)  override;
+                void cancel(AbstractChunkSource *)  override;
+                void         setLocalConnectionsAllowed();
+                void         addFactory(AbstractConnectionFactory *);
 
             private:
                 void    releaseAllConnections ();
                 Downloader                                         *downloader;
+                Downloader                                         *downloaderhp;
                 vlc_mutex_t                                         lock;
                 std::vector<AbstractConnection *>                   connectionPool;
-                ConnectionFactory                                  *factory;
+                std::list<AbstractConnectionFactory *>              factories;
+                bool                                                localAllowed;
                 AbstractConnection * reuseConnection(ConnectionParams &);
+                Downloader * getDownloadQueue(const AbstractChunkSource *) const;
+                std::list<HTTPChunkBufferedSource *> cache;
+                size_t cache_total;
+                size_t cache_max;
         };
     }
 }

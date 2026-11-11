@@ -49,68 +49,77 @@
     "Something like ft.noise or ftkleine.noise")
 
 #define T_WIDTH N_("Width")
-#define LT_WIDTH N_("Video width")
+#define LT_WIDTH NULL
 
 #define T_HEIGHT N_("Height")
-#define LT_HEIGHT N_("Video height")
+#define LT_HEIGHT NULL
 
-static int Open( vlc_object_t * );
-static void Close( vlc_object_t * );
+#define T_OFFSET_X N_("Offset X")
+#define LT_OFFSET_X NULL
+
+#define T_OFFSET_Y N_("Offset Y")
+#define LT_OFFSET_Y NULL
+
+#define T_OFFSET_Z N_("Offset Z")
+#define LT_OFFSET_Z NULL
+
+static int Open(vout_display_t *vd,
+                video_format_t *fmtp, vlc_video_context *context);
+static void Close(vout_display_t *vd);
 
 vlc_module_begin ()
     set_shortname( N_("Flaschen") )
     set_description( N_("Flaschen-Taschen video output") )
-    set_capability( "vout display", 0 )
-    set_callbacks( Open, Close )
+    set_callback_display( Open, 0 )
     add_shortcut( "flaschen" )
 
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VOUT )
-    add_string( "flaschen-display", NULL, T_FLDISPLAY, LT_FLDISPLAY, true )
-    add_integer("flaschen-width", 25, T_WIDTH, LT_WIDTH, false)
-    add_integer("flaschen-height", 20, T_HEIGHT, LT_HEIGHT, false)
+    add_string( "flaschen-display", NULL, T_FLDISPLAY, LT_FLDISPLAY )
+    add_integer("flaschen-width", 25, T_WIDTH, LT_WIDTH)
+    add_integer("flaschen-height", 20, T_HEIGHT, LT_HEIGHT)
+    add_integer("flaschen-offset-x", 0, T_OFFSET_X, LT_OFFSET_X)
+    add_integer("flaschen-offset-y", 0, T_OFFSET_Y, LT_OFFSET_Y)
+    add_integer("flaschen-offset-z", 0, T_OFFSET_Z, LT_OFFSET_Z)
 vlc_module_end ()
 
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-struct vout_display_sys_t {
+typedef struct vout_display_sys_t {
     int             fd;
+} vout_display_sys_t;
+static void            Display(vout_display_t *, picture_t *);
 
-    picture_pool_t *pool;
+static const struct vlc_display_operations ops = {
+    .close = Close,
+    .display = Display,
 };
-static picture_pool_t *Pool(vout_display_t *, unsigned count);
-static void            Display(vout_display_t *, picture_t *, subpicture_t *);
-static int             Control(vout_display_t *, int, va_list);
 
 /*****************************************************************************
  * Open: activates flaschen vout display method
  *****************************************************************************/
-static int Open(vlc_object_t *object)
+static int Open(vout_display_t *vd,
+                video_format_t *fmtp, vlc_video_context *context)
 {
-    vout_display_t *vd = (vout_display_t *)object;
     vout_display_sys_t *sys;
     int fd;
-    unsigned port = 1337;
+    const unsigned port = 1337;
 
     vd->sys = sys = calloc(1, sizeof(*sys));
     if (!sys)
         return VLC_ENOMEM;
-    sys->pool = NULL;
     sys->fd = -1;
 
     /* */
-    video_format_t fmt = vd->fmt;
-    fmt.i_chroma = VLC_CODEC_RGB24;
+    video_format_t fmt = *fmtp;
     /* TODO: check if this works on big-endian systems */
-    fmt.i_rmask = 0xff0000;
-    fmt.i_gmask = 0x00ff00;
-    fmt.i_bmask = 0x0000ff;
+    fmt.i_chroma = VLC_CODEC_RGB24;
     fmt.i_width  = var_InheritInteger(vd, "flaschen-width");
     fmt.i_height = var_InheritInteger(vd, "flaschen-height");
     fmt.i_visible_width = fmt.i_width;
     fmt.i_visible_height = fmt.i_height;
+    fmt.orientation = ORIENT_NORMAL;
 
     /* p_vd->info is not modified */
 
@@ -140,39 +149,23 @@ static int Open(vlc_object_t *object)
     setsockopt (fd, SOL_SOCKET, SO_RCVBUF, &(int){ 0 }, sizeof (int));
 
 
-    vd->fmt     = fmt;
+    *fmtp = fmt;
 
-    vd->pool    = Pool;
-    vd->prepare = NULL;
-    vd->display = Display;
-    vd->control = Control;
+    vd->ops = &ops;
 
-    vout_display_DeleteWindow(vd, NULL);
-
+    (void) context;
     return VLC_SUCCESS;
 }
 
-static void Close(vlc_object_t *object)
+static void Close(vout_display_t *vd)
 {
-    vout_display_t *vd = (vout_display_t *)object;
     vout_display_sys_t *sys = vd->sys;
-
-    if (sys->pool)
-        picture_pool_Release(sys->pool);
 
     net_Close(sys->fd);
     free(sys);
 }
 
-static picture_pool_t *Pool(vout_display_t *vd, unsigned count)
-{
-    vout_display_sys_t *sys = vd->sys;
-    if (!sys->pool)
-        sys->pool = picture_pool_NewFromFormat(&vd->fmt, count);
-    return sys->pool;
-}
-
-static void Display(vout_display_t *vd, picture_t *picture, subpicture_t *subpicture)
+static void Display(vout_display_t *vd, picture_t *picture)
 {
 #ifdef IOV_MAX
     const long iovmax = IOV_MAX;
@@ -180,17 +173,25 @@ static void Display(vout_display_t *vd, picture_t *picture, subpicture_t *subpic
     const long iovmax = sysconf(_SC_IOV_MAX);
 #endif
     vout_display_sys_t *sys = vd->sys;
+    video_format_t *fmt = &picture->format;
     int result;
-    VLC_UNUSED(subpicture);
 
     char buffer[64];
-    int header_len = snprintf(buffer, sizeof(buffer), "P6\n%d %d\n255\n",
-                              vd->fmt.i_width, vd->fmt.i_height);
-    /* TODO: support offset_{x,y,z}? (#FT:...) */
+    int header_len;
+    int offset_x = var_InheritInteger(vd, "flaschen-offset-x");
+    int offset_y = var_InheritInteger(vd, "flaschen-offset-y");
+    int offset_z = var_InheritInteger(vd, "flaschen-offset-z");
+
+    if (offset_x || offset_y || offset_z)
+        header_len = snprintf(buffer, sizeof(buffer), "P6\n%d %d\n#FT: %d %d %d\n255\n",
+                                  fmt->i_width, fmt->i_height, offset_x, offset_y, offset_z);
+    else
+        header_len = snprintf(buffer, sizeof(buffer), "P6\n%d %d\n255\n",
+                                  fmt->i_width, fmt->i_height);
     /* Note the protocol doesn't include any picture order field. */
     /* (maybe add as comment?) */
 
-    int iovcnt = 1 + vd->fmt.i_height;
+    int iovcnt = 1 + fmt->i_height;
     if (unlikely(iovcnt > iovmax))
         return;
 
@@ -202,7 +203,7 @@ static void Display(vout_display_t *vd, picture_t *picture, subpicture_t *subpic
     for (int i = 1; i < iovcnt; i++)
     {
         iov[i].iov_base = src;
-        iov[i].iov_len = vd->fmt.i_width * 3;
+        iov[i].iov_len = fmt->i_width * 3;
         src += picture->p->i_pitch;
     }
 
@@ -218,29 +219,7 @@ static void Display(vout_display_t *vd, picture_t *picture, subpicture_t *subpic
     result = sendmsg(sys->fd, &hdr, 0);
     if (result < 0)
         msg_Err(vd, "sendmsg: error %s in vout display flaschen", vlc_strerror_c(errno));
-    else if (result < (int)(header_len + vd->fmt.i_width * vd->fmt.i_height * 3))
+    else if (result < (int)(header_len + fmt->i_width * fmt->i_height * 3))
         msg_Err(vd, "sendmsg only sent %d bytes in vout display flaschen", result);
         /* we might want to drop some frames? */
-
-    picture_Release(picture);
-}
-
-/**
- * Control for vout display
- */
-static int Control(vout_display_t *vd, int query, va_list args)
-{
-    VLC_UNUSED(args);
-
-    switch (query) {
-    case VOUT_DISPLAY_CHANGE_DISPLAY_SIZE:
-    case VOUT_DISPLAY_CHANGE_ZOOM:
-    case VOUT_DISPLAY_CHANGE_DISPLAY_FILLED:
-    case VOUT_DISPLAY_CHANGE_SOURCE_ASPECT:
-        return VLC_EGENERIC;
-
-    default:
-        msg_Err(vd, "Unsupported query in vout display flaschen");
-        return VLC_EGENERIC;
-    }
 }

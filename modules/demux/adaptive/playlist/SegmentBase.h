@@ -26,21 +26,35 @@
 #define SEGMENTBASE_H_
 
 #include "Segment.h"
-#include "SegmentInfoCommon.h"
-#include "../tools/Properties.hpp"
+#include "SegmentBaseType.hpp"
 
 namespace adaptive
 {
     namespace playlist
     {
+        class SegmentInformation;
+
         /* SegmentBase can contain only one segment */
         class SegmentBase : public Segment,
-                            public Initializable<Segment>,
-                            public Indexable<Segment>
+                            public AbstractSegmentBaseType
         {
             public:
-                SegmentBase             (ICanonicalUrl *);
+                SegmentBase             (SegmentInformation * = nullptr);
                 virtual ~SegmentBase    ();
+
+                vlc_tick_t getMinAheadTime(uint64_t curnum) const override;
+                Segment *getMediaSegment(uint64_t number) const override;
+                Segment *getNextMediaSegment(uint64_t, uint64_t *, bool *) const override;
+                uint64_t getStartSegmentNumber() const override;
+
+                bool getSegmentNumberByTime(vlc_tick_t time, uint64_t *ret) const override;
+                bool getPlaybackTimeDurationBySegmentNumber(uint64_t number,
+                                            vlc_tick_t *time, vlc_tick_t *duration) const override;
+
+                void debug(vlc_object_t *,int = 0) const override;
+
+            protected:
+                SegmentInformation *parent;
         };
     }
 }

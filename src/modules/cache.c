@@ -2,7 +2,6 @@
  * cache.c: Plugins cache
  *****************************************************************************
  * Copyright (C) 2001-2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Sam Hocevar <sam@zoy.org>
  *          Ethan C. Baldridge <BaldridgeE@cadmus.com>
@@ -29,6 +28,7 @@
 #endif
 
 #include <stdalign.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,7 +39,7 @@
 
 #include <vlc_common.h>
 #include <vlc_block.h>
-#include "libvlc.h"
+#include "../libvlc.h"
 
 #include <vlc_plugin.h>
 #include <errno.h>
@@ -57,7 +57,7 @@
 #ifdef HAVE_DYNAMIC_PLUGINS
 /* Sub-version number
  * (only used to avoid breakage in dev version when cache structure changes) */
-#define CACHE_SUBVERSION_NUM 34
+#define CACHE_SUBVERSION_NUM 36
 
 /* Cache filename */
 #define CACHE_NAME "plugins.dat"
@@ -179,15 +179,16 @@ static int vlc_cache_load_align(size_t align, block_t *file)
     if (vlc_cache_load_align(alignof(t), file)) \
         goto error
 
-static int vlc_cache_load_config(module_config_t *cfg, block_t *file)
+static int vlc_cache_load_config(struct vlc_param *param, block_t *file)
 {
+    module_config_t *cfg = &param->item;
+
     LOAD_IMMEDIATE (cfg->i_type);
-    LOAD_IMMEDIATE (cfg->i_short);
-    LOAD_FLAG (cfg->b_advanced);
-    LOAD_FLAG (cfg->b_internal);
-    LOAD_FLAG (cfg->b_unsaveable);
-    LOAD_FLAG (cfg->b_safe);
-    LOAD_FLAG (cfg->b_removed);
+    LOAD_IMMEDIATE (param->shortname);
+    LOAD_FLAG (param->internal);
+    LOAD_FLAG (param->unsaved);
+    LOAD_FLAG (param->safe);
+    LOAD_FLAG (param->obsolete);
     LOAD_STRING (cfg->psz_type);
     LOAD_STRING (cfg->psz_name);
     LOAD_STRING (cfg->psz_text);
@@ -199,12 +200,11 @@ static int vlc_cache_load_config(module_config_t *cfg, block_t *file)
         const char *psz;
         LOAD_STRING(psz);
         cfg->orig.psz = (char *)psz;
-        cfg->value.psz = (psz != NULL) ? strdup (cfg->orig.psz) : NULL;
+        atomic_init(&param->value.str, NULL);
+        vlc_param_SetString(param, psz);
 
         if (cfg->list_count)
             cfg->list.psz = xmalloc (cfg->list_count * sizeof (char *));
-        else
-            LOAD_STRING(cfg->list_cb_name);
         for (unsigned i = 0; i < cfg->list_count; i++)
         {
             LOAD_STRING (cfg->list.psz[i]);
@@ -218,14 +218,18 @@ static int vlc_cache_load_config(module_config_t *cfg, block_t *file)
         LOAD_IMMEDIATE (cfg->orig);
         LOAD_IMMEDIATE (cfg->min);
         LOAD_IMMEDIATE (cfg->max);
+        if (IsConfigFloatType(cfg->i_type))
+            atomic_store_explicit(&param->value.f, cfg->orig.f,
+                                  memory_order_relaxed);
+        else
+            atomic_store_explicit(&param->value.i, cfg->orig.i,
+                                  memory_order_relaxed);
         cfg->value = cfg->orig;
 
         if (cfg->list_count)
         {
-            LOAD_ALIGNOF(*cfg->list.i);
+            LOAD_ALIGNOF(int);
         }
-        else
-            LOAD_STRING(cfg->list_cb_name);
 
         LOAD_ARRAY(cfg->list.i, cfg->list_count);
     }
@@ -254,24 +258,25 @@ static int vlc_cache_load_plugin_config(vlc_plugin_t *plugin, block_t *file)
     /* Allocate memory */
     if (lines)
     {
-        plugin->conf.items = calloc(sizeof (module_config_t), lines);
-        if (unlikely(plugin->conf.items == NULL))
+        plugin->conf.params = calloc(lines, sizeof (struct vlc_param));
+        if (unlikely(plugin->conf.params == NULL))
         {
             plugin->conf.size = 0;
             return -1;
         }
     }
     else
-        plugin->conf.items = NULL;
+        plugin->conf.params = NULL;
 
     plugin->conf.size = lines;
 
     /* Do the duplication job */
     for (size_t i = 0; i < lines; i++)
     {
-        module_config_t *item = plugin->conf.items + i;
+        struct vlc_param *param = plugin->conf.params + i;
+        module_config_t *item = &param->item;
 
-        if (vlc_cache_load_config(item, file))
+        if (vlc_cache_load_config(param, file))
             return -1;
 
         if (CONFIG_ITEM(item->i_type))
@@ -280,7 +285,7 @@ static int vlc_cache_load_plugin_config(vlc_plugin_t *plugin, block_t *file)
             if (item->i_type == CONFIG_ITEM_BOOL)
                 plugin->conf.booleans++;
         }
-        item->owner = plugin;
+        param->owner = plugin;
     }
 
     return 0;
@@ -297,6 +302,7 @@ static int vlc_cache_load_module(vlc_plugin_t *plugin, block_t *file)
     LOAD_STRING(module->psz_shortname);
     LOAD_STRING(module->psz_longname);
     LOAD_STRING(module->psz_help);
+    LOAD_STRING(module->psz_help_html);
 
     LOAD_IMMEDIATE(module->i_shortcuts);
     if (module->i_shortcuts > MODULE_SHORTCUT_MAX)
@@ -367,7 +373,7 @@ error:
  * actually load the dynamically loadable module.
  * This allows us to only fully load plugins when they are actually used.
  */
-vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
+vlc_plugin_t *vlc_cache_load(libvlc_int_t *p_this, const char *dir,
                              block_t **backingp)
 {
     char *psz_filename;
@@ -375,7 +381,7 @@ vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
     assert( dir != NULL );
 
     if( asprintf( &psz_filename, "%s"DIR_SEP CACHE_NAME, dir ) == -1 )
-        return 0;
+        return NULL;
 
     msg_Dbg( p_this, "loading plugins cache file %s", psz_filename );
 
@@ -385,7 +391,7 @@ vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
                  vlc_strerror_c(errno));
     free(psz_filename);
     if (file == NULL)
-        return 0;
+        return NULL;
 
     /* Check the file is a plugins cache */
     char cachestr[sizeof (CACHE_STRING) - 1];
@@ -395,7 +401,7 @@ vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
     {
         msg_Warn( p_this, "This doesn't look like a valid plugins cache" );
         block_Release(file);
-        return 0;
+        return NULL;
     }
 
 #ifdef DISTRO_VERSION
@@ -407,7 +413,7 @@ vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
     {
         msg_Warn( p_this, "This doesn't look like a valid plugins cache" );
         block_Release(file);
-        return 0;
+        return NULL;
     }
 #endif
 
@@ -420,7 +426,7 @@ vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
         msg_Warn( p_this, "This doesn't look like a valid plugins cache "
                   "(corrupted header)" );
         block_Release(file);
-        return 0;
+        return NULL;
     }
 
     /* Check header marker */
@@ -435,7 +441,7 @@ vlc_plugin_t *vlc_cache_load(vlc_object_t *p_this, const char *dir,
         msg_Warn( p_this, "This doesn't look like a valid plugins cache "
                   "(corrupted header)" );
         block_Release(file);
-        return 0;
+        return NULL;
     }
 
     vlc_plugin_t *cache = NULL;
@@ -512,15 +518,16 @@ static int CacheSaveAlign(FILE *file, size_t align)
     if (CacheSaveAlign(file, alignof (t))) \
         goto error
 
-static int CacheSaveConfig (FILE *file, const module_config_t *cfg)
+static int CacheSaveConfig(FILE *file, const struct vlc_param *param)
 {
+    const module_config_t *cfg = &param->item;
+
     SAVE_IMMEDIATE (cfg->i_type);
-    SAVE_IMMEDIATE (cfg->i_short);
-    SAVE_FLAG (cfg->b_advanced);
-    SAVE_FLAG (cfg->b_internal);
-    SAVE_FLAG (cfg->b_unsaveable);
-    SAVE_FLAG (cfg->b_safe);
-    SAVE_FLAG (cfg->b_removed);
+    SAVE_IMMEDIATE (param->shortname);
+    SAVE_FLAG (param->internal);
+    SAVE_FLAG (param->unsaved);
+    SAVE_FLAG (param->safe);
+    SAVE_FLAG (param->obsolete);
     SAVE_STRING (cfg->psz_type);
     SAVE_STRING (cfg->psz_name);
     SAVE_STRING (cfg->psz_text);
@@ -530,8 +537,6 @@ static int CacheSaveConfig (FILE *file, const module_config_t *cfg)
     if (IsConfigStringType (cfg->i_type))
     {
         SAVE_STRING (cfg->orig.psz);
-        if (cfg->list_count == 0)
-            SAVE_STRING(cfg->list_cb_name);
 
         for (unsigned i = 0; i < cfg->list_count; i++)
             SAVE_STRING (cfg->list.psz[i]);
@@ -544,10 +549,8 @@ static int CacheSaveConfig (FILE *file, const module_config_t *cfg)
 
         if (cfg->list_count > 0)
         {
-            SAVE_ALIGNOF(*cfg->list.i);
+            SAVE_ALIGNOF(int);
         }
-        else
-            SAVE_STRING(cfg->list_cb_name);
 
         for (unsigned i = 0; i < cfg->list_count; i++)
              SAVE_IMMEDIATE (cfg->list.i[i]);
@@ -567,7 +570,7 @@ static int CacheSaveModuleConfig(FILE *file, const vlc_plugin_t *plugin)
     SAVE_IMMEDIATE (lines);
 
     for (size_t i = 0; i < lines; i++)
-        if (CacheSaveConfig(file, plugin->conf.items + i))
+        if (CacheSaveConfig(file, plugin->conf.params + i))
            goto error;
 
     return 0;
@@ -580,6 +583,7 @@ static int CacheSaveModule(FILE *file, const module_t *module)
     SAVE_STRING(module->psz_shortname);
     SAVE_STRING(module->psz_longname);
     SAVE_STRING(module->psz_help);
+    SAVE_STRING(module->psz_help_html);
     SAVE_IMMEDIATE(module->i_shortcuts);
 
     for (size_t j = 0; j < module->i_shortcuts; j++)
@@ -602,7 +606,7 @@ static int CacheSaveBank(FILE *file, vlc_plugin_t *const *cache, size_t n)
     if (fputs (CACHE_STRING, file) == EOF)
         goto error;
 #ifdef DISTRO_VERSION
-    /* Allow binary maintaner to pass a string to detect new binary version*/
+    /* Allow binary maintainer to pass a string to detect new binary version*/
     if (fputs( DISTRO_VERSION, file ) == EOF)
         goto error;
 #endif
@@ -653,16 +657,19 @@ error:
 /**
  * Saves a module cache to disk, and release cache data from memory.
  */
-void CacheSave(vlc_object_t *p_this, const char *dir,
+void CacheSave(libvlc_int_t *p_this, const char *dir,
                vlc_plugin_t *const *entries, size_t n)
 {
     char *filename = NULL, *tmpname = NULL;
 
     if (asprintf (&filename, "%s"DIR_SEP CACHE_NAME, dir ) == -1)
-        goto out;
+        return;
 
     if (asprintf (&tmpname, "%s.%"PRIu32, filename, (uint32_t)getpid ()) == -1)
-        goto out;
+    {
+        free (filename);
+        return;
+    }
     msg_Dbg (p_this, "saving plugins cache %s", filename);
 
     FILE *file = vlc_fopen (tmpname, "wb");

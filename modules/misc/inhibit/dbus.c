@@ -39,15 +39,22 @@
 enum vlc_inhibit_api
 {
     FDO_SS, /**< KDE >= 4 and GNOME >= 3.10 */
-    FDO_PM, /**< KDE and GNOME <= 2.26 */
+    FDO_PM, /**< KDE and GNOME <= 2.26 and Xfce */
     MATE,  /**< >= 1.0 */
     GNOME, /**< GNOME 2.26..3.4 */
 };
 
 #define MAX_API (GNOME+1)
 
-/* Currently, all services have identical service and interface names. */
 static const char dbus_service[][40] =
+{
+    [FDO_SS] = "org.freedesktop.ScreenSaver",
+    [FDO_PM] = "org.freedesktop.PowerManagement",
+    [MATE]   = "org.mate.SessionManager",
+    [GNOME]  = "org.gnome.SessionManager",
+};
+
+static const char dbus_interface[][40] =
 {
     [FDO_SS] = "org.freedesktop.ScreenSaver",
     [FDO_PM] = "org.freedesktop.PowerManagement.Inhibit",
@@ -55,10 +62,10 @@ static const char dbus_service[][40] =
     [GNOME]  = "org.gnome.SessionManager",
 };
 
-static const char dbus_path[][33] =
+static const char dbus_path[][41] =
 {
     [FDO_SS] = "/ScreenSaver",
-    [FDO_PM] = "/org/freedesktop/PowerManagement",
+    [FDO_PM] = "/org/freedesktop/PowerManagement/Inhibit",
     [MATE]   = "/org/mate/SessionManager",
     [GNOME]  = "/org/gnome/SessionManager",
 };
@@ -119,15 +126,16 @@ static void Inhibit(vlc_inhibit_t *ih, unsigned flags)
     dbus_bool_t ret;
 
     DBusMessage *msg = dbus_message_new_method_call(dbus_service[type],
-                                  dbus_path[type], dbus_service[type], method);
+                                  dbus_path[type], dbus_interface[type], method);
     if (unlikely(msg == NULL))
         return;
 
     if (flags)
     {
         const char *app = PACKAGE;
-        const char *reason = _("Playing some media.");
-
+        const char *reason = (flags & VLC_INHIBIT_VIDEO) ? N_("Playing video")
+                                                         : N_("Playing audio");
+        reason = vlc_gettext(reason);
         assert(sys->cookie == 0);
 
         switch (type)
@@ -231,7 +239,6 @@ static void Close (vlc_object_t *obj)
 vlc_module_begin ()
     set_shortname (N_("D-Bus screensaver"))
     set_description (N_("D-Bus screen saver inhibition"))
-    set_category (CAT_ADVANCED)
     set_subcategory (SUBCAT_ADVANCED_MISC)
     set_capability ("inhibit", 20)
     set_callbacks (Open, Close)

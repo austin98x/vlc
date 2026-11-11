@@ -4,7 +4,7 @@
  * Copyright (C) 2005-2006 VLC authors and VideoLAN
  * Copyright © 2005-2008 Rémi Denis-Courmont
  *
- * Authors: Rémi Denis-Courmont <rem # videolan.org>
+ * Authors: Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -30,6 +30,7 @@
 
 #include <vlc_common.h>
 #include <vlc_fs.h>
+#include <vlc_sort.h>
 
 #include <assert.h>
 
@@ -105,11 +106,19 @@ static int dummy_select( const char *str )
     return 1;
 }
 
+static int compar_void(const void *a, const void *b, void *data)
+{
+    const char *sa = a, *sb = b;
+    int (*cmp)(const char **, const char **) = data;
+
+    return cmp(&sa, &sb);
+}
+
 /**
  * Does the same as vlc_scandir(), but takes an open directory pointer
  * instead of a directory path.
  */
-int vlc_loaddir( DIR *dir, char ***namelist,
+int vlc_loaddir( vlc_DIR *dir, char ***namelist,
                   int (*select)( const char * ),
                   int (*compar)( const char **, const char ** ) )
 {
@@ -121,7 +130,7 @@ int vlc_loaddir( DIR *dir, char ***namelist,
     char **tab = NULL;
     unsigned num = 0;
 
-    rewinddir (dir);
+    vlc_rewinddir (dir);
 
     for (unsigned size = 0;;)
     {
@@ -153,8 +162,7 @@ int vlc_loaddir( DIR *dir, char ***namelist,
     }
 
     if (compar != NULL && num > 0)
-        qsort (tab, num, sizeof (*tab),
-               (int (*)( const void *, const void *))compar);
+        vlc_qsort(tab, num, sizeof (*tab), compar_void, compar);
     *namelist = tab;
     return num;
 
@@ -168,10 +176,12 @@ error:
 /**
  * Selects file entries from a directory, as GNU C scandir().
  *
- * @param dirname UTF-8 diretory path
- * @param pointer [OUT] pointer set, on successful completion, to the address
+ * @param dirname UTF-8 directory path
+ * @param namelist [OUT] pointer set, on successful completion, to the address
  * of a table of UTF-8 filenames. All filenames must be freed with free().
  * The table itself must be freed with free() as well.
+ * @param select a function filtering out elements where it returns 0
+ * @param compar a function ordering pair of filtered elements
  *
  * @return How many file names were selected (possibly 0),
  * or -1 in case of error.
@@ -180,34 +190,35 @@ int vlc_scandir( const char *dirname, char ***namelist,
                   int (*select)( const char * ),
                   int (*compar)( const char **, const char ** ) )
 {
-    DIR *dir = vlc_opendir (dirname);
+    vlc_DIR *dir = vlc_opendir (dirname);
     int val = -1;
 
     if (dir != NULL)
     {
         val = vlc_loaddir (dir, namelist, select, compar);
-        closedir (dir);
+        vlc_closedir (dir);
     }
     return val;
 }
 
-#if defined (_WIN32) || defined (__OS2__)
 # include <vlc_rand.h>
 
-int vlc_mkstemp( char *template )
+VLC_WEAK int vlc_mkstemp(char *template)
 {
-    static const char digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    static const int i_digits = sizeof(digits)/sizeof(*digits) - 1;
+    static const char bytes[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqstruvwxyz_-";
+    static const size_t nbytes = ARRAY_SIZE(bytes) - 1;
+    char *pattern;
 
-    /* */
-    assert( template );
+    static_assert(((ARRAY_SIZE(bytes) - 1) & (ARRAY_SIZE(bytes) - 2)) == 0,
+                  "statistical bias");
 
     /* Check template validity */
-    const size_t i_length = strlen( template );
-    char *psz_rand = &template[i_length-6];
+    assert(template != NULL);
 
-    if( i_length < 6 || strcmp( psz_rand, "XXXXXX" ) )
-    {
+    const size_t len = strlen(template);
+    if (len < 6
+     || strcmp(pattern = template + len - 6, "XXXXXX")) {
         errno = EINVAL;
         return -1;
     }
@@ -220,7 +231,7 @@ int vlc_mkstemp( char *template )
 
         vlc_rand_bytes( pi_rand, sizeof(pi_rand) );
         for( int j = 0; j < 6; j++ )
-            psz_rand[j] = digits[pi_rand[j] % i_digits];
+            pattern[j] = bytes[pi_rand[j] % nbytes];
 
         /* */
         int fd = vlc_open( template, O_CREAT | O_EXCL | O_RDWR, 0600 );
@@ -233,4 +244,3 @@ int vlc_mkstemp( char *template )
     errno = EEXIST;
     return -1;
 }
-#endif

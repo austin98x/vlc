@@ -2,7 +2,6 @@
  * postproc.c: video postprocessing using libpostproc
  *****************************************************************************
  * Copyright (C) 1999-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@netcourrier.com>
@@ -36,12 +35,11 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
 #include <vlc_cpu.h>
-
-#include "filter_picture.h"
 
 #ifdef HAVE_POSTPROC_POSTPROCESS_H
 #   include <postproc/postprocess.h>
@@ -49,17 +47,16 @@
 #   include <libpostproc/postprocess.h>
 #endif
 
-#ifndef PP_CPU_CAPS_ALTIVEC
-#   define PP_CPU_CAPS_ALTIVEC 0
+#ifndef PP_CPU_CAPS_AUTO
+#   define PP_CPU_CAPS_AUTO 0
 #endif
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int OpenPostproc( vlc_object_t * );
-static void ClosePostproc( vlc_object_t * );
+static int OpenPostproc( filter_t * );
 
-static picture_t *PostprocPict( filter_t *, picture_t * );
+VIDEO_FILTER_WRAPPER_CLOSE(PostprocPict, ClosePostproc)
 
 static int PPQCallback( vlc_object_t *, char const *,
                         vlc_value_t, vlc_value_t, void * );
@@ -74,7 +71,6 @@ static int PPNameCallback( vlc_object_t *, char const *,
     "1: hb, 2-4: hb+vb, 5-6: hb+vb+dr" )
 
 #define NAME_TEXT N_("FFmpeg post processing filter chains")
-#define NAME_LONGTEXT NAME_TEXT
 
 #define FILTER_PREFIX "postproc-"
 
@@ -85,18 +81,15 @@ vlc_module_begin ()
     set_description( N_("Video post processing filter") )
     set_shortname( N_("Postproc" ) )
     add_shortcut( "postprocess", "pp" ) /* name is "postproc" */
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
-    set_capability( "video filter", 0 )
-
-    set_callbacks( OpenPostproc, ClosePostproc )
+    set_callback_video_filter( OpenPostproc )
 
     add_integer_with_range( FILTER_PREFIX "q", PP_QUALITY_MAX, 0,
-                            PP_QUALITY_MAX, Q_TEXT, Q_LONGTEXT, false )
+                            PP_QUALITY_MAX, Q_TEXT, Q_LONGTEXT )
         change_safe()
     add_string( FILTER_PREFIX "name", "default", NAME_TEXT,
-                NAME_LONGTEXT, true )
+                NULL )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
@@ -106,7 +99,7 @@ static const char *const ppsz_filter_options[] = {
 /*****************************************************************************
  * filter_sys_t : libpostproc video postprocessing descriptor
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     /* Never changes after init */
     pp_context *pp_context;
@@ -116,20 +109,21 @@ struct filter_sys_t
 
     /* Lock when using or changing pp_mode */
     vlc_mutex_t lock;
-};
+} filter_sys_t;
 
 
 /*****************************************************************************
  * OpenPostproc: probe and open the postproc
  *****************************************************************************/
-static int OpenPostproc( vlc_object_t *p_this )
+static int OpenPostproc( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
-    vlc_value_t val, val_orig, text;
-    int i_flags = 0;
+    vlc_value_t val, val_orig;
+    const char *desc;
+    int i_flags = PP_CPU_CAPS_AUTO;
 
-    if( p_filter->fmt_in.video.i_chroma != p_filter->fmt_out.video.i_chroma ||
+    if( !video_format_IsSameChroma( &p_filter->fmt_in.video,
+                                    &p_filter->fmt_out.video ) ||
         p_filter->fmt_in.video.i_height != p_filter->fmt_out.video.i_height ||
         p_filter->fmt_in.video.i_width != p_filter->fmt_out.video.i_width )
     {
@@ -137,23 +131,9 @@ static int OpenPostproc( vlc_object_t *p_this )
         return VLC_EGENERIC;
     }
 
-    /* Set CPU capabilities */
-#if defined(__i386__) || defined(__x86_64__)
-    if( vlc_CPU_MMX() )
-        i_flags |= PP_CPU_CAPS_MMX;
-    if( vlc_CPU_MMXEXT() )
-        i_flags |= PP_CPU_CAPS_MMX2;
-    if( vlc_CPU_3dNOW() )
-        i_flags |= PP_CPU_CAPS_3DNOW;
-#elif defined(__ppc__) || defined(__ppc64__) || defined(__powerpc__)
-    if( vlc_CPU_ALTIVEC() )
-        i_flags |= PP_CPU_CAPS_ALTIVEC;
-#endif
-
     switch( p_filter->fmt_in.video.i_chroma )
     {
         case VLC_CODEC_I444:
-        case VLC_CODEC_J444:
         /* case VLC_CODEC_YUVA:
            FIXME: Should work but alpha plane needs to be copied manually and
                   I'm kind of feeling too lazy to write the code to do that ATM
@@ -161,14 +141,12 @@ static int OpenPostproc( vlc_object_t *p_this )
             i_flags |= PP_FORMAT_444;
             break;
         case VLC_CODEC_I422:
-        case VLC_CODEC_J422:
             i_flags |= PP_FORMAT_422;
             break;
         case VLC_CODEC_I411:
             i_flags |= PP_FORMAT_411;
             break;
         case VLC_CODEC_I420:
-        case VLC_CODEC_J420:
         case VLC_CODEC_YV12:
             i_flags |= PP_FORMAT_420;
             break;
@@ -197,12 +175,11 @@ static int OpenPostproc( vlc_object_t *p_this )
 
     var_Create( p_filter, FILTER_PREFIX "q", VLC_VAR_INTEGER |
                 VLC_VAR_DOINHERIT | VLC_VAR_ISCOMMAND );
-
-    text.psz_string = _("Post processing");
-    var_Change( p_filter, FILTER_PREFIX "q", VLC_VAR_SETTEXT, &text, NULL );
+    var_Change( p_filter, FILTER_PREFIX "q", VLC_VAR_SETTEXT,
+                _("Post processing") );
 
     var_Get( p_filter, FILTER_PREFIX "q", &val_orig );
-    var_Change( p_filter, FILTER_PREFIX "q", VLC_VAR_DELCHOICE, &val_orig, NULL );
+    var_Change( p_filter, FILTER_PREFIX "q", VLC_VAR_DELCHOICE, val_orig );
 
     val.psz_string = var_GetNonEmptyString( p_filter, FILTER_PREFIX "name" );
     if( val_orig.i_int )
@@ -232,20 +209,19 @@ static int OpenPostproc( vlc_object_t *p_this )
         switch( val.i_int )
         {
             case 0:
-                text.psz_string = _("Disable");
+                desc = _("Disable");
                 break;
             case 1:
-                text.psz_string = _("Lowest");
+                desc = _("Lowest");
                 break;
             case PP_QUALITY_MAX:
-                text.psz_string = _("Highest");
+                desc = _("Highest");
                 break;
             default:
-                text.psz_string = NULL;
+                desc = NULL;
                 break;
         }
-        var_Change( p_filter, FILTER_PREFIX "q", VLC_VAR_ADDCHOICE,
-                    &val, text.psz_string?&text:NULL );
+        var_Change( p_filter, FILTER_PREFIX "q", VLC_VAR_ADDCHOICE, val, desc );
     }
 
     vlc_mutex_init( &p_sys->lock );
@@ -254,7 +230,7 @@ static int OpenPostproc( vlc_object_t *p_this )
     var_AddCallback( p_filter, FILTER_PREFIX "q", PPQCallback, NULL );
     var_AddCallback( p_filter, FILTER_PREFIX "name", PPNameCallback, NULL );
 
-    p_filter->pf_video_filter = PostprocPict;
+    p_filter->ops = &PostprocPict_ops;
 
     msg_Warn( p_filter, "Quantification table was not set by video decoder. "
                         "Postprocessing won't look good." );
@@ -264,9 +240,8 @@ static int OpenPostproc( vlc_object_t *p_this )
 /*****************************************************************************
  * ClosePostproc
  *****************************************************************************/
-static void ClosePostproc( vlc_object_t *p_this )
+static void ClosePostproc( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     /* delete the callback before destroying the mutex */
@@ -274,7 +249,6 @@ static void ClosePostproc( vlc_object_t *p_this )
     var_DelCallback( p_filter, FILTER_PREFIX "name", PPNameCallback, NULL );
 
     /* Destroy the resources */
-    vlc_mutex_destroy( &p_sys->lock );
     pp_free_context( p_sys->pp_context );
     pp_free_mode( p_sys->pp_mode );
     free( p_sys );
@@ -283,16 +257,9 @@ static void ClosePostproc( vlc_object_t *p_this )
 /*****************************************************************************
  * PostprocPict
  *****************************************************************************/
-static picture_t *PostprocPict( filter_t *p_filter, picture_t *p_pic )
+static void PostprocPict( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
 {
     filter_sys_t *p_sys = p_filter->p_sys;
-
-    picture_t *p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        picture_Release( p_pic );
-        return NULL;
-    }
 
     /* Lock to prevent issues if pp_mode is changed */
     vlc_mutex_lock( &p_sys->lock );
@@ -321,8 +288,6 @@ static picture_t *PostprocPict( filter_t *p_filter, picture_t *p_pic )
     else
         picture_CopyPixels( p_outpic, p_pic );
     vlc_mutex_unlock( &p_sys->lock );
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }
 
 /*****************************************************************************

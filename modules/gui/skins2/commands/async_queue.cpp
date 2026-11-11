@@ -2,7 +2,6 @@
  * async_queue.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -31,24 +30,13 @@
 AsyncQueue::AsyncQueue( intf_thread_t *pIntf ): SkinObject( pIntf ),
     m_cmdFlush( this )
 {
-    // Initialize the mutex
-    vlc_mutex_init( &m_lock );
-
     // Create a timer
     OSFactory *pOsFactory = OSFactory::instance( pIntf );
-    m_pTimer = pOsFactory->createOSTimer( m_cmdFlush );
+    m_pTimer.reset(pOsFactory->createOSTimer(m_cmdFlush));
 
     // Flush the queue every 10 ms
     m_pTimer->start( 10, false );
 }
-
-
-AsyncQueue::~AsyncQueue()
-{
-    delete( m_pTimer );
-    vlc_mutex_destroy( &m_lock );
-}
-
 
 AsyncQueue *AsyncQueue::instance( intf_thread_t *pIntf )
 {
@@ -75,7 +63,7 @@ void AsyncQueue::destroy( intf_thread_t *pIntf )
 
 void AsyncQueue::push( const CmdGenericPtr &rcCommand, bool removePrev )
 {
-    vlc_mutex_lock( &m_lock );
+    vlc::threads::mutex_locker guard {m_lock};
 
     if( removePrev )
     {
@@ -83,8 +71,6 @@ void AsyncQueue::push( const CmdGenericPtr &rcCommand, bool removePrev )
         remove( rcCommand.get()->getType(), rcCommand );
     }
     m_cmdList.push_back( rcCommand );
-
-    vlc_mutex_unlock( &m_lock );
 }
 
 
@@ -112,28 +98,21 @@ void AsyncQueue::remove( const std::string &rType, const CmdGenericPtr &rcComman
 
 void AsyncQueue::flush()
 {
-    while (true)
+    while (!m_cmdList.empty())
     {
-        vlc_mutex_lock( &m_lock );
-
-        if( m_cmdList.size() > 0 )
+        CmdGenericPtr cCommand;
         {
+            vlc::threads::mutex_locker guard {m_lock};
             // Pop the first command from the queue
-            CmdGenericPtr cCommand = m_cmdList.front();
+            cCommand = m_cmdList.front();
             m_cmdList.pop_front();
-
-            // Unlock the mutex to avoid deadlocks if another thread wants to
-            // enqueue/remove a command while this one is processed
-            vlc_mutex_unlock( &m_lock );
-
-            // Execute the command
-            cCommand.get()->execute();
         }
-        else
-        {
-            vlc_mutex_unlock( &m_lock );
-            break;
-        }
+
+        // Unlock the mutex to avoid deadlocks if another thread wants to
+        // enqueue/remove a command while this one is processed
+
+        // Execute the command
+        cCommand.get()->execute();
     }
 }
 

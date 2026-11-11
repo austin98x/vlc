@@ -2,7 +2,6 @@
  * darwinvlc.m: OS X specific main executable for VLC media player
  *****************************************************************************
  * Copyright (C) 2013-2015 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Felix Paul Kühne <fkuehne at videolan dot org>
  *          David Fuhrmann <dfuhrmann at videolan dot org>
@@ -27,6 +26,9 @@
 #endif
 
 #include <vlc/vlc.h>
+#include <vlc_common.h>
+#include <vlc_charset.h>
+
 #include <stdlib.h>
 #include <locale.h>
 #include <signal.h>
@@ -39,43 +41,48 @@
 #import <Breakpad/Breakpad.h>
 #endif
 
+#include "../lib/libvlc_internal.h"
+
+struct vlc_context {
+    libvlc_instance_t *vlc;
+    dispatch_queue_t intf_queue;
+    vlc_sem_t wait_quit;
+
+    bool quitting;
+};
 
 /**
  * Handler called when VLC asks to terminate the program.
  */
 static void vlc_terminate(void *data)
 {
-    (void)data;
+    struct vlc_context *context = data;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        /*
-         * Stop the main loop. When using the CoreFoundation mainloop, simply
-         * CFRunLoopStop can be used.
-         *
-         * But this does not work when having an interface.
-         * In this case, [NSApp stop:nil] needs to be used, but the used flag is only
-         * evaluated at the end of main loop event processing. This is always true
-         * in the case of code inside a action method. But here, this is
-         * not true and thus we need to send an dummy event to make sure the stop
-         * flag is actually processed by the main loop.
-         */
-        if (NSApp == nil) {
+    /* vlc_terminate can be called multiple times, for instance:
+     * - once when an interface like Qt (DialogProvider::quit) is exiting
+     * - once when libvlc_release() is called.
+     * `context` can only be guaranteed to be valid for the first call to
+     * vlc_terminate, but others will have no more effects than the first
+     * one, so we can ignore them. */
+    __block bool quitting = false;
+    static dispatch_once_t quitToken = 0;
+    dispatch_once(&quitToken, ^{
+        quitting = true;
+    });
+
+    if (!quitting)
+        return;
+
+    /* Release the libvlc instance to clean up the interfaces. */
+    dispatch_async(context->intf_queue, ^{
+        libvlc_release(context->vlc);
+        context->vlc = NULL;
+        vlc_sem_post(&context->wait_quit);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            /* Stop the main loop started in main(). */
             CFRunLoopStop(CFRunLoopGetCurrent());
-        } else {
-
-            [NSApp stop:nil];
-            NSEvent* event = [NSEvent otherEventWithType:NSApplicationDefined
-                                                location:NSMakePoint(0,0)
-                                           modifierFlags:0
-                                               timestamp:0.0
-                                            windowNumber:0
-                                                 context:nil
-                                                 subtype:0
-                                                   data1:0
-                                                   data2:0];
-            [NSApp postEvent:event atStart:YES];
-        }
-
+        });
     });
 }
 
@@ -114,6 +121,13 @@ BreakpadRef initBreakpad()
  *****************************************************************************/
 int main(int i_argc, const char *ppsz_argv[])
 {
+#ifdef HAVE_BREAKPAD
+    BreakpadRef breakpad = NULL;
+
+    if (!getenv("VLC_DISABLE_BREAKPAD"))
+        breakpad = initBreakpad();
+#endif
+
     /* The so-called POSIX-compliant MacOS X reportedly processes SIGPIPE even
      * if it is blocked in all thread.
      * Note: this is NOT an excuse for not protecting against SIGPIPE. If
@@ -130,6 +144,8 @@ int main(int i_argc, const char *ppsz_argv[])
 #ifdef TOP_BUILDDIR
     setenv("VLC_PLUGIN_PATH", TOP_BUILDDIR"/modules", 1);
     setenv("VLC_DATA_PATH", TOP_SRCDIR"/share", 1);
+    setenv("VLC_LIB_PATH", TOP_BUILDDIR"/modules", 1);
+    setenv("VLC_LIBEXEC_PATH", TOP_BUILDDIR"/modules", 1);
 #endif
 
 #ifndef ALLOW_RUN_AS_ROOT
@@ -193,74 +209,38 @@ int main(int i_argc, const char *ppsz_argv[])
     dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     dispatch_source_t sigIntSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, queue);
     dispatch_source_t sigTermSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, queue);
-    dispatch_source_t sigChldSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGCHLD, 0, queue);
 
-    if (!sigIntSource || !sigTermSource || !sigChldSource)
+    if (!sigIntSource || !sigTermSource)
         abort();
-
-    dispatch_source_set_event_handler(sigIntSource, ^{
-        vlc_terminate(nil);
-    });
-    dispatch_source_set_event_handler(sigTermSource, ^{
-        vlc_terminate(nil);
-    });
-
-    dispatch_source_set_event_handler(sigChldSource, ^{
-        int status;
-        while(waitpid(-1, &status, WNOHANG) > 0)
-            ;
-    });
 
     dispatch_resume(sigIntSource);
     dispatch_resume(sigTermSource);
-    dispatch_resume(sigChldSource);
-
 
     /* Handle parameters */
-    const char *argv[i_argc + 2];
+    const char **argv = calloc(i_argc + 2, sizeof (argv[0]));
+    if (argv == NULL)
+        exit(1);
+
     int argc = 0;
 
     argv[argc++] = "--no-ignore-config";
     argv[argc++] = "--media-library";
 
-    /* overwrite system language on Mac */
-    char *lang = NULL;
+    /* Overwrite system language */
+    CFPropertyListRef lang_pref = CFPreferencesCopyAppValue(CFSTR("language"),
+        kCFPreferencesCurrentApplication);
 
-    for (int i = 0; i < i_argc; i++) {
-        if (!strncmp(ppsz_argv[i], "--language", 10)) {
-            lang = strstr(ppsz_argv[i], "=");
-            ppsz_argv++, i_argc--;
-            continue;
-        }
-    }
-    if (lang && strncmp( lang, "auto", 4 )) {
-        char tmp[11];
-        snprintf(tmp, 11, "LANG%s", lang);
-        putenv(tmp);
-    }
-
-    if (!lang) {
-        CFStringRef language;
-        language = (CFStringRef)CFPreferencesCopyAppValue(CFSTR("language"),
-                                                          kCFPreferencesCurrentApplication);
-        if (language) {
-            CFIndex length = CFStringGetLength(language) + 1;
-            if (length > 0) {
-                CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8);
-                lang = (char *)malloc(maxSize);
-                if(lang) {
-                    CFStringGetCString(language, lang, maxSize - 1, kCFStringEncodingUTF8);
-                    if (strncmp( lang, "auto", 4 )) {
-                        char tmp[11];
-                        snprintf(tmp, 11, "LANG=%s", lang);
-                        putenv(tmp);
-
-                    }
-                }
-                free(lang);
+    if (lang_pref) {
+        if (CFGetTypeID(lang_pref) == CFStringGetTypeID()) {
+            char *lang = FromCFString(lang_pref, kCFStringEncodingUTF8);
+            if (strncmp(lang, "auto", 4)) {
+                char tmp[11];
+                snprintf(tmp, 11, "LANG=%s", lang);
+                putenv(tmp);
             }
-            CFRelease(language);
+            free(lang);
         }
+        CFRelease(lang_pref);
     }
 
     ppsz_argv++; i_argc--; /* skip executable path */
@@ -276,51 +256,86 @@ int main(int i_argc, const char *ppsz_argv[])
     argc += i_argc;
     argv[argc] = NULL;
 
-    /* Initialize libvlc */
-    libvlc_instance_t *vlc = libvlc_new(argc, argv);
-    if (vlc == NULL)
-        return 1;
+    dispatch_queue_t intf_queue = dispatch_queue_create("org.videolan.vlc", NULL);
 
+    __block struct vlc_context context = {
+        .vlc = NULL,
+        .intf_queue = intf_queue,
+    };
+    vlc_sem_init(&context.wait_quit, 0);
+
+    dispatch_source_set_event_handler(sigIntSource, ^{
+        vlc_terminate(&context);
+    });
+    dispatch_source_set_event_handler(sigTermSource, ^{
+        vlc_terminate(&context);
+    });
+
+    __block bool intf_started = true;
+    __block libvlc_instance_t *vlc = NULL;
     int ret = 1;
-    libvlc_set_exit_handler(vlc, vlc_terminate, NULL);
-    libvlc_set_app_id(vlc, "org.VideoLAN.VLC", PACKAGE_VERSION, PACKAGE_NAME);
-    libvlc_set_user_agent(vlc, "VLC media player", "VLC/"PACKAGE_VERSION);
+    dispatch_async(intf_queue, ^{
+        /* Initialize libvlc */
+        vlc = context.vlc
+            = libvlc_new(argc, argv);
+        if (vlc == NULL)
+        {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                intf_started = false;
+                CFRunLoopStop(CFRunLoopGetMain());
+            });
+            return;
+        }
 
-    libvlc_add_intf(vlc, "hotkeys,none");
+        libvlc_SetExitHandler(vlc->p_libvlc_int, vlc_terminate, &context);
+        libvlc_set_app_id(vlc, "org.VideoLAN.VLC", PACKAGE_VERSION, PACKAGE_NAME);
+        libvlc_set_user_agent(vlc, "VLC media player", "VLC/"PACKAGE_VERSION);
 
-    if (libvlc_add_intf(vlc, NULL))
-        goto out;
-    libvlc_playlist_play(vlc, -1, 0, NULL);
+
+        if (libvlc_InternalAddIntf(vlc->p_libvlc_int, NULL)) {
+            fprintf(stderr, "VLC cannot start any interface. Exiting.\n");
+            libvlc_SetExitHandler(vlc->p_libvlc_int, NULL, NULL);
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                intf_started = false;
+                CFRunLoopStop(CFRunLoopGetMain());
+            });
+            return;
+        }
+
+        libvlc_InternalPlay(vlc->p_libvlc_int);
+    });
 
     /*
      * Run the main loop. If the mac interface is not initialized, only the CoreFoundation
      * runloop is used. Otherwise, [NSApp run] needs to be called, which setups more stuff
      * before actually starting the loop.
      */
-#ifdef HAVE_BREAKPAD
-    BreakpadRef breakpad;
-    breakpad = initBreakpad();
-#endif
     @autoreleasepool {
-        if(NSApp == nil) {
-            CFRunLoopRun();
-
-        } else {
-            [NSApp run];
-        }
+        CFRunLoopRun();
     }
+
+    if (!intf_started)
+        goto out;
 
     ret = 0;
     /* Cleanup */
+    vlc_sem_wait(&context.wait_quit);
+
 out:
+
     dispatch_release(sigIntSource);
     dispatch_release(sigTermSource);
-    dispatch_release(sigChldSource);
 
-    libvlc_release(vlc);
+    dispatch_release(intf_queue);
+    free(argv);
+
+    /* If no interface were created, we release libvlc here instead. */
+    if (context.vlc)
+        libvlc_release(context.vlc);
 
 #ifdef HAVE_BREAKPAD
-    BreakpadRelease(breakpad);
+    if (breakpad)
+        BreakpadRelease(breakpad);
 #endif
 
     return ret;

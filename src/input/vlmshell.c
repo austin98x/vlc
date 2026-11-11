@@ -2,7 +2,6 @@
  * vlmshell.c: VLM interface plugin
  *****************************************************************************
  * Copyright (C) 2000-2005 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Simon Latapie <garf@videolan.org>
  *          Laurent Aimar <fenrir@videolan.org>
@@ -31,6 +30,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 
 #include <stdio.h>
 #include <ctype.h>                                              /* tolower() */
@@ -45,32 +45,22 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#include <vlc_input.h>
-#include "input_internal.h"
 #include <vlc_stream.h>
 #include "vlm_internal.h"
 #include <vlc_charset.h>
 #include <vlc_fs.h>
 #include <vlc_sout.h>
 #include <vlc_memstream.h>
-#include "../stream_output/stream_output.h"
-#include "../libvlc.h"
 
 /*****************************************************************************
  * Local prototypes.
  *****************************************************************************/
 
 /* */
-static vlm_message_t *vlm_Show( vlm_t *, vlm_media_sys_t *, vlm_schedule_sys_t *, const char * );
+static vlm_message_t *vlm_Show( vlm_t *, vlm_media_sys_t *, const char * );
 
-static vlm_schedule_sys_t *vlm_ScheduleSearch( vlm_t *, const char * );
-
-static char *Save( vlm_t * );
+VLC_MALLOC static char *Save( vlm_t * );
 static int Load( vlm_t *, char * );
-
-static vlm_schedule_sys_t *vlm_ScheduleNew( vlm_t *vlm, const char *psz_name );
-static int vlm_ScheduleSetup( vlm_schedule_sys_t *schedule, const char *psz_cmd,
-                              const char *psz_value );
 
 /* */
 static vlm_media_sys_t *vlm_MediaSearch( vlm_t *, const char *);
@@ -226,26 +216,14 @@ static bool ExecuteIsMedia( vlm_t *p_vlm, const char *psz_name )
         return false;
     return true;
 }
-static bool ExecuteIsSchedule( vlm_t *p_vlm, const char *psz_name )
-{
-    if( !psz_name || !vlm_ScheduleSearch( p_vlm, psz_name ) )
-        return false;
-    return true;
-}
 
 static int ExecuteDel( vlm_t *p_vlm, const char *psz_name, vlm_message_t **pp_status )
 {
     vlm_media_sys_t *p_media;
-    vlm_schedule_sys_t *p_schedule;
 
     p_media = vlm_MediaSearch( p_vlm, psz_name );
-    p_schedule = vlm_ScheduleSearch( p_vlm, psz_name );
 
-    if( p_schedule != NULL )
-    {
-        vlm_ScheduleDelete( p_vlm, p_schedule );
-    }
-    else if( p_media != NULL )
+    if( p_media != NULL )
     {
         vlm_ControlInternal( p_vlm, VLM_DEL_MEDIA, p_media->cfg.id );
     }
@@ -253,14 +231,9 @@ static int ExecuteDel( vlm_t *p_vlm, const char *psz_name, vlm_message_t **pp_st
     {
         vlm_ControlInternal( p_vlm, VLM_CLEAR_MEDIAS );
     }
-    else if( !strcmp(psz_name, "schedule") )
-    {
-        vlm_ControlInternal( p_vlm, VLM_CLEAR_SCHEDULES );
-    }
     else if( !strcmp(psz_name, "all") )
     {
         vlm_ControlInternal( p_vlm, VLM_CLEAR_MEDIAS );
-        vlm_ControlInternal( p_vlm, VLM_CLEAR_SCHEDULES );
     }
     else
     {
@@ -275,23 +248,19 @@ static int ExecuteDel( vlm_t *p_vlm, const char *psz_name, vlm_message_t **pp_st
 static int ExecuteShow( vlm_t *p_vlm, const char *psz_name, vlm_message_t **pp_status )
 {
     vlm_media_sys_t *p_media;
-    vlm_schedule_sys_t *p_schedule;
 
     if( !psz_name )
     {
-        *pp_status = vlm_Show( p_vlm, NULL, NULL, NULL );
+        *pp_status = vlm_Show( p_vlm, NULL, NULL );
         return VLC_SUCCESS;
     }
 
     p_media = vlm_MediaSearch( p_vlm, psz_name );
-    p_schedule = vlm_ScheduleSearch( p_vlm, psz_name );
 
-    if( p_schedule != NULL )
-        *pp_status = vlm_Show( p_vlm, NULL, p_schedule, NULL );
-    else if( p_media != NULL )
-        *pp_status = vlm_Show( p_vlm, p_media, NULL, NULL );
+    if( p_media != NULL )
+        *pp_status = vlm_Show( p_vlm, p_media, NULL );
     else
-        *pp_status = vlm_Show( p_vlm, NULL, NULL, psz_name );
+        *pp_status = vlm_Show( p_vlm, NULL, psz_name );
 
     return VLC_SUCCESS;
 }
@@ -308,10 +277,10 @@ static int ExecuteHelp( vlm_message_t **pp_status )
     *pp_status = vlm_MessageSimpleNew( "help" );
 
     message_child = MessageAdd( "Commands Syntax:" );
-    MessageAddChild( "new (name) vod|broadcast|schedule [properties]" );
+    MessageAddChild( "new (name) broadcast [properties]" );
     MessageAddChild( "setup (name) (properties)" );
-    MessageAddChild( "show [(name)|media|schedule]" );
-    MessageAddChild( "del (name)|all|media|schedule" );
+    MessageAddChild( "show [(name)|media]" );
+    MessageAddChild( "del (name)|all|media" );
     MessageAddChild( "control (name) [instance_name] (command)" );
     MessageAddChild( "save (config_file)" );
     MessageAddChild( "export" );
@@ -324,17 +293,7 @@ static int ExecuteHelp( vlm_message_t **pp_status )
     MessageAddChild( "output (output_name)" );
     MessageAddChild( "option (option_name)[=value]" );
     MessageAddChild( "enabled|disabled" );
-    MessageAddChild( "loop|unloop (broadcast only)" );
-    MessageAddChild( "mux (mux_name)" );
-
-    message_child = MessageAdd( "Schedule Proprieties Syntax:" );
-    MessageAddChild( "enabled|disabled" );
-    MessageAddChild( "append (command_until_rest_of_the_line)" );
-    MessageAddChild( "date (year)/(month)/(day)-(hour):(minutes):"
-                     "(seconds)|now" );
-    MessageAddChild( "period (years_aka_12_months)/(months_aka_30_days)/"
-                     "(days)-(hours):(minutes):(seconds)" );
-    MessageAddChild( "repeat (number_of_repetitions)" );
+    MessageAddChild( "loop|unloop" );
 
     message_child = MessageAdd( "Control Commands Syntax:" );
     MessageAddChild( "play [input_number]" );
@@ -404,10 +363,7 @@ static int ExecuteControl( vlm_t *p_vlm, const char *psz_name, const int i_arg, 
             }
         }
 
-        if( p_media->cfg.b_vod )
-            i_result = vlm_ControlInternal( p_vlm, VLM_START_MEDIA_VOD_INSTANCE, p_media->cfg.id, psz_instance, i_input_index, NULL );    // we should get here now
-        else
-            i_result = vlm_ControlInternal( p_vlm, VLM_START_MEDIA_BROADCAST_INSTANCE, p_media->cfg.id, psz_instance, i_input_index );
+        i_result = vlm_ControlInternal( p_vlm, VLM_START_MEDIA_BROADCAST_INSTANCE, p_media->cfg.id, psz_instance, i_input_index );
     }
     else if( !strcmp( psz_control, "seek" ) )
     {
@@ -425,9 +381,9 @@ static int ExecuteControl( vlm_t *p_vlm, const char *psz_name, const int i_arg, 
                 int64_t i_new_time;
 
                 if( strstr( psz_argument, "ms" ) )
-                    i_new_time =  1000 * (int64_t)atoi( psz_argument );
+                    i_new_time = INT64_C(1000) * atoi( psz_argument );
                 else
-                    i_new_time = 1000000 * (int64_t)atoi( psz_argument );
+                    i_new_time = INT64_C(1000000) * atoi( psz_argument );
 
                 if( b_relative )
                 {
@@ -442,7 +398,7 @@ static int ExecuteControl( vlm_t *p_vlm, const char *psz_name, const int i_arg, 
             else
             {
                 /* Percent */
-                double d_new_position = us_atof( psz_argument ) / 100.0;
+                double d_new_position = vlc_atof_c( psz_argument ) / 100.0;
 
                 if( b_relative )
                 {
@@ -506,7 +462,7 @@ static int ExecuteSave( vlm_t *p_vlm, const char *psz_file, vlm_message_t **pp_s
     if( psz_save == NULL )
         goto error;
     if( fputs( psz_save, f ) == EOF )
-        goto error;;
+        goto error;
     if( fclose( f ) )
     {
         f = NULL;
@@ -566,88 +522,6 @@ static int ExecuteLoad( vlm_t *p_vlm, const char *psz_path, vlm_message_t **pp_s
 
     *pp_status = vlm_MessageSimpleNew( "load" );
     return VLC_SUCCESS;
-}
-
-static int ExecuteScheduleProperty( vlm_t *p_vlm, vlm_schedule_sys_t *p_schedule, bool b_new,
-                                    const int i_property, char *ppsz_property[], vlm_message_t **pp_status )
-{
-    const char *psz_cmd = b_new ? "new" : "setup";
-    int i;
-
-    for( i = 0; i < i_property; i++ )
-    {
-        if( !strcmp( ppsz_property[i], "enabled" ) ||
-            !strcmp( ppsz_property[i], "disabled" ) )
-        {
-            if ( vlm_ScheduleSetup( p_schedule, ppsz_property[i], NULL ) )
-                goto error;
-        }
-        else if( !strcmp( ppsz_property[i], "append" ) )
-        {
-            char *psz_line, *psz_realloc;
-            int j, i_ret = VLC_SUCCESS;
-            /* Beware: everything behind append is considered as
-             * command line */
-
-            if( ++i >= i_property )
-                break;
-
-            psz_line = strdup( ppsz_property[i] );
-            if( unlikely(psz_line == NULL) )
-                goto error;
-
-            for( j = i+1; j < i_property; j++ )
-            {
-                psz_realloc = realloc( psz_line,
-                                       strlen(psz_line) + strlen(ppsz_property[j]) + 1 + 1 );
-                if( likely(psz_realloc) )
-                {
-                    psz_line = psz_realloc;
-                    strcat( psz_line, " " );
-                    strcat( psz_line, ppsz_property[j] );
-                }
-                else
-                {
-                    i_ret = VLC_ENOMEM;
-                    break;
-                }
-            }
-
-            if( i_ret == VLC_SUCCESS )
-                i_ret = vlm_ScheduleSetup( p_schedule, "append", psz_line );
-            free( psz_line );
-
-            if( i_ret )
-                goto error;
-            break;
-        }
-        else
-        {
-            if( i + 1 >= i_property )
-            {
-                if( b_new )
-                    vlm_ScheduleDelete( p_vlm, p_schedule );
-                return ExecuteSyntaxError( psz_cmd, pp_status );
-            }
-
-            if( vlm_ScheduleSetup( p_schedule, ppsz_property[i], ppsz_property[i+1] ) )
-                goto error;
-            i++;
-        }
-    }
-    *pp_status = vlm_MessageSimpleNew( psz_cmd );
-
-    vlc_mutex_lock( &p_vlm->lock_manage );
-    p_vlm->input_state_changed = true;
-    vlc_cond_signal( &p_vlm->wait_manage );
-    vlc_mutex_unlock( &p_vlm->lock_manage );
-
-    return VLC_SUCCESS;
-
-error:
-    *pp_status = vlm_MessageNew( psz_cmd, "Error while setting the property '%s' to the schedule",
-                                 ppsz_property[i] );
-    return VLC_EGENERIC;
 }
 
 static int ExecuteMediaProperty( vlm_t *p_vlm, int64_t id, bool b_new,
@@ -732,25 +606,11 @@ static int ExecuteMediaProperty( vlm_t *p_vlm, int64_t id, bool b_new,
         }
         else if( !strcmp( psz_option, "loop" ) )
         {
-            if( p_cfg->b_vod )
-                ERROR( "invalid loop option for vod" );
             p_cfg->broadcast.b_loop = true;
         }
         else if( !strcmp( psz_option, "unloop" ) )
         {
-            if( p_cfg->b_vod )
-                ERROR( "invalid unloop option for vod" );
             p_cfg->broadcast.b_loop = false;
-        }
-        else if( !strcmp( psz_option, "mux" ) )
-        {
-            MISSING( "mux" );
-            if( !p_cfg->b_vod )
-                ERROR( "invalid mux option for broadcast" );
-
-            free( p_cfg->vod.psz_mux );
-            p_cfg->vod.psz_mux = *psz_value ? strdup( psz_value ) : NULL;
-            i++;
         }
         else
         {
@@ -781,35 +641,24 @@ error:
 static int ExecuteNew( vlm_t *p_vlm, const char *psz_name, const char *psz_type, const int i_property, char *ppsz_property[], vlm_message_t **pp_status )
 {
     /* Check name */
-    if( !strcmp( psz_name, "all" ) || !strcmp( psz_name, "media" ) || !strcmp( psz_name, "schedule" ) )
+    if( !strcmp( psz_name, "all" ) || !strcmp( psz_name, "media" ) )
     {
-        *pp_status = vlm_MessageNew( "new", "\"all\", \"media\" and \"schedule\" are reserved names" );
+        *pp_status = vlm_MessageNew( "new", "\"all\" and \"media\" are reserved names" );
         return VLC_EGENERIC;
     }
-    if( ExecuteIsMedia( p_vlm, psz_name ) || ExecuteIsSchedule( p_vlm, psz_name ) )
+    if( ExecuteIsMedia( p_vlm, psz_name ) )
     {
         *pp_status = vlm_MessageNew( "new", "%s: Name already in use", psz_name );
         return VLC_EGENERIC;
     }
     /* */
-    if( !strcmp( psz_type, "schedule" ) )
-    {
-        vlm_schedule_sys_t *p_schedule = vlm_ScheduleNew( p_vlm, psz_name );
-        if( !p_schedule )
-        {
-            *pp_status = vlm_MessageNew( "new", "could not create schedule" );
-            return VLC_EGENERIC;
-        }
-        return ExecuteScheduleProperty( p_vlm, p_schedule, true, i_property, ppsz_property, pp_status );
-    }
-    else if( !strcmp( psz_type, "vod" ) || !strcmp( psz_type, "broadcast" ) )
+    if( !strcmp( psz_type, "broadcast" ) )
     {
         vlm_media_t cfg;
         int64_t id;
 
         vlm_media_Init( &cfg );
         cfg.psz_name = strdup( psz_name );
-        cfg.b_vod = !strcmp( psz_type, "vod" );
 
         if( vlm_ControlInternal( p_vlm, VLM_ADD_MEDIA, &cfg, &id ) )
         {
@@ -822,19 +671,14 @@ static int ExecuteNew( vlm_t *p_vlm, const char *psz_name, const char *psz_type,
     }
     else
     {
-        *pp_status = vlm_MessageNew( "new", "%s: Choose between vod, broadcast or schedule", psz_type );
+        *pp_status = vlm_MessageNew( "new", "%s: unsupported type", psz_type );
         return VLC_EGENERIC;
     }
 }
 
 static int ExecuteSetup( vlm_t *p_vlm, const char *psz_name, const int i_property, char *ppsz_property[], vlm_message_t **pp_status )
 {
-    if( ExecuteIsSchedule( p_vlm, psz_name ) )
-    {
-        vlm_schedule_sys_t *p_schedule = vlm_ScheduleSearch( p_vlm, psz_name );
-        return ExecuteScheduleProperty( p_vlm, p_schedule, false, i_property, ppsz_property, pp_status );
-    }
-    else if( ExecuteIsMedia( p_vlm, psz_name ) )
+    if( ExecuteIsMedia( p_vlm, psz_name ) )
     {
         int64_t id;
         if( vlm_ControlInternal( p_vlm, VLM_GET_MEDIA_ID, psz_name, &id ) )
@@ -969,246 +813,6 @@ vlm_media_sys_t *vlm_MediaSearch( vlm_t *vlm, const char *psz_name )
 }
 
 /*****************************************************************************
- * Schedule handling
- *****************************************************************************/
-static vlm_schedule_sys_t *vlm_ScheduleNew( vlm_t *vlm, const char *psz_name )
-{
-    if( !psz_name )
-        return NULL;
-
-    vlm_schedule_sys_t *p_sched = malloc( sizeof( vlm_schedule_sys_t ) );
-    if( !p_sched )
-        return NULL;
-
-    p_sched->psz_name = strdup( psz_name );
-    p_sched->b_enabled = false;
-    p_sched->i_command = 0;
-    p_sched->command = NULL;
-    p_sched->date = 0;
-    p_sched->period = 0;
-    p_sched->i_repeat = -1;
-
-    TAB_APPEND( vlm->i_schedule, vlm->schedule, p_sched );
-
-    return p_sched;
-}
-
-/* for now, simple delete. After, del with options (last arg) */
-void vlm_ScheduleDelete( vlm_t *vlm, vlm_schedule_sys_t *sched )
-{
-    int i;
-    if( sched == NULL ) return;
-
-    TAB_REMOVE( vlm->i_schedule, vlm->schedule, sched );
-
-    if( vlm->i_schedule == 0 ) free( vlm->schedule );
-    free( sched->psz_name );
-
-    for ( i = 0; i < sched->i_command; i++ )
-        free( sched->command[i] );
-    free( sched->command );
-    free( sched );
-}
-
-static vlm_schedule_sys_t *vlm_ScheduleSearch( vlm_t *vlm, const char *psz_name )
-{
-    int i;
-
-    for( i = 0; i < vlm->i_schedule; i++ )
-    {
-        if( strcmp( psz_name, vlm->schedule[i]->psz_name ) == 0 )
-        {
-            return vlm->schedule[i];
-        }
-    }
-
-    return NULL;
-}
-
-/* Ok, setup schedule command will be able to support only one (argument value) at a time  */
-static int vlm_ScheduleSetup( vlm_schedule_sys_t *schedule, const char *psz_cmd,
-                       const char *psz_value )
-{
-    if( !strcmp( psz_cmd, "enabled" ) )
-    {
-        schedule->b_enabled = true;
-    }
-    else if( !strcmp( psz_cmd, "disabled" ) )
-    {
-        schedule->b_enabled = false;
-    }
-    else if( !strcmp( psz_cmd, "date" ) )
-    {
-        struct tm time;
-        const char *p;
-
-        time.tm_sec = 0;         /* seconds */
-        time.tm_min = 0;         /* minutes */
-        time.tm_hour = 0;        /* hours */
-        time.tm_mday = 0;        /* day of the month */
-        time.tm_mon = 0;         /* month */
-        time.tm_year = 0;        /* year */
-        time.tm_wday = 0;        /* day of the week */
-        time.tm_yday = 0;        /* day in the year */
-        time.tm_isdst = -1;       /* daylight saving time */
-
-        /* date should be year/month/day-hour:minutes:seconds */
-        p = strchr( psz_value, '-' );
-
-        if( !strcmp( psz_value, "now" ) )
-        {
-            schedule->date = 0;
-        }
-        else if(p == NULL)
-        {
-            return 1;
-        }
-        else
-        {
-            unsigned i,j,k;
-
-            switch( sscanf( p + 1, "%u:%u:%u", &i, &j, &k ) )
-            {
-                case 1:
-                    time.tm_sec = i;
-                    break;
-                case 2:
-                    time.tm_min = i;
-                    time.tm_sec = j;
-                    break;
-                case 3:
-                    time.tm_hour = i;
-                    time.tm_min = j;
-                    time.tm_sec = k;
-                    break;
-                default:
-                    return 1;
-            }
-
-            switch( sscanf( psz_value, "%d/%d/%d", &i, &j, &k ) )
-            {
-                case 1:
-                    time.tm_mday = i;
-                    break;
-                case 2:
-                    time.tm_mon = i - 1;
-                    time.tm_mday = j;
-                    break;
-                case 3:
-                    time.tm_year = i - 1900;
-                    time.tm_mon = j - 1;
-                    time.tm_mday = k;
-                    break;
-                default:
-                    return 1;
-            }
-
-            schedule->date = mktime(&time);
-        }
-    }
-    else if( !strcmp( psz_cmd, "period" ) )
-    {
-        struct tm time;
-        const char *p;
-        const char *psz_time = NULL, *psz_date = NULL;
-        unsigned i,j,k;
-
-        /* First, if date or period are modified, repeat should be equal to -1 */
-        schedule->i_repeat = -1;
-
-        time.tm_sec = 0;         /* seconds */
-        time.tm_min = 0;         /* minutes */
-        time.tm_hour = 0;        /* hours */
-        time.tm_mday = 0;        /* day of the month */
-        time.tm_mon = 0;         /* month */
-        time.tm_year = 0;        /* year */
-        time.tm_wday = 0;        /* day of the week */
-        time.tm_yday = 0;        /* day in the year */
-        time.tm_isdst = -1;       /* daylight saving time */
-
-        /* date should be year/month/day-hour:minutes:seconds */
-        p = strchr( psz_value, '-' );
-        if( p )
-        {
-            psz_date = psz_value;
-            psz_time = p + 1;
-        }
-        else
-        {
-            psz_time = psz_value;
-        }
-
-        switch( sscanf( psz_time, "%u:%u:%u", &i, &j, &k ) )
-        {
-            case 1:
-                time.tm_sec = i;
-                break;
-            case 2:
-                time.tm_min = i;
-                time.tm_sec = j;
-                break;
-            case 3:
-                time.tm_hour = i;
-                time.tm_min = j;
-                time.tm_sec = k;
-                break;
-            default:
-                return 1;
-        }
-        if( psz_date )
-        {
-            switch( sscanf( psz_date, "%u/%u/%u", &i, &j, &k ) )
-            {
-                case 1:
-                    time.tm_mday = i;
-                    break;
-                case 2:
-                    time.tm_mon = i;
-                    time.tm_mday = j;
-                    break;
-                case 3:
-                    time.tm_year = i;
-                    time.tm_mon = j;
-                    time.tm_mday = k;
-                    break;
-                default:
-                    return 1;
-            }
-        }
-
-        /* ok, that's stupid... who is going to schedule streams every 42 years ? */
-        schedule->period = ((((time.tm_year * 12 + time.tm_mon) * 30
-            + time.tm_mday) * 24 + time.tm_hour) * 60 + time.tm_min) * 60
-            + time.tm_sec;
-    }
-    else if( !strcmp( psz_cmd, "repeat" ) )
-    {
-        int i;
-
-        if( sscanf( psz_value, "%d", &i ) == 1 )
-        {
-            schedule->i_repeat = i;
-        }
-        else
-        {
-            return 1;
-        }
-    }
-    else if( !strcmp( psz_cmd, "append" ) )
-    {
-        char *command = strdup( psz_value );
-
-        TAB_APPEND( schedule->i_command, schedule->command, command );
-    }
-    else
-    {
-        return 1;
-    }
-
-    return 0;
-}
-
-/*****************************************************************************
  * Message handling functions
  *****************************************************************************/
 vlm_message_t *vlm_MessageSimpleNew( const char *psz_name )
@@ -1291,16 +895,12 @@ static vlm_message_t *vlm_ShowMedia( vlm_media_sys_t *p_media )
 
     p_msg = vlm_MessageSimpleNew( p_cfg->psz_name );
     vlm_MessageAdd( p_msg,
-                    vlm_MessageNew( "type", p_cfg->b_vod ? "vod" : "broadcast" ) );
+                    vlm_MessageNew( "type", "broadcast" ) );
     vlm_MessageAdd( p_msg,
                     vlm_MessageNew( "enabled", p_cfg->b_enabled ? "yes" : "no" ) );
 
-    if( p_cfg->b_vod )
-        vlm_MessageAdd( p_msg,
-                        vlm_MessageNew( "mux", "%s", p_cfg->vod.psz_mux ) );
-    else
-        vlm_MessageAdd( p_msg,
-                        vlm_MessageNew( "loop", p_cfg->broadcast.b_loop ? "yes" : "no" ) );
+    vlm_MessageAdd( p_msg,
+                    vlm_MessageNew( "loop", p_cfg->broadcast.b_loop ? "yes" : "no" ) );
 
     p_msg_sub = vlm_MessageAdd( p_msg, vlm_MessageSimpleNew( "inputs" ) );
     for( i = 0; i < p_cfg->i_input; i++ )
@@ -1325,12 +925,18 @@ static vlm_message_t *vlm_ShowMedia( vlm_media_sys_t *p_media )
     for( i = 0; i < p_media->i_instance; i++ )
     {
         vlm_media_instance_sys_t *p_instance = p_media->instance[i];
-        vlc_value_t val;
         vlm_message_t *p_msg_instance;
 
-        val.i_int = END_S;
-        if( p_instance->p_input )
-            var_Get( p_instance->p_input, "state", &val );
+        vlc_player_Lock(p_instance->player);
+        enum vlc_player_state state = vlc_player_GetState(p_instance->player);
+        float position = vlc_player_GetPosition(p_instance->player);
+        vlc_tick_t time = vlc_player_GetTime(p_instance->player);
+        vlc_tick_t length = vlc_player_GetLength(p_instance->player);
+        float rate = vlc_player_GetRate(p_instance->player);
+        ssize_t title = vlc_player_GetSelectedTitleIdx(p_instance->player);
+        ssize_t chapter = vlc_player_GetSelectedChapterIdx(p_instance->player);
+        bool can_seek = vlc_player_CanSeek(p_instance->player);
+        vlc_player_Unlock(p_instance->player);
 
         p_msg_instance = vlm_MessageAdd( p_msg_sub, vlm_MessageSimpleNew( "instance" ) );
 
@@ -1338,24 +944,20 @@ static vlm_message_t *vlm_ShowMedia( vlm_media_sys_t *p_media )
                         vlm_MessageNew( "name" , "%s", p_instance->psz_name ? p_instance->psz_name : "default" ) );
         vlm_MessageAdd( p_msg_instance,
                         vlm_MessageNew( "state",
-                            val.i_int == PLAYING_S ? "playing" :
-                            val.i_int == PAUSE_S ? "paused" :
+                            state == VLC_PLAYER_STATE_PLAYING ? "playing" :
+                            state == VLC_PLAYER_STATE_PAUSED ? "paused" :
                             "stopped" ) );
 
         /* FIXME should not do that this way */
-        if( p_instance->p_input )
-        {
-#define APPEND_INPUT_INFO( key, format, type ) \
-            vlm_MessageAdd( p_msg_instance, vlm_MessageNew( key, format, \
-                            var_Get ## type( p_instance->p_input, key ) ) )
-            APPEND_INPUT_INFO( "position", "%f", Float );
-            APPEND_INPUT_INFO( "time", "%"PRId64, Integer );
-            APPEND_INPUT_INFO( "length", "%"PRId64, Integer );
-            APPEND_INPUT_INFO( "rate", "%f", Float );
-            APPEND_INPUT_INFO( "title", "%"PRId64, Integer );
-            APPEND_INPUT_INFO( "chapter", "%"PRId64, Integer );
-            APPEND_INPUT_INFO( "can-seek", "%d", Bool );
-        }
+#define APPEND_INPUT_INFO( key, format, value ) \
+        vlm_MessageAdd( p_msg_instance, vlm_MessageNew( key, format, value ) )
+        APPEND_INPUT_INFO( "position", "%f", position );
+        APPEND_INPUT_INFO( "time", "%"PRId64, time );
+        APPEND_INPUT_INFO( "length", "%"PRId64, length );
+        APPEND_INPUT_INFO( "rate", "%f", rate );
+        APPEND_INPUT_INFO( "title", "%zd", title );
+        APPEND_INPUT_INFO( "chapter", "%zd", chapter );
+        APPEND_INPUT_INFO( "can-seek", "%d", can_seek );
 #undef APPEND_INPUT_INFO
         vlm_MessageAdd( p_msg_instance, vlm_MessageNew( "playlistindex",
                         "%d", p_instance->i_index + 1 ) );
@@ -1364,7 +966,6 @@ static vlm_message_t *vlm_ShowMedia( vlm_media_sys_t *p_media )
 }
 
 static vlm_message_t *vlm_Show( vlm_t *vlm, vlm_media_sys_t *media,
-                                vlm_schedule_sys_t *schedule,
                                 const char *psz_filter )
 {
     if( media != NULL )
@@ -1375,98 +976,15 @@ static vlm_message_t *vlm_Show( vlm_t *vlm, vlm_media_sys_t *media,
         return p_msg;
     }
 
-    else if( schedule != NULL )
-    {
-        int i;
-        vlm_message_t *msg;
-        vlm_message_t *msg_schedule;
-        vlm_message_t *msg_child;
-        char buffer[100];
-
-        msg = vlm_MessageSimpleNew( "show" );
-        msg_schedule =
-            vlm_MessageAdd( msg, vlm_MessageSimpleNew( schedule->psz_name ) );
-
-        vlm_MessageAdd( msg_schedule, vlm_MessageNew("type", "schedule") );
-
-        vlm_MessageAdd( msg_schedule,
-                        vlm_MessageNew( "enabled", schedule->b_enabled ?
-                                        "yes" : "no" ) );
-
-        if( schedule->date != 0 )
-        {
-            struct tm date;
-
-            localtime_r( &schedule->date, &date);
-            vlm_MessageAdd( msg_schedule,
-                            vlm_MessageNew( "date", "%d/%d/%d-%d:%d:%d",
-                                            date.tm_year + 1900, date.tm_mon + 1,
-                                            date.tm_mday, date.tm_hour, date.tm_min,
-                                            date.tm_sec ) );
-        }
-        else
-            vlm_MessageAdd( msg_schedule, vlm_MessageNew("date", "now") );
-
-        if( schedule->period != 0 )
-        {
-            div_t d;
-            struct tm date;
-
-            d = div(schedule->period, 60);
-            date.tm_sec = d.rem;
-            d = div(d.quot, 60);
-            date.tm_min = d.rem;
-            d = div(d.quot, 24);
-            date.tm_hour = d.rem;
-            /* okay, okay, months are not always 30 days long */
-            d = div(d.quot, 30);
-            date.tm_mday = d.rem;
-            d = div(d.quot, 12);
-            date.tm_mon = d.rem;
-            date.tm_year = d.quot;
-
-            sprintf( buffer, "%d/%d/%d-%d:%d:%d", date.tm_year, date.tm_mon,
-                     date.tm_mday, date.tm_hour, date.tm_min, date.tm_sec);
-
-            vlm_MessageAdd( msg_schedule, vlm_MessageNew("period", "%s", buffer) );
-        }
-        else
-            vlm_MessageAdd( msg_schedule, vlm_MessageNew("period", "0") );
-
-        sprintf( buffer, "%d", schedule->i_repeat );
-        vlm_MessageAdd( msg_schedule, vlm_MessageNew( "repeat", "%s", buffer ) );
-
-        msg_child =
-            vlm_MessageAdd( msg_schedule, vlm_MessageSimpleNew("commands" ) );
-
-        for( i = 0; i < schedule->i_command; i++ )
-        {
-           vlm_MessageAdd( msg_child,
-                           vlm_MessageSimpleNew( schedule->command[i] ) );
-        }
-
-        return msg;
-
-    }
-
     else if( psz_filter && !strcmp( psz_filter, "media" ) )
     {
         vlm_message_t *p_msg;
         vlm_message_t *p_msg_child;
-        int i_vod = 0, i_broadcast = 0;
-
-        for( int i = 0; i < vlm->i_media; i++ )
-        {
-            if( vlm->media[i]->cfg.b_vod )
-                i_vod++;
-            else
-                i_broadcast++;
-        }
+        int i_broadcast = vlm->i_media;
 
         p_msg = vlm_MessageSimpleNew( "show" );
         p_msg_child = vlm_MessageAdd( p_msg, vlm_MessageNew( "media",
-                                      "( %d broadcast - %d vod )", i_broadcast,
-                                      i_vod ) );
+                                      "( %d broadcast )", i_broadcast ) );
 
         for( int i = 0; i < vlm->i_media; i++ )
             vlm_MessageAdd( p_msg_child, vlm_ShowMedia( vlm->media[i] ) );
@@ -1474,71 +992,9 @@ static vlm_message_t *vlm_Show( vlm_t *vlm, vlm_media_sys_t *media,
         return p_msg;
     }
 
-    else if( psz_filter && !strcmp( psz_filter, "schedule" ) )
+    else if( ( psz_filter == NULL ) && ( media == NULL ) )
     {
-        int i;
-        vlm_message_t *msg;
-        vlm_message_t *msg_child;
-
-        msg = vlm_MessageSimpleNew( "show" );
-        msg_child = vlm_MessageAdd( msg, vlm_MessageSimpleNew( "schedule" ) );
-
-        for( i = 0; i < vlm->i_schedule; i++ )
-        {
-            vlm_schedule_sys_t *s = vlm->schedule[i];
-            vlm_message_t *msg_schedule;
-            time_t now, next_date;
-
-            msg_schedule = vlm_MessageAdd( msg_child,
-                                           vlm_MessageSimpleNew( s->psz_name ) );
-            vlm_MessageAdd( msg_schedule,
-                            vlm_MessageNew( "enabled", s->b_enabled ?
-                                            "yes" : "no" ) );
-
-            /* calculate next date */
-            time(&now);
-            next_date = s->date;
-
-            if( s->period != 0 )
-            {
-                int j = 0;
-                while( ((s->date + j * s->period) <= now) &&
-                       ( s->i_repeat > j || s->i_repeat < 0 ) )
-                {
-                    j++;
-                }
-
-                next_date = s->date + j * s->period;
-            }
-
-            if( next_date > now )
-            {
-                struct tm tm;
-                char psz_date[32];
-
-                strftime( psz_date, sizeof(psz_date), "%Y-%m-%d %H:%M:%S (%a)",
-                          localtime_r( &next_date, &tm ) );
-                vlm_MessageAdd( msg_schedule,
-                                vlm_MessageNew( "next launch", "%s", psz_date ) );
-            }
-        }
-
-        return msg;
-    }
-
-    else if( ( psz_filter == NULL ) && ( media == NULL ) && ( schedule == NULL ) )
-    {
-        vlm_message_t *show1 = vlm_Show( vlm, NULL, NULL, "media" );
-        vlm_message_t *show2 = vlm_Show( vlm, NULL, NULL, "schedule" );
-
-        vlm_MessageAdd( show1, show2->child[0] );
-
-        /* We must destroy the parent node "show" of show2
-         * and not the children */
-        free( show2->psz_name );
-        free( show2 );
-
-        return show1;
+        return vlm_Show( vlm, NULL, "media" );
     }
 
     else
@@ -1592,11 +1048,11 @@ static int Load( vlm_t *vlm, char *file )
     return 0;
 }
 
-static char *Save( vlm_t *vlm )
+VLC_MALLOC static char *Save( vlm_t *vlm )
 {
     const char *psz_header = "\n"
                              "# VLC media player VLM command batch\n"
-                             "# http://www.videolan.org/vlc/\n\n" ;
+                             "# https://www.videolan.org/vlc/\n\n" ;
 
     struct vlc_memstream stream;
 
@@ -1608,11 +1064,11 @@ static char *Save( vlm_t *vlm )
         vlm_media_sys_t *media = vlm->media[i];
         vlm_media_t *p_cfg = &media->cfg;
 
-        vlc_memstream_printf( &stream, "new %s %s %sabled", p_cfg->psz_name,
-                              p_cfg->b_vod ? "vod" : "broadcast",
+        vlc_memstream_printf( &stream, "new %s broadcast %sabled",
+                              p_cfg->psz_name,
                               p_cfg->b_enabled ? "en" : "dis" );
 
-        if( !p_cfg->b_vod && p_cfg->broadcast.b_loop )
+        if( p_cfg->broadcast.b_loop )
             vlc_memstream_puts( &stream, " loop" );
         vlc_memstream_putc( &stream, '\n' );
 
@@ -1627,58 +1083,6 @@ static char *Save( vlm_t *vlm )
         for( int j = 0; j < p_cfg->i_option; j++ )
             vlc_memstream_printf( &stream, "setup %s option %s\n",
                                   p_cfg->psz_name, p_cfg->ppsz_option[j] );
-
-        if( p_cfg->b_vod && p_cfg->vod.psz_mux )
-            vlc_memstream_printf( &stream, "setup %s mux %s\n",
-                                  p_cfg->psz_name, p_cfg->vod.psz_mux );
-    }
-
-    /* and now, the schedule scripts */
-    for( int i = 0; i < vlm->i_schedule; i++ )
-    {
-        vlm_schedule_sys_t *schedule = vlm->schedule[i];
-        struct tm tm;
-
-        localtime_r( &schedule->date, &tm );
-        vlc_memstream_printf( &stream, "new %s schedule date "
-                              "%d/%d/%d-%d:%d:%d %sabled\n",
-                              schedule->psz_name,
-                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                              tm.tm_hour, tm.tm_min, tm.tm_sec,
-                              schedule->b_enabled ? "en" : "dis" );
-
-        if( schedule->period != 0 )
-        {
-            div_t d;
-
-            d = div(schedule->period, 60);
-            tm.tm_sec = d.rem;
-            d = div(d.quot, 60);
-            tm.tm_min = d.rem;
-            d = div(d.quot, 24);
-            tm.tm_hour = d.rem;
-            d = div(d.quot, 30);
-            tm.tm_mday = d.rem;
-            /* okay, okay, months are not always 30 days long */
-            d = div(d.quot, 12);
-            tm.tm_mon = d.rem;
-            tm.tm_year = d.quot;
-
-            vlc_memstream_printf( &stream, "setup %s "
-                                  "period %d/%d/%d-%d:%d:%d\n",
-                                  schedule->psz_name,
-                                  tm.tm_year, tm.tm_mon, tm.tm_mday,
-                                  tm.tm_hour, tm.tm_min, tm.tm_sec);
-        }
-
-        if( schedule->i_repeat >= 0 )
-            vlc_memstream_printf( &stream, "setup %s repeat %d",
-                                  schedule->psz_name, schedule->i_repeat );
-        vlc_memstream_putc( &stream, '\n' );
-
-        for( int j = 0; j < schedule->i_command; j++ )
-            vlc_memstream_printf( &stream, "setup %s append %s\n",
-                                  schedule->psz_name, schedule->command[j] );
     }
 
     if( vlc_memstream_close( &stream ) )

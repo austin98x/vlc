@@ -33,13 +33,13 @@
  * Local prototypes
  *****************************************************************************/
 static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
+static void Close( filter_t * );
 
 static block_t *Filter ( filter_t *, block_t * );
 static int paramCallback( vlc_object_t *, char const *, vlc_value_t ,
                             vlc_value_t , void * );
 
-struct filter_sys_t
+typedef struct
 {
     float *pf_ringbuf;  /* circular buffer to store samples */
     float *pf_write;    /* where to write current sample    */
@@ -48,7 +48,7 @@ struct filter_sys_t
     float f_feedback;
     float f_crossfeed;
     float f_dry_mix;
-};
+} filter_sys_t;
 
 #define HELP_TEXT N_("This filter enhances the stereo effect by "\
             "suppressing mono (signal common to both channels) "\
@@ -77,19 +77,18 @@ vlc_module_begin ()
     set_shortname( N_("Stereo Enhancer") )
     set_description( N_("Simple stereo widening effect") )
     set_help( HELP_TEXT )
-    set_category( CAT_AUDIO )
     set_subcategory( SUBCAT_AUDIO_AFILTER )
     set_capability( "audio filter", 0 )
-    set_callbacks( Open, Close )
+    set_callback( Open )
 
     add_float_with_range( CONFIG_PREFIX "delay", 20, 1, 100,
-        DELAY_TEXT, DELAY_LONGTEXT, true )
+        DELAY_TEXT, DELAY_LONGTEXT )
     add_float_with_range( CONFIG_PREFIX "feedback", 0.3, 0.0, 0.9,
-        FEEDBACK_TEXT, FEEDBACK_LONGTEXT, true )
+        FEEDBACK_TEXT, FEEDBACK_LONGTEXT )
     add_float_with_range( CONFIG_PREFIX "crossfeed", 0.3, 0.0, 0.8,
-        CROSSFEED_TEXT, CROSSFEED_LONGTEXT, true )
+        CROSSFEED_TEXT, CROSSFEED_LONGTEXT )
     add_float_with_range( CONFIG_PREFIX "dry-mix", 0.8, 0.0, 1.0,
-        DRYMIX_TEXT, DRYMIX_LONGTEXT, true )
+        DRYMIX_TEXT, DRYMIX_LONGTEXT )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -117,7 +116,7 @@ static int MakeRingBuffer( float **pp_buffer, size_t *pi_buffer,
 static int Open( vlc_object_t *obj )
 {
     filter_t *p_filter  = (filter_t *)obj;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
     filter_sys_t *p_sys;
 
     if( p_filter->fmt_in.audio.i_format != VLC_CODEC_FL32 ||
@@ -149,11 +148,15 @@ static int Open( vlc_object_t *obj )
     if( MakeRingBuffer( &p_sys->pf_ringbuf, &p_sys->i_len, &p_sys->pf_write,
                         p_sys->f_delay, p_filter->fmt_in.audio.i_rate ) != VLC_SUCCESS )
     {
-        Close( obj );
+        Close( p_filter );
         return VLC_ENOMEM;
     }
 
-    p_filter->pf_audio_filter = Filter;
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = Filter, .close = Close,
+    };
+    p_filter->ops = &filter_ops;
     return VLC_SUCCESS;
 }
 
@@ -194,10 +197,9 @@ static block_t *Filter( filter_t *p_filter, block_t *p_block )
 /*****************************************************************************
  * Close: close the plugin
  *****************************************************************************/
-static void Close( vlc_object_t *obj )
+static void Close( filter_t *p_filter )
 {
-    filter_t *p_filter  = (filter_t *)obj;
-    vlc_object_t *p_aout = p_filter->obj.parent;
+    vlc_object_t *p_aout = vlc_object_parent(p_filter);
     filter_sys_t *p_sys = p_filter->p_sys;
 
 #define DEL_VAR(var) \
@@ -222,7 +224,7 @@ static int paramCallback( vlc_object_t *p_this, char const *psz_var,
                             void *p_data )
 {
     filter_t *p_filter = (filter_t *)p_this;
-    filter_sys_t *p_sys = (filter_sys_t *) p_data;
+    filter_sys_t *p_sys = p_data;
 
     VLC_UNUSED(oldval);
     VLC_UNUSED(p_this);
@@ -232,7 +234,7 @@ static int paramCallback( vlc_object_t *p_this, char const *psz_var,
         if( MakeRingBuffer( &p_sys->pf_ringbuf, &p_sys->i_len, &p_sys->pf_write,
                             newval.f_float, p_filter->fmt_in.audio.i_rate ) != VLC_SUCCESS )
         {
-            msg_Dbg( p_filter, "Couldnt allocate buffer for delay" );
+            msg_Dbg( p_filter, "Couldn't allocate buffer for delay" );
         }
         else
         {

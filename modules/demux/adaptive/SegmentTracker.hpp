@@ -21,6 +21,10 @@
 #define SEGMENTTRACKER_HPP
 
 #include "StreamFormat.hpp"
+#include "Time.hpp"
+#include "playlist/CodecDescription.hpp"
+#include "playlist/Role.hpp"
+#include "tools/Macros.hpp"
 
 #include <vlc_common.h>
 #include <list>
@@ -28,15 +32,18 @@
 namespace adaptive
 {
     class ID;
+    class SharedResources;
 
     namespace http
     {
         class AbstractConnectionManager;
+        class ChunkInterface;
     }
 
     namespace logic
     {
         class AbstractAdaptationLogic;
+        class AbstractBufferingLogic;
     }
 
     namespace playlist
@@ -50,97 +57,219 @@ namespace adaptive
     using namespace logic;
     using namespace http;
 
-    class SegmentTrackerEvent
+    class TrackerEvent
+    {
+        PREREQ_VIRTUAL(TrackerEvent);
+
+        public:
+            enum class Type
+            {
+                Discontinuity,
+                SegmentGap,
+                RepresentationSwitch,
+                RepresentationUpdated,
+                RepresentationUpdateFailed,
+                FormatChange,
+                SegmentChange,
+                BufferingStateUpdate,
+                BufferingLevelChange,
+                PositionChange,
+            };
+            TrackerEvent() = delete;
+            virtual ~TrackerEvent() = 0;
+            Type getType() const;
+
+        protected:
+            TrackerEvent(Type t);
+
+        private:
+            Type type;
+    };
+
+    class DiscontinuityEvent : public TrackerEvent
     {
         public:
-            SegmentTrackerEvent(SegmentChunk *);
-            SegmentTrackerEvent(BaseRepresentation *, BaseRepresentation *);
-            SegmentTrackerEvent(const StreamFormat *);
-            SegmentTrackerEvent(const ID &, bool);
-            SegmentTrackerEvent(const ID &, mtime_t, mtime_t, mtime_t);
-            SegmentTrackerEvent(const ID &, mtime_t);
-            enum
-            {
-                DISCONTINUITY,
-                SWITCHING,
-                FORMATCHANGE,
-                BUFFERING_STATE,
-                BUFFERING_LEVEL_CHANGE,
-                SEGMENT_CHANGE,
-            } type;
-            union
-            {
-               struct
-               {
-                    SegmentChunk *sc;
-               } discontinuity;
-               struct
-               {
-                    BaseRepresentation *prev;
-                    BaseRepresentation *next;
-               } switching;
-               struct
-               {
-                    const StreamFormat *f;
-               } format;
-               struct
-               {
-                   const ID *id;
-                   bool enabled;
-               } buffering;
-               struct
-               {
-                   const ID *id;
-                   mtime_t minimum;
-                   mtime_t current;
-                   mtime_t target;
-               } buffering_level;
-               struct
-               {
-                    const ID *id;
-                   mtime_t duration;
-               } segment;
-            } u;
+            DiscontinuityEvent(uint64_t);
+            virtual ~DiscontinuityEvent()  = default;
+
+            uint64_t discontinuitySequenceNumber;
+    };
+
+    class SegmentGapEvent : public TrackerEvent
+    {
+        public:
+            SegmentGapEvent();
+            virtual ~SegmentGapEvent()  = default;
+    };
+
+    class RepresentationSwitchEvent : public TrackerEvent
+    {
+        public:
+            RepresentationSwitchEvent() = delete;
+            RepresentationSwitchEvent(BaseRepresentation *, BaseRepresentation *);
+            virtual ~RepresentationSwitchEvent() = default;
+
+            BaseRepresentation *prev;
+            BaseRepresentation *next;
+    };
+
+    class RepresentationUpdatedEvent : public TrackerEvent
+    {
+        public:
+            RepresentationUpdatedEvent(BaseRepresentation *);
+            virtual ~RepresentationUpdatedEvent() = default;
+
+            BaseRepresentation *rep;
+    };
+
+    class RepresentationUpdateFailedEvent : public TrackerEvent
+    {
+        public:
+            RepresentationUpdateFailedEvent(BaseRepresentation *);
+            virtual ~RepresentationUpdateFailedEvent() = default;
+
+            BaseRepresentation *rep;
+    };
+
+    class FormatChangedEvent : public TrackerEvent
+    {
+        public:
+            FormatChangedEvent() = delete;
+            FormatChangedEvent(const StreamFormat *);
+            virtual ~FormatChangedEvent() = default;
+
+            const StreamFormat *format;
+    };
+
+    class SegmentChangedEvent : public TrackerEvent
+    {
+        public:
+            SegmentChangedEvent() = delete;
+            SegmentChangedEvent(const ID &, uint64_t,
+                                vlc_tick_t, vlc_tick_t, vlc_tick_t = VLC_TICK_INVALID);
+            virtual ~SegmentChangedEvent() = default;
+
+            const ID *id;
+            uint64_t sequence;
+            vlc_tick_t displaytime;
+            vlc_tick_t starttime;
+            vlc_tick_t duration;
+    };
+
+    class BufferingStateUpdatedEvent : public TrackerEvent
+    {
+        public:
+            BufferingStateUpdatedEvent() = delete;
+            BufferingStateUpdatedEvent(const ID &, bool);
+            virtual ~BufferingStateUpdatedEvent() = default;
+
+            const ID *id;
+            bool enabled;
+    };
+
+    class BufferingLevelChangedEvent : public TrackerEvent
+    {
+        public:
+            BufferingLevelChangedEvent() = delete;
+            BufferingLevelChangedEvent(const ID &,
+                                       vlc_tick_t, vlc_tick_t, vlc_tick_t, vlc_tick_t);
+            virtual ~BufferingLevelChangedEvent() = default;
+
+            const ID *id;
+            vlc_tick_t minimum;
+            vlc_tick_t maximum;
+            vlc_tick_t current;
+            vlc_tick_t target;
+    };
+
+    class PositionChangedEvent : public TrackerEvent
+    {
+        public:
+            PositionChangedEvent(vlc_tick_t);
+            virtual ~PositionChangedEvent() = default;
+
+            vlc_tick_t resumeTime;
     };
 
     class SegmentTrackerListenerInterface
     {
+        PREREQ_INTERFACE(SegmentTrackerListenerInterface);
+
         public:
-            virtual void trackerEvent(const SegmentTrackerEvent &) = 0;
+            virtual void trackerEvent(const TrackerEvent &) = 0;
     };
 
     class SegmentTracker
     {
         public:
-            SegmentTracker(AbstractAdaptationLogic *, BaseAdaptationSet *);
+            SegmentTracker(SharedResources *,
+                           AbstractAdaptationLogic *,
+                           const AbstractBufferingLogic *,
+                           BaseAdaptationSet *,
+                           SynchronizationReferences *);
             ~SegmentTracker();
 
-            StreamFormat getCurrentFormat() const;
-            bool segmentsListReady() const;
+            class Position
+            {
+                public:
+                    Position();
+                    Position(BaseRepresentation *, uint64_t);
+                    Position & operator++();
+                    bool isValid() const;
+                    std::string toString() const;
+                    uint64_t number;
+                    BaseRepresentation *rep;
+                    bool init_sent;
+                    bool index_sent;
+            };
+
+            void getCodecsDesc(CodecDescriptionList *) const;
+            const Role & getStreamRole() const;
             void reset();
-            SegmentChunk* getNextChunk(bool, AbstractConnectionManager *);
-            bool setPositionByTime(mtime_t, bool, bool);
-            void setPositionByNumber(uint64_t, bool);
-            mtime_t getPlaybackTime() const; /* Current segment start time if selected */
-            mtime_t getMinAheadTime() const;
+            ChunkInterface* getNextChunk(bool);
+            bool setPositionByTime(vlc_tick_t, bool, bool);
+            void setPosition(const Position &, bool);
+            bool setStartPosition();
+            Position getStartPosition() const;
+            vlc_tick_t getPlaybackTime(bool = false) const; /* Current segment start time if selected */
+            bool getMediaPlaybackRange(vlc_tick_t *, vlc_tick_t *, vlc_tick_t *) const;
+            vlc_tick_t getMinAheadTime() const;
+            bool getSynchronizationReference(uint64_t, vlc_tick_t, SynchronizationReference &) const;
+            void updateSynchronizationReference(uint64_t, const Times &);
             void notifyBufferingState(bool) const;
-            void notifyBufferingLevel(mtime_t, mtime_t, mtime_t) const;
+            void notifyBufferingLevel(vlc_tick_t, vlc_tick_t, vlc_tick_t, vlc_tick_t) const;
             void registerListener(SegmentTrackerListenerInterface *);
-            void updateSelected();
+            bool updateSelected();
+            bool bufferingAvailable() const;
 
         private:
+            class ChunkEntry
+            {
+                public:
+                    ChunkEntry();
+                    ChunkEntry(SegmentChunk *c, Position p, vlc_tick_t s, vlc_tick_t d, vlc_tick_t dt);
+                    bool isValid() const;
+                    SegmentChunk *chunk;
+                    Position pos;
+                    vlc_tick_t displaytime;
+                    vlc_tick_t starttime;
+                    vlc_tick_t duration;
+            };
+            std::list<ChunkEntry> chunkssequence;
+            ChunkEntry prepareChunk(bool switch_allowed, Position pos) const;
+            void resetChunksSequence();
             void setAdaptationLogic(AbstractAdaptationLogic *);
-            void notify(const SegmentTrackerEvent &) const;
+            void notify(const TrackerEvent &) const;
             bool first;
             bool initializing;
-            bool index_sent;
-            bool init_sent;
-            uint64_t next;
-            uint64_t curNumber;
+            Position current;
+            Position next;
             StreamFormat format;
+            SharedResources *resources;
+            SynchronizationReferences *synchronizationReferences;
             AbstractAdaptationLogic *logic;
+            const AbstractBufferingLogic *bufferingLogic;
             BaseAdaptationSet *adaptationSet;
-            BaseRepresentation *curRepresentation;
             std::list<SegmentTrackerListenerInterface *> listeners;
     };
 }

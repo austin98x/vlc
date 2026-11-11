@@ -2,7 +2,6 @@
  * motionblur.c : motion blur filter for vlc
  *****************************************************************************
  * Copyright (C) 2000, 2001, 2002, 2003 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Sigmund Augdal Helberg <dnumgis@videolan.org>
  *          Antoine Cellerier <dionoea &t videolan d.t org>
@@ -33,21 +32,22 @@
 #include <stdatomic.h>
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_sout.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
-#include "filter_picture.h"
 
 /*****************************************************************************
  * Local protypes
  *****************************************************************************/
-static int  Create       ( vlc_object_t * );
-static void Destroy      ( vlc_object_t * );
-static picture_t *Filter ( filter_t *, picture_t * );
+typedef struct filter_sys_t filter_sys_t;
+
+static int  Create       ( filter_t * );
 static void RenderBlur   ( filter_sys_t *, picture_t *, picture_t * );
 static int MotionBlurCallback( vlc_object_t *, char const *,
                                vlc_value_t, vlc_value_t, void * );
+VIDEO_FILTER_WRAPPER_CLOSE(Filter, Destroy)
 
 /*****************************************************************************
  * Module descriptor
@@ -60,16 +60,14 @@ static int MotionBlurCallback( vlc_object_t *, char const *,
 vlc_module_begin ()
     set_shortname( N_("Motion blur") )
     set_description( N_("Motion blur filter") )
-    set_capability( "video filter", 0 )
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
     add_integer_with_range( FILTER_PREFIX "factor", 80, 1, 127,
-                            FACTOR_TEXT, FACTOR_LONGTEXT, false )
+                            FACTOR_TEXT, FACTOR_LONGTEXT )
 
     add_shortcut( "blur" )
 
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
@@ -89,37 +87,37 @@ struct filter_sys_t
 /*****************************************************************************
  * Create
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     const vlc_chroma_description_t *p_chroma =
         vlc_fourcc_GetChromaDescription( p_filter->fmt_in.video.i_chroma );
-    if( p_chroma == NULL || p_chroma->plane_count == 0 )
+    assert( p_chroma != NULL );
+    if( p_chroma->plane_count == 0 )
         return VLC_EGENERIC;
 
     /* Allocate structure */
-    p_filter->p_sys = malloc( sizeof( filter_sys_t ) );
-    if( p_filter->p_sys == NULL )
+    filter_sys_t *p_sys = malloc( sizeof( filter_sys_t ) );
+    if( p_sys == NULL )
         return VLC_ENOMEM;
+    p_filter->p_sys = p_sys;
 
-    p_filter->p_sys->p_tmp = picture_NewFromFormat( &p_filter->fmt_in.video );
-    if( !p_filter->p_sys->p_tmp )
+    p_sys->p_tmp = picture_NewFromFormat( &p_filter->fmt_in.video );
+    if( !p_sys->p_tmp )
     {
-        free( p_filter->p_sys );
+        free( p_sys );
         return VLC_ENOMEM;
     }
-    p_filter->p_sys->b_first = true;
+    p_sys->b_first = true;
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
 
     config_ChainParse( p_filter, FILTER_PREFIX, ppsz_filter_options,
                        p_filter->p_cfg );
 
-    atomic_init( &p_filter->p_sys->i_factor,
+    atomic_init( &p_sys->i_factor,
              var_CreateGetIntegerCommand( p_filter, FILTER_PREFIX "factor" ) );
     var_AddCallback( p_filter, FILTER_PREFIX "factor",
-                     MotionBlurCallback, p_filter->p_sys );
+                     MotionBlurCallback, p_sys );
 
 
     return VLC_SUCCESS;
@@ -128,33 +126,23 @@ static int Create( vlc_object_t *p_this )
 /*****************************************************************************
  * Destroy
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
     var_DelCallback( p_filter, FILTER_PREFIX "factor",
-                     MotionBlurCallback, p_filter->p_sys );
+                     MotionBlurCallback, p_sys );
 
-    picture_Release( p_filter->p_sys->p_tmp );
-    free( p_filter->p_sys );
+    picture_Release( p_sys->p_tmp );
+    free( p_sys );
 }
 
 /*****************************************************************************
  * Filter
  *****************************************************************************/
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t * p_outpic )
 {
-    picture_t * p_outpic;
     filter_sys_t *p_sys = p_filter->p_sys;
-
-    if( !p_pic ) return NULL;
-
-    p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        picture_Release( p_pic );
-        return NULL;
-    }
 
     if( p_sys->b_first )
     {
@@ -166,8 +154,6 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
     RenderBlur( p_sys, p_pic, p_outpic );
 
     picture_CopyPixels( p_sys->p_tmp, p_outpic );
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }
 
 /*****************************************************************************
@@ -195,8 +181,8 @@ static void RenderBlur( filter_sys_t *p_sys, picture_t *p_newpic,
 
             while ( p_out < p_out_line_end )
             {
-                *p_out++ = (((*p_old++) * i_oldfactor) +
-                            ((*p_new++) * i_newfactor)) >> 7;
+                *p_out++ = ((((*p_old++) * i_oldfactor) + (1 << 7 >> 1) +
+                            ((*p_new++) * i_newfactor))) >> 7;
             }
 
             p_old += p_sys->p_tmp->p[i_plane].i_pitch - i_visible_pitch;
@@ -211,7 +197,7 @@ static int MotionBlurCallback( vlc_object_t *p_this, char const *psz_var,
                                void *p_data )
 {
     VLC_UNUSED(p_this); VLC_UNUSED(psz_var); VLC_UNUSED(oldval);
-    filter_sys_t *p_sys = (filter_sys_t *)p_data;
+    filter_sys_t *p_sys = p_data;
 
     atomic_store( &p_sys->i_factor, VLC_CLIP( newval.i_int, 1, 127 ) );
     return VLC_SUCCESS;

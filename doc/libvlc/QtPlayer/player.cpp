@@ -11,6 +11,13 @@
 #define qtu( i ) ((i).toUtf8().constData())
 
 #include <QtGui>
+#include <QMessageBox>
+#include <QMenuBar>
+#include <QAction>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QFileDialog>
+#include <QUrl>
 
 Mwindow::Mwindow() {
     vlcPlayer = NULL;
@@ -98,7 +105,7 @@ void Mwindow::initUI() {
 
     /* Put all in layouts */
     QHBoxLayout *layout = new QHBoxLayout;
-    layout->setMargin(0);
+    layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(playBut);
     layout->addWidget(stopBut);
     layout->addWidget(muteBut);
@@ -106,7 +113,7 @@ void Mwindow::initUI() {
     layout->addWidget(volumeSlider);
 
     QVBoxLayout *layout2 = new QVBoxLayout;
-    layout2->setMargin(0);
+    layout2->setContentsMargins(0, 0, 0, 0);
     layout2->addWidget(videoWidget);
     layout2->addWidget(slider);
     layout2->addLayout(layout);
@@ -119,19 +126,19 @@ void Mwindow::initUI() {
 void Mwindow::openFile() {
 
     /* The basic file-select box */
-    QString fileOpen = QFileDialog::getOpenFileName(this, tr("Load a file"), "~");
+    QUrl url = QFileDialog::getOpenFileUrl(this, tr("Load a file"));
 
     /* Stop if something is playing */
     if (vlcPlayer && libvlc_media_player_is_playing(vlcPlayer))
         stop();
 
     /* Create a new Media */
-    libvlc_media_t *vlcMedia = libvlc_media_new_path(vlcInstance, qtu(fileOpen));
+    libvlc_media_t *vlcMedia = libvlc_media_new_location(qtu(url.toString(QUrl::FullyEncoded)));
     if (!vlcMedia)
         return;
 
     /* Create a new libvlc player */
-    vlcPlayer = libvlc_media_player_new_from_media (vlcMedia);
+    vlcPlayer = libvlc_media_player_new_from_media (vlcInstance, vlcMedia, NULL, NULL);
 
     /* Release the media */
     libvlc_media_release(vlcMedia);
@@ -142,7 +149,10 @@ void Mwindow::openFile() {
 #elif defined(Q_OS_UNIX)
     libvlc_media_player_set_xwindow(vlcPlayer, videoWidget->winId());
 #elif defined(Q_OS_WIN)
-    libvlc_media_player_set_hwnd(vlcPlayer, videoWidget->winId());
+    LONG style = GetWindowLong( videoWidget->winId(), GWL_STYLE );
+    if( !(style & WS_CLIPCHILDREN) )
+        SetWindowLong( videoWidget->winId(), GWL_STYLE, style | WS_CLIPCHILDREN );
+    libvlc_media_player_set_hwnd(vlcPlayer, (HWND)videoWidget->winId());
 #endif
 
     /* And start playback */
@@ -181,7 +191,7 @@ int Mwindow::changeVolume(int vol) { /* Called on volume slider change */
 void Mwindow::changePosition(int pos) { /* Called on position slider change */
 
     if (vlcPlayer)
-        libvlc_media_player_set_position(vlcPlayer, (float)pos/1000.0);
+        libvlc_media_player_set_position(vlcPlayer, (float)pos/1000.0, true);
 }
 
 void Mwindow::updateInterface() { //Update interface and check if song is finished
@@ -194,14 +204,14 @@ void Mwindow::updateInterface() { //Update interface and check if song is finish
     slider->setValue((int)(pos*1000.0));
 
     /* Stop the media */
-    if (libvlc_media_player_get_state(vlcPlayer) == libvlc_Ended)
+    if (libvlc_media_player_get_state(vlcPlayer) == libvlc_Stopped)
         this->stop();
 }
 
 void Mwindow::stop() {
     if(vlcPlayer) {
         /* stop the media player */
-        libvlc_media_player_stop(vlcPlayer);
+        libvlc_media_player_stop_async(vlcPlayer);
 
         /* release the media player */
         libvlc_media_player_release(vlcPlayer);

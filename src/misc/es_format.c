@@ -2,7 +2,6 @@
  * es_format.c : es_format_t helpers.
  *****************************************************************************
  * Copyright (C) 2008 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Laurent Aimar <fenrir@videolan.org>
  *
@@ -34,102 +33,6 @@
 #include <vlc_common.h>
 #include <vlc_es.h>
 
-
-/*****************************************************************************
- * BinaryLog: computes the base 2 log of a binary value
- *****************************************************************************
- * This functions is used by MaskToShift, to get a bit index from a binary
- * value.
- *****************************************************************************/
-static int BinaryLog( uint32_t i )
-{
-    int i_log = 0;
-
-    if( i == 0 ) return -31337;
-
-    if( i & 0xffff0000 ) i_log += 16;
-    if( i & 0xff00ff00 ) i_log += 8;
-    if( i & 0xf0f0f0f0 ) i_log += 4;
-    if( i & 0xcccccccc ) i_log += 2;
-    if( i & 0xaaaaaaaa ) i_log += 1;
-
-    return i_log;
-}
-
-/**
- * It transforms a color mask into right and left shifts
- * FIXME copied from video_output.c
- */
-static void MaskToShift( int *pi_left, int *pi_right, uint32_t i_mask )
-{
-    uint32_t i_low, i_high;            /* lower and higher bits of the mask */
-
-    if( !i_mask )
-    {
-        *pi_left = *pi_right = 0;
-        return;
-    }
-
-    /* Get bits */
-    i_low = i_high = i_mask;
-
-    i_low &= - (int32_t)i_low;          /* lower bit of the mask */
-    i_high += i_low;                    /* higher bit of the mask */
-
-    /* Transform bits into an index. Also deal with i_high overflow, which
-     * is faster than changing the BinaryLog code to handle 64 bit integers. */
-    i_low =  BinaryLog (i_low);
-    i_high = i_high ? BinaryLog (i_high) : 32;
-
-    /* Update pointers and return */
-    *pi_left =   i_low;
-    *pi_right = (8 - i_high + i_low);
-}
-
-/* */
-void video_format_FixRgb( video_format_t *p_fmt )
-{
-    /* FIXME find right default mask */
-    if( !p_fmt->i_rmask || !p_fmt->i_gmask || !p_fmt->i_bmask )
-    {
-        switch( p_fmt->i_chroma )
-        {
-        case VLC_CODEC_RGB15:
-            p_fmt->i_rmask = 0x7c00;
-            p_fmt->i_gmask = 0x03e0;
-            p_fmt->i_bmask = 0x001f;
-            break;
-
-        case VLC_CODEC_RGB16:
-            p_fmt->i_rmask = 0xf800;
-            p_fmt->i_gmask = 0x07e0;
-            p_fmt->i_bmask = 0x001f;
-            break;
-
-        case VLC_CODEC_RGB24:
-            p_fmt->i_rmask = 0xff0000;
-            p_fmt->i_gmask = 0x00ff00;
-            p_fmt->i_bmask = 0x0000ff;
-            break;
-        case VLC_CODEC_RGB32:
-            p_fmt->i_rmask = 0x00ff0000;
-            p_fmt->i_gmask = 0x0000ff00;
-            p_fmt->i_bmask = 0x000000ff;
-            break;
-
-        default:
-            return;
-        }
-    }
-
-    MaskToShift( &p_fmt->i_lrshift, &p_fmt->i_rrshift,
-                 p_fmt->i_rmask );
-    MaskToShift( &p_fmt->i_lgshift, &p_fmt->i_rgshift,
-                 p_fmt->i_gmask );
-    MaskToShift( &p_fmt->i_lbshift, &p_fmt->i_rbshift,
-                 p_fmt->i_bmask );
-}
-
 void video_format_Setup( video_format_t *p_fmt, vlc_fourcc_t i_chroma,
                          int i_width, int i_height,
                          int i_visible_width, int i_visible_height,
@@ -142,87 +45,9 @@ void video_format_Setup( video_format_t *p_fmt, vlc_fourcc_t i_chroma,
     p_fmt->i_visible_height = i_visible_height;
     p_fmt->i_x_offset       =
     p_fmt->i_y_offset       = 0;
+    p_fmt->orientation      = ORIENT_NORMAL;
     vlc_ureduce( &p_fmt->i_sar_num, &p_fmt->i_sar_den,
                  i_sar_num, i_sar_den, 0 );
-
-    switch( p_fmt->i_chroma )
-    {
-    case VLC_CODEC_YUVA:
-        p_fmt->i_bits_per_pixel = 32;
-        break;
-    case VLC_CODEC_YUV420A:
-        p_fmt->i_bits_per_pixel = 20;
-        break;
-    case VLC_CODEC_YUV422A:
-        p_fmt->i_bits_per_pixel = 24;
-        break;
-    case VLC_CODEC_I444:
-    case VLC_CODEC_J444:
-        p_fmt->i_bits_per_pixel = 24;
-        break;
-    case VLC_CODEC_I422:
-    case VLC_CODEC_YUYV:
-    case VLC_CODEC_YVYU:
-    case VLC_CODEC_UYVY:
-    case VLC_CODEC_VYUY:
-    case VLC_CODEC_J422:
-        p_fmt->i_bits_per_pixel = 16;
-        break;
-    case VLC_CODEC_I440:
-    case VLC_CODEC_J440:
-        p_fmt->i_bits_per_pixel = 16;
-        break;
-    case VLC_CODEC_P010:
-        p_fmt->i_bits_per_pixel = 15;
-        break;
-    case VLC_CODEC_I411:
-    case VLC_CODEC_YV12:
-    case VLC_CODEC_I420:
-    case VLC_CODEC_J420:
-    case VLC_CODEC_NV12:
-        p_fmt->i_bits_per_pixel = 12;
-        break;
-    case VLC_CODEC_YV9:
-    case VLC_CODEC_I410:
-        p_fmt->i_bits_per_pixel = 9;
-        break;
-    case VLC_CODEC_Y211:
-        p_fmt->i_bits_per_pixel = 8;
-        break;
-    case VLC_CODEC_YUVP:
-        p_fmt->i_bits_per_pixel = 8;
-        break;
-
-    case VLC_CODEC_RGB32:
-    case VLC_CODEC_RGBA:
-    case VLC_CODEC_ARGB:
-    case VLC_CODEC_BGRA:
-        p_fmt->i_bits_per_pixel = 32;
-        break;
-    case VLC_CODEC_RGB24:
-        p_fmt->i_bits_per_pixel = 24;
-        break;
-    case VLC_CODEC_RGB15:
-    case VLC_CODEC_RGB16:
-        p_fmt->i_bits_per_pixel = 16;
-        break;
-    case VLC_CODEC_RGB8:
-        p_fmt->i_bits_per_pixel = 8;
-        break;
-
-    case VLC_CODEC_GREY:
-    case VLC_CODEC_RGBP:
-        p_fmt->i_bits_per_pixel = 8;
-        break;
-
-    case VLC_CODEC_XYZ12:
-        p_fmt->i_bits_per_pixel = 48;
-        break;
-
-    default:
-        p_fmt->i_bits_per_pixel = 0;
-        break;
-    }
 }
 
 void video_format_CopyCrop( video_format_t *p_dst, const video_format_t *p_src )
@@ -384,7 +209,7 @@ void video_format_ApplyRotation( video_format_t *restrict out,
 bool video_format_IsSimilar( const video_format_t *f1,
                              const video_format_t *f2 )
 {
-    if( f1->i_chroma != f2->i_chroma )
+    if( !video_format_IsSameChroma( f1, f2 ) )
         return false;
 
     if( f1->i_width != f2->i_width || f1->i_height != f2->i_height ||
@@ -392,8 +217,8 @@ bool video_format_IsSimilar( const video_format_t *f1,
         f1->i_visible_height != f2->i_visible_height ||
         f1->i_x_offset != f2->i_x_offset || f1->i_y_offset != f2->i_y_offset )
         return false;
-    if( (int64_t)f1->i_sar_num * f2->i_sar_den !=
-        (int64_t)f2->i_sar_num * f1->i_sar_den )
+    if( (uint64_t)f1->i_sar_num * f2->i_sar_den !=
+        (uint64_t)f2->i_sar_num * f1->i_sar_den )
         return false;
 
     if( f1->orientation != f2->orientation)
@@ -402,35 +227,66 @@ bool video_format_IsSimilar( const video_format_t *f1,
     if( f1->multiview_mode!= f2->multiview_mode )
        return false;
 
-    if( f1->i_chroma == VLC_CODEC_RGB15 ||
-        f1->i_chroma == VLC_CODEC_RGB16 ||
-        f1->i_chroma == VLC_CODEC_RGB24 ||
-        f1->i_chroma == VLC_CODEC_RGB32 )
-    {
-        video_format_t v1 = *f1;
-        video_format_t v2 = *f2;
-
-        video_format_FixRgb( &v1 );
-        video_format_FixRgb( &v2 );
-
-        if( v1.i_rmask != v2.i_rmask ||
-            v1.i_gmask != v2.i_gmask ||
-            v1.i_bmask != v2.i_bmask )
-            return false;
-    }
     return true;
 }
+
+void video_format_LogDifferences(struct vlc_logger *log,
+                                 const char *name_a, const video_format_t *a,
+                                 const char *name_b, const video_format_t *b)
+{
+    if (a->i_chroma != b->i_chroma)
+        vlc_debug(log, "'%s/%s' i_chroma %4.4s / %4.4s", name_a, name_b, (char*)&a->i_chroma, (char*)&b->i_chroma);
+    if( a->i_width != b->i_width )
+        vlc_debug(log, "'%s/%s' i_width %u / %u", name_a, name_b, a->i_width, b->i_width);
+    if( a->i_height != b->i_height )
+        vlc_debug(log, "'%s/%s' i_height %u / %u", name_a, name_b, a->i_height, b->i_height);
+    if( a->i_visible_width != b->i_visible_width )
+        vlc_debug(log, "'%s/%s' i_visible_width %u / %u", name_a, name_b, a->i_visible_width, b->i_visible_width);
+    if( a->i_visible_height != b->i_visible_height )
+        vlc_debug(log, "'%s/%s' i_visible_height %u / %u", name_a, name_b, a->i_visible_height, b->i_visible_height);
+    if( a->i_x_offset != b->i_x_offset )
+        vlc_debug(log, "'%s/%s' i_x_offset %u / %u", name_a, name_b, a->i_x_offset, b->i_x_offset);
+    if( a->i_y_offset != b->i_y_offset )
+        vlc_debug(log, "'%s/%s' i_y_offset %u / %u", name_a, name_b, a->i_y_offset, b->i_y_offset);
+    if( (int64_t)a->i_sar_num * b->i_sar_den !=
+        (int64_t)b->i_sar_num * a->i_sar_den )
+        vlc_debug(log, "'%s/%s' SAR %u/%u / %u/%u", name_a, name_b, a->i_sar_den, a->i_sar_num, b->i_sar_den, b->i_sar_num);
+
+    if( a->orientation != b->orientation)
+        vlc_debug(log, "'%s/%s' orientation %d / %d", name_a, name_b, a->orientation, b->orientation);
+
+    if( a->multiview_mode!= b->multiview_mode )
+        vlc_debug(log, "'%s/%s' multiview_mode %d / %d", name_a, name_b, a->multiview_mode, b->multiview_mode);
+}
+
+static const char *orient_to_string[] =
+{
+    [ORIENT_NORMAL]             = "normal",
+    [ORIENT_TRANSPOSED]         = "transposed",
+    [ORIENT_ANTI_TRANSPOSED]    = "antitransposed",
+    [ORIENT_HFLIPPED]           = "hflip",
+    [ORIENT_VFLIPPED]           = "vflip",
+    [ORIENT_ROTATED_180]        = "80",
+    [ORIENT_ROTATED_270]        = "270",
+    [ORIENT_ROTATED_90]         = "90",
+};
+
 void video_format_Print( vlc_object_t *p_this,
                          const char *psz_text, const video_format_t *fmt )
 {
+    const char *orient;
+    if ( fmt->orientation >= 0 && fmt->orientation < ARRAY_SIZE(orient_to_string) )
+        orient = orient_to_string[fmt->orientation];
+    else orient = "error";
+
     msg_Dbg( p_this,
-             "%s sz %ix%i, of (%i,%i), vsz %ix%i, 4cc %4.4s, sar %i:%i, msk r0x%x g0x%x b0x%x",
+             "%s sz %ux%u, of (%u,%u), vsz %ux%u, 4cc %4.4s, sar %u:%u, orient: %s",
              psz_text,
              fmt->i_width, fmt->i_height, fmt->i_x_offset, fmt->i_y_offset,
              fmt->i_visible_width, fmt->i_visible_height,
              (char*)&fmt->i_chroma,
              fmt->i_sar_num, fmt->i_sar_den,
-             fmt->i_rmask, fmt->i_gmask, fmt->i_bmask );
+             orient );
 }
 
 void es_format_Init( es_format_t *fmt,
@@ -587,11 +443,13 @@ bool es_format_IsSimilar( const es_format_t *p_fmt1, const es_format_t *p_fmt2 )
     {
         video_format_t v1 = p_fmt1->video;
         video_format_t v2 = p_fmt2->video;
+        if( p_fmt1->i_profile != p_fmt2->i_profile )
+            return false;
         if( !v1.i_chroma )
             v1.i_chroma = vlc_fourcc_GetCodec( p_fmt1->i_cat, p_fmt1->i_codec );
         if( !v2.i_chroma )
             v2.i_chroma = vlc_fourcc_GetCodec( p_fmt2->i_cat, p_fmt2->i_codec );
-        return video_format_IsSimilar( &p_fmt1->video, &p_fmt2->video );
+        return video_format_IsSimilar( &v1, &v2 );
     }
 
     case SPU_ES:
@@ -600,3 +458,59 @@ bool es_format_IsSimilar( const es_format_t *p_fmt1, const es_format_t *p_fmt2 )
     }
 }
 
+
+void es_format_LogDifferences(struct vlc_logger *log,
+                              const char *name_a, const es_format_t *a,
+                              const char *name_b, const es_format_t *b)
+{
+    if (a->i_cat != b->i_cat)
+        vlc_debug(log, "'%s/%s' category %d / %d", name_a, name_b, a->i_cat, b->i_cat);
+    if (a->i_codec != b->i_codec)
+    {
+        vlc_fourcc_t a_codec = vlc_fourcc_GetCodec(a->i_cat, a->i_codec);
+        vlc_fourcc_t b_codec = vlc_fourcc_GetCodec(b->i_cat, b->i_codec);
+        vlc_debug(log, "'%s/%s' codec %4.4s(%4.4s) / %4.4s(%4.4s)",
+                  name_a, name_b, (char*)&a_codec, (char*)&a->i_codec, (char*)&b_codec, (char*)&b->i_codec);
+    }
+    switch (a->i_cat)
+    {
+    case AUDIO_ES:
+    {
+        audio_format_t aa = a->audio;
+        audio_format_t ab = b->audio;
+
+        if( aa.i_format && ab.i_format && aa.i_format != ab.i_format )
+            vlc_debug(log, "'%s/%s' format %d / %d", name_a, name_b, aa.i_format, ab.i_format);
+        if( aa.channel_type != ab.channel_type)
+            vlc_debug(log, "'%s/%s' channel_type %d / %d",
+                      name_a, name_b, aa.channel_type, ab.channel_type);
+        if( aa.i_rate != ab.i_rate)
+            vlc_debug(log, "'%s/%s' i_rate %u / %u", name_a, name_b, aa.i_rate, ab.i_rate);
+        if( aa.i_channels != ab.i_channels)
+            vlc_debug(log, "'%s/%s' i_channels %" PRIu8 " / %" PRIu8 ,
+                      name_a, name_b, aa.i_channels, ab.i_channels);
+        if( aa.i_physical_channels != ab.i_physical_channels)
+            vlc_debug(log, "'%s/%s' i_physical_channels %" PRIu16 " / %" PRIu16 ,
+                      name_a, name_b, aa.i_physical_channels, ab.i_physical_channels);
+        if( aa.i_chan_mode != ab.i_chan_mode)
+            vlc_debug(log, "'%s/%s' i_chan_mode %" PRIu16 " / %" PRIu16 ,
+                      name_a, name_b, aa.i_chan_mode, ab.i_chan_mode);
+        if (a->i_profile != b->i_profile)
+            vlc_debug(log, "'%s/%s' profile %d / %d", name_a, name_b, a->i_profile, b->i_profile);
+        break;
+    }
+    case VIDEO_ES:
+        if (a->i_profile != b->i_profile)
+            vlc_debug(log, "'%s/%s' profile %d / %d", name_a, name_b, a->i_profile, b->i_profile);
+        video_format_t va = a->video;
+        video_format_t vb = b->video;
+        if( !va.i_chroma )
+            va.i_chroma = vlc_fourcc_GetCodec(a->i_cat, a->i_codec);
+        if( !vb.i_chroma )
+            vb.i_chroma = vlc_fourcc_GetCodec(b->i_cat, b->i_codec);
+        video_format_LogDifferences(log, name_a, &va, name_b, &vb);
+        break;
+    default:
+        break;
+    }
+}

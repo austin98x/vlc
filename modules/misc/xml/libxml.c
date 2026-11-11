@@ -2,7 +2,6 @@
  * libxml.c: XML parser using libxml2
  *****************************************************************************
  * Copyright (C) 2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *
@@ -36,39 +35,22 @@
 #include <libxml/catalog.h>
 
 /*****************************************************************************
- * Module descriptor
+ * Catalogue functions
  *****************************************************************************/
-static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
+static void CatalogLoad( xml_t *p_xml, const char *psz_filename )
+{
+    VLC_UNUSED(p_xml);
+    if( !psz_filename ) xmlInitializeCatalog();
+    else xmlLoadCatalog( psz_filename );
+}
 
-static int ReaderOpen( vlc_object_t * );
-static void ReaderClose( vlc_object_t * );
-
-
-vlc_module_begin ()
-    set_description( N_("XML Parser (using libxml2)") )
-    set_capability( "xml", 10 )
-    set_callbacks( Open, Close )
-
-#ifdef _WIN32
-    cannot_unload_broken_library()
-#endif
-
-    add_submodule()
-    set_capability( "xml reader", 10 )
-    set_callbacks( ReaderOpen, ReaderClose )
-
-vlc_module_end ()
-
-static int ReaderNextNode( xml_reader_t *, const char ** );
-static const char *ReaderNextAttr( xml_reader_t *, const char ** );
-static int ReaderIsEmptyElement( xml_reader_t *);
-
-static int ReaderUseDTD ( xml_reader_t * );
-
-static void CatalogLoad( xml_t *, const char * );
-static void CatalogAdd( xml_t *, const char *, const char *, const char * );
-static int StreamRead( void *p_context, char *p_buffer, int i_buffer );
+static void CatalogAdd( xml_t *p_xml, const char *psz_arg1,
+                          const char *psz_arg2, const char *psz_filename )
+{
+    VLC_UNUSED(p_xml);
+    xmlCatalogAdd( (unsigned char*)psz_arg1, (unsigned char*)psz_arg2,
+        (unsigned char*)psz_filename );
+}
 
 static vlc_mutex_t lock = VLC_STATIC_MUTEX;
 
@@ -97,31 +79,25 @@ static int Open( vlc_object_t *p_this )
  *****************************************************************************/
 static void Close( vlc_object_t *p_this )
 {
-#ifdef LIBXML_GETS_A_CLUE_ABOUT_REENTRANCY_AND_MEMORY_LEAKS
-    vlc_mutex_lock( &lock );
-    xmlCleanupParser();
-    vlc_mutex_unlock( &lock );
-#endif
+    /* /!\
+     * In theory, xmlCleanupParser() should be called here.
+     * Unfortunately that function is not thread-safe,
+     * operating on global state. So even if we would be
+     * able to know when this module is unloaded, we could
+     * still not call it then, as other libraries or the apps
+     * using libVLC could still use libxml themselves.
+     *
+     * Citing the libxml docs for xmlCleanupParser:
+     *
+     * > If your application is multithreaded or has plugin support
+     * > calling this may crash the application if another thread or
+     * > a plugin is still using libxml2. It's sometimes very hard to
+     * > guess if libxml2 is in use in the application, some libraries
+     * > or plugins may use it without notice. In case of doubt abstain
+     * > from calling this function or do it just before calling exit()
+     * > to avoid leak reports from valgrind!
+     */
     VLC_UNUSED(p_this);
-    return;
-}
-
-/*****************************************************************************
- * Catalogue functions
- *****************************************************************************/
-static void CatalogLoad( xml_t *p_xml, const char *psz_filename )
-{
-    VLC_UNUSED(p_xml);
-    if( !psz_filename ) xmlInitializeCatalog();
-    else xmlLoadCatalog( psz_filename );
-}
-
-static void CatalogAdd( xml_t *p_xml, const char *psz_arg1,
-                          const char *psz_arg2, const char *psz_filename )
-{
-    VLC_UNUSED(p_xml);
-    xmlCatalogAdd( (unsigned char*)psz_arg1, (unsigned char*)psz_arg2,
-        (unsigned char*)psz_filename );
 }
 
 /*****************************************************************************
@@ -137,11 +113,116 @@ static void ReaderErrorHandler( void *p_arg, const char *p_msg,
     msg_Err( p_reader, "XML parser error (line %d) : %s", line, p_msg );
 }
 
-struct xml_reader_sys_t
+typedef struct
 {
     xmlTextReaderPtr xml;
     char *node;
-};
+    char *namespace;
+} xml_reader_sys_t;
+
+static int ReaderUseDTD ( xml_reader_t *p_reader )
+{
+    /* Activate DTD validation */
+    xml_reader_sys_t *p_sys = p_reader->p_sys;
+    xmlTextReaderSetParserProp( p_sys->xml,
+                                XML_PARSER_DEFAULTATTRS, true );
+    xmlTextReaderSetParserProp( p_sys->xml,
+                                XML_PARSER_VALIDATE, true );
+
+    return VLC_SUCCESS;
+}
+
+static int ReaderNextNode( xml_reader_t *p_reader, const char **pval,
+                             const char **pnamespace )
+{
+    xml_reader_sys_t *p_sys = p_reader->p_sys;
+    const xmlChar *node, *namespace = NULL;
+    int ret;
+
+    skip:
+    free( p_sys->node );
+    free( p_sys->namespace );
+    p_sys->node = NULL;
+    p_sys->namespace = NULL;
+
+    switch( xmlTextReaderRead( p_sys->xml ) )
+    {
+        case 0: /* EOF */
+            return XML_READER_NONE;
+        case -1: /* error */
+            return XML_READER_ERROR;
+    }
+
+    switch( xmlTextReaderNodeType( p_sys->xml ) )
+    {
+        case XML_READER_TYPE_ELEMENT:
+            node = xmlTextReaderConstName( p_sys->xml );
+            namespace = xmlTextReaderConstNamespaceUri( p_sys->xml );
+            ret = XML_READER_STARTELEM;
+            break;
+
+        case XML_READER_TYPE_END_ELEMENT:
+            node = xmlTextReaderConstName( p_sys->xml );
+            namespace = xmlTextReaderConstNamespaceUri( p_sys->xml );
+            ret = XML_READER_ENDELEM;
+            break;
+
+        case XML_READER_TYPE_CDATA:
+        case XML_READER_TYPE_TEXT:
+            node = xmlTextReaderConstValue( p_sys->xml );
+            ret = XML_READER_TEXT;
+            break;
+
+        case -1:
+            return XML_READER_ERROR;
+
+        default:
+            goto skip;
+    }
+
+    if( unlikely(node == NULL) )
+        return XML_READER_ERROR;
+
+    p_sys->node = strdup( (const char *) node );
+    if( namespace )
+        p_sys->namespace = strdup( (const char *) namespace );
+    if( pval != NULL )
+        *pval = p_sys->node;
+    if( pnamespace != NULL )
+        *pnamespace = p_sys->namespace;
+    return likely(p_sys->node != NULL) ? ret : XML_READER_ERROR;
+}
+
+static const char *ReaderNextAttr( xml_reader_t *p_reader, const char **pval,
+                                     const char **pnamespace )
+{
+    xml_reader_sys_t *p_sys = p_reader->p_sys;
+    xmlTextReaderPtr xml = p_sys->xml;
+    const xmlChar *name, *value;
+
+    if( xmlTextReaderMoveToNextAttribute( xml ) != 1
+     || (name = xmlTextReaderConstName( xml )) == NULL
+     || (value = xmlTextReaderConstValue( xml )) == NULL )
+        return NULL;
+
+    if( pnamespace )
+        *pnamespace = (const char *) xmlTextReaderConstNamespaceUri( xml );
+
+    *pval = (const char *)value;
+    return (const char *) name;
+}
+
+static int StreamRead( void *p_context, char *p_buffer, int i_buffer )
+{
+    stream_t *s = (stream_t*)p_context;
+    return vlc_stream_Read( s, p_buffer, i_buffer );
+}
+
+static int ReaderIsEmptyElement( xml_reader_t *p_reader )
+{
+    xml_reader_sys_t *p_sys = p_reader->p_sys;
+    return xmlTextReaderIsEmptyElement( p_sys->xml );
+}
 
 static int ReaderOpen( vlc_object_t *p_this )
 {
@@ -164,6 +245,10 @@ static int ReaderOpen( vlc_object_t *p_this )
     if( !p_libxml_reader )
     {
         free( p_sys );
+        /* /!\
+         * xmlCleanupParser should but can't be called here,
+         * for the same reason as in Close().
+         */
         return VLC_ENOMEM;
     }
 
@@ -173,6 +258,7 @@ static int ReaderOpen( vlc_object_t *p_this )
 
     p_sys->xml = p_libxml_reader;
     p_sys->node = NULL;
+    p_sys->namespace = NULL;
     p_reader->p_sys = p_sys;
     p_reader->pf_next_node = ReaderNextNode;
     p_reader->pf_next_attr = ReaderNextAttr;
@@ -188,109 +274,27 @@ static void ReaderClose( vlc_object_t *p_this )
     xml_reader_sys_t *p_sys = p_reader->p_sys;
 
     xmlFreeTextReader( p_sys->xml );
-#ifdef LIBXML_GETS_A_CLUE_ABOUT_REENTRANCY_AND_MEMORY_LEAKS
-    vlc_mutex_lock( &lock );
-    xmlCleanupParser();
-    vlc_mutex_unlock( &lock );
-#endif
     free( p_sys->node );
+    free( p_sys->namespace );
     free( p_sys );
+
+    /* /!\
+     * xmlCleanupParser should but can't be called here,
+     * same reason as in Close() of the main xml module.
+     */
 }
 
-static int ReaderUseDTD ( xml_reader_t *p_reader )
-{
-    /* Activate DTD validation */
-    xmlTextReaderSetParserProp( p_reader->p_sys->xml,
-                                XML_PARSER_DEFAULTATTRS, true );
-    xmlTextReaderSetParserProp( p_reader->p_sys->xml,
-                                XML_PARSER_VALIDATE, true );
+vlc_module_begin ()
+    set_description( N_("XML Parser (using libxml2)") )
+    set_capability( "xml", 10 )
+    set_callbacks( Open, Close )
 
-    return VLC_SUCCESS;
-}
-
-static int ReaderNextNode( xml_reader_t *p_reader, const char **pval )
-{
-    xml_reader_sys_t *p_sys = p_reader->p_sys;
-    const xmlChar *node;
-    int ret;
-
-    free( p_sys->node );
-    p_sys->node = NULL;
-
-skip:
-    switch( xmlTextReaderRead( p_sys->xml ) )
-    {
-        case 0: /* EOF */
-            return XML_READER_NONE;
-        case -1: /* error */
-            return XML_READER_ERROR;
-    }
-
-    switch( xmlTextReaderNodeType( p_sys->xml ) )
-    {
-        case XML_READER_TYPE_ELEMENT:
-            node = xmlTextReaderConstName( p_sys->xml );
-            ret = XML_READER_STARTELEM;
-            break;
-
-        case XML_READER_TYPE_END_ELEMENT:
-            node = xmlTextReaderConstName( p_sys->xml );
-            ret = XML_READER_ENDELEM;
-            break;
-
-        case XML_READER_TYPE_CDATA:
-        case XML_READER_TYPE_TEXT:
-            node = xmlTextReaderConstValue( p_sys->xml );
-            ret = XML_READER_TEXT;
-            break;
-
-        case -1:
-            return XML_READER_ERROR;
-
-        default:
-            goto skip;
-    }
-
-    if( unlikely(node == NULL) )
-        return XML_READER_ERROR;
-
-    p_sys->node = strdup( (const char *)node );
-    if( pval != NULL )
-        *pval = p_sys->node;
-    return likely(p_sys->node != NULL) ? ret : XML_READER_ERROR;
-}
-
-#if 0
-static char *ReaderValue( xml_reader_t *p_reader )
-{
-    const xmlChar *psz_value =
-        xmlTextReaderConstValue( p_reader->p_sys->xml );
-
-    return psz_value ? strdup( (const char *)psz_value ) : NULL;
-}
+#ifdef _WIN32
+    cannot_unload_broken_library()
 #endif
 
-static const char *ReaderNextAttr( xml_reader_t *p_reader, const char **pval )
-{
-    xmlTextReaderPtr xml = p_reader->p_sys->xml;
-    const xmlChar *name, *value;
+    add_submodule()
+    set_capability( "xml reader", 10 )
+    set_callbacks( ReaderOpen, ReaderClose )
 
-    if( xmlTextReaderMoveToNextAttribute( xml ) != 1
-     || (name = xmlTextReaderConstName( xml )) == NULL
-     || (value = xmlTextReaderConstValue( xml )) == NULL )
-        return NULL;
-
-    *pval = (const char *)value;
-    return (const char *)name;
-}
-
-static int StreamRead( void *p_context, char *p_buffer, int i_buffer )
-{
-    stream_t *s = (stream_t*)p_context;
-    return vlc_stream_Read( s, p_buffer, i_buffer );
-}
-
-static int ReaderIsEmptyElement( xml_reader_t *p_reader )
-{
-    return xmlTextReaderIsEmptyElement( p_reader->p_sys->xml );
-}
+vlc_module_end ()

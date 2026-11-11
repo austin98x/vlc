@@ -32,78 +32,67 @@
 
 namespace adaptive
 {
+    class ChunksSourceStream;
+
     namespace http
     {
-        class Socket;
         class AuthStorage;
+
+        constexpr unsigned MAX_REDIRECTS = 3;
 
         class AbstractConnection
         {
             public:
                 AbstractConnection(vlc_object_t *);
                 virtual ~AbstractConnection();
+                AbstractConnection(AbstractConnection&&) = delete;
+                AbstractConnection& operator=(const AbstractConnection&) = delete;
+                AbstractConnection& operator=(AbstractConnection&&) = delete;
 
                 virtual bool    prepare     (const ConnectionParams &);
                 virtual bool    canReuse     (const ConnectionParams &) const = 0;
 
-                virtual int     request     (const std::string& path, const BytesRange & = BytesRange()) = 0;
+                virtual RequestStatus request(const std::string& path,
+                                              const BytesRange & = BytesRange()) = 0;
                 virtual ssize_t read        (void *p_buffer, size_t len) = 0;
 
                 virtual size_t  getContentLength() const;
+                virtual size_t  getBytesRead() const;
+                virtual const std::string & getContentType() const;
+                virtual const ConnectionParams &getRedirection() const;
                 virtual void    setUsed( bool ) = 0;
 
             protected:
                 vlc_object_t      *p_object;
+                ConnectionParams   locationparams;
                 ConnectionParams   params;
                 bool               available;
                 size_t             contentLength;
+                std::string        contentType;
                 BytesRange         bytesRange;
                 size_t             bytesRead;
         };
 
-        class HTTPConnection : public AbstractConnection
-        {
+       class LibVLCHTTPSource;
+
+       class LibVLCHTTPConnection : public AbstractConnection
+       {
             public:
-                HTTPConnection(vlc_object_t *, AuthStorage *,  Socket *,
-                               const ConnectionParams &, bool = false);
-                virtual ~HTTPConnection();
-
-                virtual bool    canReuse     (const ConnectionParams &) const;
-                virtual int     request     (const std::string& path, const BytesRange & = BytesRange());
-                virtual ssize_t read        (void *p_buffer, size_t len);
-
-                void setUsed( bool );
-
-            protected:
-                virtual bool    connected   () const;
-                virtual bool    connect     ();
-                virtual void    disconnect  ();
-                virtual bool    send        (const void *buf, size_t size);
-                virtual bool    send        (const std::string &data);
-
-                virtual void    onHeader    (const std::string &line,
-                                             const std::string &value);
-                virtual std::string extraRequestHeaders() const;
-                virtual std::string buildRequestHeader(const std::string &path) const;
-
-                ssize_t         readChunk   (void *p_buffer, size_t len);
-                int parseReply();
-                std::string readLine();
-                char * psz_useragent;
-
-                AuthStorage        *authStorage;
-                ConnectionParams    locationparams;
-                ConnectionParams    proxyparams;
-                bool                connectionClose;
-                bool                chunked;
-                bool                chunked_eof;
-                size_t              chunkLength;
-                bool                queryOk;
-                int                 retries;
-                static const int    retryCount = 5;
+               LibVLCHTTPConnection(vlc_object_t *, AuthStorage *);
+               virtual ~LibVLCHTTPConnection();
+               bool    canReuse     (const ConnectionParams &) const override;
+               RequestStatus request(const std::string& path,
+                                     const BytesRange & = BytesRange()) override;
+               ssize_t read         (void *p_buffer, size_t len) override;
+               void    setUsed      ( bool ) override;
 
             private:
-                Socket *socket;
+               void reset();
+               std::string useragent;
+               std::string referer;
+               LibVLCHTTPSource *source;
+               ChunksSourceStream *sourceStream;
+               stream_t *stream;
        };
 
        class StreamUrlConnection : public AbstractConnection
@@ -112,33 +101,43 @@ namespace adaptive
                 StreamUrlConnection(vlc_object_t *);
                 virtual ~StreamUrlConnection();
 
-                virtual bool    canReuse     (const ConnectionParams &) const;
+                bool    canReuse     (const ConnectionParams &) const override;
 
-                virtual int     request     (const std::string& path, const BytesRange & = BytesRange());
-                virtual ssize_t read        (void *p_buffer, size_t len);
+                RequestStatus request(const std::string& path,
+                                      const BytesRange & = BytesRange()) override;
+                ssize_t read        (void *p_buffer, size_t len) override;
 
-                virtual void    setUsed( bool );
+                void    setUsed( bool ) override;
 
             protected:
                 void reset();
                 stream_t *p_streamurl;
        };
 
-       class ConnectionFactory
+       class AbstractConnectionFactory
        {
            public:
-               ConnectionFactory( AuthStorage * );
-               virtual ~ConnectionFactory();
-               virtual AbstractConnection * createConnection(vlc_object_t *, const ConnectionParams &);
+               AbstractConnectionFactory() {}
+               virtual ~AbstractConnectionFactory() {}
+               virtual AbstractConnection * createConnection(vlc_object_t *, const ConnectionParams &) = 0;
+       };
+
+       class LibVLCHTTPConnectionFactory : public AbstractConnectionFactory
+       {
+           public:
+               LibVLCHTTPConnectionFactory( AuthStorage * );
+               virtual ~LibVLCHTTPConnectionFactory() = default;
+               AbstractConnection * createConnection(vlc_object_t *, const ConnectionParams &) override;
            private:
                AuthStorage *authStorage;
        };
 
-       class StreamUrlConnectionFactory : public ConnectionFactory
+       class StreamUrlConnectionFactory : public AbstractConnectionFactory
        {
            public:
                StreamUrlConnectionFactory();
-               virtual AbstractConnection * createConnection(vlc_object_t *, const ConnectionParams &);
+               virtual ~StreamUrlConnectionFactory() {}
+               AbstractConnection * createConnection(vlc_object_t *, const ConnectionParams &) override;
        };
     }
 }

@@ -43,8 +43,7 @@ using namespace adaptive::playlist;
 
 BaseAdaptationSet::BaseAdaptationSet(BasePeriod *period) :
     CommonAttributesElements(),
-    SegmentInformation( period ),
-    isBitstreamSwitching( false )
+    SegmentInformation( period )
 {
 }
 
@@ -62,20 +61,19 @@ StreamFormat BaseAdaptationSet::getStreamFormat() const
         return StreamFormat();
 }
 
-std::vector<BaseRepresentation*>& BaseAdaptationSet::getRepresentations()
+const std::vector<BaseRepresentation*>& BaseAdaptationSet::getRepresentations() const
 {
     return representations;
 }
 
-BaseRepresentation * BaseAdaptationSet::getRepresentationByID(const ID &id)
+BaseRepresentation * BaseAdaptationSet::getRepresentationByID(const ID &id) const
 {
-    std::vector<BaseRepresentation *>::const_iterator it;
-    for(it = representations.begin(); it != representations.end(); ++it)
+    for(auto it = representations.cbegin(); it != representations.cend(); ++it)
     {
         if((*it)->getID() == id)
             return *it;
     }
-    return NULL;
+    return nullptr;
 }
 
 void BaseAdaptationSet::addRepresentation(BaseRepresentation *rep)
@@ -88,14 +86,48 @@ void BaseAdaptationSet::addRepresentation(BaseRepresentation *rep)
     childs.push_back(rep);
 }
 
-void BaseAdaptationSet::setSwitchPolicy  (bool value)
+const std::string & BaseAdaptationSet::getLang() const
 {
-    this->isBitstreamSwitching = value;
+    return lang;
 }
 
-bool BaseAdaptationSet::getBitstreamSwitching  () const
+void BaseAdaptationSet::setLang( const std::string &lang_ )
 {
-    return this->isBitstreamSwitching;
+    std::size_t pos = lang_.find_first_of('-');
+    if(pos != std::string::npos && pos > 0)
+        lang = lang_.substr(0, pos);
+    else if(lang_.size() < 4)
+        lang = lang_;
+}
+
+void BaseAdaptationSet::setSegmentAligned(bool b)
+{
+    segmentAligned = b;
+}
+
+void BaseAdaptationSet::setBitswitchAble(bool b)
+{
+    bitswitchAble = b;
+}
+
+bool BaseAdaptationSet::isSegmentAligned() const
+{
+    return segmentAligned.value_or(true);
+}
+
+bool BaseAdaptationSet::isBitSwitchable() const
+{
+    return bitswitchAble.has_value() && isSegmentAligned();
+}
+
+void BaseAdaptationSet::setRole(const Role &r)
+{
+    role = r;
+}
+
+const Role & BaseAdaptationSet::getRole() const
+{
+    return role;
 }
 
 void BaseAdaptationSet::debug(vlc_object_t *obj, int indent) const
@@ -104,6 +136,9 @@ void BaseAdaptationSet::debug(vlc_object_t *obj, int indent) const
     text.append("BaseAdaptationSet ");
     text.append(id.str());
     msg_Dbg(obj, "%s", text.c_str());
+    const AbstractSegmentBaseType *profile = getProfile();
+    if(profile)
+        profile->debug(obj, indent + 1);
     std::vector<BaseRepresentation *>::const_iterator k;
     for(k = representations.begin(); k != representations.end(); ++k)
         (*k)->debug(obj, indent + 1);

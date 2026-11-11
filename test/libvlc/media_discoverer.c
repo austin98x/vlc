@@ -23,75 +23,61 @@
 #include <string.h>
 
 static void
-ml_item_event(const struct libvlc_event_t *p_ev, const char *psz_event)
+ml_item_event(libvlc_media_t *media, const char *psz_event)
 {
-    char *psz_mrl = libvlc_media_get_mrl(p_ev->u.media_list_item_added.item);
+    char *psz_mrl = libvlc_media_get_mrl(media);
     assert(psz_mrl);
 
-    log("item %s(%d): '%s'\n", psz_event, p_ev->u.media_list_item_added.index,
-        psz_mrl);
+    test_log("item %s: '%s'\n", psz_event, psz_mrl);
     free(psz_mrl);
 }
 
 static void
-ml_item_added(const struct libvlc_event_t *p_ev, void *p_data)
+ml_item_added(void *opaque, libvlc_media_t *parent, libvlc_media_t *media)
 {
-    (void) p_data;
-    ml_item_event(p_ev, "added");
+    (void) opaque; (void) parent;
+    ml_item_event(media, "added");
 }
 
 static void
-ml_item_deleted(const struct libvlc_event_t *p_ev, void *p_data)
+ml_item_removed(void *opaque, libvlc_media_t *media)
 {
-    (void) p_data;
-    ml_item_event(p_ev, "deleted");
+    (void) opaque;
+    ml_item_event(media, "removed");
 }
 
 static void
 test_discoverer(libvlc_instance_t *p_vlc, const char *psz_name, bool b_wait)
 {
-    log("creating and starting discoverer %s\n", psz_name);
+    test_log("creating and starting discoverer %s\n", psz_name);
+
+    static const struct libvlc_media_discoverer_cbs cbs = {
+        .version = 0,
+        .on_media_added = ml_item_added,
+        .on_media_removed = ml_item_removed,
+    };
+
 
     libvlc_media_discoverer_t *p_md =
-        libvlc_media_discoverer_new(p_vlc, psz_name);
+        libvlc_media_discoverer_new(p_vlc, psz_name, &cbs, NULL);
     assert(p_md != NULL);
-
-    libvlc_media_list_t *p_ml = libvlc_media_discoverer_media_list(p_md);
-    assert(p_ml != NULL);
-
-    libvlc_event_manager_t *p_evm = libvlc_media_list_event_manager(p_ml);
-    assert(p_evm);
-
-    int i_ret;
-    i_ret = libvlc_event_attach(p_evm, libvlc_MediaListItemAdded,
-                                ml_item_added, NULL);
-    assert(i_ret == 0);
-    i_ret = libvlc_event_attach(p_evm, libvlc_MediaListItemDeleted,
-                                ml_item_deleted, NULL);
-    assert(i_ret == 0);
 
     if (libvlc_media_discoverer_start(p_md) == -1)
     {
-        log("warn: could not start md (not critical)\n");
+        test_log("warn: could not start md (not critical)\n");
     }
     else
     {
         assert(libvlc_media_discoverer_is_running(p_md));
         if (b_wait)
         {
-            log("Press any keys to stop\n");
+            test_log("Press any keys to stop\n");
             getchar();
         }
         libvlc_media_discoverer_stop(p_md);
     }
 
-    libvlc_event_detach(p_evm, libvlc_MediaListItemAdded,
-                        ml_item_added, NULL);
-    libvlc_event_detach(p_evm, libvlc_MediaListItemDeleted,
-                        ml_item_deleted, NULL);
-
-    libvlc_media_list_release(p_ml);
-    libvlc_media_discoverer_release(p_md);
+    libvlc_media_discoverer_destroy(p_md);
 }
 
 int
@@ -117,14 +103,14 @@ main(int i_argc, char *ppsz_argv[])
     for(libvlc_media_discoverer_category_t i_cat = libvlc_media_discoverer_devices;
         i_cat <= libvlc_media_discoverer_localdirs; i_cat ++)
     {
-        log("== getting list of media_discoverer for %d category ==\n", i_cat);
+        test_log("== getting list of media_discoverer for %d category ==\n", i_cat);
 
         libvlc_media_discoverer_description_t **pp_services;
         ssize_t i_count =
             libvlc_media_discoverer_list_get(p_vlc, i_cat, &pp_services);
         if (i_count <= 0)
         {
-            log("warn: no discoverers (not critical)\n");
+            test_log("warn: no discoverers (not critical)\n");
             continue;
         }
         assert(pp_services != NULL);
@@ -134,8 +120,8 @@ main(int i_argc, char *ppsz_argv[])
             libvlc_media_discoverer_description_t *p_service = pp_services[i];
 
             assert(i_cat == p_service->i_cat);
-            log("= discoverer: name: '%s', longname: '%s' =\n",
-                p_service->psz_name, p_service->psz_longname);
+            test_log("= discoverer: name: '%s', longname: '%s' =\n",
+                     p_service->psz_name, p_service->psz_longname);
 
 #if 0
             if (!strncasecmp(p_service->psz_name, "podcast", 7)

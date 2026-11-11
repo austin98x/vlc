@@ -2,7 +2,6 @@
  * subpicture.h: Private subpicture definitions
  *****************************************************************************
  * Copyright (C) 2010 Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -21,11 +20,8 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
 
-struct subpicture_region_private_t {
-    video_format_t fmt;
-    picture_t      *p_picture;
-};
-
-subpicture_region_private_t *subpicture_region_private_New(video_format_t *);
-void subpicture_region_private_Delete(subpicture_region_private_t *);
-
+picture_t * subpicture_region_cache_GetPicture( subpicture_region_t * );
+void subpicture_region_cache_Invalidate( subpicture_region_t * );
+const video_format_t * subpicture_region_cache_GetFormat( const subpicture_region_t * );
+int subpicture_region_cache_Assign( subpicture_region_t *p_region, picture_t * );
+bool subpicture_region_cache_IsValid(const subpicture_region_t *);

@@ -2,7 +2,6 @@
  * gstvlcvideopool.h: VLC pictures managed by GstBufferPool
  *****************************************************************************
  * Copyright (C) 2016 VLC authors and VideoLAN
- * $Id:
  *
  * Author: Vikram Fugro <vikram.fugro@gmail.com>
  *
@@ -26,9 +25,6 @@
  *****************************************************************************/
 #ifndef VLC_GST_VIDEO_POOL_H
 #define VLC_GST_VIDEO_POOL_H
-
-#include <gst/gstbufferpool.h>
-#include <gst/video/gstvideopool.h>
 
 #include "gstvlcpictureplaneallocator.h"
 

@@ -29,14 +29,27 @@
 #include <ole2.h>
 #include <limits.h>
 
-/* FIXME: mingw.org doesn't define secure versions of
- * http://msdn.microsoft.com/en-us/library/f30dzcf6.aspxu */
-#define NO_DSHOW_STRSAFE
+#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR < 12
+// before 1ec7fa221644b6d02a617a47f6e80f5069cdc893 using _snwprintf
+// is replaced by _snwprintf_instead_use_StringCbPrintfW_or_StringCchPrintfW
+#define STRSAFE_NO_DEPRECATE
+#endif
+
 #include <dshow.h>
+#include <tuner.h>
 
 #include <comcat.h>
-#include "dtv/bdadefs.h"
+#if defined(__MINGW64_VERSION_MAJOR)
+#include <qedit.h>
+#else
+// qedit.h is not part of the Windows 7 SDK anymore, use a local version
+#include "qedit.h"
+#endif
 #include <stdexcept>
+
+#include <vlc_threads.h>
+
+#include <wrl/client.h>
 
 
 // TBS tuner extension headers
@@ -79,7 +92,7 @@ struct ComContext
 class BDAOutput
 {
 public:
-    BDAOutput( vlc_object_t * );
+    BDAOutput( );
     ~BDAOutput();
 
     void    Push( block_t * );
@@ -87,7 +100,6 @@ public:
     void    Empty();
 
 private:
-    vlc_object_t *p_access;
     vlc_mutex_t   lock;
     vlc_cond_t    wait;
     block_t      *p_first;
@@ -129,7 +141,7 @@ private:
     STDMETHODIMP BufferCB( double d_time, BYTE* p_buffer, long l_buffer_len );
 
     vlc_object_t *p_access;
-    CLSID     guid_network_type;   /* network type in use */
+    CLSID     clsid_network_type;  /* network type in use */
     long      l_tuner_used;        /* Index of the Tuning Device in use */
     unsigned  systems;             /* bitmask of all tuners' network types */
 
@@ -138,7 +150,7 @@ private:
 
     BDAOutput       output;
 
-    IMediaControl*  p_media_control;
+    Microsoft::WRL::ComPtr<IMediaControl> p_media_control;
     IGraphBuilder*  p_filter_graph;
     ITuningSpace*               p_tuning_space;
     ITuneRequest*               p_tune_request;

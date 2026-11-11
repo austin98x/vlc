@@ -2,7 +2,6 @@
  * win32_factory.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -38,7 +37,7 @@
 #include <map>
 
 
-/// Class used to instanciate Win32 specific objects
+/// Class used to instantiate Win32 specific objects
 class Win32Factory: public OSFactory
 {
 public:
@@ -102,7 +101,7 @@ public:
     virtual int getScreenHeight() const;
 
     /// Get Monitor Information
-    virtual void getMonitorInfo( const GenericWindow &rWindow,
+    virtual void getMonitorInfo( OSWindow *pWindow,
                                  int* x, int* y,
                                  int* width, int* height ) const;
     virtual void getMonitorInfo( int numScreen,
@@ -140,10 +139,6 @@ private:
     HWND m_hParentWindow;
     /// Structure for the system tray
     NOTIFYICONDATA m_trayIcon;
-    /// Handle on msimg32.dll (for TransparentBlt)
-    HINSTANCE m_hMsimg32;
-    /// Handle on user32.dll (for SetLayeredWindowAttributes)
-    HINSTANCE m_hUser32;
     /// Directory separator
     const std::string m_dirSep;
     /// Resource path

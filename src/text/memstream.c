@@ -22,6 +22,8 @@
 # include "config.h"
 #endif
 
+#include <stdckdint.h>
+
 #include <vlc_common.h>
 #include <vlc_memstream.h>
 
@@ -49,17 +51,26 @@ int vlc_memstream_close(struct vlc_memstream *ms)
     int ret;
 
     if (unlikely(stream == NULL))
+    {
+        // was never properly opened
+        ms->ptr = NULL;
         return EOF;
+    }
 
     ms->stream = NULL;
     ret = ferror(stream);
 
     if (fclose(stream))
+    {
+        // assuming it's free'd by the memstream
+        ms->ptr = NULL;
         return EOF;
+    }
 
     if (unlikely(ret))
     {
         free(ms->ptr);
+        ms->ptr = NULL;
         return EOF;
     }
     return 0;
@@ -69,6 +80,9 @@ size_t vlc_memstream_write(struct vlc_memstream *ms, const void *ptr,
                            size_t len)
 {
     if (unlikely(ms->stream == NULL))
+        return 0;
+
+    if (len == 0)
         return 0;
 
     return fwrite(ptr, 1, len, ms->stream);
@@ -104,30 +118,45 @@ int vlc_memstream_vprintf(struct vlc_memstream *ms, const char *fmt,
 
 int vlc_memstream_open(struct vlc_memstream *ms)
 {
-    ms->error = 0;
     ms->ptr = calloc(1, 1);
     if (unlikely(ms->ptr == NULL))
-        ms->error = EOF;
+    {
+        ms->length = SIZE_MAX;
+        return EOF;
+    }
     ms->length = 0;
-    return ms->error;
+    return 0;
 }
 
 int vlc_memstream_flush(struct vlc_memstream *ms)
 {
-    return ms->error;
+    return ms->length == SIZE_MAX ? EOF : 0;
 }
 
 int vlc_memstream_close(struct vlc_memstream *ms)
 {
-    if (ms->error)
+    if (ms->length == SIZE_MAX)
+    {
         free(ms->ptr);
-    return ms->error;
-} 
+        ms->ptr = NULL;
+        return EOF;
+    }
+    return 0;
+}
 
 size_t vlc_memstream_write(struct vlc_memstream *ms, const void *ptr,
                            size_t len)
 {
-    char *base = realloc(ms->ptr, ms->length + len + 1u);
+    size_t newlen;
+
+    if (len == 0)
+        return 0;
+
+    if (unlikely(ckd_add(&newlen, ms->length, len))
+     || unlikely(ckd_add(&newlen, newlen, 1)))
+        goto error;
+
+    char *base = realloc(ms->ptr, newlen);
     if (unlikely(base == NULL))
         goto error;
 
@@ -138,7 +167,7 @@ size_t vlc_memstream_write(struct vlc_memstream *ms, const void *ptr,
     return len;
 
 error:
-    ms->error = EOF;
+    ms->length = SIZE_MAX;
     return 0;
 }
 
@@ -159,15 +188,18 @@ int vlc_memstream_vprintf(struct vlc_memstream *ms, const char *fmt,
     va_list ap;
     char *ptr;
     int len;
+    size_t newlen;
 
     va_copy(ap, args);
     len = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
 
-    if (len < 0)
+    if (len < 0
+     || unlikely(ckd_add(&newlen, ms->length, len))
+     || unlikely(ckd_add(&newlen, newlen, 1)))
         goto error;
 
-    ptr = realloc(ms->ptr, ms->length + len + 1);
+    ptr = realloc(ms->ptr, newlen);
     if (ptr == NULL)
         goto error;
 
@@ -177,7 +209,7 @@ int vlc_memstream_vprintf(struct vlc_memstream *ms, const char *fmt,
     return len;
 
 error:
-    ms->error = EOF;
+    ms->length = SIZE_MAX;
     return EOF;
 }
 #endif

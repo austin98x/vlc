@@ -24,37 +24,63 @@
 #include "SegmentChunk.hpp"
 #include "Segment.h"
 #include "BaseRepresentation.h"
+#include "../encryption/CommonEncryption.hpp"
+
+#include <vlc_block.h>
+
 #include <cassert>
 
 using namespace adaptive::playlist;
+using namespace adaptive::encryption;
 using namespace adaptive;
 
-SegmentChunk::SegmentChunk(ISegment *segment_, AbstractChunkSource *source,
-                           BaseRepresentation *rep_) :
+SegmentChunk::SegmentChunk(AbstractChunkSource *source, BaseRepresentation *rep_) :
     AbstractChunk(source)
 {
-    segment = segment_;
-    segment->chunksuse.Set(segment->chunksuse.Get() + 1);
     rep = rep_;
-    discontinuity = segment_->discontinuity;
+    encryptionSession = nullptr;
+    discontinuity = false;
+    discontinuitySequenceNumber = 0;
 }
 
 SegmentChunk::~SegmentChunk()
 {
-    assert(segment->chunksuse.Get() > 0);
-    segment->chunksuse.Set(segment->chunksuse.Get() - 1);
+    delete encryptionSession;
+}
+
+bool SegmentChunk::decrypt(block_t **pp_block)
+{
+    block_t *p_block = *pp_block;
+
+    if(encryptionSession)
+    {
+        bool b_last = !hasMoreData();
+        p_block->i_buffer = encryptionSession->decrypt(p_block->p_buffer,
+                                                       p_block->i_buffer, b_last);
+        if(b_last)
+            encryptionSession->close();
+    }
+
+    return true;
 }
 
 void SegmentChunk::onDownload(block_t **pp_block)
 {
-    segment->onChunkDownload(pp_block, this, rep);
+    decrypt(pp_block);
 }
 
 StreamFormat SegmentChunk::getStreamFormat() const
 {
-    if(rep)
-        return rep->getStreamFormat();
-    else
-        return StreamFormat();
+    return (format == StreamFormat() && rep) ? rep->getStreamFormat() : format;
 }
 
+void SegmentChunk::setStreamFormat(const StreamFormat &f)
+{
+    format = f;
+}
+
+void SegmentChunk::setEncryptionSession(CommonEncryptionSession *s)
+{
+    delete encryptionSession;
+    encryptionSession = s;
+}

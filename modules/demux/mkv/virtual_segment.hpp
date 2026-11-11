@@ -2,7 +2,6 @@
  * virtual_segment.hpp : virtual segment implementation in the MKV demuxer
  *****************************************************************************
  * Copyright © 2003-2011 VideoLAN and VLC authors
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -31,12 +30,14 @@
 #include "matroska_segment.hpp"
 #include "chapters.hpp"
 
+namespace mkv {
+
 /* virtual classes don't own anything but virtual elements so they shouldn't have to delete anything */
 
 class virtual_chapter_c
 {
 public:
-    virtual_chapter_c( matroska_segment_c &seg, chapter_item_c *p_chap, int64_t start, int64_t stop, std::vector<virtual_chapter_c *> & sub_chaps ):
+    virtual_chapter_c( matroska_segment_c &seg, chapter_item_c *p_chap, vlc_tick_t start, vlc_tick_t stop, std::vector<virtual_chapter_c *> & sub_chaps ):
         segment(seg), p_chapter(p_chap),
         i_mk_virtual_start_time(start), i_mk_virtual_stop_time(stop),
         sub_vchapters(sub_chaps)
@@ -45,21 +46,17 @@ public:
 
     static virtual_chapter_c * CreateVirtualChapter( chapter_item_c * p_chap,
                                                      matroska_segment_c & main_segment,
-                                                     std::vector<matroska_segment_c*> & segments,
-                                                     int64_t & usertime_offset, bool b_ordered );
+                                                     const std::vector<matroska_segment_c*> & opened_segments,
+                                                     vlc_tick_t & usertime_offset, bool b_ordered );
 
-    virtual_chapter_c* getSubChapterbyTimecode( int64_t time );
+    virtual_chapter_c* getSubChapterbyTimecode( vlc_tick_t time );
     bool Leave( );
     bool EnterAndLeave( virtual_chapter_c *p_leaving_vchapter, bool b_enter = true );
-    virtual_chapter_c * FindChapter( int64_t i_find_uid );
-    int PublishChapters( input_title_t & title, int & i_user_chapters, int i_level );
+    virtual_chapter_c * FindChapter( chapter_uid i_find_uid );
+    int PublishChapters( input_title_t & title, int & i_user_chapters, int i_level, bool allow_no_name );
 
-    virtual_chapter_c * BrowseCodecPrivate( unsigned int codec_id,
-                                            bool (*match)( const chapter_codec_cmds_c &data,
-                                                           const void *p_cookie,
-                                                           size_t i_cookie_size ),
-                                            const void *p_cookie,
-                                            size_t i_cookie_size );
+    virtual_chapter_c * BrowseCodecPrivate( chapter_codec_id codec_id,
+                                            chapter_cmd_match match );
     bool Enter( bool b_do_subs );
     bool Leave( bool b_do_subs );
 
@@ -68,12 +65,12 @@ public:
         return ( itemA->i_mk_virtual_start_time < itemB->i_mk_virtual_start_time );
     }
 
-    bool ContainsTimestamp( mtime_t i_pts );
+    bool ContainsTimestamp( vlc_tick_t i_pts );
 
     matroska_segment_c  &segment;
     chapter_item_c      *p_chapter;
-    mtime_t             i_mk_virtual_start_time;
-    mtime_t             i_mk_virtual_stop_time;
+    vlc_tick_t          i_mk_virtual_start_time;
+    vlc_tick_t          i_mk_virtual_stop_time;
     int                 i_seekpoint_num;
     std::vector<virtual_chapter_c *> sub_vchapters;
 #ifdef MKV_DEBUG
@@ -84,21 +81,18 @@ public:
 class virtual_edition_c
 {
 public:
-    virtual_edition_c( chapter_edition_c * p_edition, matroska_segment_c & main_segment, std::vector<matroska_segment_c*> & opened_segments );
+    virtual_edition_c( chapter_edition_c * p_edition, matroska_segment_c & main_segment, const std::vector<matroska_segment_c*> & opened_segments );
     ~virtual_edition_c();
     std::vector<virtual_chapter_c*> vchapters;
 
-    virtual_chapter_c* getChapterbyTimecode( int64_t time );
+    virtual_chapter_c* getChapterbyTimecode( vlc_tick_t time );
     std::string GetMainName();
     int PublishChapters( input_title_t & title, int & i_user_chapters, int i_level );
-    virtual_chapter_c * BrowseCodecPrivate( unsigned int codec_id,
-                                            bool (*match)( const chapter_codec_cmds_c &data,
-                                                           const void *p_cookie,
-                                                           size_t i_cookie_size ),
-                                             const void *p_cookie, size_t i_cookie_size );
+    virtual_chapter_c * BrowseCodecPrivate( chapter_codec_id codec_id,
+                                            chapter_cmd_match match );
 
     bool                b_ordered;
-    mtime_t             i_duration;
+    vlc_tick_t          i_duration;
     chapter_edition_c   *p_edition;
     int                 i_seekpoint_num;
 
@@ -106,7 +100,7 @@ private:
     void retimeChapters();
     void retimeSubChapters( virtual_chapter_c * p_vchap );
 #ifdef MKV_DEBUG
-    void print(){ for( size_t i = 0; i<chapters.size(); i++ ) chapters[i]->print(); }
+    void print(){ for( size_t i = 0; i<vchapters.size(); i++ ) vchapters[i]->print(); }
 #endif
 
 };
@@ -119,9 +113,8 @@ public:
     ~virtual_segment_c();
     std::vector<virtual_edition_c*> veditions;
     std::vector<virtual_edition_c*>::size_type i_current_edition;
-    virtual_chapter_c               *p_current_vchapter;
-    bool                            b_current_vchapter_entered;
-    int                             i_sys_title;
+    bool                            b_current_vchapter_entered = false;
+    int                             i_sys_title = 0;
 
 
     inline virtual_edition_c * CurrentEdition()
@@ -143,26 +136,26 @@ public:
         return &p_current_vchapter->segment;
     }
 
-    inline int64_t Duration()
+    inline vlc_tick_t Duration()
     {
-        return veditions[i_current_edition]->i_duration / 1000;
+        return veditions[i_current_edition]->i_duration;
     }
 
     inline std::vector<virtual_edition_c*>* Editions() { return &veditions; }
 
-    virtual_chapter_c *BrowseCodecPrivate( unsigned int codec_id,
-                                           bool (*match)( const chapter_codec_cmds_c &data,
-                                                          const void *p_cookie,
-                                                          size_t i_cookie_size ),
-                                           const void *p_cookie,
-                                           size_t i_cookie_size );
+    virtual_chapter_c *BrowseCodecPrivate( chapter_codec_id codec_id,
+                                           chapter_cmd_match match );
 
-    virtual_chapter_c * FindChapter( int64_t i_find_uid );
+    virtual_chapter_c * FindChapter( chapter_uid i_find_uid );
 
     bool UpdateCurrentToChapter( demux_t & demux );
-    bool Seek( demux_t & demuxer, mtime_t i_mk_date, virtual_chapter_c *p_vchapter, bool b_precise = true );
+    bool Seek( demux_t & demuxer, vlc_tick_t i_mk_date, virtual_chapter_c *p_vchapter, bool b_precise = true );
 private:
-    void KeepTrackSelection( matroska_segment_c & old, matroska_segment_c & next );
+    void KeepTrackSelection( const matroska_segment_c & old, const matroska_segment_c & next );
+
+    virtual_chapter_c               *p_current_vchapter = nullptr;
 };
+
+} // namespace
 
 #endif

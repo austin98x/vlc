@@ -2,7 +2,6 @@
  * extension.h: Lua Extensions (meta data, web information, ...)
  *****************************************************************************
  * Copyright (C) 2009-2010 VideoLAN and authors
- * $Id$
  *
  * Authors: Jean-Philippe André < jpeg # videolan.org >
  *
@@ -28,7 +27,14 @@
 #include <vlc_arrays.h>
 #include <vlc_dialog.h>
 
-#define WATCH_TIMER_PERIOD    (10 * CLOCK_FREQ) ///< 10s period for the timer
+#define WATCH_TIMER_PERIOD    VLC_TICK_FROM_SEC(10) ///< 10s period for the timer
+
+/* Extension capabilities */
+#define EXT_HAS_MENU          (1 << 0)   ///< Hook: menu
+#define EXT_TRIGGER_ONLY      (1 << 1)   ///< Hook: trigger. Not activable
+#define EXT_INPUT_LISTENER    (1 << 2)   ///< Hook: input_changed
+#define EXT_META_LISTENER     (1 << 3)   ///< Hook: meta_changed
+#define EXT_PLAYING_LISTENER  (1 << 4)   ///< Hook: status_changed
 
 /* List of available commands */
 typedef enum
@@ -51,7 +57,7 @@ typedef enum
     LUA_TEXT
 } lua_datatype_e;
 
-struct extension_sys_t
+struct lua_extension
 {
     /* Extension general */
     int i_capabilities;
@@ -67,9 +73,10 @@ struct extension_sys_t
     vlc_mutex_t running_lock;
     vlc_cond_t wait;
 
-    /* The input this extension should use for vlc.input
+    /* The item this extension should use for vlc.input
      * or NULL if it should use playlist's current input */
-    struct input_thread_t *p_input;
+    struct input_item_t *p_item;
+    struct vlc_player_listener_id *player_listener;
 
     extensions_manager_t *p_mgr;     ///< Parent
     /* Queue of commands to execute */
@@ -88,13 +95,15 @@ struct extension_sys_t
 
     bool b_thread_running; //< Only accessed out of the extension thread.
     bool b_activated; ///< Protected by the command lock
+    bool b_activating; ///< Protected by the command lock
+    bool b_deactivating; ///< Protected by the command lock
 };
 
 /* Extensions: manager functions */
-int Activate( extensions_manager_t *p_mgr, extension_t * );
+int Activate(extension_t *);
 int Deactivate( extensions_manager_t *p_mgr, extension_t * );
 bool QueueDeactivateCommand( extension_t *p_ext );
-void KillExtension( extensions_manager_t *p_mgr, extension_t *p_ext );
+void KillExtension(extension_t *p_ext);
 int PushCommand__( extension_t *ext, bool unique, command_type_e cmd, va_list options );
 static inline int PushCommand( extension_t *ext, int cmd, ... )
 {

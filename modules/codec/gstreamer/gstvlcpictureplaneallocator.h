@@ -2,7 +2,6 @@
  * gstvlcpictureplaneallocator.h: VLC pictures wrapped by GstAllocator
  *****************************************************************************
  * Copyright (C) 2016 VLC authors and VideoLAN
- * $Id:
  *
  * Author: Vikram Fugro <vikram.fugro@gmail.com>
  *
@@ -62,7 +61,7 @@ struct _GstVlcPicturePlane
 struct _GstVlcPicturePlaneAllocator
 {
     GstAllocator parent;
-    picture_t pic_info;;
+    picture_t pic_info;
 
     decoder_t *p_dec;
 };
@@ -80,6 +79,7 @@ bool gst_vlc_picture_plane_allocator_query_format(
         GstVideoAlignment *p_align, GstCaps *p_caps );
 bool gst_vlc_set_vout_fmt( GstVideoInfo *p_info, GstVideoAlignment *p_align,
         GstCaps *p_caps, decoder_t *p_dec );
+vlc_fourcc_t gst_vlc_to_map_format( const char* psz_fourcc );
 void gst_vlc_dec_ensure_empty_queue( decoder_t* p_dec );
 bool gst_vlc_picture_plane_allocator_hold( GstVlcPicturePlaneAllocator
         *p_allocator, GstBuffer *p_buffer );

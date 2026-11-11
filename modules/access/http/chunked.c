@@ -36,6 +36,32 @@
 #include "message.h"
 #include "conn.h"
 
+ssize_t vlc_https_chunked_write(struct vlc_tls *tls, const void *base,
+                                size_t len, bool eos)
+{
+    if (len > 0)
+    {
+        char hdr[sizeof (size_t) * 2 + 3];
+        int hlen = snprintf(hdr, sizeof (hdr), "%zx\r\n", len);
+
+        /* TODO: use iovec */
+        if (vlc_tls_Write(tls, hdr, hlen) < hlen)
+            return -1;
+        if (vlc_tls_Write(tls, base, len) < (ssize_t)len)
+            return -1;
+        if (vlc_tls_Write(tls, "\r\n", 2) < 2)
+            return -1;
+    }
+
+    if (eos)
+    {
+        if (vlc_tls_Write(tls, "0\r\n\r\n", 5) < 5)
+            return -1;
+    }
+
+    return len;
+}
+
 struct vlc_chunked_stream
 {
     struct vlc_http_stream stream;
@@ -81,9 +107,9 @@ static block_t *vlc_chunked_read(struct vlc_http_stream *stream)
             return vlc_chunked_fatal(s);
         }
 
-        int end;
+        ptrdiff_t end;
 
-        if (sscanf(line, "%jx%n", &s->chunk_length, &end) < 1
+        if (sscanf(line, "%" SCNxMAX "%tn", &s->chunk_length, &end) < 1
          || (line[end] != '\0' && line[end] != ';' /* ignore extension(s) */))
             s->chunk_length = UINTMAX_MAX;
 
@@ -146,6 +172,7 @@ static void vlc_chunked_close(struct vlc_http_stream *stream, bool abort)
 static struct vlc_http_stream_cbs vlc_chunked_callbacks =
 {
     vlc_chunked_wait,
+    NULL,
     vlc_chunked_read,
     vlc_chunked_close,
 };

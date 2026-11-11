@@ -1,8 +1,7 @@
 /*****************************************************************************
  * decoder.c: Functions for the management of decoders
  *****************************************************************************
- * Copyright (C) 1999-2004 VLC authors and VideoLAN
- * $Id$
+ * Copyright (C) 1999-2019 VLC authors, VideoLAN and Videolabs SAS
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -31,6 +30,7 @@
 #endif
 #include <assert.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 #include <vlc_common.h>
 #include <vlc_block.h>
@@ -42,16 +42,68 @@
 #include <vlc_meta.h>
 #include <vlc_dialog.h>
 #include <vlc_modules.h>
+#include <vlc_picture_pool.h>
+#include <vlc_tracer.h>
+#include <vlc_list.h>
+#include <vlc_replay_gain.h>
 
 #include "audio_output/aout_internal.h"
 #include "stream_output/stream_output.h"
-#include "input_internal.h"
-#include "clock.h"
+#include "../clock/clock.h"
 #include "decoder.h"
-#include "event.h"
 #include "resource.h"
+#include "decoder_prevframe.h"
 
-#include "../video_output/vout_control.h"
+#include "../libvlc.h"
+
+#include "../video_output/vout_internal.h"
+
+
+/**
+ * \file src/input/decoder.c
+ *
+ * The input decoder connects the input client pushing data to the
+ * decoder implementation (through the matching elementary stream)
+ * and the following output for audio, video and subtitles.
+ *
+ * It follows the locking rules below:
+ *
+ *  - The fifo cannot be locked when calling function from the
+ *    decoder module implementation.
+ *
+ *  - However, the decoder module implementation might indirectly
+ *    lock the fifo when calling the owner methods, in particular
+ *    to send a frame or update the output status.
+ *
+ *  - The input code can lock the fifo to modify the global state
+ *    of the input decoder.
+ *
+ * Backpressure preventing starvation is done by the pacing of the
+ * decoder, the calls into the decoder implementation, and the
+ * limits of the fifo queue.
+ *
+ * Basically a very fast decoder will often wait since the fifo will be
+ * consumed really quickly and thus almost never stay under the lock.
+ * Likewise, when the decoder is slower and the fifo can grow, it also
+ * means that the decoder thread will wait more often on the
+ * `decoder_t::pf_decode` call, which is done without the fifo lock as
+ * per above rules.
+ *
+ * In addition with the standard input/output cycle from the decoder,
+ * the video decoders can create sub-decoders for the closed captions
+ * support embedded in the supplementary information from the codecs.
+ *
+ * To do so, they need to create a `decoder_cc_desc_t` matching with the
+ * format that needs to be described (number of channels, type of
+ * channels) and they then create them along with the closed-captions
+ * content with `decoder_QueueCc`.
+ *
+ * In the `input/decoder.c` code, the access to the sub-decoders in the
+ * subdecs.list table is protected through the `subdecs.lock` mutex.
+ * Taking this lock ensures that the sub-decoder won't get
+ * asynchronously removed while using it, and any mutex from the
+ * sub-decoder can then be taken under this lock.
+ **/
 
 /*
  * Possibles values set in p_owner->reload atomic
@@ -63,28 +115,64 @@ enum reload
     RELOAD_DECODER_AOUT /* Stop the aout and reload the decoder module */
 };
 
-struct decoder_owner_sys_t
+struct decoder_video
 {
-    input_thread_t  *p_input;
+    vout_thread_t *vout;
+    enum vlc_vout_order vout_order;
+    bool started;
+    bool drained;
+
+    /* pool to use when the decoder doesn't use its own */
+    struct picture_pool_t *out_pool;
+    vlc_video_context *vctx;
+
+    /* Mouse event */
+    vlc_mutex_t mouse_lock;
+    vlc_mouse_event mouse_event;
+    void *mouse_opaque;
+
+    /* previous-frame */
+    struct decoder_prevframe pf;
+    vlc_tick_t pf_pts;
+};
+
+struct decoder_audio
+{
+    /* If aout is valid, then astream is valid too */
+    audio_output_t *aout;
+    vlc_aout_stream *stream;
+    bool drained;
+};
+
+struct decoder_spu
+{
+    vout_thread_t *vout;
+    ssize_t channel;
+    int64_t order;
+};
+
+struct vlc_input_decoder_t
+{
+    decoder_t        dec;
+    es_format_t      dec_fmt_in;
     input_resource_t*p_resource;
-    input_clock_t   *p_clock;
-    int             i_last_rate;
+    vlc_clock_t     *p_clock;
+    const char *psz_id;
 
-    vout_thread_t   *p_spu_vout;
-    int              i_spu_channel;
-    int64_t          i_spu_order;
+    bool hw_dec;
 
-    sout_instance_t         *p_sout;
-    sout_packetizer_input_t *p_sout_input;
+    const struct vlc_input_decoder_callbacks *cbs;
+    void *cbs_userdata;
 
     vlc_thread_t     thread;
 
-    void (*pf_update_stat)( decoder_owner_sys_t *, unsigned decoded, unsigned lost );
-
     /* Some decoders require already packetized data (ie. not truncated) */
     decoder_t *p_packetizer;
+    es_format_t pktz_fmt_in;
     bool b_packetizer;
 
+    /* initial and immutable category */
+    enum es_format_category_e cat;
     /* Current format in use by the output */
     es_format_t    fmt;
 
@@ -97,24 +185,52 @@ struct decoder_owner_sys_t
     block_fifo_t *p_fifo;
 
     /* Lock for communication with decoder thread */
-    vlc_mutex_t lock;
     vlc_cond_t  wait_request;
     vlc_cond_t  wait_acknowledge;
     vlc_cond_t  wait_fifo; /* TODO: merge with wait_acknowledge */
-    vlc_cond_t  wait_timed;
 
-    /* -- These variables need locking on write(only) -- */
-    audio_output_t *p_aout;
+    /*
+     * 3 threads can read/write these output variables, the DecoderThread, the
+     * input thread, and the ModuleThread. The ModuleThread is either the
+     * DecoderThread for synchronous modules or any thread for asynchronous
+     * modules.
+     *
+     * Asynchronous modules are responsible for serializing/locking every
+     * output calls in any thread as long as the decoder_UpdateVideoFormat() or
+     * decoder_NewPicture() calls are not concurrent, cf.
+     * decoder_UpdateVideoFormat() and decoder_NewPicture() notes.
+     *
+     * The ModuleThread is the owner of these variables, it should hold
+     * the lock when writing them but doesn't have to hold it when using them.
+     *
+     * The DecoderThread should always hold the lock when reading/using
+     * aout/vouts.
+     *
+     * The input thread can read these variables in order to stop outputs, when
+     * both ModuleThread and DecoderThread are stopped (from DecoderDelete()).
+     */
+     union {
+        struct decoder_video video;
+        struct decoder_audio audio;
+        struct decoder_spu spu;
+    };
 
-    vout_thread_t   *p_vout;
+    sout_stream_t *p_sout;
+    sout_packetizer_input_t *p_sout_input;
 
     /* -- Theses variables need locking on read *and* write -- */
     /* Preroll */
-    int64_t i_preroll_end;
-    /* Pause */
-    mtime_t pause_date;
-    unsigned frames_countdown;
-    bool paused;
+    vlc_tick_t i_preroll_end;
+
+#define PREROLL_NONE   VLC_TICK_MIN
+#define PREROLL_FORCED VLC_TICK_MAX
+
+    /* Pause & Rate */
+    vlc_tick_t pause_date, output_pause_date;
+    vlc_tick_t delay, output_delay;
+    float rate, output_rate;
+    int frames_countdown;
+    bool paused, output_paused;
 
     bool error;
 
@@ -122,144 +238,364 @@ struct decoder_owner_sys_t
     bool b_waiting;
     bool b_first;
     bool b_has_data;
+    bool out_started;
 
     /* Flushing */
     bool flushing;
     bool b_draining;
-    atomic_bool drained;
     bool b_idle;
+    bool aborting;
 
-    /* CC */
-#define MAX_CC_DECODERS 64 /* The es_out only creates one type of es */
+    /* Sub decs */
     struct
     {
+        vlc_mutex_t lock;
+        struct vlc_list list;
+    } subdecs;
+
+    /* CC */
+    struct
+    {
+        /* All members guarded by subdecs.lock */
+        size_t count;
+        vlc_fourcc_t selected_codec;
         bool b_supported;
         decoder_cc_desc_t desc;
-        decoder_t *pp_decoder[MAX_CC_DECODERS];
+        bool desc_changed;
+        bool b_sout_created;
+        sout_packetizer_input_t *p_sout_input;
+        char *sout_es_id;
     } cc;
 
-    /* Delay */
-    mtime_t i_ts_delay;
+    vlc_input_decoder_t *master_dec;
+
+    struct vlc_list node;
 };
 
 /* Pictures which are DECODER_BOGUS_VIDEO_DELAY or more in advance probably have
  * a bogus PTS and won't be displayed */
-#define DECODER_BOGUS_VIDEO_DELAY                ((mtime_t)(DEFAULT_PTS_DELAY * 30))
+#define DECODER_BOGUS_VIDEO_DELAY                ((vlc_tick_t)(DEFAULT_PTS_DELAY * 30))
 
 /* */
-#define DECODER_SPU_VOUT_WAIT_DURATION ((int)(0.200*CLOCK_FREQ))
+#define DECODER_SPU_VOUT_WAIT_DURATION   VLC_TICK_FROM_MS(200)
 #define BLOCK_FLAG_CORE_PRIVATE_RELOADED (1 << BLOCK_FLAG_CORE_PRIVATE_SHIFT)
+
+#define decoder_Notify(decoder_priv, event, ...) \
+    if (decoder_priv->cbs && decoder_priv->cbs->event) \
+        decoder_priv->cbs->event(decoder_priv, __VA_ARGS__, \
+                                 decoder_priv->cbs_userdata);
+
+static inline vlc_input_decoder_t *dec_get_owner( decoder_t *p_dec )
+{
+    return container_of( p_dec, vlc_input_decoder_t, dec );
+}
+
+/**
+ * When the input decoder is being used only for packetizing (happen in stream output
+ * configuration.), there's no need to spawn a decoder thread. The input_decoder is then considered
+ * *synchronous*.
+ *
+ * @retval true When no decoder thread will be spawned.
+ * @retval false When a decoder thread will be spawned.
+ */
+static inline bool vlc_input_decoder_IsSynchronous( const vlc_input_decoder_t *dec )
+{
+    return dec->p_sout != NULL;
+}
+
+static void Decoder_SeekPreviousFrame(vlc_input_decoder_t *owner, int steps,
+                                      bool failed)
+{
+    vlc_fifo_Assert(owner->p_fifo);
+    assert(steps != DEC_PF_SEEK_STEPS_NONE);
+
+    if (steps > DEC_PF_SEEK_STEPS_MAX)
+    {
+        /* Too much failing attempt */
+        decoder_Notify(owner, frame_previous_status, -ERANGE);
+    }
+    else
+    {
+        vlc_tick_t pts = owner->video.pf_pts;
+        unsigned frame_rate = owner->fmt.video.i_frame_rate;
+        unsigned frame_rate_base = owner->fmt.video.i_frame_rate_base;
+        /* Request the input to seek back */
+        decoder_Notify(owner, frame_previous_seek, pts,
+                       frame_rate, frame_rate_base, steps, failed);
+    }
+}
+
+static void Decoder_PausedForNextFrame(vlc_input_decoder_t *owner)
+{
+    vlc_fifo_Assert(owner->p_fifo);
+    assert(owner->cat == VIDEO_ES);
+    assert(owner->output_paused);
+
+    if (owner->video.vout == NULL)
+        return;
+
+    if (likely(owner->frames_countdown <= 0))
+        return;
+
+    /* Handle all next-frame requests that were sent while the video was
+    *  pausing */
+    int next_request_count = owner->frames_countdown;
+    owner->frames_countdown = vout_NextPicture(owner->video.vout, next_request_count);
+
+    assert(next_request_count >= owner->frames_countdown);
+    /* Notify for pictures that are processes by the vout */
+    for (int i = 0; i < next_request_count - owner->frames_countdown; ++i)
+        decoder_Notify(owner, frame_next_status, 0);
+}
+
+static void Decoder_DisplayPreviousFrame(vlc_input_decoder_t *owner, picture_t *pic)
+{
+    vlc_fifo_Assert(owner->p_fifo);
+
+    if (owner->video.vout == NULL)
+    {
+        picture_Release(pic);
+        return;
+    }
+
+    vout_PutPicture(owner->video.vout, pic);
+    vout_NextPicture(owner->video.vout, 1);
+
+    decoder_Notify(owner, frame_previous_status, 0);
+}
+
+static picture_t *Decoder_HandlePreviousFrame(vlc_input_decoder_t *owner,
+                                              picture_t *pic)
+{
+    int seek_steps;
+    pic = decoder_prevframe_AddPic(&owner->video.pf, pic,
+                                   &owner->video.pf_pts, &seek_steps);
+    if (pic != NULL)
+    {
+        owner->b_first = false;
+        picture_t *resume_pic = pic->p_next;
+        assert(resume_pic->p_next == NULL);
+        pic->p_next = NULL;
+        Decoder_DisplayPreviousFrame(owner, pic);
+        /* Keep picture for normal playback or next-frame (if resumed) */
+        pic = resume_pic;
+    }
+
+    if (seek_steps != DEC_PF_SEEK_STEPS_NONE)
+        Decoder_SeekPreviousFrame(owner, seek_steps, pic == NULL);
+
+    if (pic == NULL)
+        return NULL;
+
+    /* Wait for a new prev-frame request. If we don't wait, we will fill the
+     * vout with frames following the prev-frame, they won't be displayed but
+     * this will make next flush quite difficult to handle. When both
+     * prev-frame and resumed frames are in the fifo, it's ambiguous which
+     * frames should be flushed vs. retained during a flush operation. */
+    while (owner->frames_countdown == -1
+        && !decoder_prevframe_IsActive(&owner->video.pf))
+        vlc_fifo_Wait(owner->p_fifo);
+
+    if (decoder_prevframe_IsActive(&owner->video.pf))
+    {
+        picture_Release(pic);
+        return NULL;
+    }
+    return pic;
+}
+
+static void Decoder_RequestFramePrevious(vlc_input_decoder_t *owner)
+{
+    vlc_fifo_Assert(owner->p_fifo);
+    assert(owner->video.pf_pts != VLC_TICK_INVALID);
+
+    int seek_steps;
+    decoder_prevframe_Request(&owner->video.pf, &seek_steps);
+
+    if (seek_steps != DEC_PF_SEEK_STEPS_NONE)
+        Decoder_SeekPreviousFrame(owner, seek_steps, false);
+    vlc_fifo_Signal(owner->p_fifo);
+}
+
+static void Decoder_ChangeOutputPause( vlc_input_decoder_t *p_owner, bool paused, vlc_tick_t date )
+{
+    vlc_fifo_Assert(p_owner->p_fifo);
+
+    decoder_t *p_dec = &p_owner->dec;
+
+    switch( p_dec->fmt_in->i_cat )
+    {
+        case VIDEO_ES:
+            msg_Dbg( p_dec, "%s video", paused ? "pausing" : "resuming" );
+            if( p_owner->video.vout != NULL && p_owner->video.started )
+                vout_ChangePause( p_owner->video.vout, paused, date );
+            break;
+        case AUDIO_ES:
+            msg_Dbg( p_dec, "%s audio", paused ? "pausing" : "resuming" );
+            if( p_owner->audio.stream != NULL )
+                vlc_aout_stream_ChangePause( p_owner->audio.stream, paused, date );
+            break;
+        case SPU_ES:
+            msg_Dbg( p_dec, "not really %s SPU", paused ? "pausing" : "resuming" );
+            break;
+        default:
+            vlc_assert_unreachable();
+    }
+    p_owner->output_paused = paused;
+}
+
+static void Decoder_ChangeOutputRate( vlc_input_decoder_t *p_owner, float rate )
+{
+    vlc_fifo_Assert(p_owner->p_fifo);
+
+    decoder_t *p_dec = &p_owner->dec;
+
+    msg_Dbg( p_dec, "changing rate: %f", rate );
+    switch( p_dec->fmt_in->i_cat )
+    {
+        case VIDEO_ES:
+            if( p_owner->video.vout != NULL && p_owner->video.started )
+                vout_ChangeRate( p_owner->video.vout, rate );
+            break;
+        case AUDIO_ES:
+            if( p_owner->audio.stream != NULL )
+                vlc_aout_stream_ChangeRate( p_owner->audio.stream, rate );
+            break;
+        case SPU_ES:
+            if( p_owner->spu.vout != NULL )
+            {
+                assert(p_owner->spu.channel != VOUT_SPU_CHANNEL_INVALID);
+                vout_ChangeSpuRate(p_owner->spu.vout, p_owner->spu.channel,
+                                   rate );
+            }
+            break;
+        default:
+            vlc_assert_unreachable();
+    }
+    p_owner->output_rate = rate;
+}
+
+static void Decoder_ChangeOutputDelay( vlc_input_decoder_t *p_owner, vlc_tick_t delay )
+{
+    vlc_fifo_Assert(p_owner->p_fifo);
+
+    decoder_t *p_dec = &p_owner->dec;
+
+    msg_Dbg( p_dec, "changing delay: %"PRId64, delay );
+    switch( p_dec->fmt_in->i_cat )
+    {
+        case VIDEO_ES:
+            if( p_owner->video.vout != NULL && p_owner->video.started )
+                vout_ChangeDelay( p_owner->video.vout, delay );
+            break;
+        case AUDIO_ES:
+            if( p_owner->audio.stream != NULL )
+                vlc_aout_stream_ChangeDelay( p_owner->audio.stream, delay );
+            break;
+        case SPU_ES:
+            if( p_owner->spu.vout != NULL )
+            {
+                assert(p_owner->spu.channel != VOUT_SPU_CHANNEL_INVALID);
+                vout_ChangeSpuDelay(p_owner->spu.vout, p_owner->spu.channel,
+                                    delay);
+            }
+            break;
+        default:
+            vlc_assert_unreachable();
+    }
+    p_owner->output_delay = delay;
+}
+
+static void Decoder_ReapplyOutState(vlc_input_decoder_t *owner)
+{
+    if (owner->output_paused)
+        Decoder_ChangeOutputPause(owner, owner->output_paused, owner->pause_date);
+
+    if (owner->output_rate != 1.f)
+        Decoder_ChangeOutputRate(owner, owner->output_rate);
+
+    if (owner->output_delay != 0)
+        Decoder_ChangeOutputDelay(owner, owner->output_delay);
+}
 
 /**
  * Load a decoder module
  */
-static int LoadDecoder( decoder_t *p_dec, bool b_packetizer,
-                        const es_format_t *restrict p_fmt )
+static int LoadDecoder(decoder_t *p_dec, bool b_packetizer, es_format_t *fmt_in)
 {
     p_dec->b_frame_drop_allowed = true;
-    p_dec->i_extra_picture_buffers = 0;
 
-    p_dec->pf_decode = NULL;
-    p_dec->pf_get_cc = NULL;
-    p_dec->pf_packetize = NULL;
-    p_dec->pf_flush = NULL;
-
-    es_format_Copy( &p_dec->fmt_in, p_fmt );
-    es_format_Init( &p_dec->fmt_out, p_fmt->i_cat, 0 );
-
-    /* Find a suitable decoder/packetizer module */
-    if( !b_packetizer )
-    {
-        static const char caps[ES_CATEGORY_COUNT][16] = {
-            [VIDEO_ES] = "video decoder",
-            [AUDIO_ES] = "audio decoder",
-            [SPU_ES] = "spu decoder",
-        };
-        p_dec->p_module = module_need_var( p_dec, caps[p_dec->fmt_in.i_cat],
-                                           "codec" );
-    }
-    else
-        p_dec->p_module = module_need_var( p_dec, "packetizer", "packetizer" );
-
+    decoder_LoadModule( p_dec, b_packetizer, true );
     if( !p_dec->p_module )
     {
-        es_format_Clean( &p_dec->fmt_in );
+        decoder_Clean( p_dec );
+        es_format_Clean(fmt_in);
         return -1;
     }
-    else
-        return 0;
+    return 0;
 }
 
-/**
- * Unload a decoder module
- */
-static void UnloadDecoder( decoder_t *p_dec )
+static int DecoderThread_Reload( vlc_input_decoder_t *p_owner,
+                                 const es_format_t *restrict p_fmt,
+                                 enum reload reload )
 {
-    if( p_dec->p_module )
-    {
-        module_unneed( p_dec, p_dec->p_module );
-        p_dec->p_module = NULL;
-    }
-
-    if( p_dec->p_description )
-    {
-        vlc_meta_Delete( p_dec->p_description );
-        p_dec->p_description = NULL;
-    }
-
-    es_format_Clean( &p_dec->fmt_in );
-    es_format_Clean( &p_dec->fmt_out );
-}
-
-static int ReloadDecoder( decoder_t *p_dec, bool b_packetizer,
-                          const es_format_t *restrict p_fmt, enum reload reload )
-{
-    /* Copy p_fmt since it can be destroyed by UnloadDecoder */
+    /* Copy p_fmt since it can be destroyed by decoder_Clean */
+    decoder_t *p_dec = &p_owner->dec;
     es_format_t fmt_in;
     if( es_format_Copy( &fmt_in, p_fmt ) != VLC_SUCCESS )
     {
-        p_dec->p_owner->error = true;
+        p_owner->error = true;
         return VLC_EGENERIC;
     }
 
     /* Restart the decoder module */
-    UnloadDecoder( p_dec );
-    p_dec->p_owner->error = false;
+    vlc_fifo_Unlock(p_owner->p_fifo);
+    decoder_Clean( p_dec );
+    vlc_fifo_Lock(p_owner->p_fifo);
+    es_format_Clean( &p_owner->dec_fmt_in );
+    p_owner->error = false;
 
     if( reload == RELOAD_DECODER_AOUT )
     {
-        decoder_owner_sys_t *p_owner = p_dec->p_owner;
-        assert( p_owner->fmt.i_cat == AUDIO_ES );
-        audio_output_t *p_aout = p_owner->p_aout;
-
-        vlc_mutex_lock( &p_owner->lock );
-        p_owner->p_aout = NULL;
-        vlc_mutex_unlock( &p_owner->lock );
+        assert( p_owner->cat == AUDIO_ES );
+        audio_output_t *p_aout = p_owner->audio.aout;
+        vlc_aout_stream *p_astream = p_owner->audio.stream;
+        // no need to lock, the decoder and ModuleThread are dead
+        p_owner->audio.aout = NULL;
+        p_owner->audio.stream = NULL;
         if( p_aout )
         {
-            aout_DecDelete( p_aout );
+            assert( p_astream );
+            vlc_aout_stream_Delete( p_astream );
             input_resource_PutAout( p_owner->p_resource, p_aout );
         }
     }
 
-    if( LoadDecoder( p_dec, b_packetizer, &fmt_in ) )
+    decoder_Init(p_dec, &p_owner->dec_fmt_in, &fmt_in);
+    vlc_fifo_Unlock(p_owner->p_fifo);
+    if (LoadDecoder(p_dec, false, &p_owner->dec_fmt_in))
     {
-        p_dec->p_owner->error = true;
+        vlc_fifo_Lock(p_owner->p_fifo);
+        p_owner->error = true;
         es_format_Clean( &fmt_in );
         return VLC_EGENERIC;
     }
+    vlc_fifo_Lock(p_owner->p_fifo);
     es_format_Clean( &fmt_in );
     return VLC_SUCCESS;
 }
 
-static void DecoderUpdateFormatLocked( decoder_t *p_dec )
+static void DecoderUpdateFormatLocked( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    decoder_t *p_dec = &p_owner->dec;
 
-    vlc_assert_locked( &p_owner->lock );
+    vlc_fifo_Assert(p_owner->p_fifo);
 
     es_format_Clean( &p_owner->fmt );
     es_format_Copy( &p_owner->fmt, &p_dec->fmt_out );
+
+    assert( p_owner->fmt.i_cat == p_dec->fmt_in->i_cat );
+    assert( p_owner->cat == p_dec->fmt_in->i_cat );
 
     /* Move p_description */
     if( p_dec->p_description != NULL )
@@ -273,72 +609,57 @@ static void DecoderUpdateFormatLocked( decoder_t *p_dec )
     p_owner->b_fmt_description = true;
 }
 
+static void MouseEvent( const vlc_mouse_t *newmouse, void *user_data )
+{
+    decoder_t *dec = user_data;
+    vlc_input_decoder_t *owner = dec_get_owner( dec );
+    assert( owner->cat == VIDEO_ES );
+
+    vlc_mutex_lock( &owner->video.mouse_lock );
+    if( owner->video.mouse_event )
+        owner->video.mouse_event( newmouse, owner->video.mouse_opaque);
+    vlc_mutex_unlock( &owner->video.mouse_lock );
+}
+
 /*****************************************************************************
  * Buffers allocation callbacks for the decoders
  *****************************************************************************/
-static vout_thread_t *aout_request_vout( void *p_private,
-                                         vout_thread_t *p_vout,
-                                         const video_format_t *p_fmt, bool b_recyle )
+static int ModuleThread_UpdateAudioFormat( decoder_t *p_dec )
 {
-    decoder_t *p_dec = p_private;
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    input_thread_t *p_input = p_owner->p_input;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == AUDIO_ES );
 
-    p_vout = input_resource_RequestVout( p_owner->p_resource, p_vout, p_fmt, 1,
-                                         b_recyle );
-    if( p_input != NULL )
-        input_SendEventVout( p_input );
-
-    return p_vout;
-}
-
-static bool aout_replaygain_changed( const audio_replay_gain_t *a,
-                                     const audio_replay_gain_t *b )
-{
-    for( size_t i=0; i<AUDIO_REPLAY_GAIN_MAX; i++ )
-    {
-        if( a->pb_gain[i] != b->pb_gain[i] ||
-            a->pb_peak[i] != b->pb_peak[i] ||
-            a->pb_gain[i] != b->pb_gain[i] ||
-            a->pb_peak[i] != b->pb_peak[i] )
-            return true;
-    }
-    return false;
-}
-
-static int aout_update_format( decoder_t *p_dec )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    if( p_owner->p_aout &&
+    if( p_owner->audio.aout &&
        ( !AOUT_FMTS_IDENTICAL(&p_dec->fmt_out.audio, &p_owner->fmt.audio) ||
          p_dec->fmt_out.i_codec != p_dec->fmt_out.audio.i_format ||
          p_dec->fmt_out.i_profile != p_owner->fmt.i_profile ) )
     {
-        audio_output_t *p_aout = p_owner->p_aout;
+        audio_output_t *p_aout = p_owner->audio.aout;
+        vlc_aout_stream *p_astream = p_owner->audio.stream;
 
         /* Parameters changed, restart the aout */
-        vlc_mutex_lock( &p_owner->lock );
-        p_owner->p_aout = NULL;
-        vlc_mutex_unlock( &p_owner->lock );
-        aout_DecDelete( p_aout );
+        vlc_fifo_Lock(p_owner->p_fifo);
+        p_owner->audio.stream = NULL;
+        p_owner->audio.aout = NULL; // the DecoderThread should not use the old aout anymore
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        vlc_aout_stream_Delete( p_astream );
 
         input_resource_PutAout( p_owner->p_resource, p_aout );
     }
 
     /* Check if only replay gain has changed */
-    if( aout_replaygain_changed( &p_dec->fmt_in.audio_replay_gain,
-                                 &p_owner->fmt.audio_replay_gain ) )
+    if( replay_gain_Compare( &p_dec->fmt_in->audio_replay_gain,
+                             &p_owner->fmt.audio_replay_gain ) )
     {
-        p_dec->fmt_out.audio_replay_gain = p_dec->fmt_in.audio_replay_gain;
-        if( p_owner->p_aout )
+        p_dec->fmt_out.audio_replay_gain = p_dec->fmt_in->audio_replay_gain;
+        if( p_owner->audio.aout )
         {
-            p_owner->fmt.audio_replay_gain = p_dec->fmt_in.audio_replay_gain;
-            var_TriggerCallback( p_owner->p_aout, "audio-replay-gain-mode" );
+            p_owner->fmt.audio_replay_gain = p_dec->fmt_in->audio_replay_gain;
+            var_TriggerCallback( p_owner->audio.aout, "audio-replay-gain-mode" );
         }
     }
 
-    if( p_owner->p_aout == NULL )
+    if( p_owner->audio.aout == NULL )
     {
         p_dec->fmt_out.audio.i_format = p_dec->fmt_out.i_codec;
 
@@ -355,152 +676,96 @@ static int aout_update_format( decoder_t *p_dec )
                 format.i_chan_mode &= ~AOUT_CHANMODE_DOLBYSTEREO;
         }
 
-        aout_request_vout_t request_vout = {
-            .pf_request_vout = aout_request_vout,
-            .p_private = p_dec,
-        };
         audio_output_t *p_aout;
+        vlc_aout_stream *p_astream;
 
         p_aout = input_resource_GetAout( p_owner->p_resource );
         if( p_aout )
         {
-            /* TODO: 3.0 HACK: we need to put i_profile inside audio_format_t
-             * for 4.0 */
-            if( p_dec->fmt_out.i_codec == VLC_CODEC_DTS )
-                var_SetBool( p_aout, "dtshd", p_dec->fmt_out.i_profile > 0 );
-
-            if( aout_DecNew( p_aout, &format,
-                             &p_dec->fmt_out.audio_replay_gain,
-                             &request_vout ) )
+            const struct vlc_aout_stream_cfg cfg = {
+                .fmt = &format,
+                .profile = p_dec->fmt_out.i_profile,
+                .clock = p_owner->p_clock,
+                .str_id = p_owner->psz_id,
+                .replay_gain = &p_dec->fmt_out.audio_replay_gain,
+            };
+            p_astream = vlc_aout_stream_New( p_aout, &cfg );
+            if( p_astream == NULL )
             {
                 input_resource_PutAout( p_owner->p_resource, p_aout );
                 p_aout = NULL;
             }
         }
+        else
+            p_astream = NULL;
 
-        vlc_mutex_lock( &p_owner->lock );
-        p_owner->p_aout = p_aout;
+        vlc_fifo_Lock(p_owner->p_fifo);
+        p_owner->audio.aout = p_aout;
+        p_owner->audio.stream = p_astream;
+        p_owner->audio.drained = false;
 
-        DecoderUpdateFormatLocked( p_dec );
+        DecoderUpdateFormatLocked( p_owner );
         aout_FormatPrepare( &p_owner->fmt.audio );
-        vlc_mutex_unlock( &p_owner->lock );
-
-        if( p_owner->p_input != NULL )
-            input_SendEventAout( p_owner->p_input );
 
         if( p_aout == NULL )
         {
-            msg_Err( p_dec, "failed to create audio output" );
+            vlc_fifo_Unlock(p_owner->p_fifo);
             return -1;
         }
 
         p_dec->fmt_out.audio.i_bytes_per_frame =
             p_owner->fmt.audio.i_bytes_per_frame;
+        p_dec->fmt_out.audio.i_bitspersample =
+            p_owner->fmt.audio.i_bitspersample;
         p_dec->fmt_out.audio.i_frame_length =
             p_owner->fmt.audio.i_frame_length;
+
+        Decoder_ReapplyOutState( p_owner );
+        vlc_fifo_Unlock( p_owner->p_fifo );
     }
     return 0;
 }
 
-static int vout_update_format( decoder_t *p_dec )
+static int CreateVoutIfNeeded(vlc_input_decoder_t *);
+
+
+static int ModuleThread_UpdateVideoFormat( decoder_t *p_dec, vlc_video_context *vctx )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == VIDEO_ES );
 
-    if( p_owner->p_vout == NULL
-     || p_dec->fmt_out.video.i_width != p_owner->fmt.video.i_width
-     || p_dec->fmt_out.video.i_height != p_owner->fmt.video.i_height
-     || p_dec->fmt_out.video.i_visible_width != p_owner->fmt.video.i_visible_width
-     || p_dec->fmt_out.video.i_visible_height != p_owner->fmt.video.i_visible_height
-     || p_dec->fmt_out.video.i_x_offset != p_owner->fmt.video.i_x_offset
-     || p_dec->fmt_out.video.i_y_offset != p_owner->fmt.video.i_y_offset
-     || p_dec->fmt_out.i_codec != p_owner->fmt.video.i_chroma
-     || (int64_t)p_dec->fmt_out.video.i_sar_num * p_owner->fmt.video.i_sar_den !=
-        (int64_t)p_dec->fmt_out.video.i_sar_den * p_owner->fmt.video.i_sar_num ||
-        p_dec->fmt_out.video.orientation != p_owner->fmt.video.orientation ||
-        p_dec->fmt_out.video.multiview_mode != p_owner->fmt.video.multiview_mode )
+    int created_vout = CreateVoutIfNeeded(p_owner);
+    if (created_vout == -1)
+        return -1; // error
+    if (created_vout == 0)
     {
-        vout_thread_t *p_vout;
+        // video context didn't change
+        if (p_owner->video.vctx == vctx)
+            return 0;
+    }
+    assert(p_owner->video.vout);
 
-        if( !p_dec->fmt_out.video.i_width ||
-            !p_dec->fmt_out.video.i_height ||
-            p_dec->fmt_out.video.i_width < p_dec->fmt_out.video.i_visible_width ||
-            p_dec->fmt_out.video.i_height < p_dec->fmt_out.video.i_visible_height )
-        {
-            /* Can't create a new vout without display size */
-            return -1;
-        }
+    if (p_owner->video.vctx)
+        vlc_video_context_Release(p_owner->video.vctx);
+    p_owner->video.vctx = vctx ? vlc_video_context_Hold(vctx) : NULL;
 
-        video_format_t fmt = p_dec->fmt_out.video;
-        fmt.i_chroma = p_dec->fmt_out.i_codec;
-
-        if( vlc_fourcc_IsYUV( fmt.i_chroma ) )
-        {
-            const vlc_chroma_description_t *dsc = vlc_fourcc_GetChromaDescription( fmt.i_chroma );
-            for( unsigned int i = 0; dsc && i < dsc->plane_count; i++ )
-            {
-                while( fmt.i_width % dsc->p[i].w.den )
-                    fmt.i_width++;
-                while( fmt.i_height % dsc->p[i].h.den )
-                    fmt.i_height++;
-            }
-        }
-
-        if( !fmt.i_visible_width || !fmt.i_visible_height )
-        {
-            if( p_dec->fmt_in.video.i_visible_width &&
-                p_dec->fmt_in.video.i_visible_height )
-            {
-                fmt.i_visible_width  = p_dec->fmt_in.video.i_visible_width;
-                fmt.i_visible_height = p_dec->fmt_in.video.i_visible_height;
-                fmt.i_x_offset       = p_dec->fmt_in.video.i_x_offset;
-                fmt.i_y_offset       = p_dec->fmt_in.video.i_y_offset;
-            }
-            else
-            {
-                fmt.i_visible_width  = fmt.i_width;
-                fmt.i_visible_height = fmt.i_height;
-                fmt.i_x_offset       = 0;
-                fmt.i_y_offset       = 0;
-            }
-        }
-
-        if( fmt.i_visible_height == 1088 &&
-            var_CreateGetBool( p_dec, "hdtv-fix" ) )
-        {
-            fmt.i_visible_height = 1080;
-            if( !(fmt.i_sar_num % 136))
-            {
-                fmt.i_sar_num *= 135;
-                fmt.i_sar_den *= 136;
-            }
-            msg_Warn( p_dec, "Fixing broken HDTV stream (display_height=1088)");
-        }
-
-        if( !fmt.i_sar_num || !fmt.i_sar_den )
-        {
-            fmt.i_sar_num = 1;
-            fmt.i_sar_den = 1;
-        }
-
-        vlc_ureduce( &fmt.i_sar_num, &fmt.i_sar_den,
-                     fmt.i_sar_num, fmt.i_sar_den, 50000 );
-
-        video_format_AdjustColorSpace( &fmt );
-
-        vlc_mutex_lock( &p_owner->lock );
-
-        p_vout = p_owner->p_vout;
-        p_owner->p_vout = NULL;
-        vlc_mutex_unlock( &p_owner->lock );
-
+    // configure the new vout
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if ( p_owner->video.out_pool == NULL )
+    {
         unsigned dpb_size;
-        switch( p_dec->fmt_in.i_codec )
+        switch( p_dec->fmt_in->i_codec )
         {
         case VLC_CODEC_HEVC:
         case VLC_CODEC_H264:
         case VLC_CODEC_DIRAC: /* FIXME valid ? */
+        case VLC_CODEC_VVC:
             dpb_size = 18;
             break;
+        case VLC_CODEC_AV1:
+            dpb_size = 8; /* NUM_REF_FRAMES from the AV1 spec */
+            break;
+        case VLC_CODEC_MP4V:
         case VLC_CODEC_VP5:
         case VLC_CODEC_VP6:
         case VLC_CODEC_VP6F:
@@ -511,55 +776,241 @@ static int vout_update_format( decoder_t *p_dec )
             dpb_size = 2;
             break;
         }
-        p_vout = input_resource_RequestVout( p_owner->p_resource,
-                                             p_vout, &fmt,
-                                             dpb_size +
-                                             p_dec->i_extra_picture_buffers + 1,
-                                             true );
-        vlc_mutex_lock( &p_owner->lock );
-        p_owner->p_vout = p_vout;
+        size_t pic_count = dpb_size + p_dec->i_extra_picture_buffers;
+        pic_count ++; /* Held by the vout */
+        pic_count ++; /* Held by previous-frame handling or filters */
+        picture_pool_t *pool = picture_pool_NewFromFormat( &p_dec->fmt_out.video,
+                                                           pic_count );
 
-        DecoderUpdateFormatLocked( p_dec );
-        p_owner->fmt.video.i_chroma = p_dec->fmt_out.i_codec;
-        vlc_mutex_unlock( &p_owner->lock );
-
-        if( p_owner->p_input != NULL )
-            input_SendEventVout( p_owner->p_input );
-        if( p_vout == NULL )
+        if( pool == NULL)
         {
-            msg_Err( p_dec, "failed to create video output" );
-            return -1;
+            msg_Err(p_dec, "Failed to create a pool of %d %4.4s pictures",
+                           dpb_size + p_dec->i_extra_picture_buffers + 1,
+                           (char*)&p_dec->fmt_out.video.i_chroma);
+            vlc_fifo_Unlock(p_owner->p_fifo);
+            goto error;
         }
+
+        p_owner->video.out_pool = pool;
     }
 
+    vout_configuration_t cfg = {
+        .vout = p_owner->video.vout, .clock = p_owner->p_clock,
+        .str_id = p_owner->psz_id,
+        .fmt = &p_dec->fmt_out.video,
+        .mouse_event = MouseEvent, .mouse_opaque = p_dec,
+    };
+    vlc_fifo_Unlock(p_owner->p_fifo);
+
+    enum input_resource_vout_state vout_state;
+    vout_thread_t *p_vout =
+        input_resource_RequestVout(p_owner->p_resource, vctx, &cfg, NULL,
+                                   &vout_state);
+    if (p_vout != NULL)
+    {
+        assert(vout_state == INPUT_RESOURCE_VOUT_NOTCHANGED ||
+               vout_state == INPUT_RESOURCE_VOUT_STARTED);
+
+        vlc_fifo_Lock(p_owner->p_fifo);
+        p_owner->video.started = true;
+
+        if (vout_state == INPUT_RESOURCE_VOUT_STARTED)
+        {
+            Decoder_ReapplyOutState( p_owner );
+            decoder_Notify(p_owner, on_vout_started, p_vout,
+                           p_owner->video.vout_order);
+        }
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        return 0;
+    }
+    else
+    {
+        assert(vout_state == INPUT_RESOURCE_VOUT_NOTCHANGED ||
+               vout_state == INPUT_RESOURCE_VOUT_STOPPED);
+
+        if (vout_state == INPUT_RESOURCE_VOUT_STOPPED)
+            decoder_Notify(p_owner, on_vout_stopped, cfg.vout);
+    }
+
+error:
+    /* Clean fmt and vctx to trigger a new vout creation on the next update
+     * call */
+    vlc_fifo_Lock(p_owner->p_fifo);
+    es_format_Clean( &p_owner->fmt );
+    vlc_fifo_Unlock(p_owner->p_fifo);
+
+    if (p_owner->video.vctx != NULL)
+    {
+        vlc_video_context_Release(p_owner->video.vctx);
+        p_owner->video.vctx = NULL;
+    }
+    return -1;
+}
+
+static int CreateVoutIfNeeded(vlc_input_decoder_t *p_owner)
+{
+    decoder_t *p_dec = &p_owner->dec;
+    assert( p_owner->cat == VIDEO_ES );
+    bool need_vout = false;
+    bool need_pool = false;
+
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if( p_owner->video.vout == NULL )
+    {
+        msg_Dbg(p_dec, "vout: none found");
+        need_vout = true;
+        need_pool = true;
+    }
+    if( p_dec->fmt_out.video.i_width != p_owner->fmt.video.i_width
+             || p_dec->fmt_out.video.i_height != p_owner->fmt.video.i_height )
+    {
+        msg_Dbg(p_dec, "vout change: decoder size");
+        need_vout = true;
+        need_pool = true;
+    }
+    if( p_dec->fmt_out.video.i_visible_width != p_owner->fmt.video.i_visible_width
+             || p_dec->fmt_out.video.i_visible_height != p_owner->fmt.video.i_visible_height
+             || p_dec->fmt_out.video.i_x_offset != p_owner->fmt.video.i_x_offset
+             || p_dec->fmt_out.video.i_y_offset != p_owner->fmt.video.i_y_offset )
+    {
+        msg_Dbg(p_dec, "vout change: visible size");
+        need_vout = true;
+        need_pool = true;
+    }
+    if( p_dec->fmt_out.i_codec != p_owner->fmt.video.i_chroma )
+    {
+        msg_Dbg(p_dec, "vout change: chroma");
+        need_vout = true;
+        need_pool = true;
+    }
+    if( (int64_t)p_dec->fmt_out.video.i_sar_num * p_owner->fmt.video.i_sar_den !=
+             (int64_t)p_dec->fmt_out.video.i_sar_den * p_owner->fmt.video.i_sar_num )
+    {
+        msg_Dbg(p_dec, "vout change: SAR");
+        need_vout = true;
+        need_pool = true;
+    }
+    if( p_dec->fmt_out.video.orientation != p_owner->fmt.video.orientation )
+    {
+        msg_Dbg(p_dec, "vout change: orientation");
+        need_vout = true;
+        need_pool = true;
+    }
+    if( p_dec->fmt_out.video.multiview_mode != p_owner->fmt.video.multiview_mode )
+    {
+        msg_Dbg(p_dec, "vout change: multiview");
+        need_vout = true;
+        // no need for a new pool if only this field changed
+    }
+
+    if( !need_vout && !need_pool )
+    {
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        return 0; // vout unchanged
+    }
+
+    vout_thread_t *p_vout = p_owner->video.vout;
+    p_owner->video.vout = NULL; // the DecoderThread should not use the old vout anymore
+    p_owner->video.started = false;
+    vlc_fifo_Unlock( p_owner->p_fifo );
+
+    enum vlc_vout_order order;
+    const vout_configuration_t cfg = { .vout = p_vout, .fmt = NULL };
+    p_vout = input_resource_RequestVout( p_owner->p_resource, NULL, &cfg, &order, NULL );
+
+    vlc_fifo_Lock( p_owner->p_fifo );
+    p_owner->video.vout = p_vout;
+    p_owner->video.vout_order = order;
+
+    DecoderUpdateFormatLocked( p_owner );
+    p_owner->fmt.video.i_chroma = p_dec->fmt_out.i_codec;
+    picture_pool_t *pool = NULL;
+    if ( need_pool )
+    {
+        pool = p_owner->video.out_pool;
+        p_owner->video.out_pool = NULL;
+    }
+    vlc_fifo_Unlock( p_owner->p_fifo );
+
+     if ( pool != NULL )
+         picture_pool_Release( pool );
+
+    if( p_vout == NULL )
+    {
+        msg_Err( p_dec, "failed to create video output" );
+        return -1;
+    }
+
+    return 1; // new vout was created
+}
+
+static vlc_decoder_device * ModuleThread_GetDecoderDevice( decoder_t *p_dec )
+{
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == VIDEO_ES );
+
+    /* Requesting a decoder device will automatically enable hw decoding */
+    if (!p_owner->hw_dec)
+        return NULL;
+
+    int created_vout = CreateVoutIfNeeded(p_owner);
+    if (created_vout == -1)
+        return NULL;  // error
+
+    assert(p_owner->video.vout);
+    vlc_decoder_device *dec_device = vout_GetDevice(p_owner->video.vout);
+    if (created_vout == 1)
+        return dec_device; // new vout was created with a decoder device
+
+    bool need_format_update = false;
     if ( memcmp( &p_dec->fmt_out.video.mastering,
                  &p_owner->fmt.video.mastering,
-                 sizeof(p_owner->fmt.video.mastering)) ||
-         p_dec->fmt_out.video.lighting.MaxCLL !=
+                 sizeof(p_owner->fmt.video.mastering)) )
+    {
+        msg_Dbg(p_dec, "vout update: mastering data");
+        need_format_update = true;
+    }
+    if ( p_dec->fmt_out.video.lighting.MaxCLL !=
          p_owner->fmt.video.lighting.MaxCLL ||
          p_dec->fmt_out.video.lighting.MaxFALL !=
-         p_owner->fmt.video.lighting.MaxFALL)
+         p_owner->fmt.video.lighting.MaxFALL )
+    {
+        msg_Dbg(p_dec, "vout update: lighting data");
+        need_format_update = true;
+    }
+
+    if ( need_format_update )
     {
         /* the format has changed but we don't need a new vout */
-        vlc_mutex_lock( &p_owner->lock );
-        DecoderUpdateFormatLocked( p_dec );
-        vlc_mutex_unlock( &p_owner->lock );
+        vlc_fifo_Lock(p_owner->p_fifo);
+        DecoderUpdateFormatLocked( p_owner );
+        vlc_fifo_Unlock(p_owner->p_fifo);
     }
-    return 0;
+    return dec_device;
 }
 
-static picture_t *vout_new_buffer( decoder_t *p_dec )
+static picture_t *ModuleThread_NewVideoBuffer( decoder_t *p_dec )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    assert( p_owner->p_vout );
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == VIDEO_ES );
+    assert( p_owner->video.vout );
+    assert( p_owner->video.out_pool );
 
-    return vout_GetPicture( p_owner->p_vout );
+    picture_t *pic = picture_pool_Wait( p_owner->video.out_pool );
+
+    if (pic)
+    {
+        picture_Reset( pic );
+        pic->format.multiview_mode = p_dec->fmt_out.video.multiview_mode;
+    }
+    return pic;
 }
 
-static subpicture_t *spu_new_buffer( decoder_t *p_dec,
+static subpicture_t *ModuleThread_NewSpuBuffer( decoder_t *p_dec,
                                      const subpicture_updater_t *p_updater )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == SPU_ES );
     vout_thread_t *p_vout = NULL;
     subpicture_t *p_subpic;
     int i_attempts = 30;
@@ -573,324 +1024,314 @@ static subpicture_t *spu_new_buffer( decoder_t *p_dec,
         if( p_vout )
             break;
 
-        msleep( DECODER_SPU_VOUT_WAIT_DURATION );
+        vlc_tick_sleep( DECODER_SPU_VOUT_WAIT_DURATION );
     }
 
     if( !p_vout )
     {
         msg_Warn( p_dec, "no vout found, dropping subpicture" );
+        if( p_owner->spu.vout )
+        {
+            vlc_fifo_Lock( p_owner->p_fifo );
+            assert(p_owner->spu.channel != VOUT_SPU_CHANNEL_INVALID);
+            decoder_Notify(p_owner, on_vout_stopped, p_owner->spu.vout);
+
+            vout_UnregisterSubpictureChannel(p_owner->spu.vout,
+                                             p_owner->spu.channel);
+            p_owner->spu.channel = VOUT_SPU_CHANNEL_INVALID;
+
+            vout_Release(p_owner->spu.vout);
+            p_owner->spu.vout = NULL; // the DecoderThread should not use the old vout anymore
+            vlc_fifo_Unlock( p_owner->p_fifo );
+        }
         return NULL;
     }
 
-    if( p_owner->p_spu_vout != p_vout )
+    if( p_owner->spu.vout != p_vout )
     {
-        p_owner->i_spu_channel = vout_RegisterSubpictureChannel( p_vout );
-        p_owner->i_spu_order = 0;
-        p_owner->p_spu_vout = p_vout;
+        vlc_fifo_Lock(p_owner->p_fifo);
+
+        if (p_owner->spu.vout) /* notify the previous vout deletion unlocked */
+            decoder_Notify(p_owner, on_vout_stopped, p_owner->spu.vout);
+
+        if (p_owner->spu.vout)
+        {
+            /* Unregister the SPU channel of the previous vout */
+            assert(p_owner->spu.channel != VOUT_SPU_CHANNEL_INVALID);
+            vout_UnregisterSubpictureChannel(p_owner->spu.vout,
+                                             p_owner->spu.channel);
+            vout_Release(p_owner->spu.vout);
+            p_owner->spu.vout = NULL; // the DecoderThread should not use the old vout anymore
+        }
+
+        enum vlc_vout_order channel_order;
+        p_owner->spu.channel =
+            vout_RegisterSubpictureChannelInternal(p_vout, p_owner->p_clock,
+                                                   &channel_order);
+        p_owner->spu.order = 0;
+
+        if (p_owner->spu.channel == VOUT_SPU_CHANNEL_INVALID)
+        {
+            /* The new vout doesn't support SPU, aborting... */
+            vlc_fifo_Unlock(p_owner->p_fifo);
+            vout_Release(p_vout);
+            return NULL;
+        }
+
+        p_owner->spu.vout = p_vout;
+        Decoder_ReapplyOutState(p_owner);
+
+        assert(channel_order != VLC_VOUT_ORDER_NONE);
+        decoder_Notify(p_owner, on_vout_started, p_vout, channel_order);
+        vlc_fifo_Unlock(p_owner->p_fifo);
     }
+    else
+        vout_Release(p_vout);
 
     p_subpic = subpicture_New( p_updater );
     if( p_subpic )
     {
-        p_subpic->i_channel = p_owner->i_spu_channel;
-        p_subpic->i_order = p_owner->i_spu_order++;
-        p_subpic->b_subtitle = true;
+        p_subpic->i_channel = p_owner->spu.channel;
+        p_subpic->i_order = p_owner->spu.order++;
     }
-
-    vlc_object_release( p_vout );
 
     return p_subpic;
 }
 
-static int DecoderGetInputAttachments( decoder_t *p_dec,
+static int InputThread_GetInputAttachments( decoder_t *p_dec,
                                        input_attachment_t ***ppp_attachment,
                                        int *pi_attachment )
 {
-    input_thread_t *p_input = p_dec->p_owner->p_input;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    if (!p_owner->cbs || !p_owner->cbs->get_attachments)
+        return VLC_EINVAL;
 
-    if( unlikely(p_input == NULL) )
-        return VLC_ENOOBJ;
-    return input_Control( p_input, INPUT_GET_ATTACHMENTS,
-                          ppp_attachment, pi_attachment );
+    int ret = p_owner->cbs->get_attachments(p_owner, ppp_attachment,
+                                            p_owner->cbs_userdata);
+    if (ret < 0)
+        return VLC_EGENERIC;
+    *pi_attachment = ret;
+    return VLC_SUCCESS;
 }
 
-static mtime_t DecoderGetDisplayDate( decoder_t *p_dec, mtime_t i_ts )
+static vlc_tick_t ModuleThread_GetDisplayDate( decoder_t *p_dec,
+                                       vlc_tick_t system_now, vlc_tick_t i_ts )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
 
-    vlc_mutex_lock( &p_owner->lock );
-    if( p_owner->b_waiting )
-        i_ts = VLC_TS_INVALID;
-    vlc_mutex_unlock( &p_owner->lock );
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if( p_owner->b_waiting || p_owner->paused )
+        i_ts = VLC_TICK_INVALID;
+    float rate = p_owner->output_rate;
+    vlc_fifo_Unlock(p_owner->p_fifo);
 
-    if( !p_owner->p_clock || i_ts <= VLC_TS_INVALID )
+    if( !p_owner->p_clock || i_ts == VLC_TICK_INVALID )
         return i_ts;
 
-    if( input_clock_ConvertTS( VLC_OBJECT(p_dec), p_owner->p_clock, NULL, &i_ts, NULL, INT64_MAX ) ) {
-        msg_Err(p_dec, "Could not get display date for timestamp %"PRId64"", i_ts);
-        return VLC_TS_INVALID;
-    }
-
-    return i_ts;
+    vlc_clock_Lock( p_owner->p_clock );
+    vlc_tick_t conv_ts =
+        vlc_clock_ConvertToSystem( p_owner->p_clock, system_now, i_ts, rate, NULL );
+    vlc_clock_Unlock( p_owner->p_clock );
+    return conv_ts;
 }
 
-static int DecoderGetDisplayRate( decoder_t *p_dec )
+static float ModuleThread_GetDisplayRate( decoder_t *p_dec )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
 
     if( !p_owner->p_clock )
-        return INPUT_RATE_DEFAULT;
-    return input_clock_GetRate( p_owner->p_clock );
+        return 1.f;
+    vlc_fifo_Lock(p_owner->p_fifo);
+    float rate = p_owner->output_rate;
+    vlc_fifo_Unlock(p_owner->p_fifo);
+    return rate;
 }
 
 /*****************************************************************************
  * Public functions
  *****************************************************************************/
-block_t *decoder_NewAudioBuffer( decoder_t *dec, int samples )
+vlc_frame_t *decoder_NewAudioBuffer( decoder_t *dec, int samples )
 {
     assert( dec->fmt_out.audio.i_frame_length > 0
          && dec->fmt_out.audio.i_bytes_per_frame  > 0 );
 
     size_t length = samples * dec->fmt_out.audio.i_bytes_per_frame
                             / dec->fmt_out.audio.i_frame_length;
-    block_t *block = block_Alloc( length );
-    if( likely(block != NULL) )
+    vlc_frame_t *frame = block_Alloc( length );
+    if( likely(frame != NULL) )
     {
-        block->i_nb_samples = samples;
-        block->i_pts = block->i_length = 0;
+        frame->i_nb_samples = samples;
+        frame->i_pts = frame->i_length = 0;
     }
-    return block;
+    return frame;
 }
 
-subpicture_t *decoder_NewSubpicture( decoder_t *p_decoder,
-                                     const subpicture_updater_t *p_dyn )
+static void RequestReload( vlc_input_decoder_t *p_owner )
 {
-    subpicture_t *p_subpicture = p_decoder->pf_spu_buffer_new( p_decoder, p_dyn );
-    if( !p_subpicture )
-        msg_Warn( p_decoder, "can't get output subpicture" );
-    return p_subpicture;
-}
-
-static void RequestReload( decoder_t * p_dec )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
     /* Don't override reload if it's RELOAD_DECODER_AOUT */
     int expected = RELOAD_NO_REQUEST;
     atomic_compare_exchange_strong( &p_owner->reload, &expected, RELOAD_DECODER );
 }
 
-/* decoder_GetInputAttachments:
- */
-int decoder_GetInputAttachments( decoder_t *p_dec,
-                                 input_attachment_t ***ppp_attachment,
-                                 int *pi_attachment )
+static int DecoderWaitUnblock(vlc_input_decoder_t *p_owner, vlc_tick_t date)
 {
-    if( !p_dec->pf_get_attachments )
-        return VLC_EGENERIC;
-
-    return p_dec->pf_get_attachments( p_dec, ppp_attachment, pi_attachment );
-}
-/* decoder_GetDisplayDate:
- */
-mtime_t decoder_GetDisplayDate( decoder_t *p_dec, mtime_t i_ts )
-{
-    if( !p_dec->pf_get_display_date )
-        return VLC_TS_INVALID;
-
-    return p_dec->pf_get_display_date( p_dec, i_ts );
-}
-/* decoder_GetDisplayRate:
- */
-int decoder_GetDisplayRate( decoder_t *p_dec )
-{
-    if( !p_dec->pf_get_display_rate )
-        return INPUT_RATE_DEFAULT;
-
-    return p_dec->pf_get_display_rate( p_dec );
-}
-
-void decoder_AbortPictures( decoder_t *p_dec, bool b_abort )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    vlc_mutex_lock( &p_owner->lock );
-    if( p_owner->p_vout != NULL )
-        vout_Cancel( p_owner->p_vout, b_abort );
-    vlc_mutex_unlock( &p_owner->lock );
-}
-
-static void DecoderWaitUnblock( decoder_t *p_dec )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    vlc_assert_locked( &p_owner->lock );
-
-    for( ;; )
-    {
-        if( !p_owner->b_waiting || !p_owner->b_has_data )
-            break;
-        vlc_cond_wait( &p_owner->wait_request, &p_owner->lock );
-    }
-}
-
-/* DecoderTimedWait: Interruptible wait
- * Returns VLC_SUCCESS if wait was not interrupted, and VLC_EGENERIC otherwise */
-static int DecoderTimedWait( decoder_t *p_dec, mtime_t deadline )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    if (deadline - mdate() <= 0)
-        return VLC_SUCCESS;
-
-    vlc_fifo_Lock( p_owner->p_fifo );
-    while( !p_owner->flushing
-        && vlc_fifo_TimedWaitCond( p_owner->p_fifo, &p_owner->wait_timed,
-                                   deadline ) == 0 );
-    int ret = p_owner->flushing ? VLC_EGENERIC : VLC_SUCCESS;
-    vlc_fifo_Unlock( p_owner->p_fifo );
-    return ret;
-}
-
-static inline void DecoderUpdatePreroll( int64_t *pi_preroll, const block_t *p )
-{
-    if( p->i_flags & BLOCK_FLAG_PREROLL )
-        *pi_preroll = INT64_MAX;
-    /* Check if we can use the packet for end of preroll */
-    else if( (p->i_flags & BLOCK_FLAG_DISCONTINUITY) &&
-             (p->i_buffer == 0 || (p->i_flags & BLOCK_FLAG_CORRUPTED)) )
-        *pi_preroll = INT64_MAX;
-    else if( p->i_dts > VLC_TS_INVALID )
-        *pi_preroll = __MIN( *pi_preroll, p->i_dts );
-    else if( p->i_pts > VLC_TS_INVALID )
-        *pi_preroll = __MIN( *pi_preroll, p->i_pts );
-}
-
-static void DecoderFixTs( decoder_t *p_dec, mtime_t *pi_ts0, mtime_t *pi_ts1,
-                          mtime_t *pi_duration, int *pi_rate, mtime_t i_ts_bound )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    input_clock_t   *p_clock = p_owner->p_clock;
-
-    vlc_assert_locked( &p_owner->lock );
-
-    const mtime_t i_es_delay = p_owner->i_ts_delay;
-
-    if( !p_clock )
-        return;
-
-    const bool b_ephemere = pi_ts1 && *pi_ts0 == *pi_ts1;
-    int i_rate;
-
-    if( *pi_ts0 > VLC_TS_INVALID )
-    {
-        *pi_ts0 += i_es_delay;
-        if( pi_ts1 && *pi_ts1 > VLC_TS_INVALID )
-            *pi_ts1 += i_es_delay;
-        if( i_ts_bound != INT64_MAX )
-            i_ts_bound += i_es_delay;
-        if( input_clock_ConvertTS( VLC_OBJECT(p_dec), p_clock, &i_rate, pi_ts0, pi_ts1, i_ts_bound ) ) {
-            const char *psz_name = module_get_name( p_dec->p_module, false );
-            if( pi_ts1 != NULL )
-                msg_Err(p_dec, "Could not convert timestamps %"PRId64
-                        ", %"PRId64" for %s", *pi_ts0, *pi_ts1, psz_name );
-            else
-                msg_Err(p_dec, "Could not convert timestamp %"PRId64" for %s", *pi_ts0, psz_name );
-            *pi_ts0 = VLC_TS_INVALID;
-        }
-    }
-    else
-    {
-        i_rate = input_clock_GetRate( p_clock );
-    }
-
-    /* Do not create ephemere data because of rounding errors */
-    if( !b_ephemere && pi_ts1 && *pi_ts0 == *pi_ts1 )
-        *pi_ts1 += 1;
-
-    if( pi_duration )
-        *pi_duration = ( *pi_duration * i_rate + INPUT_RATE_DEFAULT-1 )
-            / INPUT_RATE_DEFAULT;
-
-    if( pi_rate )
-        *pi_rate = i_rate;
-}
-
-#ifdef ENABLE_SOUT
-static int DecoderPlaySout( decoder_t *p_dec, block_t *p_sout_block )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    assert( p_owner->p_clock );
-    assert( !p_sout_block->p_next );
-
-    vlc_mutex_lock( &p_owner->lock );
+    struct vlc_tracer *tracer = vlc_object_get_tracer(VLC_OBJECT(&p_owner->dec));
+    vlc_fifo_Assert(p_owner->p_fifo);
 
     if( p_owner->b_waiting )
     {
+        if (tracer != NULL)
+            vlc_tracer_TraceEvent(tracer, "DEC", p_owner->psz_id, "start wait");
         p_owner->b_has_data = true;
         vlc_cond_signal( &p_owner->wait_acknowledge );
     }
 
-    DecoderWaitUnblock( p_dec );
-    DecoderFixTs( p_dec, &p_sout_block->i_dts, &p_sout_block->i_pts,
-                  &p_sout_block->i_length, NULL, INT64_MAX );
+    while (p_owner->b_waiting && p_owner->b_has_data && !p_owner->flushing)
+        vlc_fifo_WaitCond(p_owner->p_fifo, &p_owner->wait_request);
 
-    vlc_mutex_unlock( &p_owner->lock );
+    if (!p_owner->out_started)
+    {
+        p_owner->out_started = true;
+        if (tracer != NULL)
+            vlc_tracer_TraceEvent(tracer, "DEC", p_owner->psz_id, "stop wait");
 
-    /* FIXME --VLC_TS_INVALID inspect stream_output*/
-    return sout_InputSendBuffer( p_owner->p_sout_input, p_sout_block );
+        vlc_clock_Lock(p_owner->p_clock);
+        vlc_clock_Start(p_owner->p_clock, vlc_tick_now(), date);
+        vlc_clock_Unlock(p_owner->p_clock);
+    }
+
+    if (p_owner->flushing)
+    {
+        p_owner->b_has_data = false;
+        vlc_cond_signal(&p_owner->wait_acknowledge);
+        return VLC_ENOENT;
+    }
+
+    return VLC_SUCCESS;
 }
 
-/* This function process a block for sout
- */
-static void DecoderProcessSout( decoder_t *p_dec, block_t *p_block )
+static inline void DecoderUpdatePreroll( vlc_tick_t *pi_preroll, const vlc_frame_t *p )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    block_t *p_sout_block;
-    block_t **pp_block = p_block ? &p_block : NULL;
+    if( p->i_flags & BLOCK_FLAG_PREROLL )
+        *pi_preroll = PREROLL_FORCED;
+    /* Check if we can use the packet for end of preroll */
+    else if( (p->i_flags & BLOCK_FLAG_DISCONTINUITY) &&
+             (p->i_buffer == 0 || (p->i_flags & BLOCK_FLAG_CORRUPTED)) )
+        *pi_preroll = PREROLL_FORCED;
+    else if( p->i_dts != VLC_TICK_INVALID )
+        *pi_preroll = __MIN( *pi_preroll, p->i_dts );
+    else if( p->i_pts != VLC_TICK_INVALID )
+        *pi_preroll = __MIN( *pi_preroll, p->i_pts );
+}
 
-    while( ( p_sout_block =
-                 p_dec->pf_packetize( p_dec, pp_block ) ) )
+static void DecoderSendSubstream(vlc_input_decoder_t *p_owner)
+{
+    decoder_t *p_dec = &p_owner->dec;
+    if (p_dec->pf_get_cc == NULL)
+        return;
+
+    bool b_wants_substreams;
+    int ret = sout_StreamControl(p_owner->p_sout,
+                                 SOUT_STREAM_WANTS_SUBSTREAMS,
+                                 &b_wants_substreams);
+
+    if (ret != VLC_SUCCESS || !b_wants_substreams)
+        return;
+
+    if (p_owner->cc.p_sout_input == NULL && p_owner->cc.b_sout_created)
+        return;
+
+    decoder_cc_desc_t desc;
+    vlc_frame_t *p_cc = p_dec->pf_get_cc( p_dec, &desc );
+    if (p_cc == NULL)
+        return;
+
+    if (!p_owner->cc.b_sout_created)
+    {
+        es_format_t ccfmt;
+        es_format_Init(&ccfmt, SPU_ES, VLC_CODEC_CEA608);
+        ccfmt.i_group = p_owner->fmt.i_group;
+        ccfmt.subs.cc.i_reorder_depth = desc.i_reorder_depth;
+
+        /* Create only one es ID since we simply send the CC whole side data
+         * un-decoded to the stream output.
+         * Specifying the owner's ID is important for the uniqueness for the ID.
+         */
+        if (asprintf(&p_owner->cc.sout_es_id, "%s/cc", p_owner->psz_id) == -1)
+        {
+            es_format_Clean(&ccfmt);
+            block_Release(p_cc);
+            return;
+        }
+
+        p_owner->cc.p_sout_input =
+            sout_InputNew(p_owner->p_sout, &ccfmt, p_owner->cc.sout_es_id);
+
+        es_format_Clean(&ccfmt);
+        p_owner->cc.b_sout_created = true;
+    }
+
+    if (!p_owner->cc.p_sout_input ||
+        sout_InputSendBuffer(p_owner->p_sout, p_owner->cc.p_sout_input, p_cc))
+    {
+        block_Release(p_cc);
+    }
+}
+
+/* This function process a frame for sout
+ */
+static void DecoderThread_ProcessSout( vlc_input_decoder_t *p_owner, vlc_frame_t *frame )
+{
+    decoder_t *p_dec = &p_owner->dec;
+    vlc_frame_t *sout_frame;
+    vlc_frame_t **ppframe = frame ? &frame : NULL;
+
+    while( ( sout_frame =
+                 p_dec->pf_packetize( p_dec, ppframe ) ) )
     {
         if( p_owner->p_sout_input == NULL )
         {
-            vlc_mutex_lock( &p_owner->lock );
-            DecoderUpdateFormatLocked( p_dec );
+            vlc_fifo_Lock(p_owner->p_fifo);
+            DecoderUpdateFormatLocked( p_owner );
 
-            p_owner->fmt.i_group = p_dec->fmt_in.i_group;
-            p_owner->fmt.i_id = p_dec->fmt_in.i_id;
-            if( p_dec->fmt_in.psz_language )
+            p_owner->fmt.i_group = p_dec->fmt_in->i_group;
+            p_owner->fmt.i_id = p_dec->fmt_in->i_id;
+            if( p_dec->fmt_in->psz_language )
             {
                 free( p_owner->fmt.psz_language );
                 p_owner->fmt.psz_language =
-                    strdup( p_dec->fmt_in.psz_language );
+                    strdup( p_dec->fmt_in->psz_language );
             }
-            vlc_mutex_unlock( &p_owner->lock );
+            vlc_fifo_Unlock(p_owner->p_fifo);
 
             p_owner->p_sout_input =
-                sout_InputNew( p_owner->p_sout, &p_owner->fmt );
+                sout_InputNew( p_owner->p_sout, &p_owner->fmt, p_owner->psz_id );
 
             if( p_owner->p_sout_input == NULL )
             {
-                msg_Err( p_dec, "cannot create packetizer output (%4.4s)",
+                msg_Err( p_dec, "cannot create packetized sout output (%4.4s)",
                          (char *)&p_owner->fmt.i_codec );
                 p_owner->error = true;
 
-                if(p_block)
-                    block_Release(p_block);
+                if(frame)
+                    block_Release(frame);
 
-                block_ChainRelease(p_sout_block);
+                block_ChainRelease(sout_frame);
                 break;
             }
         }
 
-        while( p_sout_block )
+        while( sout_frame )
         {
-            block_t *p_next = p_sout_block->p_next;
+            vlc_frame_t *p_next = sout_frame->p_next;
 
-            p_sout_block->p_next = NULL;
+            sout_frame->p_next = NULL;
 
-            if( DecoderPlaySout( p_dec, p_sout_block ) == VLC_EGENERIC )
+            DecoderSendSubstream( p_owner );
+
+            /* FIXME --VLC_TICK_INVALID inspect stream_output*/
+            if ( sout_InputSendBuffer( p_owner->p_sout, p_owner->p_sout_input, sout_frame ) ==
+                 VLC_EGENERIC )
             {
                 msg_Err( p_dec, "cannot continue streaming due to errors with codec %4.4s",
                                 (char *)&p_owner->fmt.i_codec );
@@ -899,63 +1340,104 @@ static void DecoderProcessSout( decoder_t *p_dec, block_t *p_block )
 
                 /* Cleanup */
 
-                if( p_block )
-                    block_Release( p_block );
+                if( frame )
+                    block_Release( frame );
 
                 block_ChainRelease( p_next );
                 return;
             }
 
-            p_sout_block = p_next;
+            sout_frame = p_next;
         }
     }
 }
-#endif
 
-static void DecoderPlayCc( decoder_t *p_dec, block_t *p_cc,
-                           const decoder_cc_desc_t *p_desc )
+static void GetCcChannels(vlc_input_decoder_t *owner, size_t *max_channels,
+                          uint64_t *bitmap)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    vlc_mutex_lock( &p_owner->lock );
-
-    p_owner->cc.desc = *p_desc;
-
-    /* Fanout data to all decoders. We do not know if es_out
-       selected 608 or 708. */
-    uint64_t i_bitmap = p_owner->cc.desc.i_608_channels |
-                        p_owner->cc.desc.i_708_channels;
-
-    for( int i=0; i_bitmap > 0; i_bitmap >>= 1, i++ )
+    switch (owner->cc.selected_codec)
     {
-        decoder_t *p_ccdec = p_owner->cc.pp_decoder[i];
-        if( !p_ccdec )
+        case VLC_CODEC_CEA608:
+            if (max_channels != NULL)
+                *max_channels = 4;
+            if (bitmap != NULL)
+                *bitmap = owner->cc.desc.i_608_channels;
+            break;
+        case VLC_CODEC_CEA708:
+            if (max_channels != NULL)
+                *max_channels = 64;
+            if (bitmap != NULL)
+                *bitmap = owner->cc.desc.i_708_channels;
+            break;
+        default: vlc_assert_unreachable();
+    }
+}
+
+static bool SubDecoderIsCc(vlc_input_decoder_t *subdec)
+{
+    return subdec->cat == SPU_ES &&
+            (subdec->dec.fmt_in->i_codec == VLC_CODEC_CEA608 ||
+             subdec->dec.fmt_in->i_codec == VLC_CODEC_CEA708);
+}
+
+/* */
+static void DecoderPlayCcLocked( vlc_input_decoder_t *p_owner, vlc_frame_t *p_cc,
+                                 const decoder_cc_desc_t *p_desc )
+{
+    vlc_fifo_Assert(p_owner->p_fifo);
+    if (p_owner->flushing || p_owner->aborting)
+    {
+        vlc_frame_Release(p_cc);
+        return;
+    }
+
+    vlc_mutex_lock(&p_owner->subdecs.lock);
+    if (p_owner->cc.desc.i_608_channels != p_desc->i_608_channels ||
+        p_owner->cc.desc.i_708_channels != p_desc->i_708_channels ||
+        p_owner->cc.desc.i_reorder_depth != p_desc->i_reorder_depth)
+    {
+        p_owner->cc.desc = *p_desc;
+        p_owner->cc.desc_changed = true;
+    }
+
+    if (p_owner->cc.count == 0)
+        goto end;
+
+    size_t cc_idx = 0;
+    vlc_input_decoder_t *it;
+
+    vlc_list_foreach(it, &p_owner->subdecs.list, node)
+    {
+        if (!SubDecoderIsCc(it))
             continue;
 
-        if( i_bitmap > 1 )
+        if (++cc_idx == p_owner->cc.count)
         {
-            block_FifoPut( p_ccdec->p_owner->p_fifo, block_Duplicate(p_cc) );
+            block_FifoPut(it->p_fifo, p_cc);
+            p_cc = NULL;
         }
         else
         {
-            block_FifoPut( p_ccdec->p_owner->p_fifo, p_cc );
-            p_cc = NULL; /* was last dec */
+            block_t *dup = block_Duplicate(p_cc);
+            if (dup == NULL)
+                break;
+            block_FifoPut(it->p_fifo, dup);
         }
     }
 
-    vlc_mutex_unlock( &p_owner->lock );
+end:
+    vlc_mutex_unlock(&p_owner->subdecs.lock);
 
-    if( p_cc ) /* can have bitmap set but no created decs */
+    if (p_cc != NULL) /* can have bitmap set but no created decs */
         block_Release( p_cc );
 }
 
-static void PacketizerGetCc( decoder_t *p_dec, decoder_t *p_dec_cc )
+static void PacketizerGetCc( vlc_input_decoder_t *p_owner, decoder_t *p_dec_cc )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    block_t *p_cc;
+    vlc_frame_t *p_cc;
     decoder_cc_desc_t desc;
 
-    /* Do not try retreiving CC if not wanted (sout) or cannot be retreived */
+    /* Do not try retrieving CC if not wanted (sout) or cannot be retrieved */
     if( !p_owner->cc.b_supported )
         return;
 
@@ -964,299 +1446,294 @@ static void PacketizerGetCc( decoder_t *p_dec, decoder_t *p_dec_cc )
     p_cc = p_dec_cc->pf_get_cc( p_dec_cc, &desc );
     if( !p_cc )
         return;
-    DecoderPlayCc( p_dec, p_cc, &desc );
+
+    DecoderPlayCcLocked( p_owner, p_cc, &desc );
 }
 
-static int DecoderQueueCc( decoder_t *p_videodec, block_t *p_cc,
-                           const decoder_cc_desc_t *p_desc )
+static void ModuleThread_QueueCc( decoder_t *p_videodec, vlc_frame_t *p_cc,
+                                  const decoder_cc_desc_t *p_desc )
 {
-    decoder_owner_sys_t *p_owner = p_videodec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_videodec );
 
-    if( unlikely( p_cc != NULL ) )
+    if (unlikely(p_cc == NULL))
+        return;
+
+    if (!p_owner->cc.b_supported ||
+       (p_owner->p_packetizer != NULL && p_owner->p_packetizer->pf_get_cc != NULL))
     {
-        if( p_owner->cc.b_supported &&
-           ( !p_owner->p_packetizer || !p_owner->p_packetizer->pf_get_cc ) )
-            DecoderPlayCc( p_videodec, p_cc, p_desc );
-        else
-            block_Release( p_cc );
+        block_Release(p_cc);
+        return;
     }
-    return 0;
+
+    vlc_fifo_Lock(p_owner->p_fifo);
+    DecoderPlayCcLocked(p_owner, p_cc, p_desc);
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-static int DecoderPlayVideo( decoder_t *p_dec, picture_t *p_picture,
-                             unsigned *restrict pi_lost_sum )
+static int ModuleThread_PlayVideo( vlc_input_decoder_t *p_owner, picture_t *p_picture )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    vout_thread_t  *p_vout = p_owner->p_vout;
-    bool prerolled;
+    decoder_t *p_dec = &p_owner->dec;
+    assert( p_owner->cat == VIDEO_ES );
 
-    vlc_mutex_lock( &p_owner->lock );
-    if( p_owner->i_preroll_end > p_picture->date )
+    if( p_picture->date == VLC_TICK_INVALID )
+        /* FIXME: VLC_TICK_INVALID -- verify video_output */
     {
-        vlc_mutex_unlock( &p_owner->lock );
+        msg_Warn( p_dec, "non-dated video buffer received" );
         picture_Release( p_picture );
-        return -1;
+        return VLC_EGENERIC;
     }
 
-    prerolled = p_owner->i_preroll_end > INT64_MIN;
-    p_owner->i_preroll_end = INT64_MIN;
-    vlc_mutex_unlock( &p_owner->lock );
+    if (p_owner->flushing || p_owner->aborting)
+    {
+        picture_Release(p_picture);
+        return VLC_SUCCESS;
+    }
+
+    vout_thread_t  *p_vout = p_owner->video.vout;
+
+    assert( p_owner->video.started );
+
+    bool prerolled = p_owner->i_preroll_end != PREROLL_NONE;
+    if( prerolled && p_owner->i_preroll_end > p_picture->date )
+    {
+        picture_Release( p_picture );
+        return VLC_SUCCESS;
+    }
+
+    p_owner->i_preroll_end = PREROLL_NONE;
 
     if( unlikely(prerolled) )
     {
         msg_Dbg( p_dec, "end of video preroll" );
 
         if( p_vout )
-            vout_Flush( p_vout, VLC_TS_INVALID+1 );
+            vout_FlushAll( p_vout );
     }
 
-    if( p_picture->date <= VLC_TS_INVALID )
+    /* previous-frame handling */
+    if (unlikely(p_owner->paused) && p_vout != NULL &&
+        decoder_prevframe_IsActive(&p_owner->video.pf))
     {
-        msg_Warn( p_dec, "non-dated video buffer received" );
-        goto discard;
+        p_picture = Decoder_HandlePreviousFrame(p_owner, p_picture);
+        if (p_picture == NULL)
+            return VLC_ENOENT;
     }
 
-    /* */
-    vlc_mutex_lock( &p_owner->lock );
-
-    if( p_owner->b_waiting && !p_owner->b_first )
+    if( p_owner->b_first && p_owner->b_waiting )
     {
-        p_owner->b_has_data = true;
-        vlc_cond_signal( &p_owner->wait_acknowledge );
-    }
-    bool b_first_after_wait = p_owner->b_waiting && p_owner->b_has_data;
-
-    DecoderWaitUnblock( p_dec );
-
-    if( p_owner->b_waiting )
-    {
-        assert( p_owner->b_first );
         msg_Dbg( p_dec, "Received first picture" );
         p_owner->b_first = false;
         p_picture->b_force = true;
     }
-
-    const bool b_dated = p_picture->date > VLC_TS_INVALID;
-    int i_rate = INPUT_RATE_DEFAULT;
-    DecoderFixTs( p_dec, &p_picture->date, NULL, NULL,
-                  &i_rate, DECODER_BOGUS_VIDEO_DELAY );
-
-    vlc_mutex_unlock( &p_owner->lock );
-
-    /* FIXME: The *input* FIFO should not be locked here. This will not work
-     * properly if/when pictures are queued asynchronously. */
-    vlc_fifo_Lock( p_owner->p_fifo );
-    if( unlikely(p_owner->paused) && likely(p_owner->frames_countdown > 0) )
-        p_owner->frames_countdown--;
-    vlc_fifo_Unlock( p_owner->p_fifo );
+    else
+    {
+        int ret = DecoderWaitUnblock(p_owner, p_picture->date);
+        if (ret != VLC_SUCCESS)
+        {
+            picture_Release(p_picture);
+            return ret;
+        }
+    }
 
     /* */
     if( p_vout == NULL )
-        goto discard;
-
-    if( p_picture->b_force || p_picture->date > VLC_TS_INVALID )
-        /* FIXME: VLC_TS_INVALID -- verify video_output */
     {
-        if( i_rate != p_owner->i_last_rate || b_first_after_wait )
-        {
-            /* Be sure to not display old picture after our own */
-            vout_Flush( p_vout, p_picture->date );
-            p_owner->i_last_rate = i_rate;
-        }
-        vout_PutPicture( p_vout, p_picture );
-    }
-    else
-    {
-        if( b_dated )
-            msg_Warn( p_dec, "early picture skipped" );
-        else
-            msg_Warn( p_dec, "non-dated video buffer received" );
-        goto discard;
+        picture_Release( p_picture );
+        return VLC_EGENERIC;
     }
 
-    return 0;
-discard:
-    *pi_lost_sum += 1;
-    picture_Release( p_picture );
-    return 0;
+    if (unlikely(p_owner->output_paused && p_owner->frames_countdown > 0))
+    {
+        p_owner->frames_countdown--;
+        vout_PutPicture(p_vout, p_picture);
+        decoder_Notify(p_owner, frame_next_status, 0);
+        return VLC_SUCCESS;
+    }
+
+    if( p_picture->b_still )
+    {
+        /* Ensure no earlier higher pts breaks still state */
+        vout_Flush( p_vout, p_picture->date );
+    }
+    vout_PutPicture( p_vout, p_picture );
+
+    return VLC_SUCCESS;
 }
 
-static void DecoderUpdateStatVideo( decoder_owner_sys_t *p_owner,
-                                    unsigned decoded, unsigned lost )
-{
-    input_thread_t *p_input = p_owner->p_input;
-    unsigned displayed = 0;
-
-    /* Update ugly stat */
-    if( p_input == NULL )
-        return;
-
-    if( p_owner->p_vout != NULL )
-    {
-        unsigned vout_lost = 0;
-
-        vout_GetResetStatistic( p_owner->p_vout, &displayed, &vout_lost );
-        lost += vout_lost;
-    }
-
-    struct input_stats *stats = input_priv(p_input)->stats;
-
-    if( stats != NULL )
-    {
-        atomic_fetch_add_explicit(&stats->decoded_video, decoded,
-                                  memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats->lost_pictures, lost,
-                                  memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats->displayed_pictures, displayed,
-                                  memory_order_relaxed);
-    }
-}
-
-static int DecoderQueueVideo( decoder_t *p_dec, picture_t *p_pic )
+static void ModuleThread_QueueVideo( decoder_t *p_dec, picture_t *p_pic )
 {
     assert( p_pic );
-    unsigned i_lost = 0;
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == VIDEO_ES );
+    struct vlc_tracer *tracer = vlc_object_get_tracer( &p_dec->obj );
 
-    int ret = DecoderPlayVideo( p_dec, p_pic, &i_lost );
+    if ( tracer != NULL )
+    {
+        vlc_tracer_TraceStreamPTS( tracer, "DEC", p_owner->psz_id,
+                            "OUT", p_pic->date );
+    }
 
-    p_owner->pf_update_stat( p_owner, 1, i_lost );
-    return ret;
+    vlc_fifo_Lock( p_owner->p_fifo );
+
+    int success = ModuleThread_PlayVideo( p_owner, p_pic );
+
+    unsigned displayed = 0;
+    unsigned vout_lost = 0;
+    unsigned vout_late = 0;
+    if( p_owner->video.vout != NULL )
+    {
+        vout_GetResetStatistic( p_owner->video.vout, &displayed, &vout_lost,
+                                &vout_late );
+    }
+    if (success != VLC_SUCCESS)
+        vout_lost++;
+
+    decoder_Notify(p_owner, on_new_video_stats, 1, vout_lost, displayed, vout_late);
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-static int DecoderPlayAudio( decoder_t *p_dec, block_t *p_audio,
-                             unsigned *restrict pi_lost_sum )
+static vlc_decoder_device * thumbnailer_get_device( decoder_t *p_dec )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    bool prerolled;
+    VLC_UNUSED(p_dec);
+    // no hardware decoder on purpose
+    // we don't want to load many DLLs and allocate many pictures
+    // just to decode one picture
+    return NULL;
+}
+
+static picture_t *thumbnailer_buffer_new( decoder_t *p_dec )
+{
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    /* Avoid decoding more than one frame when a thumbnail was
+     * already generated */
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if( !p_owner->b_first )
+    {
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        return NULL;
+    }
+    vlc_fifo_Unlock(p_owner->p_fifo);
+    return picture_NewFromFormat( &p_dec->fmt_out.video );
+}
+
+static void ModuleThread_QueueThumbnail( decoder_t *p_dec, picture_t *p_pic )
+{
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if( p_owner->b_first )
+        decoder_Notify(p_owner, on_thumbnail_ready, p_pic);
+    p_owner->b_first = false;
+    vlc_fifo_Unlock(p_owner->p_fifo);
+
+    picture_Release( p_pic );
+}
+
+static int ModuleThread_PlayAudio( vlc_input_decoder_t *p_owner, vlc_frame_t *p_audio )
+{
+    decoder_t *p_dec = &p_owner->dec;
+    assert( p_owner->cat == AUDIO_ES );
 
     assert( p_audio != NULL );
 
-    vlc_mutex_lock( &p_owner->lock );
-    if( p_owner->i_preroll_end > p_audio->i_pts )
+    if( p_audio->i_pts == VLC_TICK_INVALID ) // FIXME --VLC_TICK_INVALID verify audio_output/*
     {
-        vlc_mutex_unlock( &p_owner->lock );
+        msg_Warn( p_dec, "non-dated audio buffer received" );
         block_Release( p_audio );
-        return -1;
+        return VLC_EGENERIC;
     }
 
-    prerolled = p_owner->i_preroll_end > INT64_MIN;
-    p_owner->i_preroll_end = INT64_MIN;
-    vlc_mutex_unlock( &p_owner->lock );
+    vlc_aout_stream *p_astream = p_owner->audio.stream;
+    if( p_astream == NULL )
+    {
+        msg_Dbg( p_dec, "discarded audio buffer" );
+        block_Release( p_audio );
+        return VLC_EGENERIC;
+    }
+
+    if (p_owner->flushing || p_owner->aborting)
+    {
+        block_Release(p_audio);
+        return VLC_SUCCESS;
+    }
+
+    bool prerolled = p_owner->i_preroll_end != PREROLL_NONE;
+    if( prerolled && p_owner->i_preroll_end > p_audio->i_pts )
+    {
+        block_Release( p_audio );
+        return VLC_SUCCESS;
+    }
+
+    p_owner->i_preroll_end = PREROLL_NONE;
 
     if( unlikely(prerolled) )
     {
         msg_Dbg( p_dec, "end of audio preroll" );
 
-        if( p_owner->p_aout )
-            aout_DecFlush( p_owner->p_aout, false );
+        vlc_aout_stream_Flush( p_astream );
     }
 
-    /* */
-    if( p_audio->i_pts <= VLC_TS_INVALID ) // FIXME --VLC_TS_INVALID verify audio_output/*
+    int ret = DecoderWaitUnblock(p_owner, p_audio->i_pts);
+    if (ret != VLC_SUCCESS)
     {
-        msg_Warn( p_dec, "non-dated audio buffer received" );
-        *pi_lost_sum += 1;
-        block_Release( p_audio );
-        return 0;
+        block_Release(p_audio);
+        return ret;
     }
 
-    /* */
-    vlc_mutex_lock( &p_owner->lock );
-    if( p_owner->b_waiting )
+    int status = vlc_aout_stream_Play( p_astream, p_audio );
+    if( status == AOUT_DEC_CHANGED )
     {
-        p_owner->b_has_data = true;
-        vlc_cond_signal( &p_owner->wait_acknowledge );
+        /* Only reload the decoder */
+        RequestReload( p_owner );
     }
-
-    /* */
-    int i_rate = INPUT_RATE_DEFAULT;
-
-    DecoderWaitUnblock( p_dec );
-    DecoderFixTs( p_dec, &p_audio->i_pts, NULL, &p_audio->i_length,
-                  &i_rate, AOUT_MAX_ADVANCE_TIME );
-    vlc_mutex_unlock( &p_owner->lock );
-
-    audio_output_t *p_aout = p_owner->p_aout;
-
-    if( p_aout != NULL && p_audio->i_pts > VLC_TS_INVALID
-     && i_rate >= INPUT_RATE_DEFAULT/AOUT_MAX_INPUT_RATE
-     && i_rate <= INPUT_RATE_DEFAULT*AOUT_MAX_INPUT_RATE
-     && !DecoderTimedWait( p_dec, p_audio->i_pts - AOUT_MAX_PREPARE_TIME ) )
+    else if( status == AOUT_DEC_FAILED )
     {
-        int status = aout_DecPlay( p_aout, p_audio, i_rate );
-        if( status == AOUT_DEC_CHANGED )
-        {
-            /* Only reload the decoder */
-            RequestReload( p_dec );
-        }
-        else if( status == AOUT_DEC_FAILED )
-        {
-            /* If we reload because the aout failed, we should release it. That
-             * way, a next call to aout_update_format() won't re-use the
-             * previous (failing) aout but will try to create a new one. */
-            atomic_store( &p_owner->reload, RELOAD_DECODER_AOUT );
-        }
+        /* If we reload because the aout failed, we should release it. That
+            * way, a next call to ModuleThread_UpdateAudioFormat() won't re-use the
+            * previous (failing) aout but will try to create a new one. */
+        atomic_store( &p_owner->reload, RELOAD_DECODER_AOUT );
     }
-    else
-    {
-        msg_Dbg( p_dec, "discarded audio buffer" );
-        *pi_lost_sum += 1;
-        block_Release( p_audio );
-    }
-    return 0;
+
+    return VLC_SUCCESS;
 }
 
-static void DecoderUpdateStatAudio( decoder_owner_sys_t *p_owner,
-                                    unsigned decoded, unsigned lost )
+static void ModuleThread_QueueAudio( decoder_t *p_dec, vlc_frame_t *p_aout_buf )
 {
-    input_thread_t *p_input = p_owner->p_input;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == AUDIO_ES );
+    struct vlc_tracer *tracer = vlc_object_get_tracer( &p_dec->obj );
+
+    if ( tracer != NULL && p_aout_buf != NULL )
+    {
+        vlc_tracer_TraceStreamDTS( tracer, "DEC", p_owner->psz_id, "OUT",
+                            p_aout_buf->i_pts, p_aout_buf->i_dts );
+    }
+
+    vlc_fifo_Lock(p_owner->p_fifo);
+
+    int success = ModuleThread_PlayAudio( p_owner, p_aout_buf );
+
     unsigned played = 0;
-
-    /* Update ugly stat */
-    if( p_input == NULL )
-        return;
-
-    if( p_owner->p_aout != NULL )
+    unsigned aout_lost = 0;
+    if( p_owner->audio.stream != NULL )
     {
-        unsigned aout_lost;
-
-        aout_DecGetResetStats( p_owner->p_aout, &aout_lost, &played );
-        lost += aout_lost;
+        vlc_aout_stream_GetResetStats( p_owner->audio.stream, &aout_lost, &played );
     }
+    if (success != VLC_SUCCESS)
+        aout_lost++;
 
-    struct input_stats *stats = input_priv(p_input)->stats;
-
-    if( stats != NULL )
-    {
-        atomic_fetch_add_explicit(&stats->lost_abuffers, lost,
-                                  memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats->played_abuffers, played,
-                                  memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats->decoded_audio, decoded,
-                                  memory_order_relaxed);
-    }
+    decoder_Notify(p_owner, on_new_audio_stats, 1, aout_lost, played);
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-static int DecoderQueueAudio( decoder_t *p_dec, block_t *p_aout_buf )
+static void ModuleThread_PlaySpu( vlc_input_decoder_t *p_owner, subpicture_t *p_subpic )
 {
-    unsigned lost = 0;
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    int ret = DecoderPlayAudio( p_dec, p_aout_buf, &lost );
-
-    p_owner->pf_update_stat( p_owner, 1, lost );
-
-    return ret;
-}
-
-static void DecoderPlaySpu( decoder_t *p_dec, subpicture_t *p_subpic )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    vout_thread_t *p_vout = p_owner->p_spu_vout;
+    decoder_t *p_dec = &p_owner->dec;
+    assert( p_owner->cat == SPU_ES );
+    vout_thread_t *p_vout = p_owner->spu.vout;
 
     /* */
-    if( p_subpic->i_start <= VLC_TS_INVALID )
+    if( p_subpic->i_start == VLC_TICK_INVALID )
     {
         msg_Warn( p_dec, "non-dated spu buffer received" );
         subpicture_Delete( p_subpic );
@@ -1264,21 +1741,9 @@ static void DecoderPlaySpu( decoder_t *p_dec, subpicture_t *p_subpic )
     }
 
     /* */
-    vlc_mutex_lock( &p_owner->lock );
+    int ret = DecoderWaitUnblock(p_owner, p_subpic->i_start);
 
-    if( p_owner->b_waiting )
-    {
-        p_owner->b_has_data = true;
-        vlc_cond_signal( &p_owner->wait_acknowledge );
-    }
-
-    DecoderWaitUnblock( p_dec );
-    DecoderFixTs( p_dec, &p_subpic->i_start, &p_subpic->i_stop, NULL,
-                  NULL, INT64_MAX );
-    vlc_mutex_unlock( &p_owner->lock );
-
-    if( p_subpic->i_start <= VLC_TS_INVALID
-     || DecoderTimedWait( p_dec, p_subpic->i_start - SPU_MAX_PREPARE_TIME ) )
+    if (ret != VLC_SUCCESS || p_subpic->i_start == VLC_TICK_INVALID)
     {
         subpicture_Delete( p_subpic );
         return;
@@ -1287,71 +1752,68 @@ static void DecoderPlaySpu( decoder_t *p_dec, subpicture_t *p_subpic )
     vout_PutSubpicture( p_vout, p_subpic );
 }
 
-static void DecoderUpdateStatSpu( decoder_owner_sys_t *p_owner,
-                                  unsigned decoded, unsigned lost )
-{
-    (void) p_owner; (void) decoded; (void) lost;
-}
-
-static int DecoderQueueSpu( decoder_t *p_dec, subpicture_t *p_spu )
+static void ModuleThread_QueueSpu( decoder_t *p_dec, subpicture_t *p_spu )
 {
     assert( p_spu );
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_t *p_owner = dec_get_owner( p_dec );
+    assert( p_owner->cat == SPU_ES );
+    struct vlc_tracer *tracer = vlc_object_get_tracer( &p_dec->obj );
 
-    int i_ret = -1;
-    vout_thread_t *p_vout = input_resource_HoldVout( p_owner->p_resource );
-    if( p_vout && p_owner->p_spu_vout == p_vout )
+    if ( tracer != NULL && p_spu != NULL )
     {
-        /* Preroll does not work very well with subtitle */
-        vlc_mutex_lock( &p_owner->lock );
-        if( p_spu->i_start > VLC_TS_INVALID &&
-            p_spu->i_start < p_owner->i_preroll_end &&
-            ( p_spu->i_stop <= VLC_TS_INVALID || p_spu->i_stop < p_owner->i_preroll_end ) )
-        {
-            vlc_mutex_unlock( &p_owner->lock );
-            subpicture_Delete( p_spu );
-        }
-        else
-        {
-            vlc_mutex_unlock( &p_owner->lock );
-            DecoderPlaySpu( p_dec, p_spu );
-            i_ret = 0;
-        }
+        vlc_tracer_TraceStreamPTS( tracer, "DEC", p_owner->psz_id,
+                            "OUT", p_spu->i_start );
     }
-    else
-    {
+
+    /* The vout must be created from a previous decoder_NewSubpicture call. */
+    assert( p_owner->spu.vout );
+
+    /* Preroll does not work very well with subtitle */
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if( p_spu->i_start != VLC_TICK_INVALID &&
+        p_spu->i_start < p_owner->i_preroll_end &&
+        ( p_spu->i_stop == VLC_TICK_INVALID || p_spu->i_stop < p_owner->i_preroll_end ) )
         subpicture_Delete( p_spu );
-    }
-    if( p_vout )
-        vlc_object_release( p_vout );
-    return i_ret;
+    else
+        ModuleThread_PlaySpu( p_owner, p_spu );
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-static void DecoderProcess( decoder_t *p_dec, block_t *p_block );
-static void DecoderDecode( decoder_t *p_dec, block_t *p_block )
+static void DecoderThread_ProcessInput( vlc_input_decoder_t *p_owner, vlc_frame_t *frame );
+static void DecoderThread_DecodeBlock( vlc_input_decoder_t *p_owner, vlc_frame_t *frame )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    decoder_t *p_dec = &p_owner->dec;
+    struct vlc_tracer *tracer = vlc_object_get_tracer( &p_dec->obj );
 
-    int ret = p_dec->pf_decode( p_dec, p_block );
+    vlc_fifo_Unlock(p_owner->p_fifo);
+
+    if ( tracer != NULL && frame != NULL )
+    {
+        vlc_tracer_TraceStreamDTS( tracer, "DEC", p_owner->psz_id, "IN",
+                            frame->i_pts, frame->i_dts );
+    }
+
+    int ret = p_dec->pf_decode( p_dec, frame );
+
+    vlc_fifo_Lock(p_owner->p_fifo);
     switch( ret )
     {
         case VLCDEC_SUCCESS:
-            p_owner->pf_update_stat( p_owner, 1, 0 );
             break;
         case VLCDEC_ECRITICAL:
             p_owner->error = true;
             break;
         case VLCDEC_RELOAD:
-            RequestReload( p_dec );
-            if( unlikely( p_block == NULL ) )
+            RequestReload( p_owner );
+            if( unlikely( frame == NULL ) )
                 break;
-            if( !( p_block->i_flags & BLOCK_FLAG_CORE_PRIVATE_RELOADED ) )
+            if( !( frame->i_flags & BLOCK_FLAG_CORE_PRIVATE_RELOADED ) )
             {
-                p_block->i_flags |= BLOCK_FLAG_CORE_PRIVATE_RELOADED;
-                DecoderProcess( p_dec, p_block );
+                frame->i_flags |= BLOCK_FLAG_CORE_PRIVATE_RELOADED;
+                DecoderThread_ProcessInput( p_owner, frame );
             }
-            else /* We prefer loosing this block than an infinite recursion */
-                block_Release( p_block );
+            else /* We prefer loosing this frame than an infinite recursion */
+                block_Release( frame );
             break;
         default:
             vlc_assert_unreachable();
@@ -1359,117 +1821,116 @@ static void DecoderDecode( decoder_t *p_dec, block_t *p_block )
 }
 
 /**
- * Decode a block
+ * Decode a frame
  *
- * \param p_dec the decoder object
- * \param p_block the block to decode
+ * \param p_owner the input decoder object
+ * \param frame the block to decode
  */
-static void DecoderProcess( decoder_t *p_dec, block_t *p_block )
+static void DecoderThread_ProcessInput( vlc_input_decoder_t *p_owner, vlc_frame_t *frame )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    decoder_t *p_dec = &p_owner->dec;
 
     if( p_owner->error )
         goto error;
 
     /* Here, the atomic doesn't prevent to miss a reload request.
-     * DecoderProcess() can still be called after the decoder module or the
+     * DecoderThread_ProcessInput() can still be called after the decoder module or the
      * audio output requested a reload. This will only result in a drop of an
-     * input block or an output buffer. */
+     * input frame or an output buffer. */
     enum reload reload;
     if( ( reload = atomic_exchange( &p_owner->reload, RELOAD_NO_REQUEST ) ) )
     {
         msg_Warn( p_dec, "Reloading the decoder module%s",
                   reload == RELOAD_DECODER_AOUT ? " and the audio output" : "" );
 
-        if( ReloadDecoder( p_dec, false, &p_dec->fmt_in, reload ) != VLC_SUCCESS )
+        if( DecoderThread_Reload( p_owner, p_dec->fmt_in, reload ) != VLC_SUCCESS )
             goto error;
     }
 
     bool packetize = p_owner->p_packetizer != NULL;
-    if( p_block )
+    if( frame )
     {
-        if( p_block->i_buffer <= 0 )
+        if( frame->i_buffer <= 0 )
             goto error;
 
-        vlc_mutex_lock( &p_owner->lock );
-        DecoderUpdatePreroll( &p_owner->i_preroll_end, p_block );
-        vlc_mutex_unlock( &p_owner->lock );
-        if( unlikely( p_block->i_flags & BLOCK_FLAG_CORE_PRIVATE_RELOADED ) )
+        DecoderUpdatePreroll( &p_owner->i_preroll_end, frame );
+        if( unlikely( frame->i_flags & BLOCK_FLAG_CORE_PRIVATE_RELOADED ) )
         {
-            /* This block has already been packetized */
+            /* This frame has already been packetized */
             packetize = false;
         }
     }
 
-#ifdef ENABLE_SOUT
     if( p_owner->p_sout != NULL )
     {
-        DecoderProcessSout( p_dec, p_block );
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        DecoderThread_ProcessSout( p_owner, frame );
+        vlc_fifo_Lock(p_owner->p_fifo);
         return;
     }
-#endif
     if( packetize )
     {
-        block_t *p_packetized_block;
-        block_t **pp_block = p_block ? &p_block : NULL;
+        vlc_frame_t *packetized_frame;
+        vlc_frame_t **ppframe = frame ? &frame : NULL;
         decoder_t *p_packetizer = p_owner->p_packetizer;
 
-        while( (p_packetized_block =
-                p_packetizer->pf_packetize( p_packetizer, pp_block ) ) )
+        while( (packetized_frame =
+                p_packetizer->pf_packetize( p_packetizer, ppframe ) ) )
         {
-            if( !es_format_IsSimilar( &p_dec->fmt_in, &p_packetizer->fmt_out ) )
+            if( !es_format_IsSimilar( p_dec->fmt_in, &p_packetizer->fmt_out ) )
             {
                 msg_Dbg( p_dec, "restarting module due to input format change");
+                es_format_LogDifferences( vlc_object_logger(p_dec),
+                                          "decoder in", p_dec->fmt_in,
+                                          "packetizer out", &p_packetizer->fmt_out );
 
                 /* Drain the decoder module */
-                DecoderDecode( p_dec, NULL );
+                DecoderThread_DecodeBlock( p_owner, NULL );
 
-                if( ReloadDecoder( p_dec, false, &p_packetizer->fmt_out,
-                                   RELOAD_DECODER ) != VLC_SUCCESS )
+                if( DecoderThread_Reload( p_owner, &p_packetizer->fmt_out,
+                                          RELOAD_DECODER ) != VLC_SUCCESS )
                 {
-                    block_ChainRelease( p_packetized_block );
+                    block_ChainRelease( packetized_frame );
                     return;
                 }
             }
 
             if( p_packetizer->pf_get_cc )
-                PacketizerGetCc( p_dec, p_packetizer );
+                PacketizerGetCc( p_owner, p_packetizer );
 
-            while( p_packetized_block )
+            while( packetized_frame )
             {
-                block_t *p_next = p_packetized_block->p_next;
-                p_packetized_block->p_next = NULL;
+                vlc_frame_t *p_next = packetized_frame->p_next;
+                packetized_frame->p_next = NULL;
 
-                DecoderDecode( p_dec, p_packetized_block );
+                DecoderThread_DecodeBlock( p_owner, packetized_frame );
+
                 if( p_owner->error )
                 {
                     block_ChainRelease( p_next );
                     return;
                 }
 
-                p_packetized_block = p_next;
+                packetized_frame = p_next;
             }
         }
         /* Drain the decoder after the packetizer is drained */
-        if( !pp_block )
-            DecoderDecode( p_dec, NULL );
+        if( !ppframe )
+            DecoderThread_DecodeBlock( p_owner, NULL );
     }
     else
-        DecoderDecode( p_dec, p_block );
+        DecoderThread_DecodeBlock( p_owner, frame );
     return;
 
 error:
-    if( p_block )
-        block_Release( p_block );
+    if( frame )
+        block_Release( frame );
 }
 
-static void DecoderProcessFlush( decoder_t *p_dec )
+static void DecoderThread_Flush( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    decoder_t *p_dec = &p_owner->dec;
     decoder_t *p_packetizer = p_owner->p_packetizer;
-
-    if( p_owner->error )
-        return;
 
     if( p_packetizer != NULL && p_packetizer->pf_flush != NULL )
         p_packetizer->pf_flush( p_packetizer );
@@ -1477,107 +1938,108 @@ static void DecoderProcessFlush( decoder_t *p_dec )
     if ( p_dec->pf_flush != NULL )
         p_dec->pf_flush( p_dec );
 
-    /* flush CC sub decoders */
-    if( p_owner->cc.b_supported )
+    p_owner->error = false;
+}
+
+static void Decoder_VideoDrained(vlc_input_decoder_t *owner)
+{
+    owner->video.drained = true;
+    if (owner->frames_countdown > 0)
     {
-        for( int i=0; i<MAX_CC_DECODERS; i++ )
+        if (unlikely(vout_IsEmpty(owner->video.vout)))
         {
-            decoder_t *p_subdec = p_owner->cc.pp_decoder[i];
-            if( p_subdec && p_subdec->pf_flush )
-                p_subdec->pf_flush( p_subdec );
+            /* Unlikely case where all pictures are already sent to the vout
+             * next queue while draining. This could happen with a burst of
+             * next-frame request near EOF. */
+            owner->frames_countdown = 0;
+            decoder_Notify(owner, frame_next_status, -EAGAIN);
         }
     }
-
-#ifdef ENABLE_SOUT
-    if ( p_owner->p_sout_input != NULL )
+    else if(owner->frames_countdown == -1)
     {
-        sout_InputFlush( p_owner->p_sout_input );
+        /* Also check if we need to increase seek steps near EOF */
+        int seek_steps;
+        picture_t *nullpic =
+            decoder_prevframe_AddPic(&owner->video.pf, NULL,
+                                     &owner->video.pf_pts, &seek_steps);
+        assert(nullpic == NULL); (void) nullpic;
+        if (seek_steps != DEC_PF_SEEK_STEPS_NONE)
+            Decoder_SeekPreviousFrame(owner, seek_steps, true);
     }
-#endif
-    if( p_dec->fmt_out.i_cat == AUDIO_ES )
-    {
-        if( p_owner->p_aout )
-            aout_DecFlush( p_owner->p_aout, false );
-    }
-    else if( p_dec->fmt_out.i_cat == VIDEO_ES )
-    {
-        if( p_owner->p_vout )
-            vout_Flush( p_owner->p_vout, VLC_TS_INVALID+1 );
-    }
-    else if( p_dec->fmt_out.i_cat == SPU_ES )
-    {
-        if( p_owner->p_spu_vout )
-        {
-            vout_thread_t *p_vout = input_resource_HoldVout( p_owner->p_resource );
-
-            if( p_vout && p_owner->p_spu_vout == p_vout )
-                vout_FlushSubpictureChannel( p_vout, p_owner->i_spu_channel );
-
-            if( p_vout )
-                vlc_object_release( p_vout );
-        }
-    }
-
-    vlc_mutex_lock( &p_owner->lock );
-    p_owner->i_preroll_end = INT64_MIN;
-    vlc_mutex_unlock( &p_owner->lock );
 }
 
 /**
  * The decoding main loop
  *
- * \param p_dec the decoder
+ * \param p_data the input decoder object
  */
 static void *DecoderThread( void *p_data )
 {
-    decoder_t *p_dec = (decoder_t *)p_data;
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    bool paused = false;
+    vlc_input_decoder_t *p_owner = (vlc_input_decoder_t *)p_data;
+
+    const char *thread_name;
+    switch (p_owner->cat)
+    {
+        case VIDEO_ES: thread_name = "vlc-dec-video"; break;
+        case AUDIO_ES: thread_name = "vlc-dec-audio"; break;
+        case SPU_ES:   thread_name = "vlc-dec-spu"; break;
+        case DATA_ES:  thread_name = "vlc-dec-data"; break;
+        default:       thread_name = "vlc-decoder"; break;
+    }
+
+    vlc_thread_set_name(thread_name);
 
     /* The decoder's main loop */
     vlc_fifo_Lock( p_owner->p_fifo );
-    vlc_fifo_CleanupPush( p_owner->p_fifo );
 
-    for( ;; )
+    while( !p_owner->aborting || p_owner->flushing )
     {
         if( p_owner->flushing )
         {   /* Flush before/regardless of pause. We do not want to resume just
              * for the sake of flushing (glitches could otherwise happen). */
-            int canc = vlc_savecancel();
-
             vlc_fifo_Unlock( p_owner->p_fifo );
 
             /* Flush the decoder (and the output) */
-            DecoderProcessFlush( p_dec );
+            DecoderThread_Flush( p_owner );
 
             vlc_fifo_Lock( p_owner->p_fifo );
-            vlc_restorecancel( canc );
 
-            /* Reset flushing after DecoderProcess in case input_DecoderFlush
+            /* Reset flushing after DecoderThread_ProcessInput in case vlc_input_decoder_Flush
              * is called again. This will avoid a second useless flush (but
              * harmless). */
             p_owner->flushing = false;
-
+            p_owner->out_started = false;
+            p_owner->i_preroll_end = PREROLL_NONE;
             continue;
         }
 
-        if( paused != p_owner->paused )
+        /* Also compare the request dates: a pause and a resume requested in
+         * quick succession can cancel each other out, but each request must
+         * still be acknowledged via decoder_Notify() */
+        if( p_owner->paused != p_owner->output_paused
+         || p_owner->pause_date != p_owner->output_pause_date )
         {   /* Update playing/paused status of the output */
-            int canc = vlc_savecancel();
-            mtime_t date = p_owner->pause_date;
+            if( p_owner->paused != p_owner->output_paused )
+                Decoder_ChangeOutputPause( p_owner, p_owner->paused,
+                                           p_owner->pause_date );
+            p_owner->output_pause_date = p_owner->pause_date;
+            decoder_Notify(p_owner, on_output_paused, p_owner->paused,
+                           p_owner->pause_date);
+            if (unlikely(p_owner->paused && p_owner->cat == VIDEO_ES
+                      && p_owner->frames_countdown != 0))
+                Decoder_PausedForNextFrame(p_owner);
+            continue;
+        }
 
-            paused = p_owner->paused;
-            vlc_fifo_Unlock( p_owner->p_fifo );
+        if( p_owner->rate != p_owner->output_rate )
+        {
+            Decoder_ChangeOutputRate( p_owner, p_owner->rate );
+            continue;
+        }
 
-            /* NOTE: Only the audio and video outputs care about pause. */
-            msg_Dbg( p_dec, "toggling %s", paused ? "resume" : "pause" );
-            if( p_owner->p_vout != NULL )
-                vout_ChangePause( p_owner->p_vout, paused, date );
-            if( p_owner->p_aout != NULL )
-                aout_DecChangePause( p_owner->p_aout, paused, date );
-
-            vlc_restorecancel( canc );
-            vlc_fifo_Lock( p_owner->p_fifo );
+        if( p_owner->delay != p_owner->output_delay )
+        {
+            Decoder_ChangeOutputDelay( p_owner, p_owner->delay );
             continue;
         }
 
@@ -1591,148 +2053,187 @@ static void *DecoderThread( void *p_data )
         }
 
         vlc_cond_signal( &p_owner->wait_fifo );
-        vlc_testcancel(); /* forced expedited cancellation in case of stop */
 
-        block_t *p_block = vlc_fifo_DequeueUnlocked( p_owner->p_fifo );
-        if( p_block == NULL )
+        vlc_frame_t *frame = vlc_fifo_DequeueUnlocked( p_owner->p_fifo );
+        if( frame == NULL )
         {
             if( likely(!p_owner->b_draining) )
             {   /* Wait for a block to decode (or a request to drain) */
                 p_owner->b_idle = true;
                 vlc_cond_signal( &p_owner->wait_acknowledge );
+
+                if (p_owner->frames_countdown > 0)
+                {
+                    /* next-frames are requested but the FIFO is empty, ask for
+                     * more buffering */
+                    decoder_Notify( p_owner, frame_next_need_data, true );
+                }
                 vlc_fifo_Wait( p_owner->p_fifo );
                 p_owner->b_idle = false;
                 continue;
             }
             /* We have emptied the FIFO and there is a pending request to
-             * drain. Pass p_block = NULL to decoder just once. */
+             * drain. Pass frame = NULL to decoder just once. */
         }
 
-        vlc_fifo_Unlock( p_owner->p_fifo );
+        /* DecoderThread_ProcessInput will unlock when playing to the decoders
+         * but will ensure it re-locks in the end. This is necessary to handle
+         * reloading, CC and packetizing. */
+        DecoderThread_ProcessInput( p_owner, frame );
 
-        int canc = vlc_savecancel();
-        DecoderProcess( p_dec, p_block );
-
-        if( p_block == NULL )
-        {   /* Draining: the decoder is drained and all decoded buffers are
-             * queued to the output at this point. Now drain the output. */
-            if( p_owner->p_aout != NULL )
-                aout_DecFlush( p_owner->p_aout, true );
-        }
-        vlc_restorecancel( canc );
-
-        /* TODO? Wait for draining instead of polling. */
-        vlc_mutex_lock( &p_owner->lock );
-        if( p_owner->b_draining && (p_block == NULL) )
+        if( p_owner->b_draining && frame == NULL )
         {
             p_owner->b_draining = false;
-            p_owner->drained = true;
+
+            switch (p_owner->cat)
+            {
+                case AUDIO_ES:
+                    if( p_owner->audio.stream != NULL
+                     && !p_owner->audio.drained )
+                    {
+                        /* Draining: the decoder is drained and all decoded
+                         * buffers are queued to the output at this point.
+                         * Now drain the output. */
+                        vlc_aout_stream_Drain( p_owner->audio.stream );
+                        p_owner->audio.drained = true;
+                    }
+                    break;
+                case VIDEO_ES:
+                    Decoder_VideoDrained(p_owner);
+                    break;
+                default:
+                    break;
+            }
         }
-        vlc_fifo_Lock( p_owner->p_fifo );
+
         vlc_cond_signal( &p_owner->wait_acknowledge );
-        vlc_mutex_unlock( &p_owner->lock );
     }
-    vlc_cleanup_pop();
-    vlc_assert_unreachable();
+
+    vlc_fifo_Unlock( p_owner->p_fifo );
+    return NULL;
 }
+
+static const struct decoder_owner_callbacks dec_video_cbs =
+{
+    .video = {
+        .get_device = ModuleThread_GetDecoderDevice,
+        .format_update = ModuleThread_UpdateVideoFormat,
+        .buffer_new = ModuleThread_NewVideoBuffer,
+        .queue = ModuleThread_QueueVideo,
+        .queue_cc = ModuleThread_QueueCc,
+        .get_display_date = ModuleThread_GetDisplayDate,
+        .get_display_rate = ModuleThread_GetDisplayRate,
+    },
+    .get_attachments = InputThread_GetInputAttachments,
+};
+static const struct decoder_owner_callbacks dec_thumbnailer_cbs =
+{
+    .video = {
+        .get_device = thumbnailer_get_device,
+        .buffer_new = thumbnailer_buffer_new,
+        .queue = ModuleThread_QueueThumbnail,
+    },
+    .get_attachments = InputThread_GetInputAttachments,
+};
+static const struct decoder_owner_callbacks dec_audio_cbs =
+{
+    .audio = {
+        .format_update = ModuleThread_UpdateAudioFormat,
+        .queue = ModuleThread_QueueAudio,
+    },
+    .get_attachments = InputThread_GetInputAttachments,
+};
+static const struct decoder_owner_callbacks dec_spu_cbs =
+{
+    .spu = {
+        .buffer_new = ModuleThread_NewSpuBuffer,
+        .queue = ModuleThread_QueueSpu,
+    },
+    .get_attachments = InputThread_GetInputAttachments,
+};
 
 /**
  * Create a decoder object
  *
- * \param p_input the input thread
- * \param p_es the es descriptor
- * \param b_packetizer instead of a decoder
- * \return the decoder object
+ * \param p_parent a VLC parent object to inherit variable from
+ * \param cfg the input decoder configuration
+ * \return a new input decoder object
  */
-static decoder_t * CreateDecoder( vlc_object_t *p_parent,
-                                  input_thread_t *p_input,
-                                  const es_format_t *fmt,
-                                  input_resource_t *p_resource,
-                                  sout_instance_t *p_sout )
+static vlc_input_decoder_t *
+CreateDecoder( vlc_object_t *p_parent, const struct vlc_input_decoder_cfg *cfg )
 {
     decoder_t *p_dec;
-    decoder_owner_sys_t *p_owner;
+    vlc_input_decoder_t *p_owner;
+    static_assert(offsetof(vlc_input_decoder_t, dec) == 0,
+                  "the decoder must be first in the owner structure");
 
-    p_dec = vlc_custom_create( p_parent, sizeof( *p_dec ), "decoder" );
-    if( p_dec == NULL )
-        return NULL;
+    assert(cfg->input_type != INPUT_TYPE_PREPARSING);
 
-    /* Allocate our private structure for the decoder */
-    p_dec->p_owner = p_owner = malloc( sizeof( decoder_owner_sys_t ) );
-    if( unlikely(p_owner == NULL) )
-    {
-        vlc_object_release( p_dec );
+    const es_format_t *fmt = cfg->fmt;
+
+    p_owner = vlc_custom_create( p_parent, sizeof( *p_owner ), "decoder" );
+    if( p_owner == NULL )
         return NULL;
-    }
-    p_owner->i_preroll_end = INT64_MIN;
-    p_owner->i_last_rate = INPUT_RATE_DEFAULT;
-    p_owner->p_input = p_input;
-    p_owner->p_resource = p_resource;
-    p_owner->p_aout = NULL;
-    p_owner->p_vout = NULL;
-    p_owner->p_spu_vout = NULL;
-    p_owner->i_spu_channel = 0;
-    p_owner->i_spu_order = 0;
-    p_owner->p_sout = p_sout;
+    p_dec = &p_owner->dec;
+
+    p_owner->psz_id = cfg->str_id;
+    p_owner->p_clock = cfg->clock;
+    p_owner->i_preroll_end = PREROLL_NONE;
+    p_owner->p_resource = cfg->resource;
+    p_owner->hw_dec = cfg->hw_dec;
+    p_owner->cbs = cfg->cbs;
+    p_owner->cbs_userdata = cfg->cbs_data;
+    p_owner->p_sout = cfg->sout;
     p_owner->p_sout_input = NULL;
     p_owner->p_packetizer = NULL;
 
     p_owner->b_fmt_description = false;
     p_owner->p_description = NULL;
 
-    p_owner->paused = false;
-    p_owner->pause_date = VLC_TS_INVALID;
+    p_owner->output_delay = p_owner->delay = 0;
+    p_owner->output_rate = p_owner->rate = 1.f;
+    p_owner->output_paused = p_owner->paused = false;
+    p_owner->output_pause_date = p_owner->pause_date = VLC_TICK_INVALID;
     p_owner->frames_countdown = 0;
 
     p_owner->b_waiting = false;
     p_owner->b_first = true;
     p_owner->b_has_data = false;
+    p_owner->out_started = false;
 
     p_owner->error = false;
 
     p_owner->flushing = false;
     p_owner->b_draining = false;
-    p_owner->drained = false;
     atomic_init( &p_owner->reload, RELOAD_NO_REQUEST );
     p_owner->b_idle = false;
+    p_owner->cat = fmt->i_cat;
 
-    es_format_Init( &p_owner->fmt, fmt->i_cat, 0 );
+    es_format_Init( &p_owner->fmt, p_owner->cat, 0 );
 
     /* decoder fifo */
     p_owner->p_fifo = block_FifoNew();
     if( unlikely(p_owner->p_fifo == NULL) )
     {
-        free( p_owner );
-        vlc_object_release( p_dec );
+        vlc_object_delete(p_dec);
         return NULL;
     }
 
-    vlc_mutex_init( &p_owner->lock );
     vlc_cond_init( &p_owner->wait_request );
     vlc_cond_init( &p_owner->wait_acknowledge );
     vlc_cond_init( &p_owner->wait_fifo );
-    vlc_cond_init( &p_owner->wait_timed );
-
-    /* Set buffers allocation callbacks for the decoders */
-    p_dec->pf_aout_format_update = aout_update_format;
-    p_dec->pf_vout_format_update = vout_update_format;
-    p_dec->pf_vout_buffer_new = vout_new_buffer;
-    p_dec->pf_spu_buffer_new  = spu_new_buffer;
-    /* */
-    p_dec->pf_get_attachments  = DecoderGetInputAttachments;
-    p_dec->pf_get_display_date = DecoderGetDisplayDate;
-    p_dec->pf_get_display_rate = DecoderGetDisplayRate;
 
     /* Load a packetizer module if the input is not already packetized */
-    if( p_sout == NULL && !fmt->b_packetized )
+    if( cfg->sout == NULL && !fmt->b_packetized )
     {
         p_owner->p_packetizer =
             vlc_custom_create( p_parent, sizeof( decoder_t ), "packetizer" );
         if( p_owner->p_packetizer )
         {
-            if( LoadDecoder( p_owner->p_packetizer, true, fmt ) )
+            decoder_Init(p_owner->p_packetizer, &p_owner->pktz_fmt_in, fmt);
+            if (LoadDecoder(p_owner->p_packetizer, true, &p_owner->pktz_fmt_in))
             {
-                vlc_object_release( p_owner->p_packetizer );
+                vlc_object_delete(p_owner->p_packetizer);
                 p_owner->p_packetizer = NULL;
             }
             else
@@ -1743,137 +2244,165 @@ static decoder_t * CreateDecoder( vlc_object_t *p_parent,
         }
     }
 
-    /* Find a suitable decoder/packetizer module */
-    if( LoadDecoder( p_dec, p_sout != NULL, fmt ) )
-        return p_dec;
-
-    switch( p_dec->fmt_out.i_cat )
+    switch( fmt->i_cat )
     {
         case VIDEO_ES:
-            p_dec->pf_queue_video = DecoderQueueVideo;
-            p_dec->pf_queue_cc = DecoderQueueCc;
-            p_owner->pf_update_stat = DecoderUpdateStatVideo;
+            p_owner->video.vout = NULL;
+            p_owner->video.started = false;
+            p_owner->video.drained = false;
+            vlc_mutex_init( &p_owner->video.mouse_lock );
+            p_owner->video.mouse_event = NULL;
+            p_owner->video.mouse_opaque = NULL;
+
+            decoder_prevframe_Init( &p_owner->video.pf );
+            p_owner->video.pf_pts = VLC_TICK_INVALID;
+
+            if( cfg->input_type == INPUT_TYPE_THUMBNAILING )
+                p_dec->cbs = &dec_thumbnailer_cbs;
+            else
+                p_dec->cbs = &dec_video_cbs;
             break;
         case AUDIO_ES:
-            p_dec->pf_queue_audio = DecoderQueueAudio;
-            p_owner->pf_update_stat = DecoderUpdateStatAudio;
+            p_owner->audio.aout = NULL;
+            p_owner->audio.stream = NULL;
+            p_owner->audio.drained = false;
+            p_dec->cbs = &dec_audio_cbs;
             break;
         case SPU_ES:
-            p_dec->pf_queue_sub = DecoderQueueSpu;
-            p_owner->pf_update_stat = DecoderUpdateStatSpu;
+            p_owner->spu.vout = NULL;
+            p_owner->spu.channel = VOUT_SPU_CHANNEL_INVALID;
+            p_owner->spu.order = 0;
+            p_dec->cbs = &dec_spu_cbs;
             break;
         default:
             msg_Err( p_dec, "unknown ES format" );
-            UnloadDecoder( p_dec );
-            return p_dec;
+            return p_owner;
     }
+
+    /* Find a suitable decoder/packetizer module */
+    decoder_Init(p_dec, &p_owner->dec_fmt_in, fmt);
+    if (LoadDecoder(p_dec, cfg->sout != NULL, &p_owner->dec_fmt_in))
+        return p_owner;
+
+    assert( p_dec->fmt_in->i_cat == p_dec->fmt_out.i_cat && fmt->i_cat == p_dec->fmt_in->i_cat);
+
     /* Copy ourself the input replay gain */
     if( fmt->i_cat == AUDIO_ES )
     {
-        for( unsigned i = 0; i < AUDIO_REPLAY_GAIN_MAX; i++ )
-        {
-            if( !p_dec->fmt_out.audio_replay_gain.pb_peak[i] )
-            {
-                p_dec->fmt_out.audio_replay_gain.pb_peak[i] = fmt->audio_replay_gain.pb_peak[i];
-                p_dec->fmt_out.audio_replay_gain.pf_peak[i] = fmt->audio_replay_gain.pf_peak[i];
-            }
-            if( !p_dec->fmt_out.audio_replay_gain.pb_gain[i] )
-            {
-                p_dec->fmt_out.audio_replay_gain.pb_gain[i] = fmt->audio_replay_gain.pb_gain[i];
-                p_dec->fmt_out.audio_replay_gain.pf_gain[i] = fmt->audio_replay_gain.pf_gain[i];
-            }
-        }
+        replay_gain_Merge( &p_dec->fmt_out.audio_replay_gain, &fmt->audio_replay_gain );
     }
 
     /* */
-    p_owner->cc.b_supported = ( p_sout == NULL );
+    vlc_mutex_init(&p_owner->subdecs.lock);
+    p_owner->cc.selected_codec = cfg->cc_decoder == 708 ?
+                                 VLC_CODEC_CEA708 : VLC_CODEC_CEA608;
+    p_owner->cc.b_supported = ( cfg->sout == NULL );
 
     p_owner->cc.desc.i_608_channels = 0;
     p_owner->cc.desc.i_708_channels = 0;
-    for( unsigned i = 0; i < MAX_CC_DECODERS; i++ )
-        p_owner->cc.pp_decoder[i] = NULL;
-    p_owner->i_ts_delay = 0;
-    return p_dec;
+    vlc_list_init(&p_owner->subdecs.list);
+    p_owner->cc.count = 0;
+    p_owner->cc.p_sout_input = NULL;
+    p_owner->cc.sout_es_id = NULL;
+    p_owner->cc.b_sout_created = false;
+    p_owner->master_dec = NULL;
+    return p_owner;
 }
 
 /**
  * Destroys a decoder object
  *
- * \param p_dec the decoder object
- * \return nothing
+ * \param p_owner the input decoder object
+ * \param i_cat the elementary stream format category for the decoder
  */
-static void DeleteDecoder( decoder_t * p_dec )
+static void DeleteDecoder( vlc_input_decoder_t *p_owner, enum es_format_category_e i_cat )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
+    decoder_t *p_dec = &p_owner->dec;
     msg_Dbg( p_dec, "killing decoder fourcc `%4.4s'",
-             (char*)&p_dec->fmt_in.i_codec );
+             (char*)&p_dec->fmt_in->i_codec );
 
-    const bool b_flush_spu = p_dec->fmt_out.i_cat == SPU_ES;
-    UnloadDecoder( p_dec );
+    decoder_Clean( p_dec );
+    if( p_owner->p_packetizer != NULL )
+        decoder_Clean( p_owner->p_packetizer );
 
     /* Free all packets still in the decoder fifo. */
-    block_FifoRelease( p_owner->p_fifo );
+    block_FifoEmpty( p_owner->p_fifo );
 
     /* Cleanup */
-    if( p_owner->p_aout )
-    {
-        /* TODO: REVISIT gap-less audio */
-        aout_DecFlush( p_owner->p_aout, false );
-        aout_DecDelete( p_owner->p_aout );
-        input_resource_PutAout( p_owner->p_resource, p_owner->p_aout );
-        if( p_owner->p_input != NULL )
-            input_SendEventAout( p_owner->p_input );
-    }
-    if( p_owner->p_vout )
-    {
-        /* Reset the cancel state that was set before joining the decoder
-         * thread */
-        vout_Cancel( p_owner->p_vout, false );
-
-        input_resource_RequestVout( p_owner->p_resource, p_owner->p_vout, NULL,
-                                    0, true );
-        if( p_owner->p_input != NULL )
-            input_SendEventVout( p_owner->p_input );
-    }
-
-#ifdef ENABLE_SOUT
     if( p_owner->p_sout_input )
     {
-        sout_InputDelete( p_owner->p_sout_input );
+        sout_InputDelete( p_owner->p_sout, p_owner->p_sout_input );
+        if( p_owner->cc.p_sout_input )
+            sout_InputDelete( p_owner->p_sout, p_owner->cc.p_sout_input );
+        free( p_owner->cc.sout_es_id );
     }
-#endif
-    es_format_Clean( &p_owner->fmt );
 
-    if( b_flush_spu )
+    switch( i_cat )
     {
-        vout_thread_t *p_vout = input_resource_HoldVout( p_owner->p_resource );
-        if( p_vout )
-        {
-            if( p_owner->p_spu_vout == p_vout )
-                vout_FlushSubpictureChannel( p_vout, p_owner->i_spu_channel );
-            vlc_object_release( p_vout );
+        case AUDIO_ES:
+            if( p_owner->audio.aout )
+            {
+                /* TODO: REVISIT gap-less audio */
+                assert( p_owner->audio.stream );
+                vlc_aout_stream_Delete( p_owner->audio.stream );
+                input_resource_PutAout( p_owner->p_resource, p_owner->audio.aout );
+            }
+            break;
+        case VIDEO_ES: {
+            vout_thread_t *vout = p_owner->video.vout;
+
+            if ( p_owner->video.out_pool )
+                picture_pool_Release( p_owner->video.out_pool );
+
+            if (p_owner->video.vctx)
+                vlc_video_context_Release( p_owner->video.vctx );
+
+            if (vout != NULL)
+            {
+                /* Hold the vout since PutVout will likely release it and a
+                 * last reference is needed for notify callbacks */
+                vout_Hold(vout);
+
+                enum input_resource_vout_state vout_state;
+                input_resource_PutVout(p_owner->p_resource, vout, &vout_state);
+                if (vout_state == INPUT_RESOURCE_VOUT_STOPPED)
+                    decoder_Notify(p_owner, on_vout_stopped, vout);
+
+                vout_Release(vout);
+            }
+            break;
         }
+        case SPU_ES:
+        {
+            if( p_owner->spu.vout )
+            {
+                assert( p_owner->spu.channel != VOUT_SPU_CHANNEL_INVALID );
+                decoder_Notify(p_owner, on_vout_stopped, p_owner->spu.vout);
+
+                vout_UnregisterSubpictureChannel( p_owner->spu.vout,
+                                                  p_owner->spu.channel );
+                vout_Release(p_owner->spu.vout);
+            }
+            break;
+        }
+        case DATA_ES:
+        case UNKNOWN_ES:
+            break;
+        default:
+            vlc_assert_unreachable();
     }
+
+    es_format_Clean( &p_owner->dec_fmt_in );
+    es_format_Clean( &p_owner->pktz_fmt_in );
+    es_format_Clean( &p_owner->fmt );
 
     if( p_owner->p_description )
         vlc_meta_Delete( p_owner->p_description );
 
-    if( p_owner->p_packetizer )
-    {
-        UnloadDecoder( p_owner->p_packetizer );
-        vlc_object_release( p_owner->p_packetizer );
-    }
-
-    vlc_cond_destroy( &p_owner->wait_timed );
-    vlc_cond_destroy( &p_owner->wait_fifo );
-    vlc_cond_destroy( &p_owner->wait_acknowledge );
-    vlc_cond_destroy( &p_owner->wait_request );
-    vlc_mutex_destroy( &p_owner->lock );
-
-    vlc_object_release( p_dec );
-
-    free( p_owner );
+    block_FifoRelease( p_owner->p_fifo );
+    if( p_owner->p_packetizer != NULL )
+        vlc_object_delete( p_owner->p_packetizer );
+    vlc_object_delete( &p_owner->dec );
 }
 
 /* */
@@ -1895,136 +2424,241 @@ static void DecoderUnsupportedCodec( decoder_t *p_dec, const es_format_t *fmt, b
 }
 
 /* TODO: pass p_sout through p_resource? -- Courmisch */
-static decoder_t *decoder_New( vlc_object_t *p_parent, input_thread_t *p_input,
-                               const es_format_t *fmt, input_clock_t *p_clock,
-                               input_resource_t *p_resource,
-                               sout_instance_t *p_sout  )
+static vlc_input_decoder_t *
+decoder_New( vlc_object_t *p_parent, const struct vlc_input_decoder_cfg *cfg )
 {
-    decoder_t *p_dec = NULL;
-    const char *psz_type = p_sout ? N_("packetizer") : N_("decoder");
-    int i_priority;
+    const char *psz_type = cfg->sout ? N_("packetizer") : N_("decoder");
 
     /* Create the decoder configuration structure */
-    p_dec = CreateDecoder( p_parent, p_input, fmt, p_resource, p_sout );
-    if( p_dec == NULL )
+    vlc_input_decoder_t *p_owner = CreateDecoder( p_parent, cfg );
+    if( p_owner == NULL )
     {
-        msg_Err( p_parent, "could not create %s", psz_type );
+        msg_Err( p_parent, "could not create %s", cfg->str_id );
         vlc_dialog_display_error( p_parent, _("Streaming / Transcoding failed"),
             _("VLC could not open the %s module."), vlc_gettext( psz_type ) );
         return NULL;
     }
 
+    decoder_t *p_dec = &p_owner->dec;
     if( !p_dec->p_module )
     {
-        DecoderUnsupportedCodec( p_dec, fmt, !p_sout );
+        DecoderUnsupportedCodec( p_dec, cfg->fmt, !cfg->sout );
 
-        DeleteDecoder( p_dec );
+        /* Don't use dec->fmt_in->i_cat since it may not be initialized here. */
+        DeleteDecoder( p_owner, cfg->fmt->i_cat );
         return NULL;
     }
 
-    p_dec->p_owner->p_clock = p_clock;
-    assert( p_dec->fmt_out.i_cat != UNKNOWN_ES );
+    assert( p_dec->fmt_in->i_cat != UNKNOWN_ES );
 
-    if( p_dec->fmt_out.i_cat == AUDIO_ES )
-        i_priority = VLC_THREAD_PRIORITY_AUDIO;
-    else
-        i_priority = VLC_THREAD_PRIORITY_VIDEO;
-
-    /* Spawn the decoder thread */
-    if( vlc_clone( &p_dec->p_owner->thread, DecoderThread, p_dec, i_priority ) )
+    /* Do not delay sout creation for SPU or DATA. */
+    if( cfg->sout && cfg->fmt->b_packetized &&
+        (cfg->fmt->i_cat != VIDEO_ES && cfg->fmt->i_cat != AUDIO_ES) )
     {
-        msg_Err( p_dec, "cannot spawn decoder thread" );
-        DeleteDecoder( p_dec );
-        return NULL;
+        p_owner->p_sout_input = sout_InputNew( p_owner->p_sout, cfg->fmt, p_owner->psz_id );
+        if( p_owner->p_sout_input == NULL )
+        {
+            msg_Err( p_dec, "cannot create sout input (%4.4s)",
+                     (char *)&cfg->fmt->i_codec );
+            p_owner->error = true;
+        }
     }
 
-    return p_dec;
+    if( !vlc_input_decoder_IsSynchronous( p_owner ) )
+    {
+        /* Spawn the decoder thread in asynchronous scenario. */
+        if( vlc_clone( &p_owner->thread, DecoderThread, p_owner ) )
+        {
+            msg_Err( p_dec, "cannot spawn decoder thread" );
+            DeleteDecoder( p_owner, p_dec->fmt_in->i_cat );
+            return NULL;
+        }
+    }
+
+    return p_owner;
 }
 
 
 /**
  * Spawns a new decoder thread from the input thread
  *
- * \param p_input the input thread
- * \param p_es the es descriptor
+ * \param parent the VLC object to inherit variable from
+ * \param cfg the input decoder configuration
  * \return the spawned decoder object
  */
-decoder_t *input_DecoderNew( input_thread_t *p_input,
-                             es_format_t *fmt, input_clock_t *p_clock,
-                             sout_instance_t *p_sout  )
+vlc_input_decoder_t *
+vlc_input_decoder_New( vlc_object_t *parent, const struct vlc_input_decoder_cfg *cfg )
 {
-    return decoder_New( VLC_OBJECT(p_input), p_input, fmt, p_clock,
-                        input_priv(p_input)->p_resource, p_sout );
+    return decoder_New( parent, cfg );
 }
 
-/**
- * Spawn a decoder thread outside of the input thread.
- */
-decoder_t *input_DecoderCreate( vlc_object_t *p_parent, const es_format_t *fmt,
-                                input_resource_t *p_resource )
+vlc_input_decoder_t *
+vlc_input_decoder_Create( vlc_object_t *p_parent, const es_format_t *fmt, const char *es_id,
+                          struct vlc_clock_t *clock, input_resource_t *p_resource )
 {
-    return decoder_New( p_parent, NULL, fmt, NULL, p_resource, NULL );
+    const struct vlc_input_decoder_cfg cfg = {
+        .fmt = fmt,
+        .str_id = es_id,
+        .clock = clock,
+        .resource = p_resource,
+        .sout = NULL,
+        .input_type = INPUT_TYPE_PLAYBACK,
+        .hw_dec = var_InheritBool( p_parent, "hw-dec" ),
+        .cbs = NULL, .cbs_data = NULL,
+    };
+    return decoder_New( p_parent, &cfg );
 }
 
-
-/**
- * Kills a decoder thread and waits until it's finished
- *
- * \param p_input the input thread
- * \param p_es the es descriptor
- * \return nothing
- */
-void input_DecoderDelete( decoder_t *p_dec )
+static void RemoveCcDecoder(vlc_input_decoder_t *owner,
+                            vlc_input_decoder_t *subdec)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_mutex_lock(&owner->subdecs.lock);
 
-    vlc_cancel( p_owner->thread );
+    vlc_input_decoder_t *it;
+    vlc_list_foreach(it, &owner->subdecs.list, node)
+        if (it == subdec)
+        {
+            vlc_list_remove(&it->node);
+            owner->cc.count--;
+            vlc_mutex_unlock(&owner->subdecs.lock);
+            return;
+        }
+
+    vlc_assert_unreachable();
+}
+
+void vlc_input_decoder_Delete( vlc_input_decoder_t *p_owner )
+{
+    if (p_owner->master_dec != NULL)
+        RemoveCcDecoder(p_owner->master_dec, p_owner);
 
     vlc_fifo_Lock( p_owner->p_fifo );
-    /* Signal DecoderTimedWait */
-    p_owner->flushing = true;
-    vlc_cond_signal( &p_owner->wait_timed );
-    vlc_fifo_Unlock( p_owner->p_fifo );
+    p_owner->aborting = true;
+    p_owner->b_waiting = false;
+    vlc_fifo_Signal( p_owner->p_fifo );
 
     /* Make sure we aren't waiting/decoding anymore */
-    vlc_mutex_lock( &p_owner->lock );
-    p_owner->b_waiting = false;
     vlc_cond_signal( &p_owner->wait_request );
+    vlc_fifo_Unlock( p_owner->p_fifo );
 
-    /* If the video output is paused or slow, or if the picture pool size was
-     * under-estimated (e.g. greedy video filter, buggy decoder...), the
-     * the picture pool may be empty, and the decoder thread or any decoder
-     * module worker threads may be stuck waiting for free picture buffers.
-     *
-     * This unblocks the thread, allowing the decoder module to join all its
-     * worker threads (if any) and the decoder thread to terminate. */
-    if( p_owner->p_vout != NULL )
-        vout_Cancel( p_owner->p_vout, true );
-    vlc_mutex_unlock( &p_owner->lock );
+    if( !vlc_input_decoder_IsSynchronous( p_owner ) )
+        vlc_join( p_owner->thread, NULL );
 
-    vlc_join( p_owner->thread, NULL );
-
-    /* */
-    if( p_dec->p_owner->cc.b_supported )
-    {
-        for( int i = 0; i < MAX_CC_DECODERS; i++ )
-            input_DecoderSetCcState( p_dec, VLC_CODEC_CEA608, i, false );
-    }
+#ifndef NDEBUG
+    vlc_mutex_lock(&p_owner->subdecs.lock);
+    assert(vlc_list_is_empty(&p_owner->subdecs.list));
+    assert(p_owner->cc.count == 0);
+    vlc_mutex_unlock(&p_owner->subdecs.lock);
+#endif
 
     /* Delete decoder */
-    DeleteDecoder( p_dec );
+    DeleteDecoder(p_owner, p_owner->dec_fmt_in.i_cat);
 }
 
-/**
- * Put a block_t in the decoder's fifo.
- * Thread-safe w.r.t. the decoder. May be a cancellation point.
- *
- * \param p_dec the decoder object
- * \param p_block the data block
- */
-void input_DecoderDecode( decoder_t *p_dec, block_t *p_block, bool b_do_pace )
+void vlc_subdec_desc_Clean(struct vlc_subdec_desc *desc)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    for (size_t i = 0; i < desc->fmt_count; ++i)
+        es_format_Clean(&desc->fmt_array[i]);
+    free(desc->fmt_array);
+}
+
+static void GetCCDescLocked(vlc_input_decoder_t *owner,
+                            struct vlc_subdec_desc *desc)
+{
+    vlc_fifo_Assert(owner->p_fifo);
+
+    if (!owner->cc.desc_changed)
+    {
+        desc->fmt_array = NULL;
+        desc->fmt_count = 0;
+        return;
+    }
+    owner->cc.desc_changed = false;
+
+    size_t max_channels;
+    uint64_t bitmap;
+    GetCcChannels(owner, &max_channels, &bitmap);
+
+    int count = vlc_popcount(bitmap);
+    if (count == 0)
+    {
+        desc->fmt_array = NULL;
+        desc->fmt_count = 0;
+        return;
+    }
+
+    desc->fmt_array = vlc_alloc(count, sizeof(es_format_t));
+    if (unlikely(desc->fmt_array == NULL))
+    {
+        desc->fmt_count = 0;
+        return;
+    }
+    desc->fmt_count = count;
+
+    static const char CEA608_fmtdesc[] = N_("Closed captions %u");
+    static const char CEA708_fmtdesc[] = N_("DTVCC Closed captions %u");
+    const char *fmtdesc = owner->cc.selected_codec == VLC_CODEC_CEA608 ?
+                          CEA608_fmtdesc : CEA708_fmtdesc;
+
+    size_t array_idx = 0;
+    for (int i = 0; bitmap > 0; bitmap >>= 1, i++)
+    {
+        if ((bitmap & 1) == 0)
+            continue;
+        es_format_t *fmt = &desc->fmt_array[array_idx++];
+        es_format_Init(fmt, SPU_ES, owner->cc.selected_codec);
+        fmt->i_id = i + 1;
+        fmt->subs.cc.i_channel = i;
+        fmt->subs.cc.i_reorder_depth = owner->cc.desc.i_reorder_depth;
+        if (asprintf(&fmt->psz_description, fmtdesc, fmt->i_id) == -1)
+            fmt->psz_description = NULL;
+    }
+}
+
+static void GetStatusLocked(vlc_input_decoder_t *p_owner,
+                            struct vlc_input_decoder_status *status)
+{
+    vlc_fifo_Assert(p_owner->p_fifo);
+
+    status->format.changed = p_owner->b_fmt_description;
+    p_owner->b_fmt_description = false;
+
+    if( status->format.changed && p_owner->fmt.i_cat == UNKNOWN_ES )
+    {
+        /* The format changed but the output creation failed */
+        status->format.changed = false;
+    }
+
+    if( status->format.changed )
+    {
+        es_format_Copy( &status->format.fmt, &p_owner->fmt );
+        status->format.meta = NULL;
+
+        if( p_owner->p_description )
+        {
+            status->format.meta  = vlc_meta_New();
+            if( status->format.meta  )
+                vlc_meta_Merge( status->format.meta, p_owner->p_description );
+        }
+    }
+    GetCCDescLocked(p_owner, &status->subdec_desc);
+}
+
+void vlc_input_decoder_DecodeWithStatus(vlc_input_decoder_t *p_owner, vlc_frame_t *frame,
+                                        bool b_do_pace,
+                                        struct vlc_input_decoder_status *status)
+{
+    if( vlc_input_decoder_IsSynchronous( p_owner ) )
+    {
+        /* DecoderThread's fifo should be empty as no decoder thread is running. */
+        assert( vlc_fifo_IsEmpty( p_owner->p_fifo ) );
+        vlc_fifo_Lock(p_owner->p_fifo);
+        DecoderThread_ProcessInput( p_owner, frame );
+        if (status != NULL)
+            GetStatusLocked(p_owner, status);
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        return;
+    }
 
     vlc_fifo_Lock( p_owner->p_fifo );
     if( !b_do_pace )
@@ -2034,9 +2668,10 @@ void input_DecoderDecode( decoder_t *p_dec, block_t *p_block, bool b_do_pace )
         /* 400 MiB, i.e. ~ 50mb/s for 60s */
         if( vlc_fifo_GetBytes( p_owner->p_fifo ) > 400*1024*1024 )
         {
-            msg_Warn( p_dec, "decoder/packetizer fifo full (data not "
+            msg_Warn( &p_owner->dec, "decoder/packetizer fifo full (data not "
                       "consumed quickly enough), resetting fifo!" );
             block_ChainRelease( vlc_fifo_DequeueAllUnlocked( p_owner->p_fifo ) );
+            frame->i_flags |= BLOCK_FLAG_DISCONTINUITY;
         }
     }
     else
@@ -2048,54 +2683,87 @@ void input_DecoderDecode( decoder_t *p_dec, block_t *p_block, bool b_do_pace )
             vlc_fifo_WaitCond( p_owner->p_fifo, &p_owner->wait_fifo );
     }
 
-    vlc_fifo_QueueUnlocked( p_owner->p_fifo, p_block );
+    if (vlc_fifo_IsEmpty(p_owner->p_fifo) && p_owner->frames_countdown > 0)
+        decoder_Notify(p_owner, frame_next_need_data, false);
+
+    vlc_fifo_QueueUnlocked( p_owner->p_fifo, frame );
+    if (status != NULL)
+        GetStatusLocked(p_owner, status);
+
+    struct vlc_tracer *tracer = vlc_object_get_tracer(&p_owner->dec.obj);
+    if (tracer != NULL)
+    {
+        size_t fifo_size = vlc_fifo_GetBytes(p_owner->p_fifo);
+        size_t fifo_count = vlc_fifo_GetCount(p_owner->p_fifo);
+        vlc_tracer_Trace(tracer,
+                         VLC_TRACE("id", p_owner->psz_id),
+                         VLC_TRACE("fifo_size", (uint64_t)fifo_size),
+                         VLC_TRACE("fifo_count", (uint64_t)fifo_count),
+                         VLC_TRACE_END);
+    }
+
+
     vlc_fifo_Unlock( p_owner->p_fifo );
 }
 
-bool input_DecoderIsEmpty( decoder_t * p_dec )
+void vlc_input_decoder_Decode(vlc_input_decoder_t *p_owner, vlc_frame_t *frame,
+                              bool b_do_pace)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_input_decoder_DecodeWithStatus(p_owner, frame, b_do_pace, NULL);
+}
 
+static bool vlc_input_decoder_IsDrainedLocked(vlc_input_decoder_t *owner)
+{
+    vlc_fifo_Assert(owner->p_fifo);
+
+    if (owner->b_draining)
+        return false;
+    else if (owner->p_sout_input != NULL)
+        return true;
+    else if (owner->cat == VIDEO_ES && owner->video.vout != NULL)
+        return vout_IsEmpty(owner->video.vout);
+    else if(owner->cat == AUDIO_ES && owner->audio.stream != NULL)
+        return vlc_aout_stream_IsDrained( owner->audio.stream);
+    else
+        return true; /* TODO subtitles support */
+}
+
+bool vlc_input_decoder_IsDrained(vlc_input_decoder_t *owner)
+{
+    vlc_fifo_Lock(owner->p_fifo);
+    bool drained = vlc_input_decoder_IsDrainedLocked(owner);
+    vlc_fifo_Unlock(owner->p_fifo);
+    return drained;
+}
+
+bool vlc_input_decoder_IsEmpty( vlc_input_decoder_t * p_owner )
+{
     assert( !p_owner->b_waiting );
 
     vlc_fifo_Lock( p_owner->p_fifo );
-    if( !vlc_fifo_IsEmpty( p_dec->p_owner->p_fifo ) || p_owner->b_draining )
+    if( !vlc_fifo_IsEmpty( p_owner->p_fifo ) )
     {
         vlc_fifo_Unlock( p_owner->p_fifo );
         return false;
     }
+
+    bool b_empty = vlc_input_decoder_IsDrainedLocked( p_owner );
+
     vlc_fifo_Unlock( p_owner->p_fifo );
-
-    bool b_empty;
-
-    vlc_mutex_lock( &p_owner->lock );
-#ifdef ENABLE_SOUT
-    if( p_owner->p_sout_input != NULL )
-        b_empty = sout_InputIsEmpty( p_owner->p_sout_input );
-    else
-#endif
-    if( p_owner->fmt.i_cat == VIDEO_ES && p_owner->p_vout != NULL )
-        b_empty = vout_IsEmpty( p_owner->p_vout );
-    else if( p_owner->fmt.i_cat == AUDIO_ES )
-        b_empty = !p_owner->b_draining || p_owner->drained;
-    else
-        b_empty = true; /* TODO subtitles support */
-    vlc_mutex_unlock( &p_owner->lock );
 
     return b_empty;
 }
 
-/**
- * Signals that there are no further blocks to decode, and requests that the
- * decoder drain all pending buffers. This is used to ensure that all
- * intermediate buffers empty and no samples get lost at the end of the stream.
- *
- * @note The function does not actually wait for draining. It just signals that
- * draining should be performed once the decoder has emptied FIFO.
- */
-void input_DecoderDrain( decoder_t *p_dec )
+void vlc_input_decoder_Drain( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    if ( vlc_input_decoder_IsSynchronous( p_owner ) )
+    {
+        /* Process a NULL frame synchronously to signal draining to packetizer/decoder. */
+        vlc_fifo_Lock(p_owner->p_fifo);
+        DecoderThread_ProcessInput( p_owner, NULL );
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        return;
+    }
 
     vlc_fifo_Lock( p_owner->p_fifo );
     p_owner->b_draining = true;
@@ -2103,15 +2771,10 @@ void input_DecoderDrain( decoder_t *p_dec )
     vlc_fifo_Unlock( p_owner->p_fifo );
 }
 
-/**
- * Requests that the decoder immediately discard all pending buffers.
- * This is useful when seeking or when deselecting a stream.
- */
-void input_DecoderFlush( decoder_t *p_dec )
+void vlc_input_decoder_Flush( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
     vlc_fifo_Lock( p_owner->p_fifo );
+    enum es_format_category_e cat = p_owner->cat;
 
     /* Empty the fifo */
     block_ChainRelease( vlc_fifo_DequeueAllUnlocked( p_owner->p_fifo ) );
@@ -2121,128 +2784,116 @@ void input_DecoderFlush( decoder_t *p_dec )
      * dequeued by DecoderThread and there is no need to flush a second time in
      * a row. */
     p_owner->flushing = true;
+    p_owner->b_draining = false;
 
-    /* Flushing video decoder when paused: increment frames_countdown in order
-     * to display one frame */
-    if( p_owner->fmt.i_cat == VIDEO_ES && p_owner->paused
+    /* Flush video/spu decoder when paused: increment frames_countdown in order
+     * to display one frame/subtitle */
+    if( p_owner->paused && ( cat == VIDEO_ES || cat == SPU_ES )
      && p_owner->frames_countdown == 0 )
-        p_owner->frames_countdown++;
+        p_owner->frames_countdown = 1;
 
+    if ( p_owner->p_sout_input != NULL )
+    {
+        sout_InputFlush( p_owner->p_sout, p_owner->p_sout_input );
+    }
+    else if( cat == AUDIO_ES )
+    {
+        p_owner->audio.drained = false;
+        if( p_owner->audio.stream )
+            vlc_aout_stream_Flush( p_owner->audio.stream );
+    }
+    else if( cat == VIDEO_ES )
+    {
+        p_owner->video.drained = false;
+        if( p_owner->video.vout && p_owner->video.started
+         && p_owner->frames_countdown != -1 )
+        {
+            /* prev-frame: don't flush if frames_countdown == -1. If requests
+             * are sent in a burst, we want to avoid flushing the previous
+             * frame that is being displayed. */
+            vout_FlushAll( p_owner->video.vout );
+        }
+        decoder_prevframe_Flush( &p_owner->video.pf );
+    }
+    else if( cat == SPU_ES )
+    {
+        if( p_owner->spu.vout )
+        {
+            assert( p_owner->spu.channel != VOUT_SPU_CHANNEL_INVALID );
+            vout_FlushSubpictureChannel( p_owner->spu.vout, p_owner->spu.channel );
+        }
+    }
     vlc_fifo_Signal( p_owner->p_fifo );
-    vlc_cond_signal( &p_owner->wait_timed );
+
+    if (unlikely(p_owner->b_waiting && p_owner->b_has_data))
+    {
+        /* Signal the output thread to stop waiting from DecoderWaitUnblock()
+         * and to discard the current frame (via 'flushing' = true). */
+        vlc_cond_signal(&p_owner->wait_request);
+
+        /* Flushing is fully asynchronous, but we need to wait for the output
+         * thread to unblock in DecoderWaitUnblock() otherwise there are no
+         * ways to know if the frame referenced when waiting comes from before
+         * or after the flush. Waiting here is almost instantaneous since we
+         * are sure that the output thread is waiting in DecoderWaitUnblock().
+         */
+        while (p_owner->b_has_data)
+            vlc_fifo_WaitCond(p_owner->p_fifo, &p_owner->wait_acknowledge);
+    }
 
     vlc_fifo_Unlock( p_owner->p_fifo );
-}
 
-void input_DecoderGetCcDesc( decoder_t *p_dec, decoder_cc_desc_t *p_desc )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    vlc_mutex_lock( &p_owner->lock );
-    *p_desc = p_owner->cc.desc;
-    vlc_mutex_unlock( &p_owner->lock );
-}
-
-static bool input_DecoderHasCCChanFlag( decoder_t *p_dec,
-                                        vlc_fourcc_t codec, int i_channel )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    int i_max_channels;
-    uint64_t i_bitmap;
-    if( codec == VLC_CODEC_CEA608 )
+    if (vlc_input_decoder_IsSynchronous(p_owner))
     {
-        i_max_channels = 4;
-        i_bitmap = p_owner->cc.desc.i_608_channels;
+        /* With a synchronous decoder,there is no decoder thread which
+         * can process the flush request. We flush synchronously from
+         * here and reset the flushing state. */
+        DecoderThread_Flush(p_owner);
+        vlc_fifo_Lock(p_owner->p_fifo);
+        p_owner->flushing = false;
+        p_owner->i_preroll_end = PREROLL_NONE;
+        vlc_fifo_Unlock(p_owner->p_fifo);
     }
-    else if( codec == VLC_CODEC_CEA708 )
-    {
-        i_max_channels = 64;
-        i_bitmap = p_owner->cc.desc.i_708_channels;
-    }
-    else return false;
-
-    return ( i_channel >= 0 && i_channel < i_max_channels &&
-             ( i_bitmap & ((uint64_t)1 << i_channel) ) );
 }
 
-int input_DecoderSetCcState( decoder_t *p_dec, vlc_fourcc_t codec,
-                             int i_channel, bool b_decode )
+vlc_input_decoder_t *
+vlc_input_decoder_CreateSubDec(vlc_input_decoder_t *p_owner,
+                               const struct vlc_input_decoder_cfg *cfg)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    decoder_t *p_dec = &p_owner->dec;
 
-    //msg_Warn( p_dec, "input_DecoderSetCcState: %d @%x", b_decode, i_channel );
+    vlc_mutex_lock(&p_owner->subdecs.lock);
 
-    if( !input_DecoderHasCCChanFlag( p_dec, codec, i_channel ) )
-        return VLC_EGENERIC;
+    vlc_input_decoder_t *p_ccowner;
 
-    if( b_decode )
+    p_ccowner = vlc_input_decoder_New( VLC_OBJECT(p_dec), cfg );
+    if( !p_ccowner )
     {
-        decoder_t *p_cc;
-        es_format_t fmt;
-
-        es_format_Init( &fmt, SPU_ES, codec );
-        fmt.subs.cc.i_channel = i_channel;
-        fmt.subs.cc.i_reorder_depth = p_owner->cc.desc.i_reorder_depth;
-        p_cc = input_DecoderNew( p_owner->p_input, &fmt,
-                              p_dec->p_owner->p_clock, p_owner->p_sout );
-        if( !p_cc )
-        {
-            msg_Err( p_dec, "could not create decoder" );
-            vlc_dialog_display_error( p_dec,
-                _("Streaming / Transcoding failed"), "%s",
-                _("VLC could not open the decoder module.") );
-            return VLC_EGENERIC;
-        }
-        else if( !p_cc->p_module )
-        {
-            DecoderUnsupportedCodec( p_dec, &fmt, true );
-            input_DecoderDelete(p_cc);
-            return VLC_EGENERIC;
-        }
-        p_cc->p_owner->p_clock = p_owner->p_clock;
-
-        vlc_mutex_lock( &p_owner->lock );
-        p_owner->cc.pp_decoder[i_channel] = p_cc;
-        vlc_mutex_unlock( &p_owner->lock );
+        msg_Err( p_dec, "could not create decoder" );
+        vlc_dialog_display_error( p_dec,
+            _("Streaming / Transcoding failed"), "%s",
+            _("VLC could not open the decoder module.") );
+        vlc_mutex_unlock(&p_owner->subdecs.lock);
+        return NULL;
     }
-    else
-    {
-        decoder_t *p_cc;
+    assert(p_ccowner->dec.p_module != NULL);
 
-        vlc_mutex_lock( &p_owner->lock );
-        p_cc = p_owner->cc.pp_decoder[i_channel];
-        p_owner->cc.pp_decoder[i_channel] = NULL;
-        vlc_mutex_unlock( &p_owner->lock );
+    vlc_list_append(&p_ccowner->node, &p_owner->subdecs.list);
+    p_owner->cc.count++;
+    p_ccowner->master_dec = p_owner;
 
-        if( p_cc )
-            input_DecoderDelete(p_cc);
-    }
-    return VLC_SUCCESS;
+    vlc_mutex_unlock(&p_owner->subdecs.lock);
+    return p_ccowner;
 }
 
-int input_DecoderGetCcState( decoder_t *p_dec, vlc_fourcc_t codec,
-                             int i_channel, bool *pb_decode )
+void vlc_input_decoder_ChangePause( vlc_input_decoder_t *p_owner,
+                                    bool b_paused, vlc_tick_t i_date )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    if( !input_DecoderHasCCChanFlag( p_dec, codec, i_channel ) )
-        return VLC_EGENERIC;
-
-    vlc_mutex_lock( &p_owner->lock );
-    *pb_decode = p_owner->cc.pp_decoder[i_channel] != NULL;
-    vlc_mutex_unlock( &p_owner->lock );
-    return VLC_SUCCESS;
-}
-
-void input_DecoderChangePause( decoder_t *p_dec, bool b_paused, mtime_t i_date )
-{
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
     /* Normally, p_owner->b_paused != b_paused here. But if a track is added
      * while the input is paused (e.g. add sub file), then b_paused is
      * (incorrectly) false. FIXME: This is a bug in the decoder owner. */
     vlc_fifo_Lock( p_owner->p_fifo );
+
     p_owner->paused = b_paused;
     p_owner->pause_date = i_date;
     p_owner->frames_countdown = 0;
@@ -2250,132 +2901,285 @@ void input_DecoderChangePause( decoder_t *p_dec, bool b_paused, mtime_t i_date )
     vlc_fifo_Unlock( p_owner->p_fifo );
 }
 
-void input_DecoderChangeDelay( decoder_t *p_dec, mtime_t i_delay )
+void vlc_input_decoder_ChangeRate( vlc_input_decoder_t *owner, float rate )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
-    vlc_mutex_lock( &p_owner->lock );
-    p_owner->i_ts_delay = i_delay;
-    vlc_mutex_unlock( &p_owner->lock );
+    vlc_fifo_Lock( owner->p_fifo );
+    owner->rate = rate;
+    vlc_fifo_Unlock( owner->p_fifo );
 }
 
-void input_DecoderStartWait( decoder_t *p_dec )
+void vlc_input_decoder_ChangeDelay( vlc_input_decoder_t *owner, vlc_tick_t delay )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    vlc_fifo_Lock( owner->p_fifo );
+    owner->delay = delay;
+    vlc_fifo_Unlock( owner->p_fifo );
+}
+
+void vlc_input_decoder_StartWait( vlc_input_decoder_t *p_owner )
+{
+    if ( vlc_input_decoder_IsSynchronous( p_owner ) )
+        return;
 
     assert( !p_owner->b_waiting );
 
-    vlc_mutex_lock( &p_owner->lock );
-    p_owner->b_first = true;
+    vlc_fifo_Lock(p_owner->p_fifo);
     p_owner->b_has_data = false;
+    p_owner->b_first = true;
     p_owner->b_waiting = true;
-    vlc_cond_signal( &p_owner->wait_request );
-    vlc_mutex_unlock( &p_owner->lock );
+    vlc_cond_signal(&p_owner->wait_request);
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-void input_DecoderStopWait( decoder_t *p_dec )
+void vlc_input_decoder_StopWait( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    if ( vlc_input_decoder_IsSynchronous( p_owner ) )
+        return;
 
+    vlc_fifo_Lock(p_owner->p_fifo);
     assert( p_owner->b_waiting );
-
-    vlc_mutex_lock( &p_owner->lock );
     p_owner->b_waiting = false;
     vlc_cond_signal( &p_owner->wait_request );
-    vlc_mutex_unlock( &p_owner->lock );
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-void input_DecoderWait( decoder_t *p_dec )
+void vlc_input_decoder_Wait( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
+    if ( vlc_input_decoder_IsSynchronous( p_owner ) )
+        return;
     assert( p_owner->b_waiting );
 
-    vlc_mutex_lock( &p_owner->lock );
+    vlc_fifo_Lock(p_owner->p_fifo);
     while( !p_owner->b_has_data )
     {
         /* Don't need to lock p_owner->paused since it's only modified by the
          * owner */
         if( p_owner->paused )
             break;
-        vlc_fifo_Lock( p_owner->p_fifo );
         if( p_owner->b_idle && vlc_fifo_IsEmpty( p_owner->p_fifo ) )
         {
-            msg_Err( p_dec, "buffer deadlock prevented" );
-            vlc_fifo_Unlock( p_owner->p_fifo );
+            msg_Err( &p_owner->dec, "buffer deadlock prevented" );
             break;
         }
-        vlc_fifo_Unlock( p_owner->p_fifo );
-        vlc_cond_wait( &p_owner->wait_acknowledge, &p_owner->lock );
+        vlc_fifo_WaitCond(p_owner->p_fifo, &p_owner->wait_acknowledge);
     }
-    vlc_mutex_unlock( &p_owner->lock );
+    vlc_fifo_Unlock(p_owner->p_fifo);
 }
 
-void input_DecoderFrameNext( decoder_t *p_dec, mtime_t *pi_duration )
+static void StopFrameNextLocked(vlc_input_decoder_t *owner)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    decoder_prevframe_Reset(&owner->video.pf);
+    owner->video.pf_pts = VLC_TICK_INVALID;
+    if (owner->frames_countdown == -1)
+        owner->frames_countdown = 0;
+    vlc_fifo_Signal(owner->p_fifo);
+}
 
+void vlc_input_decoder_StopFrameNext(vlc_input_decoder_t *owner)
+{
+    vlc_fifo_Lock(owner->p_fifo);
+    StopFrameNextLocked(owner);
+    vlc_fifo_Unlock(owner->p_fifo);
+}
+
+void vlc_input_decoder_FrameNext( vlc_input_decoder_t *p_owner )
+{
     assert( p_owner->paused );
-    *pi_duration = 0;
+    assert( p_owner->cat == VIDEO_ES );
 
     vlc_fifo_Lock( p_owner->p_fifo );
-    p_owner->frames_countdown++;
-    vlc_fifo_Signal( p_owner->p_fifo );
+
+    if( p_owner->video.vout == NULL )
+    {
+        decoder_Notify( p_owner, frame_next_status, -EBUSY );
+        vlc_fifo_Unlock( p_owner->p_fifo );
+        return;
+    }
+
+    if( unlikely( p_owner->frames_countdown == INT_MAX ) )
+    {
+        decoder_Notify( p_owner, frame_next_status, -EINVAL );
+        vlc_fifo_Unlock( p_owner->p_fifo );
+        return;
+    }
+
+    if( p_owner->video.drained && vout_IsEmpty( p_owner->video.vout ) )
+    {
+        p_owner->frames_countdown = 0;
+        decoder_Notify( p_owner, frame_next_status, -EAGAIN );
+        vlc_fifo_Unlock( p_owner->p_fifo );
+        return;
+    }
+
+    StopFrameNextLocked( p_owner );
+
+    if (!p_owner->output_paused)
+    {
+        /* Request will be handled when paused, from
+         * Decoder_PausedForNextFrame() */
+        p_owner->frames_countdown++;
+        vlc_fifo_Unlock( p_owner->p_fifo );
+        return;
+    }
+
+    size_t needed_count = vout_NextPicture(p_owner->video.vout, 1);
+    assert(p_owner->frames_countdown >= 0);
+    if (needed_count > (unsigned) p_owner->frames_countdown)
+        p_owner->frames_countdown++;
+    else
+        decoder_Notify(p_owner, frame_next_status, 0);
+
     vlc_fifo_Unlock( p_owner->p_fifo );
-
-    vlc_mutex_lock( &p_owner->lock );
-    if( p_owner->fmt.i_cat == VIDEO_ES )
-    {
-        if( p_owner->p_vout )
-            vout_NextPicture( p_owner->p_vout, pi_duration );
-    }
-    vlc_mutex_unlock( &p_owner->lock );
 }
 
-bool input_DecoderHasFormatChanged( decoder_t *p_dec, es_format_t *p_fmt, vlc_meta_t **pp_meta )
+void vlc_input_decoder_FramePrevious(vlc_input_decoder_t *owner)
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-    bool b_changed;
+    assert(owner->paused);
+    assert(owner->cat == VIDEO_ES);
 
-    vlc_mutex_lock( &p_owner->lock );
-    b_changed = p_owner->b_fmt_description;
-    if( b_changed )
+    vlc_fifo_Lock(owner->p_fifo);
+
+    if (!owner->video.started)
     {
-        if( p_fmt != NULL )
-            es_format_Copy( p_fmt, &p_owner->fmt );
-
-        if( pp_meta )
-        {
-            *pp_meta = NULL;
-            if( p_owner->p_description )
-            {
-                *pp_meta = vlc_meta_New();
-                if( *pp_meta )
-                    vlc_meta_Merge( *pp_meta, p_owner->p_description );
-            }
-        }
-        p_owner->b_fmt_description = false;
+        decoder_Notify(owner, frame_previous_status, -EBUSY);
+        vlc_fifo_Unlock(owner->p_fifo);
+        return;
     }
-    vlc_mutex_unlock( &p_owner->lock );
-    return b_changed;
+
+    if (owner->frames_countdown != -1)
+    {
+        owner->frames_countdown = -1;
+
+        owner->video.pf_pts = vout_FlushAll(owner->video.vout);
+    }
+
+    if (owner->video.pf_pts == VLC_TICK_INVALID)
+    {
+        /* No frame displayed yet (that's a success) */
+        decoder_Notify(owner, frame_previous_status, 0);
+        vlc_fifo_Unlock(owner->p_fifo);
+        return;
+    }
+
+    Decoder_RequestFramePrevious(owner);
+
+    vlc_fifo_Unlock(owner->p_fifo);
 }
 
-size_t input_DecoderGetFifoSize( decoder_t *p_dec )
+size_t vlc_input_decoder_GetFifoSize( vlc_input_decoder_t *p_owner )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
-
     return block_FifoSize( p_owner->p_fifo );
 }
 
-void input_DecoderGetObjects( decoder_t *p_dec,
-                              vout_thread_t **pp_vout, audio_output_t **pp_aout )
+static bool DecoderHasVbi( decoder_t *dec )
 {
-    decoder_owner_sys_t *p_owner = p_dec->p_owner;
+    return dec->fmt_in->i_cat == SPU_ES && dec->fmt_in->i_codec == VLC_CODEC_TELETEXT
+        && var_Type( dec, "vbi-page" ) == VLC_VAR_INTEGER;
+}
 
-    vlc_mutex_lock( &p_owner->lock );
-    if( pp_vout )
-        *pp_vout = p_owner->p_vout ? vlc_object_hold( p_owner->p_vout ) : NULL;
-    if( pp_aout )
-        *pp_aout = p_owner->p_aout ? vlc_object_hold( p_owner->p_aout ) : NULL;
-    vlc_mutex_unlock( &p_owner->lock );
+int vlc_input_decoder_GetVbiPage( vlc_input_decoder_t *owner, bool *opaque )
+{
+    decoder_t *dec = &owner->dec;
+    if( !DecoderHasVbi( dec ) )
+        return -1;
+    *opaque = var_GetBool( dec, "vbi-opaque" );
+    return var_GetInteger( dec, "vbi-page" );
+}
+
+int vlc_input_decoder_SetVbiPage( vlc_input_decoder_t *owner, unsigned page )
+{
+    decoder_t *dec = &owner->dec;
+    if( !DecoderHasVbi( dec ) )
+        return VLC_EGENERIC;
+    return var_SetInteger( dec, "vbi-page", page );
+}
+
+int vlc_input_decoder_SetVbiOpaque( vlc_input_decoder_t *owner, bool opaque )
+{
+    decoder_t *dec = &owner->dec;
+    if( !DecoderHasVbi( dec ) )
+        return VLC_EGENERIC;
+    return var_SetBool( dec, "vbi-opaque", opaque );
+}
+
+void vlc_input_decoder_SetVoutMouseEvent( vlc_input_decoder_t *owner,
+                                          vlc_mouse_event mouse_event,
+                                          void *user_data )
+{
+    assert( owner->cat == VIDEO_ES );
+
+    vlc_mutex_lock( &owner->video.mouse_lock );
+
+    owner->video.mouse_event = mouse_event;
+    owner->video.mouse_opaque = user_data;
+
+    vlc_mutex_unlock( &owner->video.mouse_lock );
+}
+
+int vlc_input_decoder_AddVoutOverlay( vlc_input_decoder_t *owner, subpicture_t *sub,
+                                      size_t *channel )
+{
+    assert( owner->cat == VIDEO_ES );
+    assert( sub && channel );
+
+    vlc_fifo_Lock(owner->p_fifo);
+
+    if( !owner->video.vout )
+    {
+        vlc_fifo_Unlock(owner->p_fifo);
+        return VLC_EGENERIC;
+    }
+    ssize_t channel_id =
+        vout_RegisterSubpictureChannel( owner->video.vout );
+    if (channel_id == -1)
+    {
+        vlc_fifo_Unlock(owner->p_fifo);
+        return VLC_EGENERIC;
+    }
+    sub->i_start = sub->i_stop = vlc_tick_now();
+    sub->i_channel = *channel = channel_id;
+    sub->i_order = 0;
+    sub->b_ephemer = true;
+    vout_PutSubpicture( owner->video.vout, sub );
+
+    vlc_fifo_Unlock(owner->p_fifo);
+    return VLC_SUCCESS;
+}
+
+int vlc_input_decoder_DelVoutOverlay( vlc_input_decoder_t *owner, size_t channel )
+{
+    assert( owner->cat == VIDEO_ES );
+
+    vlc_fifo_Lock(owner->p_fifo);
+
+    if( !owner->video.vout )
+    {
+        vlc_fifo_Unlock(owner->p_fifo);
+        return VLC_EGENERIC;
+    }
+    vout_UnregisterSubpictureChannel( owner->video.vout, channel );
+
+    vlc_fifo_Unlock(owner->p_fifo);
+    return VLC_SUCCESS;
+}
+
+int vlc_input_decoder_SetSpuHighlight( vlc_input_decoder_t *p_owner,
+                                       const vlc_spu_highlight_t *spu_hl )
+{
+    assert( p_owner->cat == SPU_ES );
+
+    if( p_owner->p_sout_input )
+        sout_InputControl( p_owner->p_sout, p_owner->p_sout_input,
+                           SOUT_INPUT_SET_SPU_HIGHLIGHT, spu_hl );
+
+    vlc_fifo_Lock(p_owner->p_fifo);
+    if( !p_owner->spu.vout )
+    {
+        vlc_fifo_Unlock(p_owner->p_fifo);
+        return VLC_EGENERIC;
+    }
+
+    vout_SetSpuHighlight( p_owner->spu.vout, spu_hl );
+
+    vlc_fifo_Unlock(p_owner->p_fifo);
+    return VLC_SUCCESS;
 }

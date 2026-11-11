@@ -2,7 +2,6 @@
  * os_loop.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -32,8 +31,6 @@
 class OSLoop: public SkinObject
 {
 public:
-    virtual ~OSLoop() { }
-
     /// Enter the main loop
     virtual void run() = 0;
 

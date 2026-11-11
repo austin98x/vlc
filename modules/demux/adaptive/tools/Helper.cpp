@@ -27,6 +27,8 @@
 
 #include "Helper.h"
 #include <algorithm>
+#include <sstream>
+
 using namespace adaptive;
 
 std::string Helper::combinePaths        (const std::string &path1, const std::string &path2)
@@ -68,11 +70,25 @@ std::string Helper::getFileExtension (const std::string &uri)
     return extension.substr(pos + 1);
 }
 
-bool Helper::ifind(std::string haystack, std::string needle)
+bool Helper::icaseEquals(std::string str1, std::string str2)
 {
-    transform(haystack.begin(), haystack.end(), haystack.begin(), toupper);
-    transform(needle.begin(), needle.end(), needle.begin(), toupper);
-    return haystack.find(needle) != std::string::npos;
+    if(str1.size() != str2.size())
+        return false;
+
+    std::transform(str1.begin(), str1.end(), str1.begin(), toupper);
+    std::transform(str2.begin(), str2.end(), str2.begin(), toupper);
+    return str1 == str2;
+}
+
+bool Helper::ifind(const std::string & haystack, const std::string & needle)
+{
+    return std::search(
+        haystack.cbegin(), haystack.cend(),
+        needle.cbegin(),   needle.cend(),
+        [](unsigned char ch1, unsigned char ch2) {
+            return toupper(ch1) == toupper(ch2);
+        }
+    ) != haystack.end();
 }
 
 std::list<std::string> Helper::tokenize(const std::string &str, char c)
@@ -89,4 +105,49 @@ std::list<std::string> Helper::tokenize(const std::string &str, char c)
 
     ret.push_back(str.substr(prev));
     return ret;
+}
+
+std::string & Helper::rtrim(std::string &s, const std::string &l)
+{
+    std::size_t p = s.find_last_not_of(l);
+    if(p != std::string::npos)
+        s.erase(p + 1);
+    else
+        s.clear();
+    return s;
+}
+
+std::string & Helper::ltrim(std::string &s, const std::string &l)
+{
+    std::size_t p = s.find_first_not_of(l);
+    if(p != std::string::npos)
+        s.erase(0, p);
+    else
+        s.clear();
+    return s;
+}
+
+std::string & Helper::trim(std::string &s, const std::string &l)
+{
+    return ltrim(rtrim(s, l), l);
+}
+
+std::string Helper::unescape(const std::string &s)
+{
+    std::istringstream is(s);
+    std::ostringstream os;
+
+    char c;
+    while(is.get(c))
+    {
+        if(c == '\\')
+        {
+            if(!is.get(c))
+                break;
+        }
+
+        os << c;
+    }
+
+    return os.str();
 }

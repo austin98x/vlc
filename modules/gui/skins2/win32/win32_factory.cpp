@@ -2,7 +2,6 @@
  * win32_factory.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -31,7 +30,6 @@
 #include <windows.h>
 #include <winuser.h>
 #include <wingdi.h>
-#include <tchar.h>
 #include <shellapi.h>
 
 #include "win32_factory.hpp"
@@ -46,6 +44,8 @@
 #include "../src/generic_window.hpp"
 #include "../commands/cmd_dialogs.hpp"
 #include "../commands/cmd_minimize.hpp"
+#include <vlc_configuration.h>
+#include <vlc_charset.h>
 
 // Custom message for the notifications of the system tray
 #define MY_WM_TRAYACTION (WM_APP + 1)
@@ -74,7 +74,7 @@ LRESULT CALLBACK Win32Factory::Win32Proc( HWND hwnd, UINT uMsg,
             // If closing parent window
             if( (wParam & 0xFFF0) == SC_CLOSE )
             {
-                libvlc_Quit( p_intf->obj.libvlc );
+                libvlc_Quit( vlc_object_instance(p_intf) );
                 return 0;
             }
             else if( (wParam & 0xFFF0) == SC_MINIMIZE )
@@ -89,7 +89,7 @@ LRESULT CALLBACK Win32Factory::Win32Proc( HWND hwnd, UINT uMsg,
             }
             else
             {
-                msg_Dbg( p_intf, "WM_SYSCOMMAND %i", (wParam  & 0xFFF0) );
+                msg_Dbg( p_intf, "WM_SYSCOMMAND %i", (int)(wParam  & 0xFFF0) );
             }
         }
         // Handle systray notifications
@@ -163,7 +163,7 @@ bool Win32Factory::init()
     // Create window class
     WNDCLASS skinWindowClass;
     skinWindowClass.style = CS_DBLCLKS;
-    skinWindowClass.lpfnWndProc = (WNDPROC)Win32Factory::Win32Proc;
+    skinWindowClass.lpfnWndProc = Win32Factory::Win32Proc;
     skinWindowClass.lpszClassName = vlc_class;
     skinWindowClass.lpszMenuName = NULL;
     skinWindowClass.cbClsExtra = 0;
@@ -215,7 +215,7 @@ bool Win32Factory::init()
     m_trayIcon.uFlags = NIF_ICON|NIF_TIP|NIF_MESSAGE;
     m_trayIcon.uCallbackMessage = MY_WM_TRAYACTION;
     m_trayIcon.hIcon = LoadIcon( m_hInst, vlc_icon );
-    _tcscpy( m_trayIcon.szTip, vlc_name );
+    wcscpy( m_trayIcon.szTip, vlc_name );
 
     // Show the systray icon if needed
     if( var_InheritBool( getIntf(), "skins2-systray" ) )
@@ -233,15 +233,21 @@ bool Win32Factory::init()
     OleInitialize( NULL );
 
     // Initialize the resource path
-    char *datadir = config_GetUserDir( VLC_DATA_DIR );
-    m_resourcePath.push_back( (std::string)datadir + "\\skins" );
-    free( datadir );
-    datadir = config_GetDataDir();
-    m_resourcePath.push_back( (std::string)datadir + "\\skins" );
-    m_resourcePath.push_back( (std::string)datadir + "\\skins2" );
-    m_resourcePath.push_back( (std::string)datadir + "\\share\\skins" );
-    m_resourcePath.push_back( (std::string)datadir + "\\share\\skins2" );
-    free( datadir );
+    char *datadir = config_GetUserDir( VLC_USERDATA_DIR );
+    if (likely(datadir != nullptr))
+    {
+        m_resourcePath.push_back( (std::string)datadir + "\\skins" );
+        free( datadir );
+    }
+    datadir = config_GetSysPath(VLC_PKG_DATA_DIR, NULL);
+    if (likely(datadir != nullptr))
+    {
+        m_resourcePath.push_back( (std::string)datadir + "\\skins" );
+        m_resourcePath.push_back( (std::string)datadir + "\\skins2" );
+        m_resourcePath.push_back( (std::string)datadir + "\\share\\skins" );
+        m_resourcePath.push_back( (std::string)datadir + "\\share\\skins2" );
+        free( datadir );
+    }
 
     // Enumerate all monitors available
     EnumDisplayMonitors( NULL, NULL, MonitorEnumProc, (LPARAM)&m_monitorList );
@@ -341,11 +347,11 @@ OSTimer *Win32Factory::createOSTimer( CmdGeneric &rCmd )
 
 
 OSWindow *Win32Factory::createOSWindow( GenericWindow &rWindow, bool dragDrop,
-                                        bool playOnDrop, OSWindow *pParent,
+                                        bool, OSWindow *pParent,
                                         GenericWindow::WindowType_t type )
 {
     return new Win32Window( getIntf(), rWindow, m_hInst, m_hParentWindow,
-                            dragDrop, playOnDrop, (Win32Window*)pParent, type );
+                            dragDrop, (Win32Window*)pParent, type );
 }
 
 
@@ -384,11 +390,12 @@ int Win32Factory::getScreenHeight() const
 }
 
 
-void Win32Factory::getMonitorInfo( const GenericWindow &rWindow,
+void Win32Factory::getMonitorInfo( OSWindow *pWindow,
                                    int* p_x, int* p_y,
                                    int* p_width, int* p_height ) const
 {
-    HWND wnd = (HWND)rWindow.getOSHandle();
+    Win32Window *pWin = (Win32Window*)pWindow;
+    HWND wnd = pWin->getHandle();
     HMONITOR hmon = MonitorFromWindow( wnd, MONITOR_DEFAULTTONEAREST );
     MONITORINFO mi;
     mi.cbSize = sizeof( MONITORINFO );

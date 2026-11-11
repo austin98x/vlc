@@ -2,7 +2,6 @@
  * t140.c : trivial T.140 text encoder
  *****************************************************************************
  * Copyright © 2007 Rémi Denis-Courmont
- * $Id$
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,12 +29,11 @@
 #include <vlc_sout.h>
 
 static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
 
 vlc_module_begin ()
     set_description( N_("T.140 text encoder") )
-    set_capability( "encoder", 100 )
-    set_callbacks( Open, Close )
+    set_capability( "spu encoder", 100 )
+    set_callback( Open )
 vlc_module_end ()
 
 
@@ -66,17 +64,11 @@ static int Open( vlc_object_t *p_this )
             p_enc->fmt_out.i_codec = VLC_CODEC_ITU_T140;
     }
 
-    p_enc->p_sys = NULL;
+    static const struct vlc_encoder_operations ops =
+        { .encode_sub = Encode };
+    p_enc->ops = &ops;
 
-    p_enc->pf_encode_sub = Encode;
-    p_enc->fmt_out.i_cat = SPU_ES;
     return VLC_SUCCESS;
-}
-
-
-static void Close( vlc_object_t *p_this )
-{
-    (void)p_this;
 }
 
 
@@ -91,9 +83,9 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
     if( p_spu == NULL )
         return NULL;
 
-    p_region = p_spu->p_region;
+    p_region = vlc_spu_regions_first_or_null(&p_spu->regions);
     if( ( p_region == NULL )
-     || ( p_region->fmt.i_chroma != VLC_CODEC_TEXT )
+     || (!subpicture_region_IsText( p_region ))
      || ( p_region->p_text == NULL )
      || ( p_region->p_text->psz_text == NULL) )
         return NULL;
@@ -125,7 +117,8 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
     p_block->p_buffer[p_block->i_buffer] = 0;
 
     p_block->i_pts = p_block->i_dts = p_spu->i_start;
-    if( !p_spu->b_ephemer && ( p_spu->i_stop > p_spu->i_start ) )
+    if( !p_spu->b_ephemer &&
+        ( p_spu->i_stop != VLC_TICK_INVALID && p_spu->i_stop > p_spu->i_start ) )
         p_block->i_length = p_spu->i_stop - p_spu->i_start;
 
     return p_block;

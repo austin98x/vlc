@@ -2,7 +2,6 @@
  * imem.c : Memory input for VLC
  *****************************************************************************
  * Copyright (C) 2009-2010 Laurent Aimar
- * $Id$
  *
  * Author: Laurent Aimar <fenrir _AT_ videolan _DOT org>
  *
@@ -38,7 +37,7 @@
 #include <vlc_charset.h>
 
 /*****************************************************************************
- * Module descriptior
+ * Module descriptor
  *****************************************************************************/
 static int  OpenAccess (vlc_object_t *);
 static void CloseAccess(vlc_object_t *);
@@ -117,62 +116,61 @@ static const char *cat_texts[] = {
 vlc_module_begin()
     set_shortname(N_("Memory input"))
     set_description(N_("Memory input"))
-    set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_ACCESS)
 
-    add_string ("imem-get", "0", GET_TEXT, GET_LONGTEXT, true)
+    add_string ("imem-get", "0", GET_TEXT, GET_LONGTEXT)
         change_volatile()
-    add_string ("imem-release", "0", RELEASE_TEXT, RELEASE_LONGTEXT, true)
+    add_string ("imem-release", "0", RELEASE_TEXT, RELEASE_LONGTEXT)
         change_volatile()
-    add_string ("imem-cookie", NULL, COOKIE_TEXT, COOKIE_LONGTEXT, true)
+    add_string ("imem-cookie", NULL, COOKIE_TEXT, COOKIE_LONGTEXT)
         change_volatile()
         change_safe()
-    add_string ("imem-data", "0", DATA_TEXT, DATA_LONGTEXT, true)
+    add_string ("imem-data", "0", DATA_TEXT, DATA_LONGTEXT)
         change_volatile()
 
-    add_integer("imem-id", -1, ID_TEXT, ID_LONGTEXT, true)
+    add_integer("imem-id", -1, ID_TEXT, ID_LONGTEXT)
         change_private()
         change_safe()
-    add_integer("imem-group", 0, GROUP_TEXT, GROUP_LONGTEXT, true)
+    add_integer("imem-group", 0, GROUP_TEXT, GROUP_LONGTEXT)
         change_private()
         change_safe()
-    add_integer("imem-cat", 0, CAT_TEXT, CAT_LONGTEXT, true)
+    add_integer("imem-cat", 0, CAT_TEXT, CAT_LONGTEXT)
         change_integer_list(cat_values, cat_texts)
         change_private()
         change_safe()
-    add_string ("imem-codec", NULL, CODEC_TEXT, CODEC_LONGTEXT, true)
+    add_string ("imem-codec", NULL, CODEC_TEXT, CODEC_LONGTEXT)
         change_private()
         change_safe()
-    add_string( "imem-language", NULL, LANGUAGE_TEXT, LANGUAGE_LONGTEXT, false)
-        change_private()
-        change_safe()
-
-    add_integer("imem-samplerate", 0, SAMPLERATE_TEXT, SAMPLERATE_LONGTEXT, true)
-        change_private()
-        change_safe()
-    add_integer("imem-channels", 0, CHANNELS_TEXT, CHANNELS_LONGTEXT, true)
+    add_string( "imem-language", NULL, LANGUAGE_TEXT, LANGUAGE_LONGTEXT)
         change_private()
         change_safe()
 
-    add_integer("imem-width", 0, WIDTH_TEXT, WIDTH_LONGTEXT, true)
+    add_integer("imem-samplerate", 0, SAMPLERATE_TEXT, SAMPLERATE_LONGTEXT)
         change_private()
         change_safe()
-    add_integer("imem-height", 0, HEIGHT_TEXT, HEIGHT_LONGTEXT, true)
-        change_private()
-        change_safe()
-    add_string ("imem-dar", NULL, DAR_TEXT, DAR_LONGTEXT, true)
-        change_private()
-        change_safe()
-    add_string ("imem-fps", NULL, FPS_TEXT, FPS_LONGTEXT, true)
+    add_integer("imem-channels", 0, CHANNELS_TEXT, CHANNELS_LONGTEXT)
         change_private()
         change_safe()
 
-    add_integer ("imem-size", 0, SIZE_TEXT, SIZE_LONGTEXT, true)
+    add_integer_with_range("imem-width", 0, 0, UINT_MAX, WIDTH_TEXT, WIDTH_LONGTEXT)
+        change_private()
+        change_safe()
+    add_integer_with_range("imem-height", 0, 0, UINT_MAX, HEIGHT_TEXT, HEIGHT_LONGTEXT)
+        change_private()
+        change_safe()
+    add_string ("imem-dar", NULL, DAR_TEXT, DAR_LONGTEXT)
+        change_private()
+        change_safe()
+    add_string ("imem-fps", NULL, FPS_TEXT, FPS_LONGTEXT)
+        change_private()
+        change_safe()
+
+    add_integer ("imem-size", 0, SIZE_TEXT, SIZE_LONGTEXT)
         change_private()
         change_safe()
 
     add_shortcut("imem")
-    set_capability("access_demux", 0)
+    set_capability("access", 1)
     set_callbacks(OpenDemux, CloseDemux)
 
     add_submodule()
@@ -200,7 +198,7 @@ typedef void (*imem_release_t)(void *data, const char *cookie, size_t, void *);
  *****************************************************************************/
 
 /* */
-static block_t *Block(stream_t *, bool *);
+static block_t *Block(stream_t *, bool * restrict);
 static int ControlAccess(stream_t *, int, va_list);
 
 static int Demux(demux_t *);
@@ -217,9 +215,9 @@ typedef struct {
 
     es_out_id_t  *es;
 
-    mtime_t      dts;
+    vlc_tick_t   dts;
 
-    mtime_t      deadline;
+    vlc_tick_t   deadline;
 } imem_sys_t;
 
 static void ParseMRL(vlc_object_t *, const char *);
@@ -256,7 +254,6 @@ static int OpenCommon(vlc_object_t *object, imem_sys_t **sys_ptr, const char *ps
     free(tmp);
 
     if (!sys->source.get || !sys->source.release) {
-        msg_Err(object, "Invalid get/release function pointers");
         return VLC_EGENERIC;
     }
 
@@ -279,7 +276,7 @@ static int OpenCommon(vlc_object_t *object, imem_sys_t **sys_ptr, const char *ps
 
     /* */
     sys->dts       = 0;
-    sys->deadline  = VLC_TS_INVALID;
+    sys->deadline  = VLC_TICK_INVALID;
 
     *sys_ptr = sys;
     return VLC_SUCCESS;
@@ -306,7 +303,7 @@ static int OpenAccess(vlc_object_t *object)
     access->pf_read    = NULL;
     access->pf_block   = Block;
     access->pf_seek    = NULL;
-    access->p_sys      = (access_sys_t*)sys;
+    access->p_sys      = sys;
 
     return VLC_SUCCESS;
 }
@@ -346,11 +343,10 @@ static int ControlAccess(stream_t *access, int i_query, va_list args)
         *s = var_InheritInteger(access, "imem-size");
         return *s ? VLC_SUCCESS : VLC_EGENERIC;
     }
-    case STREAM_GET_PTS_DELAY: {
-        int64_t *delay = va_arg(args, int64_t *);
-        *delay = DEFAULT_PTS_DELAY; /* FIXME? */
+    case STREAM_GET_PTS_DELAY:
+        *va_arg(args, vlc_tick_t *) = DEFAULT_PTS_DELAY; /* FIXME? */
         return VLC_SUCCESS;
-    }
+
     case STREAM_SET_PAUSE_STATE:
         return VLC_SUCCESS;
 
@@ -360,7 +356,7 @@ static int ControlAccess(stream_t *access, int i_query, va_list args)
 }
 
 /**
- * It retreives data using the get() callback, copies them,
+ * It retrieves data using the get() callback, copies them,
  * and then release them using the release() callback.
  */
 static block_t *Block(stream_t *access, bool *restrict eof)
@@ -415,6 +411,9 @@ static int OpenDemux(vlc_object_t *object)
 {
     demux_t    *demux = (demux_t *)object;
     imem_sys_t *sys;
+
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
 
     if (OpenCommon(object, &sys, demux->psz_location))
         return VLC_EGENERIC;
@@ -492,7 +491,7 @@ static int OpenDemux(vlc_object_t *object)
     /* */
     demux->pf_control = ControlDemux;
     demux->pf_demux   = Demux;
-    demux->p_sys      = (demux_sys_t*)sys;
+    demux->p_sys      = sys;
 
     return VLC_SUCCESS;
 }
@@ -526,8 +525,7 @@ static int ControlDemux(demux_t *demux, int i_query, va_list args)
         return VLC_SUCCESS;
 
     case DEMUX_GET_PTS_DELAY: {
-        int64_t *delay = va_arg(args, int64_t *);
-        *delay = DEFAULT_PTS_DELAY; /* FIXME? */
+        *va_arg(args, vlc_tick_t *) = DEFAULT_PTS_DELAY; /* FIXME? */
         return VLC_SUCCESS;
     }
     case DEMUX_GET_POSITION: {
@@ -536,17 +534,15 @@ static int ControlDemux(demux_t *demux, int i_query, va_list args)
         return VLC_SUCCESS;
     }
     case DEMUX_GET_TIME: {
-        int64_t *t = va_arg(args, int64_t *);
-        *t = sys->dts;
+        *va_arg(args, vlc_tick_t *) = sys->dts;
         return VLC_SUCCESS;
     }
     case DEMUX_GET_LENGTH: {
-        int64_t *l = va_arg(args, int64_t *);
-        *l = 0;
+        *va_arg(args, vlc_tick_t *) = 0;
         return VLC_SUCCESS;
     }
     case DEMUX_SET_NEXT_DEMUX_TIME:
-        sys->deadline = va_arg(args, int64_t);
+        sys->deadline = va_arg(args, vlc_tick_t);
         return VLC_SUCCESS;
 
     /* */
@@ -561,14 +557,14 @@ static int ControlDemux(demux_t *demux, int i_query, va_list args)
 }
 
 /**
- * It retreives data using the get() callback, sends them to es_out
+ * It retrieves data using the get() callback, sends them to es_out
  * and the release it using the release() callback.
  */
 static int Demux(demux_t *demux)
 {
     imem_sys_t *sys = (imem_sys_t*)demux->p_sys;
 
-    if (sys->deadline == VLC_TS_INVALID)
+    if (sys->deadline == VLC_TICK_INVALID)
         sys->deadline = sys->dts + 1;
 
     for (;;) {
@@ -583,7 +579,7 @@ static int Demux(demux_t *demux)
 
         if (sys->source.get(sys->source.data, sys->source.cookie,
                             &dts, &pts, &flags, &buffer_size, &buffer))
-            return 0;
+            return VLC_DEMUXER_EOF;
 
         if (dts < 0)
             dts = pts;
@@ -591,8 +587,8 @@ static int Demux(demux_t *demux)
         if (buffer_size > 0) {
             block_t *block = block_Alloc(buffer_size);
             if (block) {
-                block->i_dts = dts >= 0 ? (1 + dts) : VLC_TS_INVALID;
-                block->i_pts = pts >= 0 ? (1 + pts) : VLC_TS_INVALID;
+                block->i_dts = dts >= 0 ? (1 + dts) : VLC_TICK_INVALID;
+                block->i_pts = pts >= 0 ? (1 + pts) : VLC_TICK_INVALID;
                 memcpy(block->p_buffer, buffer, buffer_size);
 
                 es_out_SetPCR(demux->out, block->i_dts);
@@ -605,8 +601,8 @@ static int Demux(demux_t *demux)
         sys->source.release(sys->source.data, sys->source.cookie,
                             buffer_size, buffer);
     }
-    sys->deadline = VLC_TS_INVALID;
-    return 1;
+    sys->deadline = VLC_TICK_INVALID;
+    return VLC_DEMUXER_SUCCESS;
 }
 
 /**

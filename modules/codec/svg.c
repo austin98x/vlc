@@ -37,7 +37,7 @@
 #include <glib-object.h>                                  /* g_object_unref( ) */
 
 #include <librsvg/rsvg.h>
-#include <cairo/cairo.h>
+#include <cairo.h>
 
 /*****************************************************************************
  * Local prototypes
@@ -58,7 +58,6 @@ static int DecodeBlock  ( decoder_t *, block_t * );
  * Module descriptor
  *****************************************************************************/
 vlc_module_begin ()
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_VCODEC )
     set_description( N_("SVG video decoder") )
     set_capability( "video decoder", 100 )
@@ -66,22 +65,22 @@ vlc_module_begin ()
     add_shortcut( "svg" )
 
     /* svg options */
-    add_integer_with_range( "svg-width", -1, 1, 65535,
-                            TEXT_WIDTH, LONG_TEXT_WIDTH, false )
+    add_integer_with_range( "svg-width", -1, -1, 65535,
+                            TEXT_WIDTH, LONG_TEXT_WIDTH )
         change_safe()
-    add_integer_with_range( "svg-height", -1, 1, 65535,
-                            TEXT_HEIGHT, LONG_TEXT_HEIGHT, false )
+    add_integer_with_range( "svg-height", -1, -1, 65535,
+                            TEXT_HEIGHT, LONG_TEXT_HEIGHT )
         change_safe()
 
-    add_float( "svg-scale", -1.0, TEXT_SCALE, LONG_TEXT_SCALE, false )
+    add_float( "svg-scale", -1.0, TEXT_SCALE, LONG_TEXT_SCALE )
 vlc_module_end ()
 
-struct decoder_sys_t
+typedef struct
 {
     int32_t i_width;
     int32_t i_height;
     double  f_scale;
-};
+} decoder_sys_t;
 
 /*****************************************************************************
  * OpenDecoder: probe the decoder and return score
@@ -90,7 +89,7 @@ static int OpenDecoder( vlc_object_t *p_this )
 {
     decoder_t *p_dec = (decoder_t*)p_this;
 
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_SVG )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_SVG )
         return VLC_EGENERIC;
 
     decoder_sys_t *p_sys = malloc( sizeof(decoder_sys_t) );
@@ -108,7 +107,11 @@ static int OpenDecoder( vlc_object_t *p_this )
 #endif
 
     /* Set output properties */
+#ifdef WORDS_BIGENDIAN
+    p_dec->fmt_out.i_codec = VLC_CODEC_ARGB;
+#else
     p_dec->fmt_out.i_codec = VLC_CODEC_BGRA;
+#endif
 
     /* Set callbacks */
     p_dec->pf_decode = DecodeBlock;
@@ -178,17 +181,17 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     }
 
     p_dec->fmt_out.i_codec =
+#ifdef WORDS_BIGENDIAN
+    p_dec->fmt_out.video.i_chroma = VLC_CODEC_ARGB;
+#else
     p_dec->fmt_out.video.i_chroma = VLC_CODEC_BGRA;
+#endif
     p_dec->fmt_out.video.i_width  = i_width;
     p_dec->fmt_out.video.i_height = i_height;
     p_dec->fmt_out.video.i_visible_width  = i_width;
     p_dec->fmt_out.video.i_visible_height = i_height;
     p_dec->fmt_out.video.i_sar_num = 1;
     p_dec->fmt_out.video.i_sar_den = 1;
-    p_dec->fmt_out.video.i_rmask = 0x80800000; /* Since librsvg v1.0 */
-    p_dec->fmt_out.video.i_gmask = 0x0000ff00;
-    p_dec->fmt_out.video.i_bmask = 0x000000ff;
-    video_format_FixRgb(&p_dec->fmt_out.video);
 
     /* Get a new picture */
     if( decoder_UpdateVideoFormat( p_dec ) )
@@ -196,6 +199,8 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
     p_pic = decoder_NewPicture( p_dec );
     if( !p_pic )
         goto done;
+
+    p_pic->b_progressive = true;
 
     /* NOTE: Do not use the stride calculation from cairo, because it is wrong:
      * stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, dim.width);
@@ -244,7 +249,7 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
         goto done;
     }
 
-    p_pic->date = p_block->i_pts > VLC_TS_INVALID ? p_block->i_pts : p_block->i_dts;
+    p_pic->date = p_block->i_pts != VLC_TICK_INVALID ? p_block->i_pts : p_block->i_dts;
 
 done:
     if( rsvg )

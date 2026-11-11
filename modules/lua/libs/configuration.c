@@ -2,7 +2,6 @@
  * configuration.c: Generic lua<->vlc config interface
  *****************************************************************************
  * Copyright (C) 2007-2008 the VideoLAN team
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *
@@ -21,9 +20,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
 
-/*****************************************************************************
+/// VLC configuration interactions.
+// Functions to query or change VLC configuration options
+// @module vlc.config
+
+/*
  * Preamble
- *****************************************************************************/
+ */
 #ifndef  _GNU_SOURCE
 #   define  _GNU_SOURCE
 #endif
@@ -33,37 +36,45 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 
 #include "../vlc.h"
 #include "../libs.h"
 
-/*****************************************************************************
- * Config handling
- *****************************************************************************/
+/// Config handling.
+// Functions to query or manipulate VLC configuration options.
+// @section config_handling
+
+/// Get a VLC config options value.
+//
+// Get the VLC configuration option `name`'s value.
+// @function    get
+// @tparam      string name Option name to get the value from
+// @treturn     string|int|bool|number The option value
+// @raise       Errors for an unknown option
 static int vlclua_config_get( lua_State *L )
 {
-    vlc_object_t * p_this = vlclua_get_this( L );
     const char *psz_name = luaL_checkstring( L, 1 );
     switch( config_GetType( psz_name ) )
     {
         case VLC_VAR_STRING:
         {
-            char *psz = config_GetPsz( p_this, psz_name );
+            char *psz = config_GetPsz( psz_name );
             lua_pushstring( L, psz );
             free( psz );
             break;
         }
 
         case VLC_VAR_INTEGER:
-            lua_pushinteger( L, config_GetInt( p_this, psz_name ) );
+            lua_pushinteger( L, config_GetInt( psz_name ) );
             break;
 
         case VLC_VAR_BOOL:
-            lua_pushboolean( L, config_GetInt( p_this, psz_name ) );
+            lua_pushboolean( L, config_GetInt( psz_name ) );
             break;
 
         case VLC_VAR_FLOAT:
-            lua_pushnumber( L, config_GetFloat( p_this, psz_name ) );
+            lua_pushnumber( L, config_GetFloat( psz_name ) );
             break;
 
         default:
@@ -73,27 +84,32 @@ static int vlclua_config_get( lua_State *L )
     return 1;
 }
 
+/// Set a VLC config options value.
+//
+// Set the VLC configuration option `name`'s value.
+// @function    set
+// @tparam      string name Option name to set the value for
+// @tparam      string|int|bool|number value Value to set the option to
+// @raise       Errors for an unknown option
 static int vlclua_config_set( lua_State *L )
 {
-    vlc_object_t *p_this = vlclua_get_this( L );
     const char *psz_name = luaL_checkstring( L, 1 );
     switch( config_GetType( psz_name ) )
     {
         case VLC_VAR_STRING:
-            config_PutPsz( p_this, psz_name, luaL_checkstring( L, 2 ) );
+            config_PutPsz( psz_name, luaL_checkstring( L, 2 ) );
             break;
 
         case VLC_VAR_INTEGER:
-            config_PutInt( p_this, psz_name, luaL_checkinteger( L, 2 ) );
+            config_PutInt( psz_name, luaL_checkinteger( L, 2 ) );
             break;
 
         case VLC_VAR_BOOL:
-            config_PutInt( p_this, psz_name, luaL_checkboolean( L, 2 ) );
+            config_PutInt( psz_name, luaL_checkboolean( L, 2 ) );
             break;
 
         case VLC_VAR_FLOAT:
-            config_PutFloat( p_this, psz_name,
-                             luaL_checknumber( L, 2 ) );
+            config_PutFloat( psz_name, luaL_checknumber( L, 2 ) );
             break;
 
         default:
@@ -102,25 +118,41 @@ static int vlclua_config_set( lua_State *L )
     return 0;
 }
 
-/*****************************************************************************
- * Directories configuration
- *****************************************************************************/
+/// Directories configuration.
+// Functions to query _special_ directories for the system VLC is running on.
+// @section config_dirs
+
+/// Get the VLC data directory.
+//
+// Returns the path of the VLC data directory (`VLC_PKG_DATA_DIR`).
+// @function    datadir
+// @treturn     string Path to the VLC data directory
 static int vlclua_datadir( lua_State *L )
 {
-    char *psz_data = config_GetDataDir();
+    char *psz_data = config_GetSysPath(VLC_PKG_DATA_DIR, NULL);
     lua_pushstring( L, psz_data );
     free( psz_data );
     return 1;
 }
 
+/// Get the user's VLC data directory.
+//
+// Returns the path of the user's VLC data directory (`VLC_USERDATA_DIR`).
+// @function    userdatadir
+// @treturn     string Path to the user's VLC data directory
 static int vlclua_userdatadir( lua_State *L )
 {
-    char *dir = config_GetUserDir( VLC_DATA_DIR );
+    char *dir = config_GetUserDir( VLC_USERDATA_DIR );
     lua_pushstring( L, dir );
     free( dir );
     return 1;
 }
 
+/// Get the user's home directory.
+//
+// Returns the path of the user's home directory (`VLC_HOME_DIR`).
+// @function    homedir
+// @treturn     string Path to the user's home directory
 static int vlclua_homedir( lua_State *L )
 {
     char *home = config_GetUserDir( VLC_HOME_DIR );
@@ -129,6 +161,11 @@ static int vlclua_homedir( lua_State *L )
     return 1;
 }
 
+/// Get the user's VLC config directory.
+//
+// Returns the path of the user's VLC configuration directory (`VLC_CONFIG_DIR`).
+// @function    configdir
+// @treturn     string Path to the user's VLC config directory
 static int vlclua_configdir( lua_State *L )
 {
     char *dir = config_GetUserDir( VLC_CONFIG_DIR );
@@ -137,6 +174,11 @@ static int vlclua_configdir( lua_State *L )
     return 1;
 }
 
+/// Get the user's VLC cache directory.
+//
+// Returns the path of the user's VLC cache directory (`VLC_CACHE_DIR`).
+// @function    cachedir
+// @treturn     string Path to the user's VLC cache directory
 static int vlclua_cachedir( lua_State *L )
 {
     char *dir = config_GetUserDir( VLC_CACHE_DIR );
@@ -145,6 +187,13 @@ static int vlclua_cachedir( lua_State *L )
     return 1;
 }
 
+/// Get a list of possible data directories.
+//
+// Returns the list of possible data directories in order
+// of priority, appended by `name`.
+// @function    datadir_list
+// @tparam      string name Name for the data directory
+// @treturn     {string,...} Paths to possible data directories, sorted by priority
 static int vlclua_datadir_list( lua_State *L )
 {
     const char *psz_dirname = luaL_checkstring( L, 1 );
@@ -165,9 +214,9 @@ static int vlclua_datadir_list( lua_State *L )
     return 1;
 }
 
-/*****************************************************************************
+/*
  *
- *****************************************************************************/
+ */
 static const luaL_Reg vlclua_config_reg[] = {
     { "get", vlclua_config_get },
     { "set", vlclua_config_set },

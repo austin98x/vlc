@@ -27,6 +27,7 @@
 
 #include "AbstractAdaptationLogic.h"
 #include "../tools/MovingAverage.hpp"
+#include <vlc_threads.h>
 
 namespace adaptive
 {
@@ -37,32 +38,34 @@ namespace adaptive
         {
             public:
                 RateBasedAdaptationLogic            (vlc_object_t *);
-                virtual ~RateBasedAdaptationLogic   ();
+                virtual ~RateBasedAdaptationLogic   () = default;
 
-                BaseRepresentation *getNextRepresentation(BaseAdaptationSet *, BaseRepresentation *);
-                virtual void updateDownloadRate(const ID &, size_t, mtime_t); /* reimpl */
-                virtual void trackerEvent(const SegmentTrackerEvent &); /* reimpl */
+                BaseRepresentation *getNextRepresentation(BaseAdaptationSet *,
+                                                          BaseRepresentation *) override;
+                void updateDownloadRate(const ID &, size_t,
+                                        vlc_tick_t, vlc_tick_t) override;
+                void trackerEvent(const TrackerEvent &) override;
 
             private:
                 size_t                  bpsAvg;
                 size_t                  currentBps;
                 size_t                  usedBps;
-                vlc_object_t *          p_obj;
 
                 MovingAverage<size_t>   average;
 
                 size_t                  dlsize;
-                mtime_t                 dllength;
+                vlc_tick_t              dllength;
 
-                vlc_mutex_t             lock;
+                mutable vlc_mutex_t     lock;
         };
 
         class FixedRateAdaptationLogic : public AbstractAdaptationLogic
         {
             public:
-                FixedRateAdaptationLogic(size_t);
+                FixedRateAdaptationLogic(vlc_object_t *, size_t);
 
-                BaseRepresentation *getNextRepresentation(BaseAdaptationSet *, BaseRepresentation *);
+                BaseRepresentation *getNextRepresentation(BaseAdaptationSet *,
+                                                          BaseRepresentation *) override;
 
             private:
                 size_t                  currentBps;

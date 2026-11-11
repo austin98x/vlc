@@ -38,7 +38,6 @@ static int  Open(vlc_object_t *);
 static void Close(vlc_object_t *);
 
 vlc_module_begin ()
-    set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_STREAM_FILTER)
     set_capability ("stream_filter", 0)
     add_shortcut("aribcam")
@@ -52,7 +51,7 @@ struct error_messages_s
     const char * const psz_error;
 };
 
-static const struct error_messages_s const b25_errors[] =
+static const struct error_messages_s b25_errors[] =
 {
     { ARIB_STD_B25_ERROR_INVALID_PARAM, "Invalid parameter" },
     { ARIB_STD_B25_ERROR_NO_ENOUGH_MEMORY , "Not enough memory" },
@@ -73,7 +72,7 @@ static const struct error_messages_s const b25_errors[] =
     { 0, NULL },
 };
 
-static const struct error_messages_s const bcas_errors[] =
+static const struct error_messages_s bcas_errors[] =
 {
     { B_CAS_CARD_ERROR_INVALID_PARAMETER, "Invalid parameter" },
     { B_CAS_CARD_ERROR_NOT_INITIALIZED, "Card not initialized" },
@@ -84,7 +83,7 @@ static const struct error_messages_s const bcas_errors[] =
     { 0, NULL },
 };
 
-struct stream_sys_t
+typedef struct
 {
     ARIB_STD_B25 *p_b25;
     B_CAS_CARD   *p_bcas;
@@ -94,10 +93,10 @@ struct stream_sys_t
         size_t   i_size;
         block_t *p_list;
     } remain;
-};
+} stream_sys_t;
 
 static const char * GetErrorMessage( const int i_error,
-                               const struct error_messages_s const *p_errors_messages )
+                               const struct error_messages_s *p_errors_messages )
 {
     int i = 0;
     while( p_errors_messages[i].psz_error )
@@ -197,7 +196,7 @@ static ssize_t Read( stream_t *p_stream, void *p_buf, size_t i_toread )
         else
         {
             if ( i_srcread < 0 )
-                msg_Err( p_stream, "Can't read %lu bytes from source stream: %d", i_toread, i_srcread );
+                msg_Err( p_stream, "Can't read %zu bytes from source stream: %d", i_toread, i_srcread );
             return 0;
         }
 

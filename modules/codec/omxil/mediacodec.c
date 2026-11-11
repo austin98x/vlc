@@ -27,6 +27,7 @@
 # include "config.h"
 #endif
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <assert.h>
 
@@ -35,7 +36,6 @@
 #include <vlc_plugin.h>
 #include <vlc_codec.h>
 #include <vlc_block_helper.h>
-#include <vlc_memory.h>
 #include <vlc_timestamp_helper.h>
 #include <vlc_threads.h>
 #include <vlc_bits.h>
@@ -45,12 +45,14 @@
 #include <OMX_Core.h>
 #include <OMX_Component.h>
 #include "omxil_utils.h"
-#include "../../video_output/android/display.h"
 
 #define BLOCK_FLAG_CSD (0x01 << BLOCK_FLAG_PRIVATE_SHIFT)
 
 #define DECODE_FLAG_RESTART (0x01)
 #define DECODE_FLAG_DRAIN (0x02)
+
+#define MAX_PIC 64
+
 /**
  * Callback called when a new block is processed from DecodeBlock.
  * It returns -1 in case of error, 0 if block should be dropped, 1 otherwise.
@@ -60,7 +62,8 @@ typedef int (*dec_on_new_block_cb)(decoder_t *, block_t **);
 /**
  * Callback called when decoder is flushing.
  */
-typedef void (*dec_on_flush_cb)(decoder_t *);
+struct decoder_sys_t;
+typedef void (*dec_on_flush_cb)(struct decoder_sys_t *);
 
 /**
  * Callback called when DecodeBlock try to get an output buffer (pic or block).
@@ -69,7 +72,14 @@ typedef void (*dec_on_flush_cb)(decoder_t *);
 typedef int (*dec_process_output_cb)(decoder_t *, mc_api_out *, picture_t **,
                                      block_t **);
 
-struct decoder_sys_t
+struct asurface_picture_ctx
+{
+    picture_context_t s;
+    atomic_uint refs;
+    atomic_int index;
+};
+
+typedef struct decoder_sys_t
 {
     mc_api api;
 
@@ -105,22 +115,35 @@ struct decoder_sys_t
     bool            b_aborted;
     bool            b_drained;
     bool            b_adaptive;
+
+    /* If true, the decoder_t object has been closed and decoder_* functions
+     * are now unavailable. */
+    bool            b_decoder_dead;
+
     int             i_decode_flags;
 
+    enum es_format_category_e cat;
     union
     {
         struct
         {
-            void *p_surface, *p_jsurface;
+            vlc_video_context *ctx;
+            struct asurface_picture_ctx apic_ctxs[MAX_PIC];
+            void *p_surface;
+            AWindowHandler *awh;
             unsigned i_angle;
+            unsigned i_input_offset_x, i_input_offset_y;
             unsigned i_input_width, i_input_height;
+            unsigned i_input_visible_width, i_input_visible_height;
             unsigned int i_stride, i_slice_height;
             int i_pixel_format;
             struct hxxx_helper hh;
-            /* stores the inflight picture for each output buffer or NULL */
-            picture_sys_t** pp_inflight_pictures;
-            unsigned int i_inflight_pictures;
             timestamp_fifo_t *timestamp_fifo;
+            int i_mpeg_dar_num, i_mpeg_dar_den;
+            struct vlc_asurfacetexture *surfacetexture;
+            bool use_air;
+            vlc_cond_t air_cond;
+            unsigned air_waiting_count;
         } video;
         struct {
             date_t i_end_date;
@@ -131,40 +154,41 @@ struct decoder_sys_t
             int pi_extraction[AOUT_CHAN_MAX];
         } audio;
     };
-};
+} decoder_sys_t;
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  OpenDecoderJni(vlc_object_t *);
 static int  OpenDecoderNdk(vlc_object_t *);
-static void CleanDecoder(decoder_t *);
+static void CleanDecoder(decoder_sys_t *);
 static void CloseDecoder(vlc_object_t *);
 
 static int Video_OnNewBlock(decoder_t *, block_t **);
 static int VideoHXXX_OnNewBlock(decoder_t *, block_t **);
+static int VideoMPEG2_OnNewBlock(decoder_t *, block_t **);
 static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
-static void Video_OnFlush(decoder_t *);
+static void Video_OnFlush(decoder_sys_t *);
 static int Video_ProcessOutput(decoder_t *, mc_api_out *, picture_t **,
                                block_t **);
 static int DecodeBlock(decoder_t *, block_t *);
 
 static int Audio_OnNewBlock(decoder_t *, block_t **);
-static void Audio_OnFlush(decoder_t *);
+static void Audio_OnFlush(decoder_sys_t *);
 static int Audio_ProcessOutput(decoder_t *, mc_api_out *, picture_t **,
                                block_t **);
 
-static void DecodeFlushLocked(decoder_t *);
+static void DecodeFlushLocked(decoder_sys_t *);
 static void DecodeFlush(decoder_t *);
-static void StopMediaCodec(decoder_t *);
+static void StopMediaCodec(decoder_sys_t *);
 static void *OutThread(void *);
 
-static void InvalidateAllPictures(decoder_t *);
-static void RemoveInflightPictures(decoder_t *);
+static void ReleaseAllPictureContexts(decoder_sys_t *);
 
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
+#define MEDIACODEC_ENABLE_TEXT N_("Enable hardware acceleration")
+
 #define DIRECTRENDERING_TEXT "Android direct rendering"
 #define DIRECTRENDERING_LONGTEXT \
     "Enable Android direct rendering using opaque buffers."
@@ -178,49 +202,37 @@ static void RemoveInflightPictures(decoder_t *);
 
 vlc_module_begin ()
     set_description("Video decoder using Android MediaCodec via NDK")
-    set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_VCODEC)
     set_section(N_("Decoding"), NULL)
-    set_capability("video decoder", 0) /* Only enabled via commandline arguments */
+    set_capability("video decoder", 800)
+    add_bool("mediacodec", true, MEDIACODEC_ENABLE_TEXT, NULL)
     add_bool(CFG_PREFIX "dr", true,
-             DIRECTRENDERING_TEXT, DIRECTRENDERING_LONGTEXT, true)
+             DIRECTRENDERING_TEXT, DIRECTRENDERING_LONGTEXT)
     add_bool(CFG_PREFIX "audio", false,
-             MEDIACODEC_AUDIO_TEXT, MEDIACODEC_AUDIO_LONGTEXT, true)
+             MEDIACODEC_AUDIO_TEXT, MEDIACODEC_AUDIO_LONGTEXT)
     add_bool(CFG_PREFIX "tunneled-playback", false,
-             MEDIACODEC_TUNNELEDPLAYBACK_TEXT, NULL, true)
+             MEDIACODEC_TUNNELEDPLAYBACK_TEXT, NULL)
     set_callbacks(OpenDecoderNdk, CloseDecoder)
     add_shortcut("mediacodec_ndk")
     add_submodule ()
         set_capability("audio decoder", 0)
         set_callbacks(OpenDecoderNdk, CloseDecoder)
         add_shortcut("mediacodec_ndk")
-    add_submodule ()
-        set_description("Video decoder using Android MediaCodec via JNI")
-        set_capability("video decoder", 0)
-        set_callbacks(OpenDecoderJni, CloseDecoder)
-        add_shortcut("mediacodec_jni")
-    add_submodule ()
-        set_capability("audio decoder", 0)
-        set_callbacks(OpenDecoderJni, CloseDecoder)
-        add_shortcut("mediacodec_jni")
 vlc_module_end ()
 
-static void CSDFree(decoder_t *p_dec)
+static void CSDFree(decoder_sys_t *p_sys)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
     for (unsigned int i = 0; i < p_sys->i_csd_count; ++i)
         block_Release(p_sys->pp_csd[i]);
     p_sys->i_csd_count = 0;
 }
 
 /* Init the p_sys->p_csd that will be sent from DecodeBlock */
-static void CSDInit(decoder_t *p_dec, block_t *p_blocks, size_t i_count)
+static void CSDInit(decoder_sys_t *p_sys, block_t *p_blocks, size_t i_count)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
-    assert(i_count >= 0 && i_count <= 3);
+    assert(i_count <= MAX_CSD_COUNT);
 
-    CSDFree(p_dec);
+    CSDFree(p_sys);
 
     for (size_t i = 0; i < i_count; ++i)
     {
@@ -235,14 +247,14 @@ static void CSDInit(decoder_t *p_dec, block_t *p_blocks, size_t i_count)
     p_sys->i_csd_send = 0;
 }
 
-static int CSDDup(decoder_t *p_dec, const void *p_buf, size_t i_buf)
+static int CSDDup(decoder_sys_t *p_sys, const void *p_buf, size_t i_buf)
 {
     block_t *p_block = block_Alloc(i_buf);
     if (!p_block)
         return VLC_ENOMEM;
     memcpy(p_block->p_buffer, p_buf, i_buf);
 
-    CSDInit(p_dec, p_block, 1);
+    CSDInit(p_sys, p_block, 1);
     return VLC_SUCCESS;
 }
 
@@ -252,14 +264,23 @@ static void HXXXInitSize(decoder_t *p_dec, bool *p_size_changed)
     {
         decoder_sys_t *p_sys = p_dec->p_sys;
         struct hxxx_helper *hh = &p_sys->video.hh;
-        unsigned i_w, i_h, i_vw, i_vh;
-        hxxx_helper_get_current_picture_size(hh, &i_w, &i_h, &i_vw, &i_vh);
-
-        *p_size_changed = (i_w != p_sys->video.i_input_width
-                        || i_h != p_sys->video.i_input_height);
-        p_sys->video.i_input_width = i_w;
-        p_sys->video.i_input_height = i_h;
-        /* fmt_out video size will be updated by mediacodec output callback */
+        unsigned i_ox, i_oy, i_w, i_h, i_vw, i_vh;
+        if(hxxx_helper_get_current_picture_size(hh, &i_ox, &i_oy, &i_w, &i_h, &i_vw, &i_vh)
+           == VLC_SUCCESS)
+        {
+            *p_size_changed = (i_w != p_sys->video.i_input_width
+                            || i_h != p_sys->video.i_input_height
+                            || i_vw != p_sys->video.i_input_visible_width
+                            || i_vh != p_sys->video.i_input_visible_height);
+            p_sys->video.i_input_offset_x = i_ox;
+            p_sys->video.i_input_offset_y = i_oy;
+            p_sys->video.i_input_width = i_w;
+            p_sys->video.i_input_height = i_h;
+            p_sys->video.i_input_visible_width = i_vw;
+            p_sys->video.i_input_visible_height = i_vh;
+            /* fmt_out video size will be updated by mediacodec output callback */
+        }
+        else *p_size_changed = false;
     }
 }
 
@@ -268,12 +289,12 @@ static int H264SetCSD(decoder_t *p_dec, bool *p_size_changed)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
     struct hxxx_helper *hh = &p_sys->video.hh;
-    assert(hh->h264.i_sps_count > 0 || hh->h264.i_pps_count > 0);
+    assert(hxxx_helper_has_config(hh));
 
-    block_t *p_spspps_blocks = h264_helper_get_annexb_config(hh);
+    block_t *p_spspps_blocks = hxxx_helper_get_extradata_chain(hh);
 
-    if (p_spspps_blocks != NULL)
-        CSDInit(p_dec, p_spspps_blocks, 2);
+    if (p_spspps_blocks != NULL && p_spspps_blocks->p_next)
+        CSDInit(p_sys, p_spspps_blocks, 2);
 
     HXXXInitSize(p_dec, p_size_changed);
 
@@ -286,26 +307,17 @@ static int HEVCSetCSD(decoder_t *p_dec, bool *p_size_changed)
     decoder_sys_t *p_sys = p_dec->p_sys;
     struct hxxx_helper *hh = &p_sys->video.hh;
 
-    assert(hh->hevc.i_vps_count > 0 || hh->hevc.i_sps_count > 0 ||
-           hh->hevc.i_pps_count > 0 );
+    assert(hxxx_helper_has_config(hh));
 
-    block_t *p_xps_blocks = hevc_helper_get_annexb_config(hh);
-    if (p_xps_blocks != NULL)
-    {
-        block_t *p_monolith = block_ChainGather(p_xps_blocks);
-        if (p_monolith == NULL)
-        {
-            block_ChainRelease(p_xps_blocks);
-            return VLC_ENOMEM;
-        }
-        CSDInit(p_dec, p_monolith, 1);
-    }
+    block_t *p_xps = hxxx_helper_get_extradata_block(hh);
+    if (p_xps != NULL)
+        CSDInit(p_sys, p_xps, 1);
 
     HXXXInitSize(p_dec, p_size_changed);
     return VLC_SUCCESS;
 }
 
-static int ParseVideoExtraH264(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
+static int ParseVideoExtraH264(decoder_t *p_dec, uint8_t *p_extra, size_t i_extra)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
     struct hxxx_helper *hh = &p_sys->video.hh;
@@ -313,19 +325,18 @@ static int ParseVideoExtraH264(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
     int i_ret = hxxx_helper_set_extra(hh, p_extra, i_extra);
     if (i_ret != VLC_SUCCESS)
         return i_ret;
-    assert(hh->pf_process_block != NULL);
 
     if (p_sys->api.i_quirks & MC_API_VIDEO_QUIRKS_ADAPTIVE)
         p_sys->b_adaptive = true;
 
     p_sys->pf_on_new_block = VideoHXXX_OnNewBlock;
 
-    if (hh->h264.i_sps_count > 0 || hh->h264.i_pps_count > 0)
+    if (hxxx_helper_has_config(hh))
         return H264SetCSD(p_dec, NULL);
     return VLC_SUCCESS;
 }
 
-static int ParseVideoExtraHEVC(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
+static int ParseVideoExtraHEVC(decoder_t *p_dec, uint8_t *p_extra, size_t i_extra)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
     struct hxxx_helper *hh = &p_sys->video.hh;
@@ -333,28 +344,27 @@ static int ParseVideoExtraHEVC(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
     int i_ret = hxxx_helper_set_extra(hh, p_extra, i_extra);
     if (i_ret != VLC_SUCCESS)
         return i_ret;
-    assert(hh->pf_process_block != NULL);
 
     if (p_sys->api.i_quirks & MC_API_VIDEO_QUIRKS_ADAPTIVE)
         p_sys->b_adaptive = true;
 
     p_sys->pf_on_new_block = VideoHXXX_OnNewBlock;
 
-    if (hh->hevc.i_vps_count > 0 || hh->hevc.i_sps_count > 0 ||
-        hh->hevc.i_pps_count > 0 )
+    if (hxxx_helper_has_config(hh))
         return HEVCSetCSD(p_dec, NULL);
     return VLC_SUCCESS;
 }
 
-static int ParseVideoExtraVc1(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
+static int ParseVideoExtraVc1(decoder_t *p_dec, uint8_t *p_extra, size_t i_extra)
 {
-    int offset = 0;
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    size_t offset = 0;
 
     if (i_extra < 4)
         return VLC_EGENERIC;
 
     /* Initialisation data starts with : 0x00 0x00 0x01 0x0f */
-    /* Skipping unecessary data */
+    /* Skipping unnecessary data */
     static const uint8_t vc1_start_code[4] = {0x00, 0x00, 0x01, 0x0f};
     for (; offset < i_extra - 4 ; ++offset)
     {
@@ -366,11 +376,11 @@ static int ParseVideoExtraVc1(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
     if (offset >= i_extra - 4)
         return VLC_EGENERIC;
 
-    p_dec->p_sys->pf_on_new_block = VideoVC1_OnNewBlock;
-    return CSDDup(p_dec, p_extra + offset, i_extra - offset);
+    p_sys->pf_on_new_block = VideoVC1_OnNewBlock;
+    return CSDDup(p_sys, p_extra + offset, i_extra - offset);
 }
 
-static int ParseVideoExtraWmv3(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
+static int ParseVideoExtraWmv3(decoder_t *p_dec, uint8_t *p_extra, size_t i_extra)
 {
     /* WMV3 initialisation data :
      * 8 fixed bytes
@@ -397,19 +407,19 @@ static int ParseVideoExtraWmv3(decoder_t *p_dec, uint8_t *p_extra, int i_extra)
     /* Adding extradata */
     memcpy(&p_data[8], p_extra, 4);
     /* Adding height and width, little endian */
-    SetDWLE(&(p_data[12]), p_dec->fmt_in.video.i_height);
-    SetDWLE(&(p_data[16]), p_dec->fmt_in.video.i_width);
+    SetDWLE(&(p_data[12]), p_dec->fmt_in->video.i_height);
+    SetDWLE(&(p_data[16]), p_dec->fmt_in->video.i_width);
 
-    return CSDDup(p_dec, p_data, sizeof(p_data));
+    return CSDDup(p_dec->p_sys, p_data, sizeof(p_data));
 }
 
 static int ParseExtra(decoder_t *p_dec)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
-    uint8_t *p_extra = p_dec->fmt_in.p_extra;
-    int i_extra = p_dec->fmt_in.i_extra;
+    uint8_t *p_extra = p_dec->fmt_in->p_extra;
+    size_t i_extra = p_dec->fmt_in->i_extra;
 
-    switch (p_dec->fmt_in.i_codec)
+    switch (p_dec->fmt_in->i_codec)
     {
     case VLC_CODEC_H264:
         return ParseVideoExtraH264(p_dec, p_extra, i_extra);
@@ -422,48 +432,165 @@ static int ParseExtra(decoder_t *p_dec)
     case VLC_CODEC_MP4V:
         if (!i_extra && p_sys->api.i_quirks & MC_API_VIDEO_QUIRKS_ADAPTIVE)
             p_sys->b_adaptive = true;
-        /* fall through */
-    default:
-        /* Set default CSD */
-        if (p_dec->fmt_in.i_extra)
-            return CSDDup(p_dec, p_dec->fmt_in.p_extra, p_dec->fmt_in.i_extra);
-        else
-            return VLC_SUCCESS;
+        break;
+    case VLC_CODEC_MPGV:
+    case VLC_CODEC_MP2V:
+        p_sys->pf_on_new_block = VideoMPEG2_OnNewBlock;
+        break;
+    }
+    /* Set default CSD */
+    if (p_dec->fmt_in->i_extra)
+        return CSDDup(p_sys, p_dec->fmt_in->p_extra, p_dec->fmt_in->i_extra);
+    else
+        return VLC_SUCCESS;
+}
+
+static enum mc_media_format_color_range_t
+vlc_to_mc_color_range(video_color_range_t vlc_range)
+{
+    switch (vlc_range)
+    {
+        case COLOR_RANGE_FULL:
+            return MC_COLOR_RANGE_FULL;
+        case COLOR_RANGE_LIMITED:
+            return MC_COLOR_RANGE_LIMITED;
+        default:
+            return MC_COLOR_RANGE_UNSPECIFIED;
     }
 }
 
-static int UpdateVout(decoder_t *p_dec)
+static video_color_range_t
+mc_to_vlc_color_range(enum mc_media_format_color_range_t mc_range)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    /* If MediaCodec can handle the rotation, reset the orientation to
-     * Normal in order to ask the vout not to rotate. */
-    if (p_sys->video.i_angle != 0)
+    switch (mc_range)
     {
-        assert(p_dec->fmt_out.i_codec == VLC_CODEC_ANDROID_OPAQUE);
-        p_dec->fmt_out.video.orientation = p_dec->fmt_in.video.orientation;
-        video_format_TransformTo(&p_dec->fmt_out.video, ORIENT_NORMAL);
+        case MC_COLOR_RANGE_FULL:
+            return COLOR_RANGE_FULL;
+        case MC_COLOR_RANGE_LIMITED:
+            return COLOR_RANGE_LIMITED;
+        default:
+            return COLOR_RANGE_UNDEF;
     }
+}
 
-    if (decoder_UpdateVideoFormat(p_dec) != 0)
-        return VLC_EGENERIC;
+static enum mc_media_format_color_standard_t
+vlc_to_mc_color_standard(video_color_primaries_t vlc_primaries, video_color_space_t vlc_colorspace)
+{
+    switch (vlc_primaries)
+    {
+        case COLOR_PRIMARIES_BT601_525:
+            if (vlc_colorspace == COLOR_SPACE_BT601)
+                return MC_COLOR_STANDARD_BT601_525;
+            if (vlc_colorspace == COLOR_SPACE_SMPTE_240)
+                return MC_COLOR_STANDARD_BT601_525_240M;
+            break;
+        case COLOR_PRIMARIES_BT601_625:
+            if (vlc_colorspace == COLOR_SPACE_BT601)
+                return MC_COLOR_STANDARD_BT601_625;
+            // return MC_COLOR_STANDARD_BT601_625_UNADJUSTED;
+            break;
+        case COLOR_PRIMARIES_BT709:
+            if (vlc_colorspace == COLOR_SPACE_BT709)
+                return MC_COLOR_STANDARD_BT709;
+            break;
+        case COLOR_PRIMARIES_BT2020:
+            if (vlc_colorspace == COLOR_SPACE_BT2020)
+                return MC_COLOR_STANDARD_BT2020;
+            break;
+        case COLOR_PRIMARIES_BT470_M:
+            // return MC_COLOR_STANDARD_BT470M;
+        case COLOR_PRIMARIES_DCI_P3:
+            // return MC_COLOR_STANDARD_FILM;
+        default:
+            break;
+    }
+    return MC_COLOR_STANDARD_UNSPECIFIED;
+}
 
-    if (p_dec->fmt_out.i_codec != VLC_CODEC_ANDROID_OPAQUE)
-        return VLC_SUCCESS;
+static video_color_primaries_t
+mc_to_vlc_primaries(enum mc_media_format_color_standard_t mc_standard)
+{
+    switch (mc_standard)
+    {
+        case MC_COLOR_STANDARD_BT709:
+            return COLOR_PRIMARIES_BT709;
+        case MC_COLOR_STANDARD_BT601_625:
+        case MC_COLOR_STANDARD_BT601_625_UNADJUSTED:
+            return COLOR_PRIMARIES_BT601_625;
+        case MC_COLOR_STANDARD_BT601_525:
+        case MC_COLOR_STANDARD_BT601_525_240M:
+            return COLOR_PRIMARIES_BT601_525;
+        case MC_COLOR_STANDARD_BT2020:
+            return COLOR_PRIMARIES_BT2020;
+        case MC_COLOR_STANDARD_BT470M:
+            return COLOR_PRIMARIES_BT470_M;
+        case MC_COLOR_STANDARD_FILM:
+            return COLOR_PRIMARIES_DCI_P3;
+        default:
+            return COLOR_PRIMARIES_UNDEF;
+    }
+}
 
-    /* Direct rendering: get the surface attached to the VOUT */
-    picture_t *p_dummy_hwpic = decoder_NewPicture(p_dec);
-    if (p_dummy_hwpic == NULL)
-        return VLC_EGENERIC;
+static video_color_space_t
+mc_to_vlc_color_space(enum mc_media_format_color_standard_t mc_standard)
+{
+    switch (mc_standard)
+    {
+        case MC_COLOR_STANDARD_BT709:
+            return COLOR_SPACE_BT709;
+        case MC_COLOR_STANDARD_BT601_625:
+        case MC_COLOR_STANDARD_BT601_525:
+            return COLOR_SPACE_BT601;
+        case MC_COLOR_STANDARD_BT601_525_240M:
+            return COLOR_SPACE_SMPTE_240;
+        case MC_COLOR_STANDARD_BT2020:
+            return COLOR_SPACE_BT2020;
+        case MC_COLOR_STANDARD_BT601_625_UNADJUSTED:
+        case MC_COLOR_STANDARD_BT470M:
+        case MC_COLOR_STANDARD_FILM:
+        default:
+            return COLOR_SPACE_UNDEF;
+    }
+}
 
-    assert(p_dummy_hwpic->p_sys);
-    assert(p_dummy_hwpic->p_sys->hw.p_surface);
-    assert(p_dummy_hwpic->p_sys->hw.p_jsurface);
+static enum mc_media_format_color_transfer_t
+vlc_to_mc_color_transfer(video_transfer_func_t vlc_transfer)
+{
+    switch (vlc_transfer)
+    {
+        case TRANSFER_FUNC_LINEAR:
+            return MC_COLOR_TRANSFER_LINEAR;
+        case TRANSFER_FUNC_SMPTE_ST2084:
+            return MC_COLOR_TRANSFER_ST2084;
+        case TRANSFER_FUNC_HLG:
+            return MC_COLOR_TRANSFER_HLG;
+        case TRANSFER_FUNC_BT709:
+            return MC_COLOR_TRANSFER_BT709;
+        case TRANSFER_FUNC_SRGB:
+            return MC_COLOR_TRANSFER_SRGB;
+        default:
+            return MC_COLOR_TRANSFER_UNSPECIFIED;
+    }
+}
 
-    p_sys->video.p_surface = p_dummy_hwpic->p_sys->hw.p_surface;
-    p_sys->video.p_jsurface = p_dummy_hwpic->p_sys->hw.p_jsurface;
-    picture_Release(p_dummy_hwpic);
-    return VLC_SUCCESS;
+static video_transfer_func_t
+mc_to_vlc_color_transfer(enum mc_media_format_color_transfer_t mc_transfer)
+{
+    switch (mc_transfer)
+    {
+        case MC_COLOR_TRANSFER_LINEAR:
+            return TRANSFER_FUNC_LINEAR;
+        case MC_COLOR_TRANSFER_SRGB:
+            return TRANSFER_FUNC_SRGB;
+        case MC_COLOR_TRANSFER_BT709:
+            return TRANSFER_FUNC_BT709;
+        case MC_COLOR_TRANSFER_ST2084:
+            return TRANSFER_FUNC_SMPTE_ST2084;
+        case MC_COLOR_TRANSFER_HLG:
+            return TRANSFER_FUNC_HLG;
+        default:
+            return TRANSFER_FUNC_UNDEF;
+    }
 }
 
 /*****************************************************************************
@@ -474,44 +601,547 @@ static int StartMediaCodec(decoder_t *p_dec)
     decoder_sys_t *p_sys = p_dec->p_sys;
     union mc_api_args args;
 
-    if (p_dec->fmt_in.i_cat == VIDEO_ES)
+    if (p_dec->fmt_in->i_cat == VIDEO_ES)
     {
         args.video.i_width = p_dec->fmt_out.video.i_width;
         args.video.i_height = p_dec->fmt_out.video.i_height;
         args.video.i_angle = p_sys->video.i_angle;
 
         args.video.p_surface = p_sys->video.p_surface;
-        args.video.p_jsurface = p_sys->video.p_jsurface;
+
+        args.video.color.range = vlc_to_mc_color_range(p_dec->fmt_out.video.color_range);
+        args.video.color.standard = vlc_to_mc_color_standard(p_dec->fmt_out.video.primaries, p_dec->fmt_out.video.space);
+        args.video.color.transfer = vlc_to_mc_color_transfer(p_dec->fmt_out.video.transfer);
+
+
         args.video.b_tunneled_playback = args.video.p_surface ?
                 var_InheritBool(p_dec, CFG_PREFIX "tunneled-playback") : false;
         if (p_sys->b_adaptive)
             msg_Dbg(p_dec, "mediacodec configured for adaptative playback");
         args.video.b_adaptive_playback = p_sys->b_adaptive;
+        args.video.b_low_latency = var_InheritBool(p_dec, "low-delay");
     }
     else
     {
-        date_Set(&p_sys->audio.i_end_date, VLC_TS_INVALID);
+        date_Set(&p_sys->audio.i_end_date, VLC_TICK_INVALID);
 
-        args.audio.i_sample_rate    = p_dec->fmt_in.audio.i_rate;
-        args.audio.i_channel_count  = p_dec->p_sys->audio.i_channels;
+        args.audio.i_sample_rate    = p_dec->fmt_in->audio.i_rate;
+        args.audio.i_channel_count  = p_sys->audio.i_channels;
     }
 
-    return p_sys->api.start(&p_sys->api, &args);
+    if (p_sys->api.configure_decoder(&p_sys->api, &args) != 0)
+    {
+        return MC_API_ERROR;
+    }
+
+    return p_sys->api.start(&p_sys->api);
 }
 
 /*****************************************************************************
  * StopMediaCodec: Close the mediacodec instance
  *****************************************************************************/
-static void StopMediaCodec(decoder_t *p_dec)
+static void StopMediaCodec(decoder_sys_t *p_sys)
+{
+    /* Remove all pictures that are currently in flight in order
+     * to prevent the vout from using destroyed output buffers. */
+    if (p_sys->cat == VIDEO_ES)
+        ReleaseAllPictureContexts(p_sys);
+
+    p_sys->api.stop(&p_sys->api);
+}
+
+static bool AndroidPictureContextRelease(struct asurface_picture_ctx *apctx,
+                                         bool render)
+{
+    int index = atomic_exchange(&apctx->index, -1);
+    if (index >= 0)
+    {
+        android_video_context_t *avctx =
+            vlc_video_context_GetPrivate(apctx->s.vctx, VLC_VIDEO_CONTEXT_AWINDOW);
+        decoder_sys_t *p_sys = avctx->dec_opaque;
+
+        p_sys->api.release_out(&p_sys->api, index, render);
+        return true;
+    }
+    return false;
+}
+
+static bool PictureContextRenderPic(struct picture_context_t *ctx)
+{
+    struct asurface_picture_ctx *apctx =
+        container_of(ctx, struct asurface_picture_ctx, s);
+
+    return AndroidPictureContextRelease(apctx, true);
+}
+
+static bool PictureContextRenderPicTs(struct picture_context_t *ctx,
+                                      vlc_tick_t ts)
+{
+    struct asurface_picture_ctx *apctx =
+        container_of(ctx, struct asurface_picture_ctx, s);
+
+    int index = atomic_exchange(&apctx->index, -1);
+    if (index >= 0)
+    {
+        android_video_context_t *avctx =
+            vlc_video_context_GetPrivate(ctx->vctx, VLC_VIDEO_CONTEXT_AWINDOW);
+        decoder_sys_t *p_sys = avctx->dec_opaque;
+
+        p_sys->api.release_out_ts(&p_sys->api, index, ts * INT64_C(1000));
+        return true;
+    }
+    return false;
+}
+
+static struct vlc_asurfacetexture *
+PictureContextGetTexture(picture_context_t *context)
+{
+    android_video_context_t *avctx =
+        vlc_video_context_GetPrivate(context->vctx, VLC_VIDEO_CONTEXT_AWINDOW);
+    decoder_sys_t *p_sys = avctx->dec_opaque;
+
+    return p_sys->video.surfacetexture;
+}
+
+static void ASurfacePictureContextDestroy(struct picture_context_t *ctx)
+{
+    struct asurface_picture_ctx *apctx =
+        container_of(ctx, struct asurface_picture_ctx, s);
+
+    if (atomic_fetch_sub_explicit(&apctx->refs, 1, memory_order_acq_rel) == 1)
+        AndroidPictureContextRelease(apctx, false);
+}
+
+static struct picture_context_t *ASurfacePictureContextCopy(struct picture_context_t *ctx)
+{
+    struct asurface_picture_ctx *apctx =
+        container_of(ctx, struct asurface_picture_ctx, s);
+
+    atomic_fetch_add_explicit(&apctx->refs, 1, memory_order_relaxed);
+    vlc_video_context_Hold(ctx->vctx);
+    return ctx;
+}
+
+static void AbortDecoderLocked(decoder_sys_t *p_dec);
+static void CleanFromLegacyVideoContext(void *priv)
+{
+    android_video_context_t *avctx = priv;
+    decoder_sys_t *p_sys = avctx->dec_opaque;
+
+    assert(!p_sys->video.use_air);
+
+    vlc_mutex_lock(&p_sys->lock);
+    /* Unblock output thread waiting in dequeue_out */
+    DecodeFlushLocked(p_sys);
+    /* Cancel the output thread */
+    AbortDecoderLocked(p_sys);
+    vlc_mutex_unlock(&p_sys->lock);
+
+    vlc_join(p_sys->out_thread, NULL);
+
+    CleanDecoder(p_sys);
+}
+
+static void ReleaseAllPictureContexts(decoder_sys_t *p_sys)
+{
+    /* No picture context if no direct rendering or using air. */
+    if (p_sys->video.ctx == NULL || p_sys->video.use_air)
+        return;
+
+    for (size_t i = 0; i < ARRAY_SIZE(p_sys->video.apic_ctxs); ++i)
+    {
+        struct asurface_picture_ctx *apctx = &p_sys->video.apic_ctxs[i];
+
+        /* Don't decrement apctx->refs, the picture_context should stay valid
+         * even if the underlying buffer is released since it might still be
+         * used by the vout (but the vout won't be able to render it). */
+        AndroidPictureContextRelease(apctx, false);
+    }
+}
+
+static struct asurface_picture_ctx *
+GetPictureContext(decoder_t *p_dec, unsigned index)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    bool slept = false;
+
+    for (;;)
+    {
+        for (size_t i = 0; i < ARRAY_SIZE(p_sys->video.apic_ctxs); ++i)
+        {
+            struct asurface_picture_ctx *apctx = &p_sys->video.apic_ctxs[i];
+            /* Find an available picture context (ie. refs == 0) */
+            unsigned expected_refs = 0;
+            if (atomic_compare_exchange_strong(&apctx->refs, &expected_refs, 1))
+            {
+                int expected_index = -1;
+                /* Store the new index */
+                if (likely(atomic_compare_exchange_strong(&apctx->index,
+                                                          &expected_index, index)))
+                    return apctx;
+
+                /* Unlikely: Restore the ref count and try a next one, since
+                 * this picture context is being released. Cf.
+                 * ASurfacePictureContextDestroy(), this function first decrement the
+                 * ref count before releasing the index.  */
+                atomic_store(&apctx->refs, 0);
+            }
+        }
+
+        /* This is very unlikely since there are generally more picture
+         * contexts than android MediaCodec buffers */
+        if (!slept)
+            msg_Warn(p_dec, "waiting for more picture contexts (unlikely)");
+        vlc_tick_sleep(VOUT_OUTMEM_SLEEP);
+        slept = true;
+    }
+}
+
+static picture_t*
+NewPicture(decoder_t *p_dec, vlc_tick_t ts)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
-    /* Remove all pictures that are currently in flight in order
-     * to prevent the vout from using destroyed output buffers. */
-    if (p_sys->api.b_direct_rendering)
-        RemoveInflightPictures(p_dec);
+    /* If the oldest input block had no PTS, the timestamp of
+     * the frame returned by MediaCodec might be wrong so we
+     * overwrite it with the corresponding dts. Call FifoGet
+     * first in order to avoid a gap if buffers are released
+     * due to an invalid format or a preroll */
+    vlc_tick_t forced_ts = timestamp_FifoGet(p_sys->video.timestamp_fifo);
 
-    p_sys->api.stop(&p_sys->api);
+    picture_t *p_pic = decoder_NewPicture(p_dec);
+    if (p_pic == NULL)
+        return NULL;
+
+    if (forced_ts == VLC_TICK_INVALID)
+        p_pic->date = ts;
+    else
+        p_pic->date = forced_ts;
+    p_pic->b_progressive = true;
+    return p_pic;
+}
+
+static void CleanFromVideoContext(void *priv)
+{
+    android_video_context_t *avctx = priv;
+    assert(avctx->dec_opaque == NULL);
+    assert(avctx->air != NULL);
+    avctx->air_api->AImageReader.delete(avctx->air);
+}
+
+static void
+android_picture_ctx_destroy(picture_context_t *context)
+{
+    struct android_picture_ctx *apctx = container_of(context, struct android_picture_ctx, s);
+
+    if (!vlc_atomic_rc_dec(&apctx->rc))
+        return;
+
+    android_video_context_t *avctx =
+        vlc_video_context_GetPrivate(apctx->s.vctx, VLC_VIDEO_CONTEXT_AWINDOW);
+
+    if (apctx->fence_fd >= 0)
+        close(apctx->fence_fd);
+
+    avctx->air_api->AImage.deleteAsync(apctx->image, apctx->read_fence_fd);
+
+    free(apctx);
+}
+
+static picture_context_t *
+android_picture_ctx_copy(picture_context_t *src)
+{
+    struct android_picture_ctx *src_ctx = container_of(src, struct android_picture_ctx, s);
+    vlc_atomic_rc_inc(&src_ctx->rc);
+    vlc_video_context_Hold(src_ctx->s.vctx);
+    return &src_ctx->s;
+}
+
+static int
+QueueAImagePicture(decoder_t *p_dec, android_video_context_t *avctx,
+                   AImage *image, int fence_fd)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    /* same value than p_out->buf.i_ts (propagated from MediaCodec input to
+     * output to AImageReader */
+    int64_t timestamp;
+    int32_t status = avctx->air_api->AImage.getTimestamp(image, &timestamp);
+
+    vlc_tick_t date = status == 0 ? VLC_TICK_FROM_NS(timestamp) : 0;
+
+    picture_t *p_pic = NewPicture(p_dec, date);
+    if (p_pic == NULL)
+        goto error;
+
+    if (p_pic->date == VLC_TICK_INVALID)
+    {
+        msg_Warn(p_dec, "invalid ts from AImageReader");
+        goto error;
+    }
+
+    struct android_picture_ctx *apctx = malloc(sizeof(*apctx));
+    if (apctx == NULL)
+        goto error;
+
+    apctx->image = image;
+    apctx->fence_fd = fence_fd;
+    apctx->read_fence_fd = -1;
+    apctx->sc = NULL;
+    vlc_atomic_rc_init(&apctx->rc);
+
+    apctx->s = (picture_context_t) {
+        android_picture_ctx_destroy, android_picture_ctx_copy, p_sys->video.ctx,
+    };
+    p_pic->context = &apctx->s;
+    vlc_video_context_Hold(apctx->s.vctx);
+    decoder_QueueVideo(p_dec, p_pic);
+
+    return VLC_SUCCESS;
+
+error:
+    if (p_pic != NULL)
+        picture_Release(p_pic);
+    if (fence_fd > 0)
+        close(fence_fd);
+    avctx->air_api->AImage.deleteAsync(image, -1);
+    return VLC_EGENERIC;
+}
+
+static void
+AImageReader_OnImageAvailable(void *context, AImageReader *reader)
+{
+    decoder_t *p_dec = context;
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    assert(p_sys->video.use_air);
+    android_video_context_t *avctx =
+        vlc_video_context_GetPrivate(p_sys->video.ctx, VLC_VIDEO_CONTEXT_AWINDOW);
+    assert(avctx->air != NULL);
+    assert(reader == avctx->air); (void) reader;
+
+    AImage *image = NULL;
+    int fence_fd = -1;
+    int32_t status =
+        avctx->air_api->AImageReader.acquireNextImageAsync(avctx->air, &image,
+                                                           &fence_fd);
+    if (status != 0)
+    {
+        msg_Warn(p_dec, "AImageReader_acquireNextImageAsync failed: %d",
+                    status);
+        return;
+    }
+    vlc_mutex_lock(&p_sys->lock);
+    assert(p_sys->video.air_waiting_count > 0);
+    p_sys->video.air_waiting_count--;
+    vlc_cond_broadcast(&p_sys->video.air_cond);
+    if (p_sys->b_flush_out)
+        avctx->air_api->AImage.deleteAsync(image, fence_fd);
+    else
+        QueueAImagePicture(p_dec, avctx, image, fence_fd);
+    vlc_mutex_unlock(&p_sys->lock);
+}
+
+static int
+CreateSurfaceFromAImageReader(decoder_t *p_dec, vlc_decoder_device *dec_dev,
+                              AWindowHandler *awh, bool need_gpu)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    struct aimage_reader_api *air_api = AWindowHandler_getAImageReaderApi(awh);
+    struct asurface_control_api *asc_api = AWindowHandler_getASurfaceControlApi(awh);
+    if (air_api == NULL || asc_api == NULL)
+        return VLC_EGENERIC;
+
+    int32_t width = 1, height = 1; /* Ignored by MediaCodec */
+    int32_t format = AIMAGE_FORMAT_PRIVATE;
+    uint64_t usage = 0;
+    int32_t max_images = 32;
+
+    if (need_gpu)
+        usage |= AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+
+    AImageReader *reader;
+    int32_t status = air_api->AImageReader.newWithUsage(width, height, format,
+                                                        usage, max_images,
+                                                        &reader);
+
+    if (status != 0)
+    {
+        msg_Warn(p_dec, "AImageReader_newWithUsage failed: %d", status);
+        return VLC_EGENERIC;
+    }
+
+    ANativeWindow *window;
+    status = air_api->AImageReader.getWindow(reader, &window);
+
+    if (status != 0)
+    {
+        air_api->AImageReader.delete(reader);
+        msg_Warn(p_dec, "AImageReader_getWindow failed: %d", status);
+        return VLC_EGENERIC;
+    }
+
+    struct AImageReader_ImageListener listener = {
+        .context = p_dec,
+        .onImageAvailable = AImageReader_OnImageAvailable,
+    };
+
+    air_api->AImageReader.setImageListener(reader, &listener);
+
+    static const struct vlc_video_context_operations ops =
+    {
+        .destroy = CleanFromVideoContext,
+    };
+    p_sys->video.ctx =
+        vlc_video_context_Create(dec_dev, VLC_VIDEO_CONTEXT_AWINDOW,
+                                 sizeof(android_video_context_t), &ops);
+
+    if (!p_sys->video.ctx)
+    {
+        air_api->AImageReader.delete(reader);
+        return VLC_EGENERIC;
+    }
+
+    android_video_context_t *avctx =
+        vlc_video_context_GetPrivate(p_sys->video.ctx, VLC_VIDEO_CONTEXT_AWINDOW);
+    avctx->dec_opaque = NULL;
+    avctx->air_api = air_api;
+    avctx->asc_api = asc_api;
+    avctx->air = reader;
+    avctx->render = NULL;
+    avctx->render_ts = NULL;
+    avctx->get_texture = NULL;
+    avctx->texture = NULL;
+    p_sys->video.p_surface = window;
+    p_sys->video.use_air = true;
+    p_sys->video.air_waiting_count = 0;
+    assert(window != NULL);
+    return VLC_SUCCESS;
+}
+
+static int
+CreateSurface(decoder_t *p_dec, vlc_decoder_device *dec_dev,
+              AWindowHandler *awh, bool use_surfacetexture)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    static const struct vlc_video_context_operations ops =
+    {
+        .destroy = CleanFromLegacyVideoContext,
+    };
+    p_sys->video.ctx =
+        vlc_video_context_Create(dec_dev, VLC_VIDEO_CONTEXT_AWINDOW,
+                                 sizeof(android_video_context_t), &ops);
+
+    if (!p_sys->video.ctx)
+        return VLC_EGENERIC;
+
+    android_video_context_t *avctx =
+        vlc_video_context_GetPrivate(p_sys->video.ctx, VLC_VIDEO_CONTEXT_AWINDOW);
+
+    if (!use_surfacetexture)
+    {
+        p_sys->video.p_surface = AWindowHandler_getANativeWindow(awh, AWindow_Video);
+        assert (p_sys->video.p_surface);
+        if (!p_sys->video.p_surface)
+        {
+            msg_Err(p_dec, "Could not find a valid ANativeWindow");
+            goto error;
+        }
+        p_sys->video.awh = awh;
+        goto end;
+    }
+
+    p_sys->video.surfacetexture = vlc_asurfacetexture_New(awh, false);
+    assert(p_sys->video.surfacetexture);
+    if (p_sys->video.surfacetexture == NULL)
+        goto error;
+
+    p_sys->video.p_surface = p_sys->video.surfacetexture->window;
+    assert(p_sys->video.p_surface);
+
+end:
+    avctx->dec_opaque = p_dec->p_sys;
+    avctx->air_api = NULL;
+    avctx->air = NULL;
+    avctx->render = PictureContextRenderPic;
+    avctx->render_ts = p_sys->api.release_out_ts ? PictureContextRenderPicTs : NULL;
+    avctx->get_texture = p_sys->video.surfacetexture ? PictureContextGetTexture : NULL;
+    avctx->texture = NULL;
+
+    for (size_t i = 0; i < ARRAY_SIZE(p_sys->video.apic_ctxs); ++i)
+    {
+        struct asurface_picture_ctx *apctx = &p_sys->video.apic_ctxs[i];
+
+        apctx->s = (picture_context_t) {
+            ASurfacePictureContextDestroy, ASurfacePictureContextCopy,
+            p_sys->video.ctx,
+        };
+        atomic_init(&apctx->index, -1);
+        atomic_init(&apctx->refs, 0);
+    }
+
+    return VLC_SUCCESS;
+
+error:
+    vlc_video_context_Release(p_sys->video.ctx);
+    p_sys->video.ctx = NULL;
+    return VLC_EGENERIC;
+}
+
+static int
+CreateVideoContext(decoder_t *p_dec)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    vlc_decoder_device *dec_dev = decoder_GetDecoderDevice(p_dec);
+    if (!dec_dev || dec_dev->type != VLC_DECODER_DEVICE_AWINDOW)
+    {
+        msg_Err(p_dec, "Could not find an AWINDOW decoder device");
+        return VLC_EGENERIC;
+    }
+
+    assert(dec_dev->opaque);
+    AWindowHandler *awh = dec_dev->opaque;
+
+    /* Force OpenGL interop (via AWindow_SurfaceTexture) if there is a
+     * projection or an orientation to handle, if the Surface owner is not able
+     * to modify its layout. */
+    p_sys->video.surfacetexture = NULL;
+    int awh_caps = AWindowHandler_getCapabilities(awh);
+    bool can_set_video_layout = awh_caps & AWH_CAPS_SET_VIDEO_LAYOUT;
+    bool can_use_surfacetexture = awh_caps & AWH_CAPS_SURFACE_VIEW;
+
+    bool need_gpu_transform =
+        p_dec->fmt_out.video.projection_mode != PROJECTION_MODE_RECTANGULAR
+        || (!p_sys->api.b_support_rotation && p_dec->fmt_out.video.orientation != ORIENT_NORMAL)
+        || !can_set_video_layout;
+
+    bool use_surfacetexture = need_gpu_transform && can_use_surfacetexture;
+
+    int ret = CreateSurfaceFromAImageReader(p_dec, dec_dev, awh,
+                                            need_gpu_transform);
+    if (ret == VLC_SUCCESS)
+    {
+        vlc_decoder_device_Release(dec_dev);
+        return VLC_SUCCESS;
+    }
+
+    ret = CreateSurface(p_dec, dec_dev, awh, use_surfacetexture);
+    vlc_decoder_device_Release(dec_dev);
+
+    return ret;
+}
+
+static void CleanInputVideo(decoder_t *p_dec)
+{
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    if (p_dec->fmt_in->i_cat == VIDEO_ES)
+    {
+        if (p_dec->fmt_in->i_codec == VLC_CODEC_H264
+         || p_dec->fmt_in->i_codec == VLC_CODEC_HEVC)
+            hxxx_helper_clean(&p_sys->video.hh);
+    }
 }
 
 /*****************************************************************************
@@ -520,13 +1150,17 @@ static void StopMediaCodec(decoder_t *p_dec)
 static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
 {
     decoder_t *p_dec = (decoder_t *)p_this;
+
+    if (!var_InheritBool(p_dec, "mediacodec"))
+        return VLC_EGENERIC;
+
     decoder_sys_t *p_sys;
     int i_ret;
-    int i_profile = p_dec->fmt_in.i_profile;
+    int i_profile = p_dec->fmt_in->i_profile;
     const char *mime = NULL;
 
     /* Video or Audio if "mediacodec-audio" bool is true */
-    if (p_dec->fmt_in.i_cat != VIDEO_ES && (p_dec->fmt_in.i_cat != AUDIO_ES
+    if (p_dec->fmt_in->i_cat != VIDEO_ES && (p_dec->fmt_in->i_cat != AUDIO_ES
      || !var_InheritBool(p_dec, CFG_PREFIX "audio")))
         return VLC_EGENERIC;
 
@@ -534,20 +1168,20 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
     if (var_Type(p_dec, "mediacodec-failed") != 0)
         return VLC_EGENERIC;
 
-    if (p_dec->fmt_in.i_cat == VIDEO_ES)
+    if (p_dec->fmt_in->i_cat == VIDEO_ES)
     {
         /* Not all mediacodec versions can handle a size of 0. Hopefully, the
          * packetizer will trigger a decoder restart when a new video size is
          * found. */
-        if (!p_dec->fmt_in.video.i_width || !p_dec->fmt_in.video.i_height)
+        if (!p_dec->fmt_in->video.i_width || !p_dec->fmt_in->video.i_height)
             return VLC_EGENERIC;
 
-        switch (p_dec->fmt_in.i_codec) {
+        switch (p_dec->fmt_in->i_codec) {
         case VLC_CODEC_HEVC:
             if (i_profile == -1)
             {
                 uint8_t i_hevc_profile;
-                if (hevc_get_profile_level(&p_dec->fmt_in, &i_hevc_profile, NULL, NULL))
+                if (hevc_get_profile_level(p_dec->fmt_in, &i_hevc_profile, NULL, NULL))
                     i_profile = i_hevc_profile;
             }
             mime = "video/hevc";
@@ -556,28 +1190,38 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
             if (i_profile == -1)
             {
                 uint8_t i_h264_profile;
-                if (h264_get_profile_level(&p_dec->fmt_in, &i_h264_profile, NULL, NULL))
+                if (h264_get_profile_level(p_dec->fmt_in, &i_h264_profile, NULL, NULL))
                     i_profile = i_h264_profile;
             }
             mime = "video/avc";
             break;
         case VLC_CODEC_H263: mime = "video/3gpp"; break;
         case VLC_CODEC_MP4V: mime = "video/mp4v-es"; break;
+        case VLC_CODEC_MPGV:
+        case VLC_CODEC_MP2V:
+            mime = "video/mpeg2";
+            break;
         case VLC_CODEC_WMV3: mime = "video/x-ms-wmv"; break;
-        case VLC_CODEC_VC1:  mime = "video/wvc1"; break;
-        case VLC_CODEC_VP8:  mime = "video/x-vnd.on2.vp8"; break;
-        case VLC_CODEC_VP9:  mime = "video/x-vnd.on2.vp9"; break;
-        /* FIXME: mpeg2 is disabled: sar num/den can't be updated from
-         * MediaCodec. Use avcodec instead that will update it. The proper
-         * solution is to update sar from a mpeg2 packetizer.
-         *
-         * case VLC_CODEC_MPGV: mime = "video/mpeg2"; break;
-         */
+        case VLC_CODEC_VC1:
+            /* Android has no VC-1 profiles */
+            i_profile = -1;
+            mime = "video/wvc1";
+            break;
+        case VLC_CODEC_VP8:
+            if (es_format_HasVpxAlpha(p_dec->fmt_in)) // contains alpha extradata
+                return VLC_ENOTSUP;
+            mime = "video/x-vnd.on2.vp8"; break;
+        case VLC_CODEC_VP9:
+            if (es_format_HasVpxAlpha(p_dec->fmt_in)) // contains alpha extradata
+                return VLC_ENOTSUP;
+            mime = "video/x-vnd.on2.vp9"; break;
+        case VLC_CODEC_APV:
+            mime = "video/avp"; break;
         }
     }
     else
     {
-        switch (p_dec->fmt_in.i_codec) {
+        switch (p_dec->fmt_in->i_codec) {
         case VLC_CODEC_AMR_NB: mime = "audio/3gpp"; break;
         case VLC_CODEC_AMR_WB: mime = "audio/amr-wb"; break;
         case VLC_CODEC_MPGA:
@@ -602,7 +1246,7 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
     if (!mime)
     {
         msg_Dbg(p_dec, "codec %4.4s not supported",
-                (char *)&p_dec->fmt_in.i_codec);
+                (char *)&p_dec->fmt_in->i_codec);
         return VLC_EGENERIC;
     }
 
@@ -611,23 +1255,27 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
         return VLC_ENOMEM;
 
     p_sys->api.p_obj = p_this;
-    p_sys->api.i_codec = p_dec->fmt_in.i_codec;
-    p_sys->api.i_cat = p_dec->fmt_in.i_cat;
+    p_sys->api.i_codec = p_dec->fmt_in->i_codec;
+    p_sys->api.i_cat = p_dec->fmt_in->i_cat;
     p_sys->api.psz_mime = mime;
+    p_sys->video.i_mpeg_dar_num = 0;
+    p_sys->video.i_mpeg_dar_den = 0;
+    p_sys->video.surfacetexture = NULL;
+    p_sys->b_decoder_dead = false;
 
     if (pf_init(&p_sys->api) != 0)
     {
         free(p_sys);
         return VLC_EGENERIC;
     }
-    if (p_sys->api.configure(&p_sys->api, i_profile) != 0)
+    if (p_sys->api.prepare(&p_sys->api, i_profile) != 0)
     {
         /* If the device can't handle video/wvc1,
          * it can probably handle video/x-ms-wmv */
-        if (!strcmp(mime, "video/wvc1") && p_dec->fmt_in.i_codec == VLC_CODEC_VC1)
+        if (!strcmp(mime, "video/wvc1") && p_dec->fmt_in->i_codec == VLC_CODEC_VC1)
         {
             p_sys->api.psz_mime = "video/x-ms-wmv";
-            if (p_sys->api.configure(&p_sys->api, i_profile) != 0)
+            if (p_sys->api.prepare(&p_sys->api, i_profile) != 0)
             {
                 p_sys->api.clean(&p_sys->api);
                 free(p_sys);
@@ -648,14 +1296,18 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
     vlc_cond_init(&p_sys->cond);
     vlc_cond_init(&p_sys->dec_cond);
 
-    if (p_dec->fmt_in.i_cat == VIDEO_ES)
+    if (p_dec->fmt_in->i_cat == VIDEO_ES)
     {
-        switch (p_dec->fmt_in.i_codec)
+        vlc_cond_init(&p_sys->video.air_cond);
+        p_sys->video.use_air = false;
+        p_sys->video.air_waiting_count = 0;
+
+        switch (p_dec->fmt_in->i_codec)
         {
         case VLC_CODEC_H264:
         case VLC_CODEC_HEVC:
             hxxx_helper_init(&p_sys->video.hh, VLC_OBJECT(p_dec),
-                             p_dec->fmt_in.i_codec, false);
+                             p_dec->fmt_in->i_codec, 0, 0);
             break;
         }
         p_sys->pf_on_new_block = Video_OnNewBlock;
@@ -666,18 +1318,33 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
         if (!p_sys->video.timestamp_fifo)
             goto bailout;
 
-        TAB_INIT(p_sys->video.i_inflight_pictures,
-                 p_sys->video.pp_inflight_pictures);
-
         if (var_InheritBool(p_dec, CFG_PREFIX "dr"))
         {
             /* Direct rendering: Request a valid OPAQUE Vout in order to get
              * the surface attached to it */
             p_dec->fmt_out.i_codec = VLC_CODEC_ANDROID_OPAQUE;
 
-            if (p_sys->api.b_support_rotation)
+            p_dec->fmt_out.video = p_dec->fmt_in->video;
+            if (p_dec->fmt_out.video.i_sar_num * p_dec->fmt_out.video.i_sar_den == 0)
             {
-                switch (p_dec->fmt_out.video.orientation)
+                p_dec->fmt_out.video.i_sar_num = 1;
+                p_dec->fmt_out.video.i_sar_den = 1;
+            }
+
+            p_sys->video.i_input_width =
+            p_dec->fmt_out.video.i_visible_width = p_dec->fmt_out.video.i_width;
+            p_sys->video.i_input_height =
+            p_dec->fmt_out.video.i_visible_height = p_dec->fmt_out.video.i_height;
+
+            if (CreateVideoContext(p_dec) != VLC_SUCCESS)
+            {
+                msg_Err(p_dec, "video context creation failed");
+                goto bailout;
+            }
+
+            if (p_sys->api.b_support_rotation && p_sys->video.surfacetexture == NULL)
+            {
+                switch (p_dec->fmt_in->video.orientation)
                 {
                     case ORIENT_ROTATED_90:
                         p_sys->video.i_angle = 90;
@@ -694,27 +1361,25 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
                 }
             }
             else
-                p_sys->video.i_angle = 0;
-
-            p_dec->fmt_out.video = p_dec->fmt_in.video;
-            p_sys->video.i_input_width =
-            p_dec->fmt_out.video.i_visible_width = p_dec->fmt_out.video.i_width;
-            p_sys->video.i_input_height =
-            p_dec->fmt_out.video.i_visible_height = p_dec->fmt_out.video.i_height;
-
-            if (UpdateVout(p_dec) != VLC_SUCCESS)
             {
-                msg_Err(p_dec, "Opaque Vout request failed");
-                goto bailout;
+                /* Let the GL vout handle the rotation */
+                p_sys->video.i_angle = 0;
             }
+
         }
+        else
+        {
+            p_dec->fmt_out.video.i_width = p_dec->fmt_in->video.i_width;
+            p_dec->fmt_out.video.i_height = p_dec->fmt_in->video.i_height;
+        }
+        p_sys->cat = VIDEO_ES;
     }
     else
     {
         p_sys->pf_on_new_block = Audio_OnNewBlock;
         p_sys->pf_on_flush = Audio_OnFlush;
         p_sys->pf_process_output = Audio_ProcessOutput;
-        p_sys->audio.i_channels = p_dec->fmt_in.audio.i_channels;
+        p_sys->audio.i_channels = p_dec->fmt_in->audio.i_channels;
 
         if ((p_sys->api.i_quirks & MC_API_AUDIO_QUIRKS_NEED_CHANNELS)
          && !p_sys->audio.i_channels)
@@ -723,7 +1388,8 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
             goto bailout;
         }
 
-        p_dec->fmt_out.audio = p_dec->fmt_in.audio;
+        p_dec->fmt_out.audio = p_dec->fmt_in->audio;
+        p_sys->cat = AUDIO_ES;
     }
 
     /* Try first to configure CSD */
@@ -733,14 +1399,14 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
     if ((p_sys->api.i_quirks & MC_API_QUIRKS_NEED_CSD) && !p_sys->i_csd_count
      && !p_sys->b_adaptive)
     {
-        switch (p_dec->fmt_in.i_codec)
+        switch (p_dec->fmt_in->i_codec)
         {
         case VLC_CODEC_H264:
         case VLC_CODEC_HEVC:
             break; /* CSDs will come from hxxx_helper */
         default:
             msg_Warn(p_dec, "Not CSD found for %4.4s",
-                     (const char *) &p_dec->fmt_in.i_codec);
+                     (const char *) &p_dec->fmt_in->i_codec);
             goto bailout;
         }
     }
@@ -752,8 +1418,7 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
         goto bailout;
     }
 
-    if (vlc_clone(&p_sys->out_thread, OutThread, p_dec,
-                  VLC_THREAD_PRIORITY_LOW))
+    if (vlc_clone(&p_sys->out_thread, OutThread, p_dec))
     {
         msg_Err(p_dec, "vlc_clone failed");
         vlc_mutex_unlock(&p_sys->lock);
@@ -766,7 +1431,8 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
     return VLC_SUCCESS;
 
 bailout:
-    CleanDecoder(p_dec);
+    CleanInputVideo(p_dec);
+    CleanDecoder(p_sys);
     return VLC_EGENERIC;
 }
 
@@ -775,44 +1441,41 @@ static int OpenDecoderNdk(vlc_object_t *p_this)
     return OpenDecoder(p_this, MediaCodecNdk_Init);
 }
 
-static int OpenDecoderJni(vlc_object_t *p_this)
+static void AbortDecoderLocked(decoder_sys_t *p_sys)
 {
-    return OpenDecoder(p_this, MediaCodecJni_Init);
-}
-
-static void AbortDecoderLocked(decoder_t *p_dec)
-{
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
     if (!p_sys->b_aborted)
     {
         p_sys->b_aborted = true;
-        vlc_cancel(p_sys->out_thread);
+        vlc_cond_broadcast(&p_sys->cond);
+        if (p_sys->cat == VIDEO_ES && p_sys->video.use_air)
+            vlc_cond_signal(&p_sys->video.air_cond);
     }
 }
 
-static void CleanDecoder(decoder_t *p_dec)
+static void CleanDecoder(decoder_sys_t *p_sys)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
+    StopMediaCodec(p_sys);
 
-    vlc_mutex_destroy(&p_sys->lock);
-    vlc_cond_destroy(&p_sys->cond);
-    vlc_cond_destroy(&p_sys->dec_cond);
-
-    StopMediaCodec(p_dec);
-
-    CSDFree(p_dec);
+    CSDFree(p_sys);
     p_sys->api.clean(&p_sys->api);
 
-    if (p_dec->fmt_in.i_cat == VIDEO_ES)
+    switch (p_sys->cat)
     {
-        if (p_dec->fmt_in.i_codec == VLC_CODEC_H264
-         || p_dec->fmt_in.i_codec == VLC_CODEC_HEVC)
-            hxxx_helper_clean(&p_sys->video.hh);
+        case VIDEO_ES:
+            if (p_sys->video.surfacetexture)
+                vlc_asurfacetexture_Delete(p_sys->video.surfacetexture);
 
-        if (p_sys->video.timestamp_fifo)
-            timestamp_FifoRelease(p_sys->video.timestamp_fifo);
+            if (p_sys->video.awh != NULL)
+                AWindowHandler_releaseANativeWindow(p_sys->video.awh,
+                                                    AWindow_Video);
+
+            if (p_sys->video.timestamp_fifo)
+                timestamp_FifoRelease(p_sys->video.timestamp_fifo);
+            break;
+        default:
+            break;
     }
+
     free(p_sys);
 }
 
@@ -825,70 +1488,38 @@ static void CloseDecoder(vlc_object_t *p_this)
     decoder_sys_t *p_sys = p_dec->p_sys;
 
     vlc_mutex_lock(&p_sys->lock);
+    p_sys->b_decoder_dead = true;
+    vlc_mutex_unlock(&p_sys->lock);
+
+    if (p_sys->cat == VIDEO_ES && p_sys->video.ctx)
+    {
+        if (!p_sys->video.use_air)
+        {
+            vlc_video_context_Release(p_sys->video.ctx);
+            /* If we have a video context, we're using Surface with inflight
+            * pictures, which might already have been queued, and flushing
+            * them would make them invalid, breaking mechanism like waiting
+            * on OnFrameAvailableListener.*/
+            CleanInputVideo(p_dec);
+            return;
+        }
+        android_video_context_t *avctx =
+            vlc_video_context_GetPrivate(p_sys->video.ctx, VLC_VIDEO_CONTEXT_AWINDOW);
+        avctx->air_api->AImageReader.setImageListener(avctx->air, NULL);
+        vlc_video_context_Release(p_sys->video.ctx);
+    }
+
+    vlc_mutex_lock(&p_sys->lock);
     /* Unblock output thread waiting in dequeue_out */
-    DecodeFlushLocked(p_dec);
+    DecodeFlushLocked(p_sys);
     /* Cancel the output thread */
-    AbortDecoderLocked(p_dec);
+    AbortDecoderLocked(p_sys);
     vlc_mutex_unlock(&p_sys->lock);
 
     vlc_join(p_sys->out_thread, NULL);
 
-    CleanDecoder(p_dec);
-}
-
-/*****************************************************************************
- * vout callbacks
- *****************************************************************************/
-static void ReleasePicture(decoder_t *p_dec, unsigned i_index, bool b_render)
-{
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    p_sys->api.release_out(&p_sys->api, i_index, b_render);
-}
-
-static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, mtime_t i_ts)
-{
-    decoder_sys_t *p_sys = p_dec->p_sys;
-    assert(p_sys->api.release_out_ts);
-
-    p_sys->api.release_out_ts(&p_sys->api, i_index, i_ts * INT64_C(1000));
-}
-
-static void InvalidateAllPictures(decoder_t *p_dec)
-{
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    for (unsigned int i = 0; i < p_sys->video.i_inflight_pictures; ++i)
-        AndroidOpaquePicture_Release(p_sys->video.pp_inflight_pictures[i],
-                                     false);
-}
-
-static int InsertInflightPicture(decoder_t *p_dec, picture_sys_t *p_picsys)
-{
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    if (!p_picsys->hw.p_dec)
-    {
-        p_picsys->hw.p_dec = p_dec;
-        p_picsys->hw.pf_release = ReleasePicture;
-        if (p_sys->api.release_out_ts)
-            p_picsys->hw.pf_release_ts = ReleasePictureTs;
-        TAB_APPEND_CAST((picture_sys_t **),
-                        p_sys->video.i_inflight_pictures,
-                        p_sys->video.pp_inflight_pictures,
-                        p_picsys);
-    } /* else already attached */
-    return 0;
-}
-
-static void RemoveInflightPictures(decoder_t *p_dec)
-{
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    for (unsigned int i = 0; i < p_sys->video.i_inflight_pictures; ++i)
-        AndroidOpaquePicture_DetachDecoder(p_sys->video.pp_inflight_pictures[i]);
-    TAB_CLEAN(p_sys->video.i_inflight_pictures,
-              p_sys->video.pp_inflight_pictures);
+    CleanInputVideo(p_dec);
+    CleanDecoder(p_sys);
 }
 
 static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
@@ -900,99 +1531,183 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
 
     if (p_out->type == MC_OUT_TYPE_BUF)
     {
-        picture_t *p_pic = NULL;
-
-        /* If the oldest input block had no PTS, the timestamp of
-         * the frame returned by MediaCodec might be wrong so we
-         * overwrite it with the corresponding dts. Call FifoGet
-         * first in order to avoid a gap if buffers are released
-         * due to an invalid format or a preroll */
-        int64_t forced_ts = timestamp_FifoGet(p_sys->video.timestamp_fifo);
-
         if (!p_sys->b_has_format) {
             msg_Warn(p_dec, "Buffers returned before output format is set, dropping frame");
+            timestamp_FifoGet(p_sys->video.timestamp_fifo); /* Remove timestamp */
             return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
         }
 
         if (p_out->buf.i_ts <= p_sys->i_preroll_end)
+        {
+            timestamp_FifoGet(p_sys->video.timestamp_fifo); /* Remove timestamp */
             return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
+        }
 
         if (!p_sys->api.b_direct_rendering && p_out->buf.p_ptr == NULL)
         {
             /* This can happen when receiving an EOS buffer */
             msg_Warn(p_dec, "Invalid buffer, dropping frame");
+            timestamp_FifoGet(p_sys->video.timestamp_fifo); /* Remove timestamp */
             return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
         }
-
-        p_pic = decoder_NewPicture(p_dec);
-        if (!p_pic) {
-            msg_Warn(p_dec, "NewPicture failed");
-            return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
-        }
-
-        if (forced_ts == VLC_TS_INVALID)
-            p_pic->date = p_out->buf.i_ts;
-        else
-            p_pic->date = forced_ts;
-        p_pic->b_progressive = true;
 
         if (p_sys->api.b_direct_rendering)
         {
-            p_pic->p_sys->hw.i_index = p_out->buf.i_index;
-            InsertInflightPicture(p_dec, p_pic->p_sys);
+            if (p_sys->video.use_air)
+            {
+                /* We need to wait for AImageReader. Otherwise, we might
+                 * overwrite a picture (even when using acquireNextImageAsync) */
+                while (p_sys->video.air_waiting_count != 0
+                       && !p_sys->b_aborted && !p_sys->b_flush_out)
+                    vlc_cond_wait(&p_sys->video.air_cond, &p_sys->lock);
+
+                if (p_sys->b_flush_out)
+                {
+                    /* Drop this buffer so OutThread can acknowledge the flush. */
+                    p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
+                    return 0;
+                }
+
+                p_sys->video.air_waiting_count++;
+
+                p_sys->api.release_out(&p_sys->api, p_out->buf.i_index,
+                                       !p_sys->b_aborted);
+                /* picture will be wrapped from AImageReader callback */
+                assert(*pp_out_pic  == NULL);
+            }
+            else
+            {
+                picture_t *p_pic = NewPicture(p_dec, p_out->buf.i_ts);
+                if (!p_pic) {
+                    msg_Warn(p_dec, "NewPicture failed");
+                    return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
+                }
+
+                struct asurface_picture_ctx *apctx =
+                    GetPictureContext(p_dec,p_out->buf.i_index);
+                assert(apctx);
+                assert(apctx->s.vctx);
+                vlc_video_context_Hold(apctx->s.vctx);
+                p_pic->context = &apctx->s;
+                *pp_out_pic = p_pic;
+            }
         } else {
+            picture_t *p_pic = NewPicture(p_dec, p_out->buf.i_ts);
+            if (!p_pic) {
+                msg_Warn(p_dec, "NewPicture failed");
+                return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
+            }
+
             unsigned int chroma_div;
-            GetVlcChromaSizes(p_dec->fmt_out.i_codec,
+            if( !GetVlcChromaSizes(p_dec->fmt_out.i_codec,
                               p_dec->fmt_out.video.i_width,
                               p_dec->fmt_out.video.i_height,
-                              NULL, NULL, &chroma_div);
+                              NULL, NULL, &chroma_div) )
+            {
+                p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
+                picture_Release(p_pic);
+                return -1;
+            }
             CopyOmxPicture(p_sys->video.i_pixel_format, p_pic,
                            p_sys->video.i_slice_height, p_sys->video.i_stride,
-                           (uint8_t *)p_out->buf.p_ptr, chroma_div, NULL);
+                           (uint8_t *)p_out->buf.p_ptr, chroma_div);
 
             if (p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false))
             {
                 picture_Release(p_pic);
                 return -1;
             }
+            *pp_out_pic = p_pic;
         }
-        assert(!(*pp_out_pic));
-        *pp_out_pic = p_pic;
         return 1;
     } else {
         assert(p_out->type == MC_OUT_TYPE_CONF);
         p_sys->video.i_pixel_format = p_out->conf.video.pixel_format;
 
-        const char *name = "unknown";
+        const char *name;
         if (!p_sys->api.b_direct_rendering
-         && !GetVlcChromaFormat(p_sys->video.i_pixel_format,
-                                &p_dec->fmt_out.i_codec, &name))
+         && (p_dec->fmt_out.i_codec =
+             GetVlcChromaFormat(p_sys->video.i_pixel_format)) == 0)
         {
             msg_Err(p_dec, "color-format not recognized");
             return -1;
         }
 
-        msg_Err(p_dec, "output: %d %s, %dx%d stride %d %d, crop %d %d %d %d",
+        name = vlc_fourcc_GetDescription( VIDEO_ES,p_dec->fmt_out.i_codec );
+        if (name == NULL)
+            name = "unknown";
+
+        msg_Dbg(p_dec, "output: %d %s, %dx%d stride %d %d, crop %d %d %d %d",
                 p_sys->video.i_pixel_format, name,
                 p_out->conf.video.width, p_out->conf.video.height,
                 p_out->conf.video.stride, p_out->conf.video.slice_height,
                 p_out->conf.video.crop_left, p_out->conf.video.crop_top,
                 p_out->conf.video.crop_right, p_out->conf.video.crop_bottom);
 
-        int i_width  = p_out->conf.video.crop_right + 1
+        /* Only use MediaCodec output as fallback when container/input is unspecified */
+        if (p_dec->fmt_out.video.primaries == COLOR_PRIMARIES_UNDEF)
+            p_dec->fmt_out.video.primaries =
+                mc_to_vlc_primaries(p_out->conf.video.color.standard);
+
+        if (p_dec->fmt_out.video.space == COLOR_SPACE_UNDEF)
+            p_dec->fmt_out.video.space =
+                 mc_to_vlc_color_space(p_out->conf.video.color.standard);
+
+        if (p_dec->fmt_out.video.transfer == TRANSFER_FUNC_UNDEF)
+            p_dec->fmt_out.video.transfer =
+                mc_to_vlc_color_transfer(p_out->conf.video.color.transfer);
+
+        if (p_dec->fmt_out.video.color_range == COLOR_RANGE_UNDEF)
+            p_dec->fmt_out.video.color_range =
+                mc_to_vlc_color_range(p_out->conf.video.color.range);
+
+        bool valid_crop =
+            p_out->conf.video.crop_left >= 0 &&
+            p_out->conf.video.crop_top >= 0 &&
+            p_out->conf.video.crop_right >= p_out->conf.video.crop_left &&
+            p_out->conf.video.crop_bottom >= p_out->conf.video.crop_top &&
+            p_out->conf.video.crop_right < INT_MAX &&
+            p_out->conf.video.crop_bottom < INT_MAX &&
+            (unsigned)p_out->conf.video.crop_right < p_out->conf.video.width &&
+            (unsigned)p_out->conf.video.crop_bottom < p_out->conf.video.height;
+
+        int i_width, i_height;
+        if (valid_crop)
+        {
+            i_width  = p_out->conf.video.crop_right + 1
                      - p_out->conf.video.crop_left;
-        int i_height = p_out->conf.video.crop_bottom + 1
+            i_height = p_out->conf.video.crop_bottom + 1
                      - p_out->conf.video.crop_top;
-        if (i_width <= 1 || i_height <= 1)
+        }
+        else
         {
             i_width = p_out->conf.video.width;
             i_height = p_out->conf.video.height;
         }
+        if (i_width <= 1 || i_height <= 1)
+        {
+            i_width = p_out->conf.video.width;
+            i_height = p_out->conf.video.height;
+            valid_crop = false;
+        }
 
-        p_dec->fmt_out.video.i_visible_width =
-        p_dec->fmt_out.video.i_width = i_width;
-        p_dec->fmt_out.video.i_visible_height =
-        p_dec->fmt_out.video.i_height = i_height;
+        if (!(p_sys->api.i_quirks & MC_API_VIDEO_QUIRKS_IGNORE_SIZE))
+        {
+            p_dec->fmt_out.video.i_visible_width =
+            p_dec->fmt_out.video.i_width = i_width;
+            p_dec->fmt_out.video.i_visible_height =
+            p_dec->fmt_out.video.i_height = i_height;
+            p_dec->fmt_out.video.i_x_offset = valid_crop ? p_out->conf.video.crop_left : 0;
+            p_dec->fmt_out.video.i_y_offset = valid_crop ? p_out->conf.video.crop_top : 0;
+        }
+        else
+        {
+            p_dec->fmt_out.video.i_visible_width = p_sys->video.i_input_visible_width;
+            p_dec->fmt_out.video.i_width = p_sys->video.i_input_width;
+            p_dec->fmt_out.video.i_visible_height = p_sys->video.i_input_visible_height;
+            p_dec->fmt_out.video.i_height = p_sys->video.i_input_height;
+            msg_Dbg(p_dec, "video size ignored from MediaCodec");
+        }
 
         p_sys->video.i_stride = p_out->conf.video.stride;
         p_sys->video.i_slice_height = p_out->conf.video.slice_height;
@@ -1001,15 +1716,40 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
         if (p_sys->video.i_slice_height <= 0)
             p_sys->video.i_slice_height = p_out->conf.video.height;
 
-        if (p_sys->video.i_pixel_format == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar)
-            p_sys->video.i_slice_height -= p_out->conf.video.crop_top/2;
+        if (p_sys->video.i_pixel_format == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar
+            && valid_crop)
+        {
+            unsigned int crop_adj = p_out->conf.video.crop_top / 2;
+            if (crop_adj < p_sys->video.i_slice_height)
+                p_sys->video.i_slice_height -= crop_adj;
+        }
         if ((p_sys->api.i_quirks & MC_API_VIDEO_QUIRKS_IGNORE_PADDING))
         {
             p_sys->video.i_slice_height = 0;
             p_sys->video.i_stride = p_dec->fmt_out.video.i_width;
         }
 
-        if (UpdateVout(p_dec) != VLC_SUCCESS)
+
+        if ((p_dec->fmt_in->i_codec == VLC_CODEC_MPGV ||
+             p_dec->fmt_in->i_codec == VLC_CODEC_MP2V) &&
+            (p_sys->video.i_mpeg_dar_num * p_sys->video.i_mpeg_dar_den != 0))
+        {
+            p_dec->fmt_out.video.i_sar_num =
+                p_sys->video.i_mpeg_dar_num * p_dec->fmt_out.video.i_height;
+            p_dec->fmt_out.video.i_sar_den =
+                p_sys->video.i_mpeg_dar_den * p_dec->fmt_out.video.i_width;
+        }
+
+        /* If MediaCodec can handle the rotation, reset the orientation to
+         * Normal in order to ask the vout not to rotate. */
+        p_dec->fmt_out.video.orientation = p_dec->fmt_in->video.orientation;
+        if (p_sys->video.i_angle != 0)
+        {
+            assert(p_dec->fmt_out.i_codec == VLC_CODEC_ANDROID_OPAQUE);
+            video_format_TransformTo(&p_dec->fmt_out.video, ORIENT_NORMAL);
+        }
+
+        if (decoder_UpdateVideoOutput(p_dec, p_sys->video.ctx) != 0)
         {
             msg_Err(p_dec, "UpdateVout failed");
             return -1;
@@ -1131,9 +1871,8 @@ static int Audio_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
     }
 }
 
-static void DecodeFlushLocked(decoder_t *p_dec)
+static void DecodeFlushLocked(decoder_sys_t *p_sys)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
     bool b_had_input = p_sys->b_input_dequeued;
 
     p_sys->b_input_dequeued = false;
@@ -1143,11 +1882,11 @@ static void DecodeFlushLocked(decoder_t *p_dec)
     /* Resend CODEC_CONFIG buffer after a flush */
     p_sys->i_csd_send = 0;
 
-    p_sys->pf_on_flush(p_dec);
+    p_sys->pf_on_flush(p_sys);
 
     if (b_had_input && p_sys->api.flush(&p_sys->api) != VLC_SUCCESS)
     {
-        AbortDecoderLocked(p_dec);
+        AbortDecoderLocked(p_sys);
         return;
     }
 
@@ -1162,7 +1901,7 @@ static void DecodeFlush(decoder_t *p_dec)
     decoder_sys_t *p_sys = p_dec->p_sys;
 
     vlc_mutex_lock(&p_sys->lock);
-    DecodeFlushLocked(p_dec);
+    DecodeFlushLocked(p_dec->p_sys);
     vlc_mutex_unlock(&p_sys->lock);
 }
 
@@ -1171,15 +1910,18 @@ static void *OutThread(void *data)
     decoder_t *p_dec = data;
     decoder_sys_t *p_sys = p_dec->p_sys;
 
+    vlc_thread_set_name("vlc-mediacodec");
+
     vlc_mutex_lock(&p_sys->lock);
-    mutex_cleanup_push(&p_sys->lock);
-    for (;;)
+    while (!p_sys->b_aborted)
     {
         int i_index;
 
         /* Wait for output ready */
-        while (!p_sys->b_flush_out && !p_sys->b_output_ready)
+        if (!p_sys->b_flush_out && !p_sys->b_output_ready) {
             vlc_cond_wait(&p_sys->cond, &p_sys->lock);
+            continue;
+        }
 
         if (p_sys->b_flush_out)
         {
@@ -1189,8 +1931,6 @@ static void *OutThread(void *data)
             continue;
         }
 
-        int canc = vlc_savecancel();
-
         vlc_mutex_unlock(&p_sys->lock);
 
         /* Wait for an output buffer. This function returns when a new output
@@ -1199,8 +1939,9 @@ static void *OutThread(void *data)
 
         vlc_mutex_lock(&p_sys->lock);
 
-        /* Ignore dequeue_out errors caused by flush */
-        if (p_sys->b_flush_out)
+        /* Ignore dequeue_out errors caused by flush, or late picture being
+         * dequeued after close. */
+        if (p_sys->b_flush_out || p_sys->b_decoder_dead)
         {
             /* If i_index >= 0, Release it. There is no way to know if i_index
              * is owned by us, so don't check the error. */
@@ -1210,10 +1951,13 @@ static void *OutThread(void *data)
             /* Parse output format/buffers even when we are flushing */
             if (i_index != MC_API_INFO_OUTPUT_FORMAT_CHANGED
              && i_index != MC_API_INFO_OUTPUT_BUFFERS_CHANGED)
-            {
-                vlc_restorecancel(canc);
                 continue;
-            }
+        }
+
+        if (i_index == MC_API_ERROR)
+        {
+            msg_Warn(p_dec, "Failure in MediaCodec.dequeueOutputBuffer");
+            break;
         }
 
         /* Process output returned by dequeue_out */
@@ -1232,7 +1976,6 @@ static void *OutThread(void *data)
                                              &p_block) == -1 && !out.b_eos)
                 {
                     msg_Err(p_dec, "pf_process_output failed");
-                    vlc_restorecancel(canc);
                     break;
                 }
                 if (p_pic)
@@ -1249,24 +1992,18 @@ static void *OutThread(void *data)
             } else if (i_ret != 0)
             {
                 msg_Err(p_dec, "get_out failed");
-                vlc_restorecancel(canc);
                 break;
             }
         }
         else
-        {
-            vlc_restorecancel(canc);
             break;
-        }
-        vlc_restorecancel(canc);
     }
-    msg_Warn(p_dec, "OutThread stopped");
+    if (!p_sys->b_decoder_dead)
+        msg_Warn(p_dec, "OutThread stopped");
 
     /* Signal DecoderFlush that the output thread aborted */
     p_sys->b_aborted = true;
     vlc_cond_signal(&p_sys->dec_cond);
-
-    vlc_cleanup_pop();
     vlc_mutex_unlock(&p_sys->lock);
 
     return NULL;
@@ -1285,7 +2022,6 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
     block_t *p_block = NULL;
-    bool b_dequeue_timeout = false;
 
     assert(p_sys->api.b_started);
 
@@ -1296,21 +2032,15 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
     /* Queue CSD blocks and input blocks */
     while (b_drain || (p_block = GetNextBlock(p_sys, p_in_block)))
     {
-        int i_index;
-
         vlc_mutex_unlock(&p_sys->lock);
-        /* Wait for an input buffer. This function returns when a new input
-         * buffer is available or after 2secs of timeout. */
-        i_index = p_sys->api.dequeue_in(&p_sys->api,
-                                        p_sys->api.b_direct_rendering ?
-                                        INT64_C(2000000) : -1);
+        int i_index = p_sys->api.dequeue_in(&p_sys->api, -1);
         vlc_mutex_lock(&p_sys->lock);
 
         if (p_sys->b_aborted)
             return VLC_EGENERIC;
 
         bool b_config = false;
-        mtime_t i_ts = 0;
+        vlc_tick_t i_ts = 0;
         p_sys->b_input_dequeued = true;
         const void *p_buf = NULL;
         size_t i_size = 0;
@@ -1347,34 +2077,11 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
                     assert(p_block == p_in_block),
                     p_in_block = NULL;
                 }
-                b_dequeue_timeout = false;
                 if (b_drain)
                     break;
             } else
             {
                 msg_Err(p_dec, "queue_in failed");
-                goto error;
-            }
-        }
-        else if (i_index == MC_API_INFO_TRYAGAIN)
-        {
-            /* HACK: When direct rendering is enabled, there is a possible
-             * deadlock between the Decoder and the Vout. It happens when the
-             * Vout is paused and when the Decoder is flushing. In that case,
-             * the Vout won't release any output buffers, therefore MediaCodec
-             * won't dequeue any input buffers. To work around this issue,
-             * release all output buffers if DecodeBlock is waiting more than
-             * 2secs for a new input buffer. */
-            if (!b_dequeue_timeout)
-            {
-                msg_Warn(p_dec, "Decoder stuck: invalidate all buffers");
-                InvalidateAllPictures(p_dec);
-                b_dequeue_timeout = true;
-                continue;
-            }
-            else
-            {
-                msg_Err(p_dec, "dequeue_in timeout: no input available for 2secs");
                 goto error;
             }
         }
@@ -1392,14 +2099,14 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
         /* Wait for the OutThread to stop (and process all remaining output
          * frames. Use a timeout here since we can't know if all decoders will
          * behave correctly. */
-        mtime_t deadline = mdate() + INT64_C(3000000);
+        vlc_tick_t deadline = vlc_tick_now() + INT64_C(3000000);
         while (!p_sys->b_aborted && !p_sys->b_drained
             && vlc_cond_timedwait(&p_sys->dec_cond, &p_sys->lock, deadline) == 0);
 
         if (!p_sys->b_drained)
         {
             msg_Err(p_dec, "OutThread timed out");
-            AbortDecoderLocked(p_dec);
+            AbortDecoderLocked(p_sys);
         }
         p_sys->b_drained = false;
     }
@@ -1407,7 +2114,7 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
     return VLC_SUCCESS;
 
 error:
-    AbortDecoderLocked(p_dec);
+    AbortDecoderLocked(p_sys);
     return VLC_EGENERIC;
 }
 
@@ -1440,7 +2147,7 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
     {
         if (p_sys->b_output_ready)
             QueueBlockLocked(p_dec, NULL, true);
-        DecodeFlushLocked(p_dec);
+        DecodeFlushLocked(p_sys);
         if (p_sys->b_aborted)
             goto end;
         if (p_in_block->i_flags & BLOCK_FLAG_CORRUPTED)
@@ -1463,7 +2170,7 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
     {
         if (i_ret != 0)
         {
-            AbortDecoderLocked(p_dec);
+            AbortDecoderLocked(p_sys);
             msg_Err(p_dec, "pf_on_new_block failed");
         }
         goto end;
@@ -1477,13 +2184,13 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
         /* Drain and flush before restart to unblock OutThread */
         if (p_sys->b_output_ready)
             QueueBlockLocked(p_dec, NULL, true);
-        DecodeFlushLocked(p_dec);
+        DecodeFlushLocked(p_sys);
         if (p_sys->b_aborted)
             goto end;
 
         if (b_restart)
         {
-            StopMediaCodec(p_dec);
+            StopMediaCodec(p_sys);
 
             int i_ret = StartMediaCodec(p_dec);
             switch (i_ret)
@@ -1491,11 +2198,9 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
             case VLC_SUCCESS:
                 msg_Warn(p_dec, "Restarted from DecodeBlock");
                 break;
-            case VLC_ENOOBJ:
-                break;
             default:
                 msg_Err(p_dec, "StartMediaCodec failed");
-                AbortDecoderLocked(p_dec);
+                AbortDecoderLocked(p_sys);
                 goto end;
             }
         }
@@ -1529,7 +2234,7 @@ static int Video_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
     block_t *p_block = *pp_block;
 
     timestamp_FifoPut(p_sys->video.timestamp_fifo,
-                      p_block->i_pts ? VLC_TS_INVALID : p_block->i_dts);
+                      p_block->i_pts ? VLC_TICK_INVALID : p_block->i_dts);
 
     return 1;
 }
@@ -1538,27 +2243,24 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
     struct hxxx_helper *hh = &p_sys->video.hh;
-    bool b_config_changed = false;
-    bool *p_config_changed = p_sys->b_adaptive ? NULL : &b_config_changed;
 
-    *pp_block = hh->pf_process_block(hh, *pp_block, p_config_changed);
+    *pp_block = hxxx_helper_process_block(hh, *pp_block);
     if (!*pp_block)
         return 0;
-    if (b_config_changed)
+    if (!p_sys->b_adaptive && hxxx_helper_has_new_config(hh))
     {
         bool b_size_changed;
         int i_ret;
-        switch (p_dec->fmt_in.i_codec)
+        switch (p_dec->fmt_in->i_codec)
         {
         case VLC_CODEC_H264:
-            if (hh->h264.i_sps_count > 0 || hh->h264.i_pps_count > 0)
+            if (hxxx_helper_has_config(hh))
                 i_ret = H264SetCSD(p_dec, &b_size_changed);
             else
                 i_ret = VLC_EGENERIC;
             break;
         case VLC_CODEC_HEVC:
-            if (hh->hevc.i_vps_count > 0 || hh->hevc.i_sps_count > 0 ||
-                hh->hevc.i_pps_count > 0 )
+            if (hxxx_helper_has_config(hh))
                 i_ret = HEVCSetCSD(p_dec, &b_size_changed);
             else
                 i_ret = VLC_EGENERIC;
@@ -1582,11 +2284,49 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
     return Video_OnNewBlock(p_dec, pp_block);
 }
 
+static int VideoMPEG2_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+{
+    if (pp_block == NULL || (*pp_block)->i_buffer <= 7)
+        return 1;
+
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    const int startcode = (*pp_block)->p_buffer[3];
+
+    /* DAR aspect ratio from the DVD MPEG2 standard */
+    static const int mpeg2_aspect[16][2] =
+    {
+        {0,0}, /* reserved */
+        {0,0}, /* DAR = 0:0 will result in SAR = 1:1 */
+        {4,3}, {16,9}, {221,100},
+        /* reserved */
+        {0,0}, {0,0}, {0,0}, {0,0}, {0,0}, {0,0}, {0,0}, {0,0}, {0,0},
+        {0,0}, {0,0}
+    };
+
+    if (startcode == 0xB3 /* SEQUENCE_HEADER_STARTCODE */)
+    {
+        int mpeg_dar_code = (*pp_block)->p_buffer[7] >> 4;
+
+        if (mpeg_dar_code >= 16)
+            return 0;
+
+        p_sys->video.i_mpeg_dar_num = mpeg2_aspect[mpeg_dar_code][0];
+        p_sys->video.i_mpeg_dar_den = mpeg2_aspect[mpeg_dar_code][1];
+    }
+
+    return 1;
+}
+
 static int VideoVC1_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
 {
     block_t *p_block = *pp_block;
 
-    /* Adding frame start code */
+    /* Adding frame start code, unless the block already begins with one. */
+    static const uint8_t vc1_start_code_prefix[3] = {0x00, 0x00, 0x01};
+    if (p_block->i_buffer >= 4
+     && !memcmp(p_block->p_buffer, vc1_start_code_prefix, 3))
+        return Video_OnNewBlock(p_dec, pp_block);
+
     p_block = *pp_block = block_Realloc(p_block, 4, p_block->i_buffer);
     if (p_block == NULL)
         return VLC_ENOMEM;
@@ -1598,16 +2338,21 @@ static int VideoVC1_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
     return Video_OnNewBlock(p_dec, pp_block);
 }
 
-static void Video_OnFlush(decoder_t *p_dec)
+static void Video_OnFlush(decoder_sys_t *p_sys)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
     timestamp_FifoEmpty(p_sys->video.timestamp_fifo);
     /* Invalidate all pictures that are currently in flight
      * since flushing make all previous indices returned by
      * MediaCodec invalid. */
-    if (p_sys->api.b_direct_rendering)
-        InvalidateAllPictures(p_dec);
+    ReleaseAllPictureContexts(p_sys);
+
+    if (p_sys->video.use_air)
+    {
+        /* Drain AImageReader callbacks before AMediaCodec_flush() invalidates
+         * output buffer indices, or air_waiting_count may stay stuck. */
+        while (p_sys->video.air_waiting_count != 0 && !p_sys->b_aborted)
+            vlc_cond_wait(&p_sys->video.air_cond, &p_sys->lock);
+    }
 }
 
 static int Audio_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
@@ -1616,9 +2361,9 @@ static int Audio_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
     block_t *p_block = *pp_block;
 
     /* We've just started the stream, wait for the first PTS. */
-    if (!date_Get(&p_sys->audio.i_end_date))
+    if (date_Get(&p_sys->audio.i_end_date) == VLC_TICK_INVALID)
     {
-        if (p_block->i_pts <= VLC_TS_INVALID)
+        if (p_block->i_pts == VLC_TICK_INVALID)
             return 0;
         date_Set(&p_sys->audio.i_end_date, p_block->i_pts);
     }
@@ -1626,9 +2371,7 @@ static int Audio_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
     return 1;
 }
 
-static void Audio_OnFlush(decoder_t *p_dec)
+static void Audio_OnFlush(decoder_sys_t *p_sys)
 {
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    date_Set(&p_sys->audio.i_end_date, VLC_TS_INVALID);
+    date_Set(&p_sys->audio.i_end_date, VLC_TICK_INVALID);
 }

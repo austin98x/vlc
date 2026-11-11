@@ -25,25 +25,24 @@
 # include "config.h"
 #endif
 
-#include <vlc_vout_wrapper.h>
 #include "events.h"
+#include "sensors.h"
 
 #include <initguid.h>
+#include <wrl/client.h>
 #include <propsys.h> /* stupid mingw headers don't include this */
 #include <sensors.h>
 #include <sensorsapi.h>
 
 #include <new>
 
-#ifndef _MSC_VER
-DEFINE_PROPERTYKEY(SENSOR_DATA_TYPE_MAGNETOMETER_ACCURACY, 0x1637d8a2, 0x4248, 0x4275, 0x86, 0x5d, 0x55, 0x8d, 0xe8, 0x4a, 0xed, 0xfd, 22);
-#endif
+using Microsoft::WRL::ComPtr;
 
 class SensorReceiver : public ISensorEvents
 {
 public:
-    SensorReceiver(vout_display_t *vd, const vlc_viewpoint_t & init_viewpoint)
-        :vd(vd)
+    SensorReceiver(const vout_display_owner_t *o, const vlc_viewpoint_t & init_viewpoint)
+        :owner(*o)
         ,current_pos(init_viewpoint)
     {}
 
@@ -123,13 +122,18 @@ public:
             PropVariantClear(&pvRot);
         }
 
-        vlc_viewpoint_t vp = {
+        // TODO: use current_pos directly?
+        /* Zero initialize vp for field of view. */
+        vlc_viewpoint_t vp {};
+        vp.fov = 0.f;
+        vlc_viewpoint_from_euler(&vp,
             old_pos.yaw   - current_pos.yaw,
             old_pos.pitch - current_pos.pitch,
-            old_pos.roll  - current_pos.roll,
-            0.0f
-        };
-        vout_display_SendEventViewpointMoved(vd, &vp);
+            old_pos.roll  - current_pos.roll
+        );
+        if (owner.viewpoint_moved)
+            owner.viewpoint_moved(owner.sys, &vp);
+
         return S_OK;
     }
 
@@ -148,83 +152,80 @@ public:
     }
 
 private:
-    vout_display_t *const vd;
+    vout_display_owner_t owner;
     vlc_viewpoint_t current_pos;
     long m_cRef;
 };
 
-void *HookWindowsSensors(vout_display_t *vd, HWND hwnd)
+void *HookWindowsSensors(vlc_logger *vd, const vout_display_owner_t *move, HWND hwnd)
 {
-    ISensor *pSensor = NULL;
-    ISensorManager *pSensorManager;
-    HRESULT hr = CoCreateInstance( CLSID_SensorManager,
+    ComPtr<ISensorManager> pSensorManager;
+    HRESULT hr = CoCreateInstance( __uuidof(SensorManager),
                       NULL, CLSCTX_INPROC_SERVER,
-                      IID_ISensorManager, (void**)&pSensorManager );
-    if (SUCCEEDED(hr))
+                      IID_PPV_ARGS(pSensorManager.GetAddressOf()) );
+    if (FAILED(hr))
+        return NULL;
+
+    ComPtr<ISensorCollection> pInclinometers;
+    hr = pSensorManager->GetSensorsByType(SENSOR_TYPE_INCLINOMETER_3D, &pInclinometers);
+    if (FAILED(hr))
     {
-        ISensorCollection *pInclinometers;
-        hr = pSensorManager->GetSensorsByType(SENSOR_TYPE_INCLINOMETER_3D, &pInclinometers);
-        if (SUCCEEDED(hr))
-        {
-            ULONG count;
-            pInclinometers->GetCount(&count);
-            msg_Dbg(vd, "Found %lu inclinometer", count);
-            for (ULONG i=0; i<count; ++i)
-            {
-                hr = pInclinometers->GetAt(i, &pSensor);
-                if (SUCCEEDED(hr))
-                {
-                    SensorState state = SENSOR_STATE_NOT_AVAILABLE;
-                    hr = pSensor->GetState(&state);
-                    if (SUCCEEDED(hr))
-                    {
-                        if (state == SENSOR_STATE_ACCESS_DENIED)
-                            hr = pSensorManager->RequestPermissions(hwnd, pInclinometers, TRUE);
-
-                        if (SUCCEEDED(hr))
-                        {
-                            vlc_viewpoint_t start_viewpoint;
-                            vlc_viewpoint_init(&start_viewpoint);
-                            PROPVARIANT pvRot;
-                            PropVariantInit(&pvRot);
-                            hr = pSensor->GetProperty(SENSOR_DATA_TYPE_TILT_X_DEGREES, &pvRot);
-                            if (SUCCEEDED(hr) && pvRot.vt == VT_R4)
-                            {
-                                start_viewpoint.pitch = pvRot.fltVal;
-                                PropVariantClear(&pvRot);
-                            }
-                            hr = pSensor->GetProperty(SENSOR_DATA_TYPE_TILT_Y_DEGREES, &pvRot);
-                            if (SUCCEEDED(hr) && pvRot.vt == VT_R4)
-                            {
-                                start_viewpoint.roll = pvRot.fltVal;
-                                PropVariantClear(&pvRot);
-                            }
-                            hr = pSensor->GetProperty(SENSOR_DATA_TYPE_TILT_Z_DEGREES, &pvRot);
-                            if (SUCCEEDED(hr) && pvRot.vt == VT_R4)
-                            {
-                                start_viewpoint.yaw = pvRot.fltVal;
-                                PropVariantClear(&pvRot);
-                            }
-
-                            SensorReceiver *received = new(std::nothrow) SensorReceiver(vd, start_viewpoint);
-                            if (received)
-                            {
-                                pSensor->SetEventSink(received);
-                                break;
-                            }
-                        }
-                    }
-
-                    pSensor->Release();
-                }
-            }
-            pInclinometers->Release();
-        }
-        else
-            msg_Dbg(vd, "inclinometer not found. (hr=0x%lX)", hr);
-        pSensorManager->Release();
+        vlc_debug(vd, "inclinometer not found. (hr=0x%lX)", hr);
+        return NULL;
     }
-    return pSensor;
+
+    ULONG count;
+    pInclinometers->GetCount(&count);
+    vlc_debug(vd, "Found %lu inclinometer", count);
+    for (ULONG i=0; i<count; ++i)
+    {
+        ComPtr<ISensor> pSensor;
+        hr = pInclinometers->GetAt(i, &pSensor);
+        if (FAILED(hr))
+            continue;
+
+        SensorState state = SENSOR_STATE_NOT_AVAILABLE;
+        hr = pSensor->GetState(&state);
+        if (FAILED(hr))
+            continue;
+
+        if (state == SENSOR_STATE_ACCESS_DENIED)
+            hr = pSensorManager->RequestPermissions(hwnd, pInclinometers.Get(), TRUE);
+
+        if (FAILED(hr))
+            continue;
+
+        vlc_viewpoint_t start_viewpoint;
+        vlc_viewpoint_init(&start_viewpoint);
+        PROPVARIANT pvRot;
+        PropVariantInit(&pvRot);
+        hr = pSensor->GetProperty(SENSOR_DATA_TYPE_TILT_X_DEGREES, &pvRot);
+        if (SUCCEEDED(hr) && pvRot.vt == VT_R4)
+        {
+            start_viewpoint.pitch = pvRot.fltVal;
+            PropVariantClear(&pvRot);
+        }
+        hr = pSensor->GetProperty(SENSOR_DATA_TYPE_TILT_Y_DEGREES, &pvRot);
+        if (SUCCEEDED(hr) && pvRot.vt == VT_R4)
+        {
+            start_viewpoint.roll = pvRot.fltVal;
+            PropVariantClear(&pvRot);
+        }
+        hr = pSensor->GetProperty(SENSOR_DATA_TYPE_TILT_Z_DEGREES, &pvRot);
+        if (SUCCEEDED(hr) && pvRot.vt == VT_R4)
+        {
+            start_viewpoint.yaw = pvRot.fltVal;
+            PropVariantClear(&pvRot);
+        }
+
+        SensorReceiver *received = new(std::nothrow) SensorReceiver(move, start_viewpoint);
+        if (received)
+        {
+            pSensor->SetEventSink(received);
+            return pSensor.Detach();
+        }
+    }
+    return NULL;
 }
 
 void UnhookWindowsSensors(void *vSensor)

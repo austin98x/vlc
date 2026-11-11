@@ -1,7 +1,6 @@
 --[[
 Resolve Twitch channel and video URLs to the actual stream URL
 
- $Id$
  Copyright © 2017 the VideoLAN team
 
  Author: Marvin Scholz <epirat07 at gmail dot com>
@@ -58,7 +57,7 @@ end
 -- Make a request to the Twitch API endpoint given by url
 -- Returns: obj, err
 function twitch_api_req(url)
-    local obj, pos, err = parse_json(url .. "?client_id=jzkbprff40iqj646a697cyrvl0zt2m6")
+    local obj, pos, err = parse_json(url .. "?client_id=kimne78kx3ncx6brgo4mv6wki5h1ko")
 
     if err then
         return nil, "Error getting JSON object: " .. err

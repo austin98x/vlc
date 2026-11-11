@@ -2,7 +2,6 @@
  * fsm.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -54,7 +53,7 @@ void FSM::addTransition( const std::string &state1, const std::string &event,
         return;
     }
 
-    m_transitions[key] = data;
+    m_transitions[key] = std::move(data);
 }
 
 

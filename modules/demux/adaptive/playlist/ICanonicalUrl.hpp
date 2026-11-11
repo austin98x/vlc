@@ -21,6 +21,7 @@
 #define CANONICALURL_HPP
 
 #include "Url.hpp"
+#include "../tools/Macros.hpp"
 
 namespace adaptive
 {
@@ -28,8 +29,11 @@ namespace adaptive
     {
         class ICanonicalUrl
         {
+            PREREQ_VIRTUAL(ICanonicalUrl);
+
             public:
-                ICanonicalUrl( const ICanonicalUrl *parent = NULL ) { setParent(parent); }
+                ICanonicalUrl( const ICanonicalUrl *parent = nullptr ) { setParent(parent); }
+                virtual ~ICanonicalUrl() = default;
                 virtual Url getUrlSegment() const = 0;
                 void setParent( const ICanonicalUrl *parent ) { parentUrlMember = parent; }
 

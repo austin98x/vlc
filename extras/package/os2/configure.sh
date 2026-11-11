@@ -9,8 +9,6 @@ OPTIONS="
       --enable-dvdnav
       --enable-sftp
       --enable-vcd
-      --enable-libcddb
-      --enable-realrtsp
       --enable-dvbpsi
       --enable-ogg
       --enable-mad
@@ -19,15 +17,12 @@ OPTIONS="
       --enable-avformat
       --enable-swscale
       --enable-postproc
-      --enable-a52
       --enable-flac
-      --enable-libmpeg2
       --enable-vorbis
       --enable-png
       --enable-x264
       --enable-libass
       --disable-xcb
-      --disable-xvideo
       --enable-freetype
       --enable-fribidi
       --enable-fontconfig
@@ -42,8 +37,8 @@ OPTIONS="
 "
 
 export ARCHFLAGS=${ARCHFLAGS-"-march=i686"}
-export CFLAGS="${CFLAGS} ${ARCHFLAGS} -std=gnu11"
-export CXXFLAGS="${CXXFLAGS} ${ARCHFLAGS} -std=gnu++11"
-export BUILDCC="gcc -std=gnu11"
+export CFLAGS="${CFLAGS} ${ARCHFLAGS} -std=gnu17"
+export CXXFLAGS="${CXXFLAGS} ${ARCHFLAGS} -std=gnu++17"
+export BUILDCC="gcc -std=gnu17"
 
 sh "$(dirname $0)"/../../../configure ${OPTIONS} "$@"

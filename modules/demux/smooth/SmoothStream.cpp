@@ -29,45 +29,25 @@ using namespace smooth;
 SmoothStream::SmoothStream(demux_t *demux)
     :AbstractStream(demux)
 {
+    mightalwaysstartfromzero = true;
 }
 
-AbstractDemuxer * SmoothStream::createDemux(const StreamFormat &format)
+AbstractDemuxer *SmoothStream::newDemux(vlc_object_t *p_obj, const StreamFormat &format,
+                                        es_out_t *out, AbstractSourceStream *source) const
 {
-    AbstractDemuxer *ret = NULL;
-    switch((unsigned)format)
-    {
-        case StreamFormat::MP4:
-            ret = new Demuxer(p_realdemux, "mp4", fakeesout->getEsOut(), demuxersource);
-            break;
-
-        default:
-        case StreamFormat::UNSUPPORTED:
-            break;
-    }
-
-    if(ret && !ret->create())
-    {
-        delete ret;
-        ret = NULL;
-    }
-    else commandsqueue->Commit();
-
-    return ret;
-}
-
-block_t * SmoothStream::checkBlock(block_t *p_block, bool)
-{
-    return p_block;
+    if(format != StreamFormat::Type::MP4)
+        return nullptr;
+    return AbstractStream::newDemux(p_obj, format, out, source);
 }
 
 AbstractStream * SmoothStreamFactory::create(demux_t *realdemux, const StreamFormat &format,
-                                             SegmentTracker *tracker, AbstractConnectionManager *manager) const
+                                             SegmentTracker *tracker) const
 {
     SmoothStream *stream = new (std::nothrow) SmoothStream(realdemux);
-    if(stream && !stream->init(format,tracker, manager))
+    if(stream && !stream->init(format,tracker))
     {
         delete stream;
-        return NULL;
+        return nullptr;
     }
     return stream;
 }

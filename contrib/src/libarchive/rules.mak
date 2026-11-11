@@ -1,38 +1,42 @@
 # LIBARCHIVE
-LIBARCHIVE_VERSION := 3.3.2
-LIBARCHIVE_URL := http://www.libarchive.org/downloads/libarchive-$(LIBARCHIVE_VERSION).tar.gz
+LIBARCHIVE_VERSION := 3.8.9
+LIBARCHIVE_URL := $(GITHUB)/libarchive/libarchive/releases/download/v$(LIBARCHIVE_VERSION)/libarchive-$(LIBARCHIVE_VERSION).tar.xz
 
 PKGS += libarchive
 ifeq ($(call need_pkg,"libarchive >= 3.2.0"),)
 PKGS_FOUND += libarchive
 endif
 
-DEPS_libarchive = zlib
+DEPS_libarchive = zlib $(DEPS_zlib)
+ifdef HAVE_WINSTORE
+# libarchive uses CreateHardLinkW and wincrypt
+DEPS_libarchive += alloweduwp $(DEPS_alloweduwp)
+endif
 
-$(TARBALLS)/libarchive-$(LIBARCHIVE_VERSION).tar.gz:
+LIBARCHIVE_CONF := \
+		-DENABLE_CPIO=OFF -DENABLE_TAR=OFF -DENABLE_CAT=OFF \
+		-DENABLE_LIBXML2=OFF -DENABLE_LZMA=OFF -DENABLE_ICONV=OFF -DENABLE_EXPAT=OFF \
+		-DENABLE_TEST=OFF -DENABLE_WERROR=OFF
+
+# bsdunzip doesn't build on macos, android and emscripten and it's disabled on Windows
+LIBARCHIVE_CONF +=-DENABLE_UNZIP=OFF
+
+$(TARBALLS)/libarchive-$(LIBARCHIVE_VERSION).tar.xz:
 	$(call download_pkg,$(LIBARCHIVE_URL),libarchive)
 
-.sum-libarchive: libarchive-$(LIBARCHIVE_VERSION).tar.gz
+.sum-libarchive: libarchive-$(LIBARCHIVE_VERSION).tar.xz
 
-libarchive: libarchive-$(LIBARCHIVE_VERSION).tar.gz .sum-libarchive
+libarchive: libarchive-$(LIBARCHIVE_VERSION).tar.xz .sum-libarchive
 	$(UNPACK)
-	$(APPLY) $(SRC)/libarchive/0001-Fix-build-failure-without-STATVFS.patch
-ifdef HAVE_ANDROID
-	$(APPLY) $(SRC)/libarchive/android.patch
-endif
-ifdef HAVE_WINSTORE
-	$(APPLY) $(SRC)/libarchive/no-windows-files.patch
-	$(APPLY) $(SRC)/libarchive/winrt.patch
-endif
-	$(APPLY) $(SRC)/libarchive/fix-types.patch
+	$(APPLY) $(SRC)/libarchive/0001-zstd-use-GetNativeSystemInfo-to-get-the-number-of-th.patch
+	# Do not use WINAPI_PARTITION_SYSTEM, It's not handled properly by the mingw64 macro
+	sed -i.orig 's, | WINAPI_PARTITION_SYSTEM,,' $(UNPACK_DIR)/libarchive/archive_write_disk_windows.c
 	$(call pkg_static,"build/pkgconfig/libarchive.pc.in")
 	$(MOVE)
 
-.libarchive: libarchive
-	$(RECONF)
-	cd $< && $(HOSTVARS) ./configure $(HOSTCONF) \
-		--disable-bsdcpio --disable-bsdtar --disable-bsdcat \
-		--without-nettle --without-cng \
-		--without-xml2 --without-lzma --without-iconv --without-expat
-	cd $< && $(MAKE) install
+.libarchive: libarchive toolchain.cmake
+	$(CMAKECLEAN)
+	$(HOSTVARS_CMAKE) $(CMAKE) $(LIBARCHIVE_CONF)
+	+$(CMAKEBUILD)
+	$(CMAKEINSTALL)
 	touch $@

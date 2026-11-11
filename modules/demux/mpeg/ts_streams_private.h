@@ -19,27 +19,29 @@
 #ifndef VLC_TS_STREAMS_PRIVATE_H
 #define VLC_TS_STREAMS_PRIVATE_H
 
-typedef struct dvbpsi_s dvbpsi_t;
+typedef struct ts_psi_context_t ts_psi_context_t;
 typedef struct ts_sections_processor_t ts_sections_processor_t;
 
 #include "mpeg4_iod.h"
+#include "timestamps.h"
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_es.h>
 
 struct ts_pat_t
 {
+    ts_psi_context_t *p_ctx;
     int             i_version;
     int             i_ts_id;
     bool            b_generated;
-    dvbpsi_t       *handle;
     DECL_ARRAY(ts_pid_t *) programs;
 
 };
 
 struct ts_pmt_t
 {
-    dvbpsi_t       *handle;
+    ts_psi_context_t *p_ctx;
     int             i_version;
     int             i_number;
     int             i_pid_pcr;
@@ -57,11 +59,11 @@ struct ts_pmt_t
 
     struct
     {
-        mtime_t i_current;
-        mtime_t i_first; // seen <> != -1
+        vlc_tick_t i_current;
+        vlc_tick_t i_first; // seen <> != TS_TICK_UNKNOWN
         /* broken PCR handling */
-        mtime_t i_first_dts;
-        mtime_t i_pcroffset;
+        vlc_tick_t i_first_dts;
+        vlc_tick_t i_pcroffset;
         bool    b_disable; /* ignore PCR field, use dts */
         bool    b_fix_done;
     } pcr;
@@ -72,8 +74,12 @@ struct ts_pmt_t
         time_t i_event_length;
     } eit;
 
-    mtime_t i_last_dts;
+    vlc_tick_t i_last_dts;
     uint64_t i_last_dts_byte;
+    bool b_last_dts_probed;
+
+    /* CA */
+    //en50221_capmt_info_t *capmt;
 
     /* ARIB specific */
     struct
@@ -98,7 +104,8 @@ struct ts_es_t
     struct
     {
         uint8_t i_service_id;
-        uint32_t i_format;
+        uint32_t i_application_format_identifier;
+        uint32_t i_format_identifier;
     } metadata;
 };
 
@@ -125,6 +132,8 @@ struct ts_stream_t
         block_t     **pp_last;
         uint8_t     saved[5];
         size_t      i_saved;
+        ts_90khz_t  i_append_pcr;
+        uint32_t    i_block_flags;
     } gather;
 
     bool        b_always_receive;
@@ -137,14 +146,15 @@ struct ts_stream_t
         block_t *p_head;
         block_t **pp_last;
     } prepcr;
+
+    vlc_tick_t i_last_dts;
 };
 
 typedef struct ts_si_context_t ts_si_context_t;
 
 struct ts_si_t
 {
-    dvbpsi_t *handle;
-    int       i_version;
+    ts_si_context_t *p_ctx;
     /* Track successfully set pid */
     ts_pid_t *eitpid;
     ts_pid_t *tdtpid;
@@ -155,10 +165,8 @@ typedef struct ts_psip_context_t ts_psip_context_t;
 
 struct ts_psip_t
 {
-    dvbpsi_t       *handle;
-    int             i_version;
-    ts_es_t    *p_eas_es;
     ts_psip_context_t *p_ctx;
+    ts_es_t    *p_eas_es;
     /* Used to track list of active pid for eit/ett, to call PIDRelease on them.
        VCT table could have been used, but PIDSetup can fail, and we can't alter
        the VCT table accordingly without going ahead of more troubles */

@@ -1,35 +1,38 @@
 # HARFBUZZ
 
-HARFBUZZ_VERSION := 1.7.4
-HARFBUZZ_URL := http://www.freedesktop.org/software/harfbuzz/release/harfbuzz-$(HARFBUZZ_VERSION).tar.bz2
+HARFBUZZ_VERSION := 14.2.1
+HARFBUZZ_URL := $(GITHUB)/harfbuzz/harfbuzz/releases/download/$(HARFBUZZ_VERSION)/harfbuzz-$(HARFBUZZ_VERSION).tar.xz
 PKGS += harfbuzz
 ifeq ($(call need_pkg,"harfbuzz"),)
 PKGS_FOUND += harfbuzz
 endif
 
-HARFBUZZCONF = --with-icu=no --with-glib=no --with-fontconfig=no
-
-ifdef HAVE_DARWIN_OS
-HARFBUZZCONF += --with-coretext=yes
-endif
-
-$(TARBALLS)/harfbuzz-$(HARFBUZZ_VERSION).tar.bz2:
+$(TARBALLS)/harfbuzz-$(HARFBUZZ_VERSION).tar.xz:
 	$(call download_pkg,$(HARFBUZZ_URL),harfbuzz)
 
-.sum-harfbuzz: harfbuzz-$(HARFBUZZ_VERSION).tar.bz2
+.sum-harfbuzz: harfbuzz-$(HARFBUZZ_VERSION).tar.xz
 
-harfbuzz: harfbuzz-$(HARFBUZZ_VERSION).tar.bz2 .sum-harfbuzz
+harfbuzz: harfbuzz-$(HARFBUZZ_VERSION).tar.xz .sum-harfbuzz
 	$(UNPACK)
-	$(UPDATE_AUTOCONFIG)
-	$(APPLY) $(SRC)/harfbuzz/harfbuzz-aarch64.patch
-	$(APPLY) $(SRC)/harfbuzz/harfbuzz-clang.patch
-	$(APPLY) $(SRC)/harfbuzz/harfbuzz-coretext.patch
+	$(APPLY) $(SRC)/harfbuzz/0001-disable-building-hb-gpu-encode-all-app.patch
+	$(APPLY) $(SRC)/harfbuzz/0001-Ignore-Wunused-template.patch
 	$(MOVE)
 
-DEPS_harfbuzz = freetype2 $(DEPS_freetype2)
+DEPS_harfbuzz = freetype2 $(DEPS_freetype2) png $(DEPS_png)
 
-.harfbuzz: harfbuzz
-	cd $< && env NOCONFIGURE=1 sh autogen.sh
-	cd $< && $(HOSTVARS) CFLAGS="$(CFLAGS)" ./configure $(HOSTCONF) $(HARFBUZZCONF)
-	cd $< && $(MAKE) install
+HARFBUZZ_CONF := -Dfreetype=enabled \
+	-Dglib=disabled \
+	-Dgobject=disabled \
+	-Ddocs=disabled \
+	-Dtests=disabled \
+	-Dgpu_demo=disabled
+
+ifdef HAVE_DARWIN_OS
+HARFBUZZ_CONF += -Dcoretext=enabled
+endif
+
+.harfbuzz: harfbuzz crossfile.meson
+	$(MESONCLEAN)
+	$(MESON) $(HARFBUZZ_CONF)
+	+$(MESONBUILD)
 	touch $@

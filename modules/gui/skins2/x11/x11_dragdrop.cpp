@@ -2,7 +2,6 @@
  * x11_dragdrop.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -68,7 +67,7 @@ void X11DragDrop::dndEnter( ldata_t data )
         for( unsigned long i=0; i<nitems; i++ )
         {
             std::string dataType = XGetAtomName( XDISPLAY, dataList[i] );
-            dataTypes.push_back( dataType );
+            dataTypes.push_back( std::move(dataType) );
         }
         XFree( (void*)dataList );
     }
@@ -79,7 +78,7 @@ void X11DragDrop::dndEnter( ldata_t data )
             if( data[i] != None )
             {
                 std::string dataType = XGetAtomName( XDISPLAY, data[i] );
-                dataTypes.push_back( dataType );
+                dataTypes.push_back( std::move(dataType) );
             }
         }
     }

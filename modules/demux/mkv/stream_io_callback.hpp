@@ -2,7 +2,6 @@
  * stream_io_callback.hpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -21,10 +20,25 @@
  * along with this program; if not, write to the Free Software Foundation,
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
-#include "mkv.hpp"
+
+#ifndef VLC_MKV_STREAM_IO_CALLBACK_HPP_
+#define VLC_MKV_STREAM_IO_CALLBACK_HPP_
+
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
+#include <vlc_demux.h>
+
+#include <ebml/IOCallback.h>
+#include <ebml/EbmlStream.h>
+
+using namespace libebml;
+
+namespace mkv {
 
 /*****************************************************************************
- * Stream managment
+ * Stream management
  *****************************************************************************/
 class vlc_stream_io_callback: public IOCallback
 {
@@ -44,11 +58,30 @@ class vlc_stream_io_callback: public IOCallback
 
     bool IsEOF() const { return mb_eof; }
 
-    virtual uint32   read            ( void *p_buffer, size_t i_size);
-    virtual void     setFilePointer  ( int64_t i_offset, seek_mode mode = seek_beginning );
-    virtual size_t   write           ( const void *p_buffer, size_t i_size);
-    virtual uint64   getFilePointer  ( void );
-    virtual void     close           ( void ) { return; }
-    uint64           toRead          ( void );
+    uint32_t read            ( void *p_buffer, size_t i_size) override;
+    void     setFilePointer  ( int64_t i_offset, seek_mode mode = seek_beginning ) override;
+    size_t   write           ( const void *p_buffer, size_t i_size) override;
+    uint64_t getFilePointer  ( void ) override;
+    void     close           ( void ) override { return; }
 };
 
+class matroska_iostream_c : public EbmlStream
+{
+public:
+    matroska_iostream_c(vlc_stream_io_callback & io)
+        :EbmlStream(io)
+    {}
+
+    inline vlc_stream_io_callback & I_O() {
+        return static_cast<vlc_stream_io_callback &>(EbmlStream::I_O());
+    }
+
+private:
+    // hide generic method
+    using EbmlStream::I_O;
+};
+
+
+} // namespace
+
+#endif

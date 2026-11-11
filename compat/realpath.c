@@ -47,11 +47,11 @@ char *realpath(const char * restrict relpath, char * restrict resolved_path)
 
     MultiByteToWideChar( CP_UTF8, 0, relpath, -1, wrelpath, len );
 
-    wchar_t *wfullpath = _wfullpath( NULL, wrelpath, _MAX_PATH );
+    wchar_t *wfullpath = _wfullpath( NULL, wrelpath, 0 );
     free(wrelpath);
     if (wfullpath != NULL)
     {
-        size_t len = WideCharToMultiByte( CP_UTF8, 0, wfullpath, -1, NULL, 0, NULL, NULL );
+        len = WideCharToMultiByte( CP_UTF8, 0, wfullpath, -1, NULL, 0, NULL, NULL );
         if (len != 0)
         {
             if (resolved_path != NULL)

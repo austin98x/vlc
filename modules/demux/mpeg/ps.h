@@ -2,7 +2,6 @@
  * ps.h: Program Stream demuxer helper
  *****************************************************************************
  * Copyright (C) 2004-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -23,47 +22,61 @@
 
 #include <assert.h>
 #include <vlc_demux.h>
-#include <vlc_memory.h>
 #include "timestamps.h"
 
 #define PS_STREAM_ID_END_STREAM       0xB9
 #define PS_STREAM_ID_PACK_HEADER      0xBA
 #define PS_STREAM_ID_SYSTEM_HEADER    0xBB
-#define PS_STREAM_ID_MAP              0xBC
-#define PS_STREAM_ID_PRIVATE_STREAM1  0xBD
-#define PS_STREAM_ID_PADDING          0xBE
-#define PS_STREAM_ID_EXTENDED         0xFD
-#define PS_STREAM_ID_DIRECTORY        0xFF
 
-/* 256-0xC0 for normal stream, 256 for 0xbd stream, 256 for 0xfd stream, 8 for 0xa0 AOB stream */
+#define PS_PACKET_ID_MASK_VOB        0xBD00
+#define PS_PACKET_ID_MASK_AOB        0xA000
+#define PS_PACKET_ID_MASK_EXTENDED   0xFD00
+
+/* 0xBD20 + 0x00 to 0x1f */
+#define PS_SPU_ID_OFFSET             (PS_PACKET_ID_MASK_VOB | 0x20)
+
+#define PS_AOB_PACKET_ID_LPCM        (PS_PACKET_ID_MASK_AOB | 0x00)
+#define PS_AOB_PACKET_ID_MLP         (PS_PACKET_ID_MASK_AOB | 0x01)
+#define PS_VOB_PACKET_ID_MLP         (PS_PACKET_ID_MASK_VOB | 0xA1)
+
+enum ps_source {
+    PS_SOURCE_UNKNOWN, // any PS/PES source
+    PS_SOURCE_VOB,     // when reading a DVD-Video
+    PS_SOURCE_AOB,     // when reading a DVD-Audio
+};
+
+/* 256-0xC0 for normal stream, 256 for VOB stream, 256 for EVOB stream, 8 for AOB stream */
 #define PS_TK_COUNT (256+256+256+8 - 0xc0)
-static inline int ps_id_to_tk( unsigned i_id )
+static inline unsigned ps_id_to_tk( unsigned i_id )
 {
+    assert(i_id >= 0xc0);
+    if(unlikely(i_id < 0xc0))
+        return 0;
     if( i_id <= 0xff )
         return i_id - 0xc0;
-    else if( (i_id & 0xff00) == 0xbd00 )
+    if( (i_id & 0xff00) == PS_PACKET_ID_MASK_VOB )
         return 256-0xC0 + (i_id & 0xff);
-    else if( (i_id & 0xff00) == 0xfd00 )
+    if( (i_id & 0xff00) == PS_PACKET_ID_MASK_EXTENDED )
         return 512-0xc0 + (i_id & 0xff);
-    else
-        return 768-0xc0 + (i_id & 0x07);
+    assert( (i_id & 0xff00) == PS_PACKET_ID_MASK_AOB );
+    return 768-0xc0 + (i_id & 0x07);
 }
 
 typedef struct ps_psm_t ps_psm_t;
-static inline int ps_id_to_type( const ps_psm_t *, int );
-static inline const uint8_t *ps_id_to_lang( const ps_psm_t *, int );
+static inline uint8_t ps_id_to_type( const ps_psm_t *, uint16_t );
+static inline const uint8_t *ps_id_to_lang( const ps_psm_t *, uint16_t );
 
 typedef struct
 {
     bool        b_configured;
-    bool        b_seen;
+    bool        b_updated;
     int         i_skip;
     int         i_id;
     int         i_next_block_flags;
     es_out_id_t *es;
     es_format_t fmt;
-    mtime_t     i_first_pts;
-    mtime_t     i_last_pts;
+    vlc_tick_t  i_first_pts;
+    vlc_tick_t  i_last_pts;
 
 } ps_track_t;
 
@@ -74,13 +87,13 @@ static inline void ps_track_init( ps_track_t tk[PS_TK_COUNT] )
     for( i = 0; i < PS_TK_COUNT; i++ )
     {
         tk[i].b_configured = false;
-        tk[i].b_seen = false;
+        tk[i].b_updated = false;
         tk[i].i_skip = 0;
         tk[i].i_id   = 0;
         tk[i].i_next_block_flags = 0;
         tk[i].es     = NULL;
-        tk[i].i_first_pts = -1;
-        tk[i].i_last_pts = -1;
+        tk[i].i_first_pts = VLC_TICK_INVALID;
+        tk[i].i_last_pts = VLC_TICK_INVALID;
         es_format_Init( &tk[i].fmt, UNKNOWN_ES, 0 );
     }
 }
@@ -118,14 +131,40 @@ static inline bool ps_is_H264( const uint8_t *p_data, size_t i_data )
     return false;
 }
 
-/* From id fill i_skip and es_format_t */
-static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
-                                 int i_id, block_t *p_pkt, bool b_mpeg2only )
+static inline bool ps_is_EAC3( const uint8_t *p_data, size_t i_data )
 {
+    /* AC-3 marking, see vlc_a52_header_Parse */
+    if( i_data < 8 || p_data[0] != 0x0b || p_data[1] != 0x77 )
+        return false;
+    int bsid = p_data[5] >> 3;
+    return bsid > 10 && bsid <= 16;
+}
+
+/* From id fill i_skip and es_format_t */
+enum ps_mapping_override_e
+{
+    PS_MAP_OVERRIDE_NONE,
+    PS_MAP_OVERRIDE_MPEG2_ONLY,
+    PS_MAP_OVERRIDE_PSMF,
+};
+
+static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
+                                 int i_id,
+                                 const uint8_t *p_pkt, size_t i_pkt,
+                                 enum ps_mapping_override_e map_opt )
+{
+    const bool b_mpeg2only = map_opt == PS_MAP_OVERRIDE_MPEG2_ONLY;
     tk->i_skip = 0;
     tk->i_id = i_id;
 
-    if( ( i_id&0xff00 ) == 0xbd00 ) /* 0xBD00 -> 0xBDFF, Private Stream 1 */
+    if( map_opt == PS_MAP_OVERRIDE_PSMF )
+    {
+        es_format_Change( &tk->fmt, UNKNOWN_ES, 0 );
+        tk->fmt.i_id = i_id;
+        return VLC_SUCCESS;
+    }
+
+    if( ( i_id&0xff00 ) == PS_PACKET_ID_MASK_VOB ) /* 0xBD00 -> 0xBDFF, VOB Private Stream 1 */
     {
         if( ( i_id&0xf8 ) == 0x88 || /* 0x88 -> 0x8f - Can be DTS-HD primary audio in evob */
             ( i_id&0xf8 ) == 0x98 )  /* 0x98 -> 0x9f - Can be DTS-HD secondary audio in evob */
@@ -139,21 +178,12 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
             bool b_eac3 = false;
             if( ( i_id&0xf0 ) == 0xc0 )
             {
-                if( p_pkt == NULL || p_pkt->i_buffer < 9 )
+                if( p_pkt == NULL || i_pkt < 9 )
                     return VLC_EGENERIC;
 
-                unsigned i_start = 9 + p_pkt->p_buffer[8];
-                if( i_start + 9 < p_pkt->i_buffer )
-                {
-                    /* AC-3 marking, see vlc_a52_header_Parse */
-                    if( p_pkt->p_buffer[i_start + 4] == 0x0b ||
-                        p_pkt->p_buffer[i_start + 5] == 0x77 )
-                    {
-                        int bsid = p_pkt->p_buffer[i_start + 9] >> 3;
-                        if( bsid > 10 )
-                            b_eac3 = true;
-                    }
-                }
+                unsigned i_start = 9 + p_pkt[8];
+                if( i_start + 9 < i_pkt )
+                    b_eac3 = ps_is_EAC3( &p_pkt[i_start + 4], i_pkt - i_start - 4 );
             }
 
             es_format_Change( &tk->fmt, AUDIO_ES, b_eac3 ? VLC_CODEC_EAC3 : VLC_CODEC_A52 );
@@ -162,6 +192,11 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
         else if( ( i_id&0xfc ) == 0x00 ) /* 0x00 -> 0x03 */
         {
             es_format_Change( &tk->fmt, SPU_ES, VLC_CODEC_CVD );
+        }
+        else if( ( i_id&0xff ) == 0x0b ) /* 0x0b */
+        {
+            bool b_eac3 = i_pkt > 8 && ps_is_EAC3( &p_pkt[9], i_pkt - 9 );
+            es_format_Change( &tk->fmt, AUDIO_ES, b_eac3 ? VLC_CODEC_EAC3 : VLC_CODEC_A52 );
         }
         else if( ( i_id&0xff ) == 0x10 ) /* 0x10 */
         {
@@ -192,7 +227,7 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
             return VLC_EGENERIC;
         }
     }
-    else if( (i_id&0xff00) == 0xfd00 ) /* 0xFD00 -> 0xFDFF */
+    else if( (i_id&0xff00) == PS_PACKET_ID_MASK_EXTENDED ) /* EVOB: 0xFD00 -> 0xFDFF */
     {
         uint8_t i_sub_id = i_id & 0xff;
         if( ( i_sub_id >= 0x55 && i_sub_id <= 0x5f ) || /* Can be primary VC-1 in evob */
@@ -206,7 +241,7 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
             return VLC_EGENERIC;
         }
     }
-    else if( (i_id&0xff00) == 0xa000 ) /* 0xA000 -> 0xA0FF */
+    else if( (i_id&0xff00) == PS_PACKET_ID_MASK_AOB ) /* AOB: 0xA000 -> 0xA0FF */
     {
         uint8_t i_sub_id = i_id & 0x07;
         if( i_sub_id == 0 )
@@ -255,15 +290,15 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
                 es_format_Change( &tk->fmt, VIDEO_ES, VLC_CODEC_HEVC );
             }
             else if( i_id == 0xe2 || /* Primary H.264 in evob */
-                     i_id == 0xe3 )  /* Seconday H.264 in evob */
+                     i_id == 0xe3 )  /* Secondary H.264 in evob */
             {
                 es_format_Change( &tk->fmt, VIDEO_ES, VLC_CODEC_H264 );
             }
             else if( p_pkt && i_type == 0x00 && /* Not from PSM */
-                     p_pkt->i_buffer > 9 + 5 &&
-                     p_pkt->i_buffer > 9U + 5 + p_pkt->p_buffer[8] &&
-                     ps_is_H264( &p_pkt->p_buffer[ 9 + p_pkt->p_buffer[8] ],
-                                  p_pkt->i_buffer - 9 - p_pkt->p_buffer[8] ) )
+                     i_pkt > 9 + 5 &&
+                     i_pkt > 9U + 5 + p_pkt[8] &&
+                     ps_is_H264( &p_pkt[ 9 + p_pkt[8] ],
+                                  i_pkt - 9 - p_pkt[8] ) )
             {
                 es_format_Change( &tk->fmt, VIDEO_ES, VLC_CODEC_H264 );
             }
@@ -289,6 +324,10 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
             {
                 es_format_Change( &tk->fmt, AUDIO_ES, VLC_CODEC_MP4A );
                 tk->fmt.i_original_fourcc = VLC_FOURCC('L','A','T','M');
+            }
+            else if( i_type == 0x2d )
+            {
+                es_format_Change( &tk->fmt, AUDIO_ES, VLC_CODEC_MPEGH );
             }
             else if( tk->fmt.i_cat == UNKNOWN_ES )
             {
@@ -316,39 +355,45 @@ static inline int ps_track_fill( ps_track_t *tk, ps_psm_t *p_psm,
 }
 
 /* return the id of a PES (should be valid) */
-static inline int ps_pkt_id( block_t *p_pkt )
+static inline int ps_pkt_id( const uint8_t *p_pkt, size_t i_pkt, enum ps_source source )
 {
-    if( p_pkt->p_buffer[3] == 0xbd )
+    if(unlikely(i_pkt < 4))
+        return 0;
+    if( p_pkt[3] == STREAM_ID_PRIVATE_STREAM_1 )
     {
         uint8_t i_sub_id = 0;
-        if( p_pkt->i_buffer >= 9 &&
-            p_pkt->i_buffer >= 9 + (size_t)p_pkt->p_buffer[8] )
+        if( i_pkt >= 9 &&
+            i_pkt > 9 + (size_t)p_pkt[8] )
         {
-            const unsigned i_start = 9 + p_pkt->p_buffer[8];
-            i_sub_id = p_pkt->p_buffer[i_start];
+            const unsigned i_start = 9 + p_pkt[8];
+            i_sub_id = p_pkt[i_start];
 
-            if( (i_sub_id & 0xfe) == 0xa0 &&
-                p_pkt->i_buffer >= i_start + 7 &&
-                ( p_pkt->p_buffer[i_start + 5] >=  0xc0 ||
-                p_pkt->p_buffer[i_start + 6] != 0x80 ) )
+            if( i_sub_id == 0xa0 &&
+                i_pkt >= i_start + 7 &&
+                p_pkt[i_start + 6] != 0x80 )
             {
-                /* AOB LPCM/MLP extension
-                * XXX for MLP I think that the !=0x80 test is not good and
-                * will fail for some valid files */
-                return 0xa000 | (i_sub_id & 0x01);
+                /* AOB LPCM extension */
+                return PS_PACKET_ID_MASK_AOB | (i_sub_id & 0x01);
+            }
+
+            if( i_sub_id == 0xa1 &&
+                source == PS_SOURCE_AOB )
+            {
+                /* AOB MLP extension */
+                return PS_PACKET_ID_MASK_AOB | (i_sub_id & 0x01);
             }
         }
 
         /* VOB extension */
-        return 0xbd00 | i_sub_id;
+        return PS_PACKET_ID_MASK_VOB | i_sub_id;
     }
-    else if( p_pkt->p_buffer[3] == 0xfd &&
-             p_pkt->i_buffer >= 9 &&
-             (p_pkt->p_buffer[6]&0xC0) == 0x80 &&   /* mpeg2 */
-             (p_pkt->p_buffer[7]&0x01) == 0x01 )    /* extension_flag */
+    if( i_pkt >= 9 &&
+             p_pkt[3] == STREAM_ID_EXTENDED_STREAM_ID &&
+             (p_pkt[6]&0xC0) == 0x80 &&   /* mpeg2 */
+             (p_pkt[7]&0x01) == 0x01 )    /* extension_flag */
     {
         /* ISO 13818 amendment 2 and SMPTE RP 227 */
-        const uint8_t i_flags = p_pkt->p_buffer[7];
+        const uint8_t i_flags = p_pkt[7];
         unsigned int i_skip = 9;
 
         /* Find PES extension */
@@ -369,34 +414,34 @@ static inline int ps_pkt_id( block_t *p_pkt )
         if( (i_flags & 0x02 ) )
             i_skip += 2;
 
-        if( i_skip < p_pkt->i_buffer && (p_pkt->p_buffer[i_skip]&0x01) )
+        if( i_skip < i_pkt && (p_pkt[i_skip]&0x01) )
         {
-            const uint8_t i_flags2 = p_pkt->p_buffer[i_skip];
+            const uint8_t i_flags2 = p_pkt[i_skip];
 
             /* Find PES extension 2 */
             i_skip += 1;
             if( i_flags2 & 0x80 )
                 i_skip += 16;
-            if( (i_flags2 & 0x40) && i_skip < p_pkt->i_buffer )
-                i_skip += 1 + p_pkt->p_buffer[i_skip];
+            if( (i_flags2 & 0x40) && i_skip < i_pkt )
+                i_skip += 1 + p_pkt[i_skip];
             if( i_flags2 & 0x20 )
                 i_skip += 2;
             if( i_flags2 & 0x10 )
                 i_skip += 2;
 
-            if( i_skip + 1 < p_pkt->i_buffer )
+            if( i_skip + 1 < i_pkt )
             {
-                const int i_extension_field_length = p_pkt->p_buffer[i_skip]&0x7f;
+                const int i_extension_field_length = p_pkt[i_skip]&0x7f;
                 if( i_extension_field_length >=1 )
                 {
-                    int i_stream_id_extension_flag = (p_pkt->p_buffer[i_skip+1] >> 7)&0x1;
+                    int i_stream_id_extension_flag = (p_pkt[i_skip+1] >> 7)&0x1;
                     if( i_stream_id_extension_flag == 0 )
-                        return 0xfd00 | (p_pkt->p_buffer[i_skip+1]&0x7f);
+                        return PS_PACKET_ID_MASK_EXTENDED | (p_pkt[i_skip+1]&0x7f);
                 }
             }
         }
     }
-    return p_pkt->p_buffer[3];
+    return p_pkt[3];
 }
 
 /* return the size of the next packet */
@@ -415,14 +460,14 @@ static inline int ps_pkt_size( const uint8_t *p, int i_peek )
             {
                 if( i_peek >= 14 && (p[4] >> 6) == 0x01 )
                     return 14 + (p[13]&0x07);
-                else if( i_peek >= 12 && (p[4] >> 4) == 0x02 )
+                if( i_peek >= 12 && (p[4] >> 4) == 0x02 )
                     return 12;
             }
             break;
 
         case PS_STREAM_ID_SYSTEM_HEADER:
-        case PS_STREAM_ID_MAP:
-        case PS_STREAM_ID_DIRECTORY:
+        case STREAM_ID_PROGRAM_STREAM_MAP:
+        case STREAM_ID_PROGRAM_STREAM_DIRECTORY:
         default:
             if( i_peek >= 6 )
                 return 6 + ((p[4]<<8) | p[5] );
@@ -431,50 +476,53 @@ static inline int ps_pkt_size( const uint8_t *p, int i_peek )
 }
 
 /* parse a PACK PES */
-static inline int ps_pkt_parse_pack( block_t *p_pkt, int64_t *pi_scr,
-                                     int *pi_mux_rate )
+static inline int ps_pkt_parse_pack( const uint8_t *p_pkt, size_t i_pkt,
+                                     vlc_tick_t *pi_scr, int *pi_mux_rate )
 {
-    uint8_t *p = p_pkt->p_buffer;
-    if( p_pkt->i_buffer >= 14 && (p[4] >> 6) == 0x01 )
+    const uint8_t *p = p_pkt;
+    ts_90khz_t i_scr;
+    if( i_pkt >= 14 && (p[4] >> 6) == 0x01 ) /* 0b01 H.222 MPEG-2 Pack Header */
     {
-        *pi_scr = FROM_SCALE_NZ( ExtractPackHeaderTimestamp( &p[4] ) );
+        i_scr = ExtractPackHeaderTimestamp( &p[4] );
         *pi_mux_rate = ( p[10] << 14 )|( p[11] << 6 )|( p[12] >> 2);
     }
-    else if( p_pkt->i_buffer >= 12 && (p[4] >> 4) == 0x02 ) /* MPEG-1 Pack SCR, same bits as PES/PTS */
+    else if( i_pkt >= 12 && (p[4] >> 4) == 0x02 ) /* 0b0010 ISO 11172-1 MPEG-1 Pack Header */
     {
-        if(!ExtractPESTimestamp( &p[4], 0x02, pi_scr ))
+        if(!ExtractPESTimestamp( &p[4], 0x02, &i_scr )) /* same bits as PES/PTS */
             return VLC_EGENERIC;
-        *pi_scr = FROM_SCALE_NZ( *pi_scr );
         *pi_mux_rate = ( ( p[9]&0x7f )<< 15 )|( p[10] << 7 )|( p[11] >> 1);
     }
     else
     {
         return VLC_EGENERIC;
     }
+    *pi_scr = FROM_SCALE( i_scr );
     return VLC_SUCCESS;
 }
 
 /* Parse a SYSTEM PES */
-static inline int ps_pkt_parse_system( block_t *p_pkt, ps_psm_t *p_psm,
+static inline int ps_pkt_parse_system( const uint8_t *p_pkt, size_t i_pkt,
+                                       ps_psm_t *p_psm,
                                        ps_track_t tk[PS_TK_COUNT] )
 {
-    uint8_t *p = &p_pkt->p_buffer[6 + 3 + 1 + 1 + 1];
+    const uint8_t *p = &p_pkt[6 + 3 + 1 + 1 + 1];
+    const uint8_t *p_pktend = &p_pkt[i_pkt];
 
-    /* System header is not useable if it references private streams (0xBD)
+    /* System header is not usable if it references private streams (0xBD)
      * or 'all audio streams' (0xB8) or 'all video streams' (0xB9) */
-    while( p < &p_pkt->p_buffer[p_pkt->i_buffer] && (p[0] & 0x80) )
+    while( p < p_pktend && (p[0] & 0x80) )
     {
         int i_id = p[0];
         switch( i_id )
         {
             case 0xB7:
-                if( &p_pkt->p_buffer[p_pkt->i_buffer] - p < 6 )
+                if( p_pktend - p < 6 )
                     return VLC_EGENERIC;
-                i_id = ((int)PS_STREAM_ID_EXTENDED << 8) | (p[2] & 0x7F);
+                i_id = PS_PACKET_ID_MASK_EXTENDED | (p[2] & 0x7F);
                 p += 6;
                 break;
             default:
-                if( &p_pkt->p_buffer[p_pkt->i_buffer] - p < 3 )
+                if( p_pktend - p < 3 )
                     return VLC_EGENERIC;
                 p += 3;
                 break;
@@ -483,9 +531,9 @@ static inline int ps_pkt_parse_system( block_t *p_pkt, ps_psm_t *p_psm,
         if( i_id < 0xc0 )
             continue;
 
-        int i_tk = ps_id_to_tk( i_id );
+        unsigned i_tk = ps_id_to_tk( i_id );
         if( !tk[i_tk].b_configured )
-            ps_track_fill( &tk[i_tk], p_psm, i_id, NULL, false );
+            ps_track_fill( &tk[i_tk], p_psm, i_id, NULL, 0, PS_MAP_OVERRIDE_NONE );
     }
     return VLC_SUCCESS;
 }
@@ -493,23 +541,23 @@ static inline int ps_pkt_parse_system( block_t *p_pkt, ps_psm_t *p_psm,
 /* Parse a PES (and skip i_skip_extra in the payload) */
 static inline int ps_pkt_parse_pes( vlc_object_t *p_object, block_t *p_pes, int i_skip_extra )
 {
-    unsigned int i_skip  = 0;
-    mtime_t i_pts = -1;
-    mtime_t i_dts = -1;
-    uint8_t i_stream_id = 0;
-    bool b_pes_scrambling = false;
+    unsigned int i_skip;
+    ts_pes_header_t pesh;
+    ts_pes_header_init( &pesh );
 
-    if( ParsePESHeader( p_object, p_pes->p_buffer, p_pes->i_buffer,
-                        &i_skip, &i_dts, &i_pts, &i_stream_id, &b_pes_scrambling ) != VLC_SUCCESS )
+    if( ParsePESHeader( p_object->logger, p_pes->p_buffer, p_pes->i_buffer, &pesh ) != VLC_SUCCESS )
         return VLC_EGENERIC;
 
-    if( b_pes_scrambling )
+    i_skip = pesh.i_size;
+
+    if( pesh.b_scrambling )
         p_pes->i_flags |= BLOCK_FLAG_SCRAMBLED;
 
     if( i_skip_extra >= 0 )
         i_skip += i_skip_extra;
     else if( p_pes->i_buffer > i_skip + 3 &&
-             ( ps_pkt_id( p_pes ) == 0xa001 || ps_pkt_id( p_pes ) == 0xbda1 ) )
+             ( ps_pkt_id( p_pes->p_buffer, p_pes->i_buffer, PS_SOURCE_AOB ) == PS_AOB_PACKET_ID_MLP ||
+               ps_pkt_id( p_pes->p_buffer, p_pes->i_buffer, PS_SOURCE_VOB ) == PS_VOB_PACKET_ID_MLP ) )
         i_skip += 4 + p_pes->p_buffer[i_skip+3];
 
     if( p_pes->i_buffer <= i_skip )
@@ -520,10 +568,14 @@ static inline int ps_pkt_parse_pes( vlc_object_t *p_object, block_t *p_pes, int 
     p_pes->p_buffer += i_skip;
     p_pes->i_buffer -= i_skip;
 
-    if( i_dts >= 0 )
-        p_pes->i_dts = FROM_SCALE( i_dts );
-    if( i_pts >= 0 )
-        p_pes->i_pts = FROM_SCALE( i_pts );
+    if( pesh.i_pts != TS_90KHZ_INVALID )
+    {
+        p_pes->i_pts = FROM_SCALE( pesh.i_pts );
+        if( pesh.i_dts != TS_90KHZ_INVALID )
+            p_pes->i_dts = FROM_SCALE( pesh.i_dts );
+        else /* ISO/IEC 13818-1 2.7.5: if pts and no dts, then dts == pts */
+            p_pes->i_dts = p_pes->i_pts;
+    }
 
     return VLC_SUCCESS;
 }
@@ -537,8 +589,8 @@ typedef struct
 /* Program stream map handling */
 typedef struct ps_es_t
 {
-    int i_type;
-    int i_id;
+    uint8_t i_type;
+    uint16_t i_id;
 
     ps_descriptors_t desc;
 
@@ -546,7 +598,7 @@ typedef struct ps_es_t
 
 struct ps_psm_t
 {
-    int i_version;
+    uint8_t i_version;
 
     size_t  i_es;
     ps_es_t *es;
@@ -554,7 +606,7 @@ struct ps_psm_t
     ps_descriptors_t uniqueextdesc;
 };
 
-static inline int ps_id_to_type( const ps_psm_t *p_psm, int i_id )
+static inline uint8_t ps_id_to_type( const ps_psm_t *p_psm, uint16_t i_id )
 {
     size_t i;
     for( i = 0; p_psm && i < p_psm->i_es; i++ )
@@ -564,7 +616,7 @@ static inline int ps_id_to_type( const ps_psm_t *p_psm, int i_id )
     return 0;
 }
 
-static inline const uint8_t *ps_id_to_lang( const ps_psm_t *p_psm, int i_id )
+static inline const uint8_t *ps_id_to_lang( const ps_psm_t *p_psm, uint16_t i_id )
 {
     size_t i;
     for( i = 0; p_psm && i < p_psm->i_es; i++ )
@@ -577,7 +629,7 @@ static inline const uint8_t *ps_id_to_lang( const ps_psm_t *p_psm, int i_id )
 
 static inline void ps_psm_init( ps_psm_t *p_psm )
 {
-    p_psm->i_version = 0xFFFF;
+    p_psm->i_version = 0xFF;
     p_psm->i_es = 0;
     p_psm->es = 0;
     memset( &p_psm->uniqueextdesc, 0, 3 );
@@ -611,20 +663,22 @@ static inline void ps_parse_descriptors( const uint8_t *p_data, size_t i_data,
     }
 }
 
-static inline int ps_psm_fill( ps_psm_t *p_psm, block_t *p_pkt,
-                               ps_track_t tk[PS_TK_COUNT], es_out_t *out )
+static inline int ps_psm_fill( ps_psm_t *p_psm,
+                               const uint8_t *p_buffer, size_t i_pkt,
+                               ps_track_t tk[PS_TK_COUNT])
 {
-    size_t i_buffer = p_pkt->i_buffer;
-    uint8_t *p_buffer = p_pkt->p_buffer;
     size_t i_length, i_info_length, i_es_base;
-    int i_version;
+    uint8_t i_version;
     bool b_single_extension;
 
-    if( !p_psm || p_buffer[3] != PS_STREAM_ID_MAP )
+    // Demux() checks that we have at least 4 bytes, but we need
+    // at least 10 to read up to the info_length field
+    assert(i_pkt >= 4);
+    if( !p_psm || i_pkt < 10 || p_buffer[3] != STREAM_ID_PROGRAM_STREAM_MAP)
         return VLC_EGENERIC;
 
     i_length = GetWBE(&p_buffer[4]) + 6;
-    if( i_length > i_buffer ) return VLC_EGENERIC;
+    if( i_length > i_pkt ) return VLC_EGENERIC;
 
     if((p_buffer[6] & 0x80) == 0) /* current_next_indicator */
         return VLC_EGENERIC;
@@ -666,7 +720,7 @@ static inline int ps_psm_fill( ps_psm_t *p_psm, block_t *p_pkt,
          *      descriptor 0x5 with format_identifier == 0x56432D31 (VC-1)
          *      (I need a sample that use PSM with VC-1) */
 
-        if( p_es->i_id == PS_STREAM_ID_EXTENDED && b_single_extension == 0 )
+        if( p_es->i_id == STREAM_ID_EXTENDED_STREAM_ID && b_single_extension == 0 )
         {
             if( i_info_length < 3 )
                 break;
@@ -691,12 +745,14 @@ static inline int ps_psm_fill( ps_psm_t *p_psm, block_t *p_pkt,
     /* Check/Modify our existing tracks */
     for( int i = 0; i < PS_TK_COUNT; i++ )
     {
-        if( !tk[i].b_configured || !tk[i].es ) continue;
+        if( !tk[i].b_configured )
+            continue;
 
         ps_track_t tk_tmp;
         es_format_Init( &tk_tmp.fmt, UNKNOWN_ES, 0 );
 
-        if( ps_track_fill( &tk_tmp, p_psm, tk[i].i_id, p_pkt, false ) != VLC_SUCCESS )
+        if( ps_track_fill( &tk_tmp, p_psm, tk[i].i_id,
+                           p_buffer, i_pkt, PS_MAP_OVERRIDE_NONE ) != VLC_SUCCESS )
             continue;
 
         if( tk_tmp.fmt.i_codec == tk[i].fmt.i_codec )
@@ -705,12 +761,12 @@ static inline int ps_psm_fill( ps_psm_t *p_psm, block_t *p_pkt,
             continue;
         }
 
-        es_out_Del( out, tk[i].es );
-        es_format_Clean( &tk[i].fmt );
-
+        /* replace with new version */
         tk_tmp.b_configured = true;
+        tk_tmp.b_updated = true;
+        tk_tmp.es = tk[i].es;
+        es_format_Clean( &tk[i].fmt );
         tk[i] = tk_tmp;
-        tk[i].es = es_out_Add( out, &tk[i].fmt );
     }
 
     return VLC_SUCCESS;

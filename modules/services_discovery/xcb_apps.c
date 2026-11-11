@@ -28,6 +28,7 @@
 typedef xcb_atom_t Atom;
 #include <X11/Xatom.h> /* XA_WINDOW */
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_services_discovery.h>
 #include <vlc_dialog.h>
 #include <vlc_charset.h>
@@ -35,7 +36,12 @@ typedef xcb_atom_t Atom;
 #ifdef HAVE_SEARCH_H
 # include <search.h>
 #endif
-#include <poll.h>
+#ifdef HAVE_POLL_H
+# include <poll.h>
+#endif
+#ifdef _WIN32
+# include <winsock2.h>
+#endif
 
 static int  Open (vlc_object_t *);
 static void Close (vlc_object_t *);
@@ -47,7 +53,6 @@ static int vlc_sd_probe_Open (vlc_object_t *);
 vlc_module_begin ()
     set_shortname (N_("Screen capture"))
     set_description (N_("Screen capture"))
-    set_category (CAT_PLAYLIST)
     set_subcategory (SUBCAT_PLAYLIST_SD)
     set_capability ("services_discovery", 0)
     set_callbacks (Open, Close)
@@ -57,7 +62,7 @@ vlc_module_begin ()
     VLC_SD_PROBE_SUBMODULE
 vlc_module_end ()
 
-struct services_discovery_sys_t
+typedef struct
 {
     xcb_connection_t *conn;
     vlc_thread_t      thread;
@@ -66,7 +71,7 @@ struct services_discovery_sys_t
     xcb_window_t      root_window;
     void             *apps;
     input_item_t     *apps_root;
-};
+} services_discovery_sys_t;
 
 static void *Run (void *);
 static void UpdateApps (services_discovery_t *);
@@ -164,14 +169,15 @@ static int Open (vlc_object_t *obj)
     }
 
     p_sys->apps = NULL;
-    p_sys->apps_root = input_item_NewExt("vlc://nop", _("Applications"), -1,
+    p_sys->apps_root = input_item_NewExt(INPUT_ITEM_URI_NOP, _("Applications"),
+                                         INPUT_DURATION_INDEFINITE,
                                          ITEM_TYPE_NODE, ITEM_LOCAL);
     if (likely(p_sys->apps_root != NULL))
         services_discovery_AddItem(sd, p_sys->apps_root);
 
     UpdateApps (sd);
 
-    if (vlc_clone (&p_sys->thread, Run, sd, VLC_THREAD_PRIORITY_LOW))
+    if (vlc_clone (&p_sys->thread, Run, sd))
         goto error;
     return VLC_SUCCESS;
 
@@ -204,6 +210,8 @@ static void Close (vlc_object_t *obj)
 
 static void *Run (void *data)
 {
+    vlc_thread_set_name("vlc-xcb-servis");
+
     services_discovery_t *sd = data;
     services_discovery_sys_t *p_sys = sd->p_sys;
     xcb_connection_t *conn = p_sys->conn;
@@ -305,7 +313,7 @@ static int cmpapp (const void *a, const void *b)
     if (wa < wb)
         return -1;
     return 0;
-} 
+}
 
 static void UpdateApps (services_discovery_t *sd)
 {
@@ -329,7 +337,7 @@ static void UpdateApps (services_discovery_t *sd)
         xcb_window_t id = *(ent++);
         struct app *app;
 
-        struct app **pa = tfind (&id, &oldnodes, cmpapp);
+        void **pa = tfind (&id, &oldnodes, cmpapp);
         if (pa != NULL) /* existing entry */
         {
             app = *pa;

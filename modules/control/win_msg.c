@@ -30,8 +30,8 @@
 #include <vlc_plugin.h>
 #include <vlc_interface.h>
 #include <vlc_playlist.h>
-#include <vlc_input.h>
 #include <vlc_url.h> // FIXME: move URL generation to calling process
+#include <vlc_input_item.h>
 
 #include <windows.h>
 
@@ -49,6 +49,25 @@ typedef struct
     int enqueue;
     char data[];
 } vlc_ipc_data_t;
+
+static void add_to_playlist(intf_thread_t *intf, const char *uri,
+                            bool play_now, int options_count,
+                            const char *const *options)
+{
+    vlc_playlist_t *playlist = vlc_intf_GetMainPlaylist(intf);
+
+    input_item_t *media = input_item_New(uri, NULL);
+    if (!media)
+        return;
+    input_item_AddOptions(media, options_count, options, VLC_INPUT_OPTION_TRUSTED);
+
+    vlc_playlist_Lock(playlist);
+    vlc_playlist_AppendOne(playlist, media);
+    if (play_now)
+        vlc_playlist_Start(playlist);
+    vlc_playlist_Unlock(playlist);
+    input_item_Release(media);
+}
 
 static LRESULT CALLBACK WMCOPYWNDPROC(HWND hwnd, UINT uMsg,
                                       WPARAM wParam, LPARAM lParam)
@@ -72,13 +91,15 @@ static LRESULT CALLBACK WMCOPYWNDPROC(HWND hwnd, UINT uMsg,
             char **ppsz_argv;
             vlc_ipc_data_t *p_data = (vlc_ipc_data_t *)pwm_data->lpData;
             size_t i_data = 0;
+            size_t i_len;
             int i_argc = p_data->argc, i_opt, i_options;
 
             ppsz_argv = vlc_alloc( i_argc, sizeof(char *) );
             for( i_opt = 0; i_opt < i_argc; i_opt++ )
             {
-                ppsz_argv[i_opt] = p_data->data + i_data + sizeof(size_t);
-                i_data += sizeof(size_t) + *((size_t *)(p_data->data + i_data));
+                memcpy( &i_len, &p_data->data[i_data], sizeof(size_t) );
+                ppsz_argv[i_opt] = &p_data->data[i_data] + sizeof(size_t);
+                i_data += sizeof(size_t) + i_len;
             }
 
             for( i_opt = 0; i_opt < i_argc; i_opt++ )
@@ -98,14 +119,9 @@ static LRESULT CALLBACK WMCOPYWNDPROC(HWND hwnd, UINT uMsg,
                 char *psz_URI = NULL;
                 if( strstr( ppsz_argv[i_opt], "://" ) == NULL )
                     psz_URI = vlc_path2uri( ppsz_argv[i_opt], NULL );
-                playlist_AddExt( pl_Get(intf),
-                        (psz_URI != NULL) ? psz_URI : ppsz_argv[i_opt],
-                        NULL, (i_opt == 0 && !p_data->enqueue),
-                        i_options,
-                        (char const **)( i_options ? &ppsz_argv[i_opt+1] : NULL ),
-                        VLC_INPUT_OPTION_TRUSTED,
-                        true );
-
+                add_to_playlist(intf, (psz_URI != NULL) ? psz_URI : ppsz_argv[i_opt],
+                                (i_opt == 0 && !p_data->enqueue), i_options,
+                                (char const **)( i_options ? &ppsz_argv[i_opt+1] : NULL ));
                 i_opt += i_options;
                 free( psz_URI );
             }
@@ -121,6 +137,8 @@ static void *HelperThread(void *data)
 {
     intf_thread_t *intf = data;
     intf_sys_t *sys = intf->p_sys;
+
+    vlc_thread_set_name("vlc-ctrl-win");
 
     HWND ipcwindow =
         CreateWindow(L"STATIC",                      /* name of window class */
@@ -164,7 +182,7 @@ static int Open(vlc_object_t *obj)
     /* Run the helper thread */
     sys->ready = CreateEvent(NULL, FALSE, FALSE, NULL);
 
-    if (vlc_clone(&sys->thread, HelperThread, intf, VLC_THREAD_PRIORITY_LOW))
+    if (vlc_clone(&sys->thread, HelperThread, intf))
     {
         free(sys);
         msg_Err(intf, "one instance mode DISABLED "
@@ -191,7 +209,6 @@ static void Close(vlc_object_t *obj)
 vlc_module_begin()
     set_shortname(N_("WinMsg"))
     set_description(N_("Windows messages interface"))
-    set_category(CAT_INTERFACE)
     set_subcategory(SUBCAT_INTERFACE_CONTROL)
     set_capability("interface", 0)
     set_callbacks(Open, Close)

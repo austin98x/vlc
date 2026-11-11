@@ -1,5 +1,5 @@
 /*****************************************************************************
- * substx3gsub.c : MP4 tx3g subtitles decoder
+ * substx3g.c : MP4 tx3g subtitles decoder
  *****************************************************************************
  * Copyright (C) 2014 VLC authors and VideoLAN
  *
@@ -46,15 +46,14 @@ vlc_module_begin ()
     set_description( N_("tx3g subtitles decoder") )
     set_shortname( N_("tx3g subtitles") )
     set_capability( "spu decoder", 100 )
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_SCODEC )
     set_callbacks( OpenDecoder, CloseDecoder )
 #ifdef ENABLE_SOUT
     add_submodule ()
         set_description( N_("tx3g subtitles encoder") )
         set_shortname( N_("tx3g subtitles encoder") )
-        set_capability( "encoder", 101 )
-        set_callbacks( OpenEncoder, NULL )
+        set_capability( "spu encoder", 101 )
+        set_callback( OpenEncoder )
 #endif
 vlc_module_end ()
 
@@ -96,19 +95,22 @@ static size_t str8len( const char *psz_string )
 
 static char * str8indup( const char *psz_string, size_t i_skip, size_t n )
 {
-    while( i_skip && *psz_string )
+    for( size_t i = 0; i< i_skip && *psz_string; i++ )
     {
-        if ( (*psz_string & 0xC0) != 0x80 ) i_skip--;
-        psz_string++;
+        while( *(++psz_string) && (*psz_string & 0xC0) == 0x80 )
+        {};
     }
-    if ( ! *psz_string || i_skip ) return NULL;
+
+    if ( ! *psz_string )
+        return NULL;
 
     const char *psz_tmp = psz_string;
-    while( n && *psz_tmp )
+    for( size_t i = 0; i < n && *psz_tmp; i++ )
     {
-        if ( (*psz_tmp & 0xC0) != 0x80 ) n--;
-        psz_tmp++;
+        while( *(++psz_tmp) && (*psz_tmp & 0xC0) == 0x80 )
+        {};
     }
+
     return strndup( psz_string, psz_tmp - psz_string );
 }
 
@@ -300,41 +302,36 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
         return VLCDEC_SUCCESS;
 
     if( ( p_block->i_flags & (BLOCK_FLAG_CORRUPTED) ) ||
-          p_block->i_buffer < sizeof(uint16_t) )
+          p_block->i_buffer < 2U )
     {
         block_Release( p_block );
         return VLCDEC_SUCCESS;
     }
 
-    uint8_t *p_buf = p_block->p_buffer;
-
     /* Read our raw string and create the styled segment for HTML */
-    uint16_t i_psz_bytelength = GetWBE( p_buf );
+    uint16_t i_psz_bytelength = GetWBE( p_block->p_buffer );
     if( p_block->i_buffer < i_psz_bytelength + 2U )
     {
         block_Release( p_block );
         return VLCDEC_SUCCESS;
     }
 
-    const uint8_t *p_pszstart = p_block->p_buffer + sizeof(uint16_t);
+    const uint8_t *p_pszstart = p_block->p_buffer + 2U;
     char *psz_subtitle;
     if ( i_psz_bytelength > 2 &&
          ( !memcmp( p_pszstart, "\xFE\xFF", 2 ) || !memcmp( p_pszstart, "\xFF\xFE", 2 ) )
        )
-    {
         psz_subtitle = FromCharset( "UTF-16", p_pszstart, i_psz_bytelength );
-        if ( !psz_subtitle )
-            return VLCDEC_SUCCESS;
-    }
     else
-    {
         psz_subtitle = strndup( (const char*) p_pszstart, i_psz_bytelength );
-        if ( !psz_subtitle )
-            return VLCDEC_SUCCESS;
-    }
-    p_buf += i_psz_bytelength + sizeof(uint16_t);
 
-    for( uint16_t i=0; i < i_psz_bytelength; i++ )
+    if ( !psz_subtitle )
+    {
+        block_Release( p_block );
+        return VLCDEC_SUCCESS;
+    }
+
+    for( size_t i=0; psz_subtitle[i] != '\0'; i++ )
      if ( psz_subtitle[i] == '\r' ) psz_subtitle[i] = '\n';
 
     tx3g_segment_t *p_segment3g = tx3g_segment_New( psz_subtitle );
@@ -345,6 +342,7 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
     {
         text_segment_Delete( p_segment3g->s );
         free( p_segment3g );
+        block_Release( p_block );
         return VLCDEC_SUCCESS;
     }
 
@@ -354,17 +352,18 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
     {
         text_segment_Delete( p_segment3g->s );
         free( p_segment3g );
+        block_Release( p_block );
         return VLCDEC_SUCCESS;
     }
 
-    subpicture_updater_sys_t *p_spu_sys = p_spu->updater.p_sys;
+    subtext_updater_sys_t *p_spu_sys = p_spu->updater.sys;
     const text_style_t *p_root_style = (text_style_t *) p_dec->p_sys;
 
     mp4_box_iterator_t it;
-    mp4_box_iterator_Init( &it, p_buf,
-                           p_block->i_buffer - (p_buf - p_block->p_buffer) );
+    mp4_box_iterator_Init( &it, p_block->p_buffer + 2U + i_psz_bytelength,
+                           p_block->i_buffer - (2U + i_psz_bytelength) );
     /* Parse our styles */
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_QTXT )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_QTXT )
     while( mp4_box_iterator_Next( &it ) )
     {
         switch( it.i_type )
@@ -415,8 +414,8 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
     p_spu->i_start    = p_block->i_pts;
     p_spu->i_stop     = p_block->i_pts + p_block->i_length;
     p_spu->b_ephemer  = (p_block->i_length == 0);
-    p_spu->b_absolute = false;
 
+    p_spu_sys->region.b_absolute = false; p_spu_sys->region.b_in_window = false;
     p_spu_sys->region.align = SUBPICTURE_ALIGN_BOTTOM;
 
     text_style_Merge( p_spu_sys->p_default_style, p_root_style, true );
@@ -451,9 +450,9 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
 static void ParseExtradataTx3g( decoder_t *p_dec )
 {
     text_style_t *p_style = (text_style_t *) p_dec->p_sys;
-    const uint8_t *p_extra = p_dec->fmt_in.p_extra;
+    const uint8_t *p_extra = p_dec->fmt_in->p_extra;
 
-    if( p_dec->fmt_in.i_extra < 32 )
+    if( p_dec->fmt_in->i_extra < 32 )
         return;
 
     /* DF @0 */
@@ -481,26 +480,42 @@ static void ParseExtradataTx3g( decoder_t *p_dec )
 static void ParseExtradataTextMedia( decoder_t *p_dec )
 {
     text_style_t *p_style = (text_style_t *) p_dec->p_sys;
-    const uint8_t *p_extra = p_dec->fmt_in.p_extra;
+    const uint8_t *p_extra = p_dec->fmt_in->p_extra;
 
-    if( p_dec->fmt_in.i_extra < 44 )
+    if( p_dec->fmt_in->i_extra < 44 )
         return;
 
     /* DF @0 */
+    uint32_t i_flags = GetDWBE(p_extra);
+    if(i_flags & 0x1000) /* drop shadow */
+    {
+        p_style->i_style_flags |= STYLE_SHADOW;
+        p_style->i_features    |= STYLE_HAS_SHADOW_COLOR|STYLE_HAS_FLAGS|STYLE_HAS_SHADOW_ALPHA;
+        p_style->i_shadow_color = 0xC0C0C0;
+        p_style->i_shadow_alpha = STYLE_ALPHA_OPAQUE;
+    }
+    if(i_flags & 0x4000) /* key text*/
+    {
+        /*Controls background color. If this flag is set to 1, the text media handler does not display the
+          background color, so that the text overlay background tracks.*/
+        p_style->i_style_flags &= ~STYLE_BACKGROUND;
+    }
+
     /* Just @4 */
 
     /* BGColor @8, read top of 16 bits */
     p_style->i_background_color = (p_extra[8]  << 16) |
                                   (p_extra[10] <<  8) |
                                    p_extra[12];
-    p_style->i_features |= STYLE_HAS_BACKGROUND_COLOR;
+    p_style->i_features |= STYLE_HAS_BACKGROUND_COLOR | STYLE_HAS_BACKGROUND_ALPHA;
+    p_style->i_background_alpha = STYLE_ALPHA_OPAQUE;
 
     /* BoxRecord @14 */
     /* Reserved 64 @22 */
     /* Font # @30 */
 
     /* Font Face @32 */
-    p_style->i_style_flags = ConvertToVLCFlags( GetWBE(&p_extra[32]) );
+    p_style->i_style_flags |= ConvertToVLCFlags( GetWBE(&p_extra[32]) );
     if( p_style->i_style_flags )
         p_style->i_features |= STYLE_HAS_FLAGS;
     /* Reserved 8 @34 */
@@ -526,17 +541,21 @@ static int OpenDecoder( vlc_object_t *p_this )
 {
     decoder_t     *p_dec = (decoder_t *) p_this;
 
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_TX3G &&
-        p_dec->fmt_in.i_codec != VLC_CODEC_QTXT )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_TX3G &&
+        p_dec->fmt_in->i_codec != VLC_CODEC_QTXT )
         return VLC_EGENERIC;
 
     p_dec->pf_decode = Decode;
 
-    p_dec->p_sys = (decoder_sys_t *) text_style_Create( STYLE_NO_DEFAULTS );
+    p_dec->p_sys = text_style_Create( STYLE_NO_DEFAULTS );
     if( !p_dec->p_sys )
         return VLC_ENOMEM;
 
-    if( p_dec->fmt_in.i_codec == VLC_CODEC_TX3G )
+    text_style_t *p_default_style = p_dec->p_sys;
+    p_default_style->i_style_flags |= STYLE_BACKGROUND;
+    p_default_style->i_features |= STYLE_HAS_FLAGS;
+
+    if( p_dec->fmt_in->i_codec == VLC_CODEC_TX3G )
         ParseExtradataTx3g( p_dec );
     else
         ParseExtradataTextMedia( p_dec );
@@ -550,11 +569,13 @@ static int OpenDecoder( vlc_object_t *p_this )
  * Encoder entry/exit
  *****************************************************************************/
 #ifdef ENABLE_SOUT
-static void FillExtradataTx3g( void **pp_extra, int *pi_extra )
+static void FillExtradataTx3g(void **pp_extra, size_t *pi_extra)
 {
     size_t i_extra = 32 + 37;
     uint8_t *p_extra = calloc( 1, i_extra );
-    if( p_extra )
+    if (p_extra == NULL)
+        return;
+
     {
         p_extra[4] = 0x01;/* 1  center, horizontal */
         p_extra[5] = 0xFF;/* -1 bottom, vertical */
@@ -591,13 +612,14 @@ static int OpenEncoder( vlc_object_t *p_this )
 
     p_enc->fmt_in.i_codec = VLC_CODEC_TEXT;
 
-    p_enc->p_sys = NULL;
-
-    p_enc->pf_encode_sub = Encode;
-    p_enc->fmt_out.i_cat = SPU_ES;
-
     if( !p_enc->fmt_out.i_extra )
         FillExtradataTx3g( &p_enc->fmt_out.p_extra, &p_enc->fmt_out.i_extra );
+
+    static const struct vlc_encoder_operations ops =
+    {
+        .encode_sub = Encode,
+    };
+    p_enc->ops = &ops;
 
     return VLC_SUCCESS;
 }
@@ -619,9 +641,9 @@ static int ConvertFromVLCFlags( const text_style_t *p_style )
 
 static uint32_t ConvertFromVLCColor( const text_style_t *p_style )
 {
-    uint32_t rgba = 0;
+    uint32_t rgba;
     if( p_style->i_features & STYLE_HAS_FONT_COLOR )
-        rgba = ((uint32_t)p_style->i_font_color) << 8;
+        rgba = p_style->i_font_color << 8;
     else
         rgba = 0xFFFFFF00U;
     if( p_style->i_features & STYLE_HAS_FONT_ALPHA )
@@ -682,9 +704,9 @@ static block_t *GetStylBlock( const text_segment_t *p_segment, size_t i_styles )
 static block_t * Encode( encoder_t *p_enc, subpicture_t *p_spu )
 {
     VLC_UNUSED(p_enc);
-    const text_segment_t *p_segments = (p_spu->p_region)
-                                     ? p_spu->p_region->p_text
-                                     : NULL;
+    subpicture_region_t *p_region =
+        vlc_spu_regions_first_or_null(&p_spu->regions);
+    const text_segment_t *p_segments = p_region ? p_region->p_text : NULL;
     size_t i_len = 0;
     size_t i_styles = 0;
 

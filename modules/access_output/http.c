@@ -2,7 +2,6 @@
  * http.c
  *****************************************************************************
  * Copyright (C) 2001-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Remi Denis-Courmont
@@ -33,12 +32,12 @@
 #include <stdint.h>
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_sout.h>
 #include <vlc_block.h>
 
 
-#include <vlc_input.h>
 #include <vlc_httpd.h>
 
 /*****************************************************************************
@@ -68,16 +67,14 @@ vlc_module_begin ()
     set_capability( "sout access", 0 )
     set_shortname( "HTTP" )
     add_shortcut( "http", "https", "mmsh" )
-    set_category( CAT_SOUT )
     set_subcategory( SUBCAT_SOUT_ACO )
     add_string( SOUT_CFG_PREFIX "user", "",
-                USER_TEXT, USER_LONGTEXT, true )
-    add_password( SOUT_CFG_PREFIX "pwd", "",
-                  PASS_TEXT, PASS_LONGTEXT, true )
+                USER_TEXT, USER_LONGTEXT )
+    add_password(SOUT_CFG_PREFIX "pwd", "", PASS_TEXT, PASS_LONGTEXT)
     add_string( SOUT_CFG_PREFIX "mime", "",
-                MIME_TEXT, MIME_LONGTEXT, true )
+                MIME_TEXT, MIME_LONGTEXT )
     add_bool( SOUT_CFG_PREFIX "metacube", false,
-              METACUBE_TEXT, METACUBE_LONGTEXT, true )
+              METACUBE_TEXT, METACUBE_LONGTEXT )
     set_callbacks( Open, Close )
 vlc_module_end ()
 
@@ -92,7 +89,7 @@ static const char *const ppsz_sout_options[] = {
 static ssize_t Write( sout_access_out_t *, block_t * );
 static int Control( sout_access_out_t *, int, va_list );
 
-struct sout_access_out_sys_t
+typedef struct
 {
     /* host */
     httpd_host_t        *p_httpd_host;
@@ -107,7 +104,7 @@ struct sout_access_out_sys_t
     bool                b_header_complete;
     bool                b_metacube;
     bool                b_has_keyframes;
-};
+} sout_access_out_sys_t;
 
 /* Definitions for the Metacube2 protocol, used to communicate with Cubemap. */
 

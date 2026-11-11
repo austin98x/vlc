@@ -29,21 +29,22 @@
 
 #include <vector>
 #include <stack>
+#include <cstring>
 #include <vlc_xml.h>
 
 using namespace adaptive::xml;
 
 DOMParser::DOMParser() :
-    root( NULL ),
-    stream( NULL ),
-    vlc_reader( NULL )
+    root( nullptr ),
+    stream( nullptr ),
+    vlc_reader( nullptr )
 {
 }
 
 DOMParser::DOMParser    (stream_t *stream) :
-    root( NULL ),
+    root( nullptr ),
     stream( stream ),
-    vlc_reader( NULL )
+    vlc_reader( nullptr )
 {
 }
 
@@ -66,12 +67,12 @@ bool    DOMParser::parse                    (bool b)
     if(!vlc_reader && !(vlc_reader = xml_ReaderCreate(stream, stream)))
         return false;
 
-    const int i_flags = vlc_reader->obj.flags;
+    struct vlc_logger *const logger = vlc_reader->obj.logger;
     if(!b)
-        vlc_reader->obj.flags |= OBJECT_FLAGS_QUIET;
+        vlc_reader->obj.logger = nullptr;
     root = processNode(b);
-    vlc_reader->obj.flags = i_flags;
-    if ( root == NULL )
+    vlc_reader->obj.logger = logger;
+    if ( root == nullptr )
         return false;
 
     return true;
@@ -83,32 +84,37 @@ bool DOMParser::reset(stream_t *s)
     if(!vlc_reader)
         return true;
     delete root;
-    root = NULL;
-    vlc_reader = xml_ReaderReset(vlc_reader, s);
+    root = nullptr;
+
+    xml_ReaderDelete(vlc_reader);
+    vlc_reader = xml_ReaderCreate(s, s);
     return !!vlc_reader;
 }
 
 Node* DOMParser::processNode(bool b_strict)
 {
-    const char *data;
+    const char *data, *ns;
     int type;
     std::stack<Node *> lifo;
 
-    while( (type = xml_ReaderNextNode(vlc_reader, &data)) > 0 )
+    while( (type = xml_ReaderNextNodeNS(vlc_reader, &data, &ns)) > 0 )
     {
         switch(type)
         {
             case XML_READER_STARTELEM:
             {
+                Namespaces::Ptr ptr = nss.registerNamespace(ns);
                 bool empty = xml_ReaderIsEmptyElement(vlc_reader);
-                Node *node = new (std::nothrow) Node();
+                const char *unprefixed = std::strchr(data, ':');
+                data = unprefixed ? unprefixed + 1 : data;
+                auto name = std::make_unique<std::string>(data);
+                Node *node = new (std::nothrow) Node(std::move(name), ptr);
                 if(node)
                 {
                     if(!lifo.empty())
                         lifo.top()->addSubNode(node);
                     lifo.push(node);
 
-                    node->setName(std::string(data));
                     addAttributesToNode(node);
                 }
 
@@ -127,7 +133,7 @@ Node* DOMParser::processNode(bool b_strict)
             case XML_READER_ENDELEM:
             {
                 if(lifo.empty())
-                    return NULL;
+                    return nullptr;
 
                 Node *node = lifo.top();
                 lifo.pop();
@@ -143,12 +149,12 @@ Node* DOMParser::processNode(bool b_strict)
     while( lifo.size() > 1 )
         lifo.pop();
 
-    Node *node = (!lifo.empty()) ? lifo.top() : NULL;
+    Node *node = (!lifo.empty()) ? lifo.top() : nullptr;
 
     if(b_strict && node)
     {
         delete node;
-        return NULL;
+        return nullptr;
     }
 
     return node;
@@ -158,12 +164,14 @@ void    DOMParser::addAttributesToNode      (Node *node)
 {
     const char *attrValue;
     const char *attrName;
+    const char *ns;
 
-    while((attrName = xml_ReaderNextAttr(this->vlc_reader, &attrValue)) != NULL)
+    while((attrName = xml_ReaderNextAttrNS(this->vlc_reader, &attrValue, &ns)) != nullptr)
     {
+        Namespaces::Ptr ptr = nss.registerNamespace(ns ? ns : "");
         std::string key     = attrName;
         std::string value   = attrValue;
-        node->addAttribute(key, value);
+        node->addAttribute(key, ptr, value);
     }
 }
 void    DOMParser::print                    (Node *node, int offset)
@@ -173,10 +181,10 @@ void    DOMParser::print                    (Node *node, int offset)
 
     msg_Dbg(this->stream, "%s", node->getName().c_str());
 
-    std::vector<std::string> keys = node->getAttributeKeys();
+    const Node::Attributes &attributes = node->getAttributes();
 
-    for(size_t i = 0; i < keys.size(); i++)
-        msg_Dbg(this->stream, " %s=%s", keys.at(i).c_str(), node->getAttributeValue(keys.at(i)).c_str());
+    for(auto & attr : attributes)
+        msg_Dbg(this->stream, " %s=%s", attr.name.c_str(), attr.value.c_str());
 
     msg_Dbg(this->stream, "\n");
 

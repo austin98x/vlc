@@ -38,18 +38,22 @@
 static int  Open (vlc_object_t *);
 static void Close (vlc_object_t *);
 
+#define GME_PLAYBACK_LIMIT N_("Automatically use track length metadata as the fadeout time")
+
 vlc_module_begin ()
     set_shortname ("GME")
     set_description ("Game Music Emu")
-    set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_DEMUX)
+#if GME_VERSION >= 0x000603
+    add_bool("gme-playback-limit", false, GME_PLAYBACK_LIMIT, GME_PLAYBACK_LIMIT)
+#endif
     set_capability ("demux", 10)
     set_callbacks (Open, Close)
 vlc_module_end ()
 
 #define RATE 48000
 
-struct demux_sys_t
+typedef struct
 {
     Music_Emu   *emu;
     unsigned     track_id;
@@ -60,7 +64,7 @@ struct demux_sys_t
     input_title_t **titlev;
     unsigned        titlec;
     bool            title_changed;
-};
+} demux_sys_t;
 
 
 static int Demux (demux_t *);
@@ -107,6 +111,14 @@ static int Open (vlc_object_t *obj)
         free (sys);
         return VLC_ENOMEM;
     }
+
+    /* Autoload
+     * See https://github.com/libgme/game-music-emu/issues/77#issuecomment-1805027715 */
+#if GME_VERSION >= 0x000603
+    bool playback_limit = var_InheritBool(demux, "gme-playback-limit");
+    gme_set_autoload_playback_limit (sys->emu, playback_limit);
+#endif
+
     if (data)
     {
         gme_load_custom (sys->emu, ReaderBlock, data->i_buffer, data);
@@ -129,8 +141,14 @@ static int Open (vlc_object_t *obj)
     fmt.i_bitrate = RATE * 4;
 
     sys->es = es_out_Add (demux->out, &fmt);
+    if (unlikely(sys->es == NULL))
+    {
+        gme_delete (sys->emu);
+        free (sys);
+        return VLC_ENOMEM;
+    }
     date_Init (&sys->pts, RATE, 1);
-    date_Set (&sys->pts, 0);
+    date_Set(&sys->pts, VLC_TICK_0);
 
     /* Titles */
     unsigned n = gme_track_count (sys->emu);
@@ -150,7 +168,7 @@ static int Open (vlc_object_t *obj)
              continue;
          msg_Dbg (obj, "track %u: %s %d ms", i, infos->song, infos->length);
          if (infos->length != -1)
-             title->i_length = infos->length * INT64_C(1000);
+             title->i_length = VLC_TICK_FROM_MS(infos->length);
          if (infos->song[0])
              title->psz_name = strdup (infos->song);
          gme_free_info (infos);
@@ -210,7 +228,7 @@ static int Demux (demux_t *demux)
     {
         msg_Dbg (demux, "track %u ended", sys->track_id);
         if (++sys->track_id >= (unsigned)gme_track_count (sys->emu))
-            return 0;
+            return VLC_DEMUXER_EOF;
 
         sys->title_changed = true;
         gme_start_track (sys->emu, sys->track_id);
@@ -219,21 +237,21 @@ static int Demux (demux_t *demux)
 
     block_t *block = block_Alloc (2 * 2 * SAMPLES);
     if (unlikely(block == NULL))
-        return 0;
+        return VLC_DEMUXER_EOF;
 
     gme_err_t ret = gme_play (sys->emu, 2 * SAMPLES, (void *)block->p_buffer);
     if (ret != NULL)
     {
         block_Release (block);
         msg_Err (demux, "%s", ret);
-        return 0;
+        return VLC_DEMUXER_EOF;
     }
 
-    block->i_pts = block->i_dts = VLC_TS_0 + date_Get (&sys->pts);
+    block->i_pts = block->i_dts = date_Get (&sys->pts);
     es_out_SetPCR (demux->out, block->i_pts);
     es_out_Send (demux->out, sys->es, block);
     date_Increment (&sys->pts, SAMPLES);
-    return 1;
+    return VLC_DEMUXER_SUCCESS;
 }
 
 
@@ -272,7 +290,7 @@ static int Control (demux_t *demux, int query, va_list args)
              || (sys->titlev[sys->track_id]->i_length == 0))
                 break;
 
-            int seek = (sys->titlev[sys->track_id]->i_length / 1000) * pos;
+            int seek = MS_FROM_VLC_TICK(sys->titlev[sys->track_id]->i_length) * pos;
             if (gme_seek (sys->emu, seek))
                 break;
             return VLC_SUCCESS;
@@ -280,25 +298,22 @@ static int Control (demux_t *demux, int query, va_list args)
 
         case DEMUX_GET_LENGTH:
         {
-            int64_t *v = va_arg (args, int64_t *);
-
             if (unlikely(sys->track_id >= sys->titlec)
              || (sys->titlev[sys->track_id]->i_length == 0))
                 break;
-            *v = sys->titlev[sys->track_id]->i_length;
+            *va_arg (args, vlc_tick_t *) = sys->titlev[sys->track_id]->i_length;
             return VLC_SUCCESS;
         }
 
         case DEMUX_GET_TIME:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = gme_tell (sys->emu) * INT64_C(1000);
+            *va_arg (args, vlc_tick_t *) = VLC_TICK_FROM_MS(gme_tell (sys->emu));
             return VLC_SUCCESS;
         }
 
         case DEMUX_SET_TIME:
         {
-            int64_t v = va_arg (args, int64_t) / 1000;
+            int64_t v = MS_FROM_VLC_TICK( va_arg (args, vlc_tick_t) );
             if (v > INT_MAX || gme_seek (sys->emu, v))
                 break;
             return VLC_SUCCESS;

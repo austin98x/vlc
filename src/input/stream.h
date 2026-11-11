@@ -3,7 +3,6 @@
  *****************************************************************************
  * Copyright (C) 1998-2008 VLC authors and VideoLAN
  * Copyright (C) 2008 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -27,14 +26,25 @@
 
 #include <vlc_common.h>
 #include <vlc_stream.h>
+#include "input_internal.h"
+#include "mrl_helpers.h"
+
+stream_t *vlc_stream_CustomNew(vlc_object_t *parent,
+                               void (*destroy)(stream_t *), size_t extra_size,
+                               const char *type_name);
+void *vlc_stream_Private(stream_t *stream);
 
 /* */
 void stream_CommonDelete( stream_t *s );
 
+stream_t *vlc_stream_AttachmentNew(vlc_object_t *p_this,
+                                   input_attachment_t *attachment);
+
 /**
  * This function creates a raw stream_t from an URL.
  */
-stream_t *stream_AccessNew(vlc_object_t *, input_thread_t *, bool, const char *);
+stream_t *stream_AccessNew(vlc_object_t *, input_thread_t *, es_out_t *, bool,
+                           const char *);
 
 /**
  * Probes stream filters automatically.
@@ -49,7 +59,7 @@ stream_t *stream_AccessNew(vlc_object_t *, input_thread_t *, bool, const char *)
  * so on. Any attempt to access the original stream filter directly is
  * explicitly undefined.
  *
- * If, and only if, no filters were probed succesfully, a pointer to the
+ * If, and only if, no filters were probed successfully, a pointer to the
  * unchanged source stream will be returned. Otherwise, this returns a stream
  * filter. The return value is thus guaranteed to be non-NULL.
  *
@@ -83,6 +93,11 @@ stream_t *stream_FilterAutoNew( stream_t *source ) VLC_USED;
 stream_t *stream_FilterChainNew( stream_t *source, const char *list ) VLC_USED;
 
 /**
+ * \addtogroup stream_extractor_Internals
+ * @{
+ */
+
+/**
  * Attach \ref stream_extractor%s according to specified data
  *
  * This function will parse the passed data, and try to attach a \ref
@@ -101,16 +116,18 @@ stream_t *stream_FilterChainNew( stream_t *source, const char *list ) VLC_USED;
  *          stream-extractors referred to by `psz_data`, something which is not
  *          guaranteed.
  *
- * \param[out] source a pointer-to-pointer to stream where the attached
+ * \param[out] stream a pointer-to-pointer to stream where the attached
  *             stream-extractor will be applied. `*stream` will refer
  *             to the last successful attachment.
+ * \param      data the fragment data string to parse.
  * \param[out] out_extra `*out_extra` will point to any additional data
  *             in `psz_data` that does not specify an entity (if any).
  * \return VLC_SUCCESS on success, an error-code on failure
  **/
-int stream_extractor_AttachParsed( stream_t** stream, const char* psz_data,
-                                   char const** out_extra );
+int stream_extractor_AttachParsed( stream_t** stream, const struct mrl_info * );
 
-char *get_path(const char *location);
+/**
+ * @}
+ */
 
 #endif

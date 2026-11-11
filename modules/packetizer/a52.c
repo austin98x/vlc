@@ -2,7 +2,6 @@
  * a52.c: parse A/52 audio sync info and packetize the stream
  *****************************************************************************
  * Copyright (C) 2001-2016 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Stéphane Borel <stef@via.ecp.fr>
  *          Christophe Massiot <massiot@via.ecp.fr>
@@ -46,19 +45,20 @@ static int  Open( vlc_object_t * );
 static void Close( vlc_object_t * );
 
 vlc_module_begin ()
-    set_category(CAT_SOUT)
     set_subcategory(SUBCAT_SOUT_PACKETIZER)
     set_description( N_("A/52 audio packetizer") )
-    set_capability( "packetizer", 10 )
+    set_capability( "audio packetizer", 10 )
     set_callbacks( Open, Close )
 vlc_module_end ()
 
-struct decoder_sys_t
+static const uint8_t startcode[2] = { 0x0b, 0x77 };
+
+typedef struct
 {
     /*
      * Input properties
      */
-    int i_state;
+    enum vlc_packetizer_state i_state;
 
     block_bytestream_t bytestream;
 
@@ -66,20 +66,21 @@ struct decoder_sys_t
      * Common properties
      */
     date_t  end_date;
-    mtime_t i_prev_bytestream_pts;
+    vlc_tick_t i_prev_bytestream_pts;
     bool    b_discontuinity;
 
     vlc_a52_header_t frame;
-};
+    size_t  i_input_size;
+} decoder_sys_t;
 
 static void PacketizeFlush( decoder_t *p_dec )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
 
     p_sys->b_discontuinity = true;
-    date_Set( &p_sys->end_date, VLC_TS_INVALID );
+    date_Set( &p_sys->end_date, VLC_TICK_INVALID );
     p_sys->i_state = STATE_NOSYNC;
-    p_sys->i_prev_bytestream_pts = VLC_TS_INVALID;
+    p_sys->i_prev_bytestream_pts = VLC_TICK_INVALID;
     block_BytestreamEmpty( &p_sys->bytestream );
 }
 
@@ -89,7 +90,7 @@ static block_t *GetOutBuffer( decoder_t *p_dec )
 
     assert( p_sys->frame.i_rate > 0 );
 
-    block_t *p_block = block_Alloc( p_sys->frame.i_size );
+    block_t *p_block = block_Alloc( p_sys->i_input_size );
     if( p_block == NULL )
         return NULL;
 
@@ -103,11 +104,25 @@ static block_t *GetOutBuffer( decoder_t *p_dec )
             date_Init( &p_sys->end_date, p_sys->frame.i_rate, 1 );
     }
 
-    if( p_sys->bytestream.p_block->i_pts != date_Get( &p_sys->end_date ) &&
-        p_sys->bytestream.p_block->i_pts != VLC_TS_INVALID )
+    block_t *p_bshead = p_sys->bytestream.p_block;
+    /* Ensure we can recover if there's only dts set */
+    if( date_Get( &p_sys->end_date ) == VLC_TICK_INVALID && p_bshead->i_pts == VLC_TICK_INVALID )
+        p_bshead->i_pts = p_bshead->i_dts;
+
+    if( p_bshead->i_pts != VLC_TICK_INVALID && p_bshead->i_pts != date_Get( &p_sys->end_date ) )
     {
-        date_Set( &p_sys->end_date, p_sys->bytestream.p_block->i_pts );
-        p_sys->bytestream.p_block->i_pts = VLC_TS_INVALID;
+        /* Make sure we don't reuse the same pts twice
+         * as A/52 in PES sends multiple times the same pts */
+        if( p_sys->bytestream.p_block->i_pts != p_sys->i_prev_bytestream_pts )
+        {
+            date_t tempdate = p_sys->end_date;
+            date_Increment( &tempdate, p_sys->frame.i_samples );
+            vlc_tick_t samplesduration = date_Get( &tempdate ) - date_Get( &p_sys->end_date );
+            if( llabs(p_sys->bytestream.p_block->i_pts  - date_Get( &p_sys->end_date )) > samplesduration )
+                date_Set( &p_sys->end_date, p_sys->bytestream.p_block->i_pts );
+            p_sys->i_prev_bytestream_pts = p_sys->bytestream.p_block->i_pts;
+            p_sys->bytestream.p_block->i_pts = VLC_TICK_INVALID;
+        }
     }
 
     p_dec->fmt_out.audio.i_rate     = p_sys->frame.i_rate;
@@ -123,7 +138,7 @@ static block_t *GetOutBuffer( decoder_t *p_dec )
 
     p_block->i_nb_samples = p_sys->frame.i_samples;
     p_block->i_pts = p_block->i_dts = date_Get( &p_sys->end_date );
-    if( p_block->i_pts != VLC_TS_INVALID )
+    if( p_block->i_pts != VLC_TICK_INVALID )
         p_block->i_length = date_Increment( &p_sys->end_date,
                                             p_block->i_nb_samples ) - p_block->i_pts;
 
@@ -133,7 +148,7 @@ static block_t *GetOutBuffer( decoder_t *p_dec )
 static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
-    uint8_t p_header[VLC_A52_HEADER_SIZE];
+    uint8_t p_header[VLC_A52_MIN_HEADER_SIZE];
     block_t *p_out_buffer;
 
     block_t *p_block = pp_block ? *pp_block : NULL;
@@ -156,15 +171,6 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
             }
         }
 
-        /* Make sure we don't reuse the same pts twice */
-        if( p_block->i_pts > VLC_TS_INVALID )
-        {
-            if( p_block->i_pts == p_sys->i_prev_bytestream_pts )
-                p_block->i_pts = VLC_TS_INVALID;
-            else
-                p_sys->i_prev_bytestream_pts = p_block->i_pts;
-        }
-
         block_BytestreamPush( &p_sys->bytestream, p_block );
     }
 
@@ -173,15 +179,16 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
         switch( p_sys->i_state )
         {
         case STATE_NOSYNC:
-            while( block_PeekBytes( &p_sys->bytestream, p_header, 2 )
+            while( block_PeekBytes( &p_sys->bytestream, p_header, sizeof(startcode) )
                    == VLC_SUCCESS )
             {
-                if( p_header[0] == 0x0b && p_header[1] == 0x77 )
+                if( !memcmp(p_header, startcode, sizeof(startcode)) )
                 {
                     p_sys->i_state = STATE_SYNC;
                     break;
                 }
-                block_SkipByte( &p_sys->bytestream );
+
+                (void) block_SkipByte( &p_sys->bytestream );
             }
             if( p_sys->i_state != STATE_SYNC )
             {
@@ -199,15 +206,15 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
         case STATE_HEADER:
             /* Get A/52 frame header (VLC_A52_HEADER_SIZE bytes) */
             if( block_PeekBytes( &p_sys->bytestream, p_header,
-                                 VLC_A52_HEADER_SIZE ) != VLC_SUCCESS )
+                                 VLC_A52_MIN_HEADER_SIZE ) != VLC_SUCCESS )
             {
                 /* Need more data */
                 return NULL;
             }
 
             /* Check if frame is valid and get frame info */
-            vlc_a52_header_t a52;
-            if( vlc_a52_header_Parse( &a52, p_header, VLC_A52_HEADER_SIZE ) )
+            if( vlc_a52_header_Parse( &p_sys->frame, p_header,
+                                      VLC_A52_MIN_HEADER_SIZE ) != VLC_SUCCESS )
             {
                 msg_Dbg( p_dec, "emulated sync word" );
                 block_SkipByte( &p_sys->bytestream );
@@ -215,30 +222,25 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
                 break;
             }
 
-            if( a52.b_eac3 && a52.eac3.strmtyp != EAC3_STRMTYP_INDEPENDENT )
+            if( p_sys->frame.b_eac3 && p_sys->frame.bs.eac3.strmtyp == EAC3_STRMTYP_DEPENDENT )
             {
-                /* Use the channel configuration of the independent stream */
-                if( !p_sys->frame.i_blocks_per_sync_frame )
-                {
-                    /* Not synced on main stream yet */
-                    block_SkipByte( &p_sys->bytestream );
-                    p_sys->i_state = STATE_NOSYNC;
-                    break;
-                }
-                p_sys->frame.i_samples = a52.i_samples;
-                p_sys->frame.i_size = a52.i_size;
+                msg_Warn( p_dec, "starting with dependent stream, skip it" );
+                p_sys->i_state = STATE_NOSYNC;
+                if( block_SkipBytes( &p_sys->bytestream,
+                                     p_sys->frame.i_size ) != VLC_SUCCESS )
+                    return NULL;
+                break;
             }
-            else
-                p_sys->frame = a52;
 
+            p_sys->i_input_size = p_sys->frame.i_size;
             p_sys->i_state = STATE_NEXT_SYNC;
             /* fallthrough */
 
         case STATE_NEXT_SYNC:
             /* Check if next expected frame contains the sync word */
-            if( block_PeekOffsetBytes( &p_sys->bytestream,
-                                       p_sys->frame.i_size, p_header, 2 )
-                != VLC_SUCCESS )
+            if( block_PeekOffsetBytes( &p_sys->bytestream, p_sys->i_input_size,
+                                       p_header, VLC_A52_MIN_HEADER_SIZE )
+                                       != VLC_SUCCESS )
             {
                 if( p_block == NULL ) /* drain */
                 {
@@ -249,28 +251,50 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
                 return NULL;
             }
 
-            if( p_header[0] == 0 && p_header[1] == 0 )
+            if( p_header[0] == 0 || p_header[1] == 0 )
             {
                 /* A52 wav files and audio CD's use stuffing */
                 p_sys->i_state = STATE_GET_DATA;
                 break;
             }
 
-            if( p_header[0] != 0x0b || p_header[1] != 0x77 )
+            if( memcmp(p_header, startcode, sizeof(startcode)) )
             {
                 msg_Dbg( p_dec, "emulated sync word "
                          "(no sync on following frame)" );
-                p_sys->i_state = STATE_NOSYNC;
-                block_SkipByte( &p_sys->bytestream );
-                break;
+                size_t offset = VLC_A52_MIN_HEADER_SIZE;
+                if( !block_FindStartcodeFromOffset( &p_sys->bytestream, &offset,
+                                                    startcode, sizeof(startcode),
+                                                    NULL, NULL ) )
+                {
+                    if( offset < p_sys->i_input_size )
+                        p_sys->i_input_size = offset;
+                    /* else will resync after read */
+                }
+                else
+                {
+                    p_sys->i_state = STATE_NOSYNC;
+                    block_SkipByte( &p_sys->bytestream );
+                    break;
+                }
             }
+
+            vlc_a52_header_t a52;
+            if( !vlc_a52_header_Parse( &a52, p_header, VLC_A52_MIN_HEADER_SIZE )
+             && a52.b_eac3 && a52.bs.eac3.strmtyp == EAC3_STRMTYP_DEPENDENT )
+            {
+                p_sys->i_input_size += a52.i_size;
+                p_dec->fmt_out.i_codec = VLC_CODEC_A52;
+                p_dec->fmt_out.i_profile = VLC_A52_PROFILE_EAC3_DEPENDENT;
+            }
+
             p_sys->i_state = STATE_GET_DATA;
             break;
 
         case STATE_GET_DATA:
             /* Make sure we have enough data. */
             if( block_WaitBytes( &p_sys->bytestream,
-                                 p_sys->frame.i_size ) != VLC_SUCCESS )
+                                 p_sys->i_input_size ) != VLC_SUCCESS )
             {
                 /* Need more data */
                 return NULL;
@@ -287,11 +311,11 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
             /* Copy the whole frame into the buffer. When we reach this point
              * we already know we have enough data available. */
             block_GetBytes( &p_sys->bytestream, p_out_buffer->p_buffer,
-                            __MIN( p_sys->frame.i_size, p_out_buffer->i_buffer ) );
+                            p_out_buffer->i_buffer );
 
             p_sys->i_state = STATE_NOSYNC;
 
-            if( p_out_buffer->i_dts == VLC_TS_INVALID )
+            if( p_out_buffer->i_dts == VLC_TICK_INVALID )
             {
                 block_Release( p_out_buffer );
                 return NULL;
@@ -308,6 +332,9 @@ static block_t *PacketizeBlock( decoder_t *p_dec, block_t **pp_block )
                 *pp_block = block_BytestreamPop( &p_sys->bytestream );
 
             return p_out_buffer;
+
+        case STATE_CUSTOM_FIRST:
+            break; // do nothing
         }
     }
 }
@@ -327,7 +354,7 @@ static int Open( vlc_object_t *p_this )
     decoder_t *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
 
-    switch( p_dec->fmt_in.i_codec )
+    switch( p_dec->fmt_in->i_codec )
     {
     case VLC_CODEC_EAC3:
     case VLC_CODEC_A52:
@@ -343,20 +370,21 @@ static int Open( vlc_object_t *p_this )
 
     /* Misc init */
     p_sys->i_state = STATE_NOSYNC;
-    date_Set( &p_sys->end_date, VLC_TS_INVALID );
+    date_Set( &p_sys->end_date, VLC_TICK_INVALID );
     p_sys->b_discontuinity = false;
-    p_sys->i_prev_bytestream_pts = VLC_TS_INVALID;
+    p_sys->i_prev_bytestream_pts = VLC_TICK_INVALID;
     memset(&p_sys->frame, 0, sizeof(vlc_a52_header_t));
 
     block_BytestreamInit( &p_sys->bytestream );
 
     /* Set output properties (Passthrough ONLY) */
-    p_dec->fmt_out.i_codec = p_dec->fmt_in.i_codec;
-    p_dec->fmt_out.audio = p_dec->fmt_in.audio;
+    p_dec->fmt_out.i_codec = p_dec->fmt_in->i_codec;
+    p_dec->fmt_out.audio = p_dec->fmt_in->audio;
     p_dec->fmt_out.audio.i_rate = 0;
 
     /* Set callback */
     p_dec->pf_packetize = PacketizeBlock;
     p_dec->pf_flush     = PacketizeFlush;
+    p_dec->pf_get_cc    = NULL;
     return VLC_SUCCESS;
 }

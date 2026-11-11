@@ -2,7 +2,6 @@
  * vlc_access.h: Access descriptor, queries and methods
  *****************************************************************************
  * Copyright (C) 1999-2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -72,6 +71,7 @@ VLC_API int access_vaDirectoryControlHelper( stream_t *p_access, int i_query, va
         p_access->pf_block = (block); \
         p_access->pf_control = (control); \
         p_access->pf_seek = (seek); \
+        p_access->pf_demux = NULL; \
     } while(0)
 
 /**

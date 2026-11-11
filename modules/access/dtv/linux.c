@@ -38,8 +38,8 @@
 #include <linux/dvb/frontend.h>
 #include <linux/dvb/dmx.h>
 
-#include "dtv/dtv.h"
-#include "dtv/en50221.h"
+#include "dtv.h"
+#include "en50221.h"
 
 #ifndef O_SEARCH
 # define O_SEARCH O_RDONLY
@@ -114,7 +114,7 @@ static int dvb_parse_modulation (const char *str, int def)
         { "QAM",     QAM_AUTO },
         { "QPSK",   QPSK      },
     };
-    return dvb_parse_str (str, mods, sizeof (mods) / sizeof (*mods), def);
+    return dvb_parse_str (str, mods, ARRAY_SIZE(mods), def);
 }
 
 static int dvb_parse_fec (uint32_t fec)
@@ -136,8 +136,7 @@ static int dvb_parse_fec (uint32_t fec)
         { VLC_FEC(9,10), FEC_9_10 },
         { VLC_FEC_AUTO,  FEC_AUTO },
     };
-    return dvb_parse_int (fec, rates, sizeof (rates) / sizeof (*rates),
-                          FEC_AUTO);
+    return dvb_parse_int (fec, rates, ARRAY_SIZE(rates), FEC_AUTO);
 }
 
 
@@ -476,6 +475,7 @@ static int dvb_open_frontend (dvb_device_t *d)
  */
 unsigned dvb_enum_systems (dvb_device_t *d)
 {
+    unsigned systems = 0;
     if (dvb_open_frontend (d))
         return 0;
 #if DVBv5(5)
@@ -516,7 +516,6 @@ unsigned dvb_enum_systems (dvb_device_t *d)
         //[SYS_TURBO]
         [SYS_DVBC_ANNEX_C] = DTV_DELIVERY_ISDB_C, // another name for ISDB-C?
     };
-    unsigned systems = 0;
 
     msg_Dbg (d->obj, "probing frontend (kernel API v%u.%u, user API v%u.%u)",
              prop[0].u.data >> 8, prop[0].u.data & 0xFF,
@@ -526,7 +525,7 @@ unsigned dvb_enum_systems (dvb_device_t *d)
     {
         unsigned sys = prop[1].u.buffer.data[i];
 
-        if (sys >= (sizeof (systab) / sizeof (systab[0])) || !systab[sys])
+        if (sys >= ARRAY_SIZE(systab) || !systab[sys])
         {
             msg_Warn (d->obj, "unknown delivery system %u", sys);
             continue;
@@ -546,7 +545,6 @@ legacy:
         .num = 1,
         .props = prop
     };
-    unsigned systems = 0;
 #endif
     if (ioctl (d->frontend, FE_GET_PROPERTY, &props) < 0)
     {
@@ -633,7 +631,7 @@ float dvb_get_snr (dvb_device_t *d)
     return snr / 65535.;
 }
 
-bool dvb_set_ca_pmt (dvb_device_t *d, en50221_capmt_info_t *p_capmtinfo)
+bool dvb_set_ca_pmt (dvb_device_t *d, const en50221_capmt_info_t *p_capmtinfo)
 {
     if (d->cam != NULL)
     {
@@ -783,7 +781,7 @@ int dvb_set_sec (dvb_device_t *d, uint64_t freq_Hz, char pol,
         };
         uint_fast16_t mHz = freq / 1000;
 
-        for (size_t i = 0; i < sizeof (tab) / sizeof (tab[0]); i++)
+        for (size_t i = 0; i < ARRAY_SIZE(tab); i++)
              if (mHz >= tab[i].min && mHz <= tab[i].max)
              {
                  lowf = tab[i].low * 1000;
@@ -821,7 +819,7 @@ known:
     unsigned satno = var_InheritInteger (d->obj, "dvb-satno");
     if (satno > 0)
     {
-#undef msleep /* we know what we are doing! */
+#undef vlc_tick_sleep /* we know what we are doing! */
 
         /* DiSEqC Bus Specification:
  http://www.eutelsat.com/satellites/pdf/Diseqc/Reference%20docs/bus_spec.pdf */
@@ -843,7 +841,7 @@ known:
         cmd.msg[4] = cmd.msg[5] = 0; /* unused */
         cmd.msg_len = 4; /* length */
 
-        msleep (15000); /* wait 15 ms before DiSEqC command */
+        vlc_tick_sleep (VLC_TICK_FROM_MS(15)); /* wait 15 ms before DiSEqC command */
         unsigned uncommitted = var_InheritInteger (d->obj, "dvb-uncommitted");
         if (uncommitted > 0)
         {
@@ -872,7 +870,7 @@ known:
                        vlc_strerror_c(errno));
               return -1;
           }
-          msleep(125000); /* wait 125 ms before committed DiSEqC command */
+          vlc_tick_sleep(VLC_TICK_FROM_MS(125)); /* wait 125 ms before committed DiSEqC command */
         }
         if (ioctl (d->frontend, FE_DISEQC_SEND_MASTER_CMD, &cmd) < 0)
         {
@@ -880,7 +878,7 @@ known:
                      vlc_strerror_c(errno));
             return -1;
         }
-        msleep (54000 + 15000);
+        vlc_tick_sleep (VLC_TICK_FROM_MS(54 + 15));
 
         /* Mini-DiSEqC */
         satno &= 1;
@@ -891,7 +889,7 @@ known:
                      vlc_strerror_c(errno));
             return -1;
         }
-        msleep (15000);
+        vlc_tick_sleep (VLC_TICK_FROM_MS(15));
     }
 
     /* Continuous tone (to select high oscillator frequency) */
@@ -983,8 +981,7 @@ static int dvb_parse_transmit_mode (int i)
         { 32, TRANSMISSION_MODE_32K  },
 #endif
     };
-    return dvb_parse_int (i, tab, sizeof (tab) / sizeof (*tab),
-                          TRANSMISSION_MODE_AUTO);
+    return dvb_parse_int (i, tab, ARRAY_SIZE(tab), TRANSMISSION_MODE_AUTO);
 }
 
 static int dvb_parse_guard (uint32_t guard)
@@ -1001,8 +998,7 @@ static int dvb_parse_guard (uint32_t guard)
 #endif
         { VLC_GUARD_AUTO,    GUARD_INTERVAL_AUTO },
     };
-    return dvb_parse_int (guard, tab, sizeof (tab) / sizeof (*tab),
-                          GUARD_INTERVAL_AUTO);
+    return dvb_parse_int (guard, tab, ARRAY_SIZE(tab), GUARD_INTERVAL_AUTO);
 }
 
 static int dvb_parse_hierarchy (int i)
@@ -1014,8 +1010,7 @@ static int dvb_parse_hierarchy (int i)
         { HIERARCHY_2,     2 },
         { HIERARCHY_4,     4 },
     };
-    return dvb_parse_int (i, tab, sizeof (tab) / sizeof (*tab),
-                          HIERARCHY_AUTO);
+    return dvb_parse_int (i, tab, ARRAY_SIZE(tab), HIERARCHY_AUTO);
 }
 
 int dvb_set_dvbt (dvb_device_t *d, uint32_t freq, const char *modstr,

@@ -2,10 +2,9 @@
  * vlc_url.h: URL related macros
  *****************************************************************************
  * Copyright (C) 2002-2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Christophe Massiot <massiot@via.ecp.fr>
- *          Rémi Denis-Courmont <rem # videolan.org>
+ *          Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -26,9 +25,9 @@
 # define VLC_URL_H
 
 /**
- * \file
- * This file defines functions for manipulating URL in vlc
- *
+ * \file vlc_url.h
+ * \ingroup url
+ * \defgroup url Uniform Resource Locator (URL)
  * \ingroup strings
  * @{
  */
@@ -68,7 +67,7 @@ VLC_API char *vlc_uri2path(const char *url) VLC_MALLOC;
  * \warning <b>This function does NOT decode entire URIs.</b>
  * URI can only be decoded (and encoded) one component at a time
  * (e.g. the host name, one directory, the file name).
- * Complete URIs are always "encoded" (or they are syntaxically invalid).
+ * Complete URIs are always "encoded" (or they are syntactically invalid).
  * See IETF RFC3986, especially §2.4 for details.
  *
  * \note URI encoding is <b>different</b> from Javascript escaping. Especially,
@@ -144,16 +143,17 @@ VLC_API char *vlc_uri_fixup(const char *) VLC_MALLOC;
 
 struct vlc_url_t
 {
-    char *psz_protocol;
+    const char *psz_protocol;
     char *psz_username;
     char *psz_password;
     char *psz_host;
     unsigned i_port;
     char *psz_path;
     char *psz_option;
+    char *psz_fragment;
 
-    char *psz_buffer; /* to be freed */
-    char *psz_pathbuffer; /* to be freed */
+    void *psz_buffer; /* to be freed */
+    void *psz_pathbuffer; /* to be freed */
 };
 
 /**

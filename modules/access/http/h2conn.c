@@ -26,13 +26,15 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdlib.h>
-#ifdef HAVE_POLL
+#ifdef HAVE_POLL_H
 # include <poll.h>
 #endif
 #ifdef HAVE_SYS_UIO_H
 # include <sys/uio.h>
 #endif
 #include <vlc_common.h>
+#include <vlc_threads.h>
+#include <vlc_poll.h>
 #include <vlc_block.h>
 #include <vlc_interrupt.h>
 #include <vlc_tls.h>
@@ -55,6 +57,11 @@ struct vlc_h2_conn
     struct vlc_h2_stream *streams; /**< List of open streams */
     uint32_t next_id; /**< Next free stream identifier */
     bool released; /**< Connection released by owner */
+
+    uint32_t max_send_frame; /**< Maximum sent frame size */
+    uint32_t init_send_cwnd; /**< Initial send congestion window */
+    uint64_t send_cwnd; /**< Send congestion window */
+    vlc_cond_t send_wait;
 
     vlc_mutex_t lock; /**< State machine lock */
     vlc_thread_t thread; /**< Receive thread */
@@ -80,6 +87,9 @@ struct vlc_h2_stream
     struct vlc_h2_frame *recv_head; /**< Earliest pending received buffer */
     struct vlc_h2_frame **recv_tailp; /**< Tail of receive queue */
     vlc_cond_t recv_wait;
+
+    uint64_t send_cwnd; /**< Send congestion window */
+    vlc_cond_t send_wait;
 };
 
 static int vlc_h2_conn_queue(struct vlc_h2_conn *conn, struct vlc_h2_frame *f)
@@ -176,7 +186,6 @@ static int vlc_h2_stream_data(void *ctx, struct vlc_h2_frame *f)
         free(f);
         return vlc_h2_stream_fatal(s, VLC_H2_FLOW_CONTROL_ERROR);
     }
-    s->recv_cwnd -= len;
 
     *(s->recv_tailp) = f;
     s->recv_tailp = &f->next;
@@ -207,6 +216,22 @@ static int vlc_h2_stream_reset(void *ctx, uint_fast32_t code)
     s->recv_err = ECONNRESET;
     vlc_cond_broadcast(&s->recv_wait);
     return 0;
+}
+
+/** Reports remote window size increments */
+static void vlc_h2_stream_window_update(void *ctx, uint_fast32_t credit)
+{
+    struct vlc_h2_stream *s = ctx;
+
+    /* In the extremely unlikely event of an overflow, the window will be
+     * treated as negative, and we will stop sending: the peer is definitely
+     * insanely broken anyway.
+     */
+    s->send_cwnd += credit;
+    vlc_cond_broadcast(&s->send_wait);
+
+    vlc_http_dbg(SO(s), "stream %"PRIu32" window update: +%"PRIuFAST32" to "
+                 "%"PRIu64, s->id, credit, s->send_cwnd);
 }
 
 static void vlc_h2_stream_wake_up(void *data)
@@ -244,11 +269,7 @@ static struct vlc_http_msg *vlc_h2_stream_wait(struct vlc_http_stream *stream)
 
     vlc_h2_stream_lock(s);
     while ((m = s->recv_hdr) == NULL && !s->recv_end && !s->interrupted)
-    {
-        mutex_cleanup_push(&conn->lock);
         vlc_cond_wait(&s->recv_wait, &conn->lock);
-        vlc_cleanup_pop();
-    }
     s->recv_hdr = NULL;
     vlc_h2_stream_unlock(s);
 
@@ -256,6 +277,93 @@ static struct vlc_http_msg *vlc_h2_stream_wait(struct vlc_http_stream *stream)
     if (m != NULL)
         vlc_http_msg_attach(m, stream);
     return m;
+}
+
+static ssize_t vlc_h2_stream_write(struct vlc_http_stream *stream,
+                                   const void *base, size_t length, bool eos)
+{
+    struct vlc_h2_stream *s =
+        container_of(stream, struct vlc_h2_stream, stream);
+    struct vlc_h2_conn *conn = s->conn;
+    ssize_t total = 0;
+    int err = 0;
+
+    if (unlikely(length == 0 && !eos))
+        return 0;
+
+    vlc_h2_stream_lock(s);
+    do
+    {
+        size_t size = length;
+
+        /* This and the following flow control comparison and subtraction all
+         * assumes that we do *not* use any padding on the data frames.
+         */
+        if (size > conn->max_send_frame)
+            size = conn->max_send_frame;
+
+        /* Stream flow control */
+        if (size > s->send_cwnd)
+            size = s->send_cwnd;
+        if (size == 0 && length > 0)
+        {
+            if (s->interrupted)
+            {
+                err = EINTR;
+                break;
+            }
+
+            vlc_cond_wait(&s->send_wait, &conn->lock);
+            continue;
+        }
+
+        /* Connection flow control */
+        if (size > conn->send_cwnd)
+            size = conn->send_cwnd;
+        if (size == 0 && length > 0)
+        {
+            if (s->interrupted)
+            {
+                err = EINTR;
+                break;
+            }
+
+            vlc_cond_wait(&conn->send_wait, &conn->lock);
+            continue;
+        }
+
+        /* Frame send */
+        bool end = eos && length == size;
+        struct vlc_h2_frame *f = vlc_h2_frame_data(s->id, base, size, end);
+
+        if (f == NULL)
+        {
+            err = ENOMEM;
+            break;
+        }
+
+        if (vlc_h2_conn_queue(conn, f))
+        {
+            err = ECONNRESET;
+            break;
+        }
+
+        if (likely(size > 0))
+            base = (const char *)base + size;
+        length -= size;
+        total += size;
+        s->send_cwnd -= size;
+        conn->send_cwnd -= size;
+    }
+    while (length > 0);
+    vlc_h2_stream_unlock(s);
+
+    if (total == 0 && err != 0)
+    {
+        errno = err;
+        total = -1;
+    }
+    return total;
 }
 
 /**
@@ -276,11 +384,7 @@ static block_t *vlc_h2_stream_read(struct vlc_http_stream *stream)
 
     vlc_h2_stream_lock(s);
     while ((f = s->recv_head) == NULL && !s->recv_end && !s->interrupted)
-    {
-        mutex_cleanup_push(&conn->lock);
         vlc_cond_wait(&s->recv_wait, &conn->lock);
-        vlc_cleanup_pop();
-    }
 
     if (f == NULL)
     {
@@ -302,6 +406,12 @@ static block_t *vlc_h2_stream_read(struct vlc_http_stream *stream)
         s->recv_tailp = &s->recv_head;
     }
 
+    size_t len;
+    uint8_t *buf = vlc_h2_frame_data_get(f, &len);
+
+    assert(s->recv_cwnd >= len);
+    s->recv_cwnd -= len;
+
     /* Credit the receive window if missing credit exceeds 50%. */
     uint_fast32_t credit = VLC_H2_INIT_WINDOW - s->recv_cwnd;
     if (credit >= (VLC_H2_INIT_WINDOW / 2)
@@ -317,9 +427,6 @@ static block_t *vlc_h2_stream_read(struct vlc_http_stream *stream)
         vlc_h2_stream_error(conn, s->id, VLC_H2_INTERNAL_ERROR);
         return vlc_http_error;
     }
-
-    size_t len;
-    uint8_t *buf = vlc_h2_frame_data_get(f, &len);
 
     assert(block->i_buffer >= len);
     assert(block->p_buffer <= buf);
@@ -371,7 +478,6 @@ static void vlc_h2_stream_close(struct vlc_http_stream *stream, bool aborted)
         free(f);
     }
 
-    vlc_cond_destroy(&s->recv_wait);
     free(s);
 
     if (destroy)
@@ -381,6 +487,7 @@ static void vlc_h2_stream_close(struct vlc_http_stream *stream, bool aborted)
 static const struct vlc_http_stream_cbs vlc_h2_stream_callbacks =
 {
     vlc_h2_stream_wait,
+    vlc_h2_stream_write,
     vlc_h2_stream_read,
     vlc_h2_stream_close,
 };
@@ -394,11 +501,13 @@ static const struct vlc_http_stream_cbs vlc_h2_stream_callbacks =
  * Headers are sent asynchronously. To obtain the result and answer from the
  * other end, use vlc_http_stream_recv_headers().
  *
+ * \param c the HTTP connection to initialize the stream from
  * \param msg HTTP message headers (including response status or request)
+ * \param has_data whether the HTTP request will have a request payload
  * \return an HTTP stream, or NULL on error
  */
 static struct vlc_http_stream *vlc_h2_stream_open(struct vlc_http_conn *c,
-                                                const struct vlc_http_msg *msg)
+                                 const struct vlc_http_msg *msg, bool has_data)
 {
     struct vlc_h2_conn *conn = container_of(c, struct vlc_h2_conn, conn);
     struct vlc_h2_stream *s = malloc(sizeof (*s));
@@ -415,6 +524,8 @@ static struct vlc_http_stream *vlc_h2_stream_open(struct vlc_http_conn *c,
     s->recv_head = NULL;
     s->recv_tailp = &s->recv_head;
     vlc_cond_init(&s->recv_wait);
+    vlc_cond_init(&s->send_wait);
+    s->send_cwnd = conn->init_send_cwnd;
 
     vlc_mutex_lock(&conn->lock);
     assert(!conn->released); /* Caller is buggy! */
@@ -428,7 +539,7 @@ static struct vlc_http_stream *vlc_h2_stream_open(struct vlc_http_conn *c,
     s->id = conn->next_id;
     conn->next_id += 2;
 
-    struct vlc_h2_frame *f = vlc_http_msg_h2_frame(msg, s->id, true);
+    struct vlc_h2_frame *f = vlc_http_msg_h2_frame(msg, s->id, !has_data);
     if (f == NULL)
         goto error;
 
@@ -443,12 +554,27 @@ static struct vlc_http_stream *vlc_h2_stream_open(struct vlc_http_conn *c,
 
 error:
     vlc_mutex_unlock(&conn->lock);
-    vlc_cond_destroy(&s->recv_wait);
     free(s);
     return NULL;
 }
 
 /* Global/Connection frame callbacks */
+
+static void vlc_h2_initial_window_update(struct vlc_h2_conn *conn,
+                                         uint_fast32_t value)
+{
+    uint64_t delta = (uint64_t)value - conn->init_send_cwnd;
+
+    conn->init_send_cwnd = value;
+    conn->send_cwnd += delta;
+    vlc_cond_broadcast(&conn->send_wait);
+
+    for (struct vlc_h2_stream *s = conn->streams; s != NULL; s = s->older)
+    {
+        s->send_cwnd += delta;
+        vlc_cond_broadcast(&s->send_wait);
+    }
+}
 
 /** Reports an HTTP/2 peer connection setting */
 static void vlc_h2_setting(void *ctx, uint_fast16_t id, uint_fast32_t value)
@@ -457,6 +583,18 @@ static void vlc_h2_setting(void *ctx, uint_fast16_t id, uint_fast32_t value)
 
     vlc_http_dbg(CO(conn), "setting: %s (0x%04"PRIxFAST16"): %"PRIuFAST32,
                  vlc_h2_setting_name(id), id, value);
+
+    switch (id)
+    {
+        case VLC_H2_SETTING_INITIAL_WINDOW_SIZE:
+            vlc_h2_initial_window_update(conn, value);
+            break;
+        case VLC_H2_SETTING_MAX_FRAME_SIZE:
+            if (value >= VLC_H2_MIN_MAX_FRAME
+             && value <= VLC_H2_MAX_MAX_FRAME)
+                conn->max_send_frame = value;
+            break;
+    }
 }
 
 /** Reports end of HTTP/2 peer settings */
@@ -525,6 +663,17 @@ static void vlc_h2_window_status(void *ctx, uint32_t *restrict rcwd)
         *rcwd += 1 << 30;
 }
 
+static void vlc_h2_window_update(void *ctx, uint_fast32_t credit)
+{
+    struct vlc_h2_conn *conn = ctx;
+
+    conn->send_cwnd += credit;
+    vlc_cond_broadcast(&conn->send_wait);
+
+    vlc_http_dbg(CO(conn), "window update: +%"PRIuFAST32" to %"PRIu64,
+                 credit, conn->send_cwnd);
+}
+
 /** HTTP/2 frames parser callbacks table */
 static const struct vlc_h2_parser_cbs vlc_h2_parser_callbacks =
 {
@@ -534,12 +683,14 @@ static const struct vlc_h2_parser_cbs vlc_h2_parser_callbacks =
     vlc_h2_error,
     vlc_h2_reset,
     vlc_h2_window_status,
+    vlc_h2_window_update,
     vlc_h2_stream_lookup,
     vlc_h2_stream_error,
     vlc_h2_stream_headers,
     vlc_h2_stream_data,
     vlc_h2_stream_end,
     vlc_h2_stream_reset,
+    vlc_h2_stream_window_update,
 };
 
 /**
@@ -551,19 +702,16 @@ static const struct vlc_h2_parser_cbs vlc_h2_parser_callbacks =
  */
 static ssize_t vlc_https_recv(vlc_tls_t *tls, void *buf, size_t len)
 {
-    struct pollfd ufd;
     struct iovec iov;
     size_t count = 0;
 
-    ufd.fd = vlc_tls_GetFD(tls);
-    ufd.events = POLLIN;
     iov.iov_base = buf;
     iov.iov_len = len;
 
     while (iov.iov_len > 0)
     {
         int canc = vlc_savecancel();
-        ssize_t val = tls->readv(tls, &iov, 1);
+        ssize_t val = tls->ops->readv(tls, &iov, 1);
 
         vlc_restorecancel(canc);
 
@@ -581,6 +729,10 @@ static ssize_t vlc_https_recv(vlc_tls_t *tls, void *buf, size_t len)
         if (errno != EINTR && errno != EAGAIN)
             return count ? (ssize_t)count : -1;
 
+        struct pollfd ufd;
+
+        ufd.events = POLLIN;
+        ufd.fd = vlc_tls_GetPollFD(tls, &ufd.events);
         poll(&ufd, 1, -1);
     }
 
@@ -643,6 +795,8 @@ static void *vlc_h2_recv_thread(void *data)
     struct vlc_h2_parser *parser;
     int canc, val;
 
+    vlc_thread_set_name("vlc-h2-recv");
+
     canc = vlc_savecancel();
     parser = vlc_h2_parse_init(conn, &vlc_h2_parser_callbacks);
     if (unlikely(parser == NULL))
@@ -672,8 +826,10 @@ static void *vlc_h2_recv_thread(void *data)
     vlc_h2_parse_destroy(parser);
 fail:
     /* Terminate any remaining stream */
+    vlc_mutex_lock(&conn->lock);
     for (struct vlc_h2_stream *s = conn->streams; s != NULL; s = s->older)
         vlc_h2_stream_reset(s, VLC_H2_CANCEL);
+    vlc_mutex_unlock(&conn->lock);
     return NULL;
 }
 
@@ -685,7 +841,6 @@ static void vlc_h2_conn_destroy(struct vlc_h2_conn *conn)
 
     vlc_cancel(conn->thread);
     vlc_join(conn->thread, NULL);
-    vlc_mutex_destroy(&conn->lock);
 
     vlc_h2_output_destroy(conn->out);
     vlc_tls_Shutdown(conn->conn.tls, true);
@@ -729,17 +884,19 @@ struct vlc_http_conn *vlc_h2_conn_create(void *ctx, struct vlc_tls *tls)
     conn->streams = NULL;
     conn->next_id = 1; /* TODO: server side */
     conn->released = false;
+    conn->max_send_frame = VLC_H2_DEFAULT_MAX_FRAME;
+    conn->init_send_cwnd = VLC_H2_DEFAULT_INIT_WINDOW;
+    conn->send_cwnd = VLC_H2_DEFAULT_INIT_WINDOW;
 
     if (unlikely(conn->out == NULL))
         goto error;
 
     vlc_mutex_init(&conn->lock);
+    vlc_cond_init(&conn->send_wait);
 
     if (vlc_h2_conn_queue(conn, vlc_h2_frame_settings())
-     || vlc_clone(&conn->thread, vlc_h2_recv_thread, conn,
-                  VLC_THREAD_PRIORITY_INPUT))
+     || vlc_clone(&conn->thread, vlc_h2_recv_thread, conn))
     {
-        vlc_mutex_destroy(&conn->lock);
         vlc_h2_output_destroy(conn->out);
         goto error;
     }

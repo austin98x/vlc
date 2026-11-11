@@ -2,7 +2,6 @@
  * ctrl_radialslider.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -46,19 +45,22 @@ public:
                       float maxAngle, const UString &rHelp,
                       VarBool *pVisible );
 
-    virtual ~CtrlRadialSlider();
+    ~CtrlRadialSlider() override;
 
     /// Handle an event
-    virtual void handleEvent( EvtGeneric &rEvent );
+    void handleEvent(EvtGeneric &rEvent) override;
 
     /// Check whether coordinates are inside the control
-    virtual bool mouseOver( int x, int y ) const;
+    bool mouseOver(int x, int y) const override;
 
     /// Draw the control on the given graphics
-    virtual void draw( OSGraphics &rImage, int xDest, int yDest, int w, int h );
+    void draw(OSGraphics &rImage, int xDest, int yDest, int w, int h) override;
 
     /// Get the type of control (custom RTTI)
-    virtual std::string getType() const { return "radial_slider"; }
+    std::string getType() const override { return "radial_slider"; }
+
+protected:
+    using CtrlGeneric::onUpdate;
 
 private:
     /// Finite state machine of the control
@@ -84,7 +86,7 @@ private:
     DEFINE_CALLBACK( CtrlRadialSlider, Move )
 
     /// Method called when the observed variable is modified
-    virtual void onUpdate( Subject<VarPercent> &rVariable, void* );
+    void onUpdate(Subject<VarPercent> &rVariable, void*) override;
 
     /// Change the position of the cursor, with the given position of
     /// the mouse (relative to the layout). Is blocking is true, the

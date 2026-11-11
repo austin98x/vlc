@@ -2,7 +2,6 @@
  * vlc.h: VLC specific lua library functions.
  *****************************************************************************
  * Copyright (C) 2007-2008 the VideoLAN team
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *          Pierre d'Herbemont <pdherbemont # videolan.org>
@@ -49,7 +48,7 @@
 # define lua_strlen(L,idx)         lua_rawlen(L,idx)
 #endif
 
-#if LUA_VERSION_NUM >= 503
+#if LUA_VERSION_NUM >= 502
 # undef luaL_register
 # define luaL_register(L, n, l) luaL_setfuncs(L, (l), 0)
 # define luaL_register_namespace(L, n, l) \
@@ -81,7 +80,6 @@ void Close_LuaPlaylist( vlc_object_t * );
 int Open_LuaIntf( vlc_object_t * );
 void Close_LuaIntf( vlc_object_t * );
 int Open_LuaHTTP( vlc_object_t * );
-int Open_LuaCLI( vlc_object_t * );
 int Open_LuaTelnet( vlc_object_t * );
 
 
@@ -143,8 +141,8 @@ void vlclua_set_this( lua_State *, vlc_object_t * );
 #define vlclua_set_this(a, b) vlclua_set_this(a, VLC_OBJECT(b))
 vlc_object_t * vlclua_get_this( lua_State * );
 
-void vlclua_set_playlist_internal( lua_State *, playlist_t * );
-playlist_t * vlclua_get_playlist_internal( lua_State * );
+void vlclua_set_playlist_internal( lua_State *, vlc_playlist_t * );
+vlc_playlist_t * vlclua_get_playlist_internal( lua_State * );
 
 /*****************************************************************************
  * Lua function bridge

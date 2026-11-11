@@ -3,7 +3,6 @@
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
  * Copyright © 2007 Rémi Denis-Courmont
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  * RFC 4175 support based on gstrtpvrawpay.c (LGPL 2) by:
@@ -36,12 +35,15 @@
 #include "rtp.h"
 #include "../demux/xiph.h"
 #include "../packetizer/hxxx_nal.h"
+#include "../packetizer/h264_nal.h"
+#include "../packetizer/hevc_nal.h"
 
 #include <assert.h>
 
 static int rtp_packetize_mpa  (sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_mpv  (sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_ac3  (sout_stream_id_sys_t *, block_t *);
+static int rtp_packetize_eac3(sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_simple(sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_split(sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_pcm(sout_stream_id_sys_t *, block_t *);
@@ -63,6 +65,7 @@ static int rtp_packetize_vp8 (sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_jpeg (sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_r420 (sout_stream_id_sys_t *, block_t *);
 static int rtp_packetize_rgb24 (sout_stream_id_sys_t *, block_t *);
+static int rtp_packetize_bgr24 (sout_stream_id_sys_t *, block_t *);
 
 #define XIPH_IDENT (0)
 
@@ -72,20 +75,21 @@ static int rtp_xiph_pack_headers(size_t room, void *p_extra, size_t i_extra,
                                  uint8_t **p_buffer, size_t *i_buffer,
                                  uint8_t *theora_pixel_fmt)
 {
-    unsigned packet_size[XIPH_MAX_HEADER_COUNT];
-    void *packet[XIPH_MAX_HEADER_COUNT];
-    unsigned packet_count;
+    size_t packet_size[XIPH_MAX_HEADER_COUNT];
+    const void *packet[XIPH_MAX_HEADER_COUNT];
+    size_t packet_count;
+
     if (xiph_SplitHeaders(packet_size, packet, &packet_count,
                                 i_extra, p_extra))
-        return VLC_EGENERIC;;
+        return VLC_EGENERIC;
     if (packet_count < 3)
-        return VLC_EGENERIC;;
+        return VLC_EGENERIC;
 
     if (theora_pixel_fmt != NULL)
     {
         if (packet_size[0] < 42)
             return VLC_EGENERIC;
-        *theora_pixel_fmt = (((uint8_t *)packet[0])[41] >> 3) & 0x03;
+        *theora_pixel_fmt = (((const uint8_t *)packet[0])[41] >> 3) & 0x03;
     }
 
     unsigned length_size[2] = { 0, 0 };
@@ -154,7 +158,8 @@ static char *rtp_xiph_b64_oob_config(void *p_extra, size_t i_extra,
 
 static void sprintf_hexa( char *s, const uint8_t *p_data, int i_data )
 {
-    static const char hex[16] = "0123456789abcdef";
+    static const char hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
+                                 '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
 
     for( int i = 0; i < i_data; i++ )
     {
@@ -248,7 +253,7 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
             rtp_fmt->ptname = "MPV";
             rtp_fmt->pf_packetize = rtp_packetize_mpv;
             break;
-        case VLC_CODEC_ADPCM_G726:
+        case VLC_CODEC_ADPCM_G726_LE:
             switch( p_fmt->i_bitrate / 1000 )
             {
             case 16:
@@ -273,9 +278,23 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
                 return VLC_EGENERIC;
             }
             break;
+        case VLC_CODEC_ADPCM_G726:
+            if( p_fmt->i_bitrate != 32000 )
+            {
+                msg_Err( obj, "cannot add this stream (unsupported "
+                        "G.726 bit rate: %u)", p_fmt->i_bitrate );
+                return VLC_EGENERIC;
+            }
+            rtp_fmt->ptname = "32kadpcm";
+            rtp_fmt->pf_packetize = rtp_packetize_g726_32;
+            break;
         case VLC_CODEC_A52:
             rtp_fmt->ptname = "ac3";
             rtp_fmt->pf_packetize = rtp_packetize_ac3;
+            break;
+        case VLC_CODEC_EAC3:
+            rtp_fmt->ptname = "eac3";
+            rtp_fmt->pf_packetize = rtp_packetize_eac3;
             break;
         case VLC_CODEC_H263:
             rtp_fmt->ptname = "H263-1998";
@@ -305,17 +324,17 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
                         continue;
                     }
 
-                    const int i_nal_type = p_nal[0]&0x1f;
+                    const enum h264_nal_unit_type_e i_nal_type = h264_getNALType(p_nal);
 
                     msg_Dbg( obj, "we found a startcode for NAL with TYPE:%d", i_nal_type );
 
-                    if( i_nal_type == 7 && i_nal >= 4 )
+                    if( i_nal_type == H264_NAL_SPS && i_nal >= 4 )
                     {
                         free( p_64_sps );
                         p_64_sps = vlc_b64_encode_binary( p_nal, i_nal );
                         sprintf_hexa( hexa, &p_nal[1], 3 );
                     }
-                    else if( i_nal_type == 8 )
+                    else if( i_nal_type == H264_NAL_PPS )
                     {
                         free( p_64_pps );
                         p_64_pps = vlc_b64_encode_binary( p_nal, i_nal );
@@ -354,10 +373,10 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
                 const char *psz_name;
                 char *psz_64;
             } nalsets[4] = {
-                { 32, 0, "vps", NULL },
-                { 33, 0, "sps", NULL },
-                { 34, 0, "pps", NULL },
-                { 39, 1, "sei", NULL },
+                { HEVC_NAL_VPS, 0, "vps", NULL },
+                { HEVC_NAL_SPS, 0, "sps", NULL },
+                { HEVC_NAL_PPS, 0, "pps", NULL },
+                { HEVC_NAL_PREF_SEI, 1, "sei", NULL },
             };
 
             if( p_fmt->i_extra > 0 )
@@ -372,7 +391,7 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
                     size_t i_nal;
                     while( hxxx_annexb_iterate_next( &it, &p_nal, &i_nal ) )
                     {
-                        const uint8_t i_nal_type = (p_nal[0] & 0x7E) >> 1;
+                        const uint8_t i_nal_type = hevc_getNALType( p_nal );
                         if( i_nal_type < set->i_nal ||
                             i_nal_type > set->i_nal + set->i_extend )
                             continue;
@@ -397,7 +416,7 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
                             }
                         }
 
-                        if( i_nal_type == 33 && i_nal > 12 )
+                        if( i_nal_type == HEVC_NAL_SPS && i_nal > 12 )
                         {
                             if( i_profile < 0 )
                                 i_profile = p_nal[1] & 0x1F;
@@ -626,11 +645,13 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
                 rtp_fmt->fmtp = strdup( "sprop-stereo=1" );
             break;
         case VLC_CODEC_VP8:
+            if (es_format_HasVpxAlpha(p_fmt)) // contains alpha extradata
+                return VLC_ENOTSUP;
             rtp_fmt->ptname = "VP8";
             rtp_fmt->pf_packetize = rtp_packetize_vp8;
             break;
         case VLC_CODEC_R420:
-            rtp_fmt->ptname = "RAW";
+            rtp_fmt->ptname = "raw";
             rtp_fmt->pf_packetize = rtp_packetize_r420;
             if( asprintf( &rtp_fmt->fmtp,
                     "sampling=YCbCr-4:2:0; width=%d; height=%d; "
@@ -643,10 +664,23 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
             }
             break;
         case VLC_CODEC_RGB24:
-            rtp_fmt->ptname = "RAW";
+            rtp_fmt->ptname = "raw";
             rtp_fmt->pf_packetize = rtp_packetize_rgb24;
             if( asprintf( &rtp_fmt->fmtp,
                     "sampling=RGB; width=%d; height=%d; "
+                    "depth=8; colorimetry=SMPTE240M",
+                    p_fmt->video.i_visible_width,
+                    p_fmt->video.i_visible_height ) == -1 )
+            {
+                rtp_fmt->fmtp = NULL;
+                return VLC_ENOMEM;
+            }
+            break;
+        case VLC_CODEC_BGR24:
+            rtp_fmt->ptname = "raw";
+            rtp_fmt->pf_packetize = rtp_packetize_bgr24;
+            if( asprintf( &rtp_fmt->fmtp,
+                    "sampling=BGR; width=%d; height=%d; "
                     "depth=8; colorimetry=SMPTE240M",
                     p_fmt->video.i_visible_width,
                     p_fmt->video.i_visible_height ) == -1 )
@@ -674,26 +708,26 @@ int rtp_get_fmt( vlc_object_t *obj, const es_format_t *p_fmt, const char *mux,
 
 static int
 rtp_packetize_h264_nal( sout_stream_id_sys_t *id,
-                        const uint8_t *p_data, int i_data, int64_t i_pts,
-                        int64_t i_dts, bool b_last, int64_t i_length );
+                        const uint8_t *p_data, int i_data, vlc_tick_t i_pts,
+                        vlc_tick_t i_dts, bool b_last, vlc_tick_t i_length );
 
 int rtp_packetize_xiph_config( sout_stream_id_sys_t *id, const char *fmtp,
-                               int64_t i_pts )
+                               vlc_tick_t i_pts )
 {
     if (fmtp == NULL)
         return VLC_EGENERIC;
 
     /* extract base64 configuration from fmtp */
-    char *start = strstr(fmtp, "configuration=");
+    const char *start = strstr(fmtp, "configuration=");
     assert(start != NULL);
     start += sizeof("configuration=") - 1;
-    char *end = strchr(start, ';');
+    const char *end = strchr(start, ';');
     assert(end != NULL);
     size_t len = end - start;
 
     char *b64 = malloc(len + 1);
-    if(!b64)
-        return VLC_EGENERIC;
+    if (unlikely(b64 == NULL))
+        return VLC_ENOMEM;
 
     memcpy(b64, start, len);
     b64[len] = '\0';
@@ -719,6 +753,11 @@ int rtp_packetize_xiph_config( sout_stream_id_sys_t *id, const char *fmtp,
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 18 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            free(p_orig);
+            return VLC_ENOMEM;
+        }
 
         unsigned fragtype, numpkts;
         if (i_count == 1)
@@ -773,6 +812,11 @@ static int rtp_packetize_xiph( sout_stream_id_sys_t *id, block_t *in )
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 18 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         unsigned fragtype, numpkts;
         if (i_count == 1)
@@ -829,6 +873,11 @@ static int rtp_packetize_mpa( sout_stream_id_sys_t *id, block_t *in )
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 16 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         /* rtp common header */
         rtp_packetize_common( id, out, (i == i_count - 1)?1:0, in->i_pts );
@@ -907,6 +956,12 @@ static int rtp_packetize_mpv( sout_stream_id_sys_t *id, block_t *in )
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 16 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
+
         /* MBZ:5 T:1 TR:10 AN:1 N:1 S:1 B:1 E:1 P:3 FBV:1 BFC:3 FFV:1 FFC:3 */
         uint32_t      h = ( i_temporal_ref << 16 )|
                           ( b_sequence_start << 13 )|
@@ -917,7 +972,7 @@ static int rtp_packetize_mpv( sout_stream_id_sys_t *id, block_t *in )
 
         /* rtp common header */
         rtp_packetize_common( id, out, (i == i_count - 1)?1:0,
-                          in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts );
+                          in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts );
 
         SetDWBE( out->p_buffer + 12, h );
 
@@ -944,19 +999,31 @@ static int rtp_packetize_ac3( sout_stream_id_sys_t *id, block_t *in )
     uint8_t *p_data = in->p_buffer;
     int     i_data  = in->i_buffer;
     int     i;
+    uint8_t hdr[2];
+
+    if (i_count <= 1)
+        hdr[0] = 0; /* One complete frame */
+    else if (i_data * 5 <= i_max * 8)
+        hdr[0] = 1; /* Initial fragment with at least 5/8th of frame */
+    else
+        hdr[0] = 2; /* Initial fragment with less than 5/8th of frame */
+
+    hdr[1] = i_count;
 
     for( i = 0; i < i_count; i++ )
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 14 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         /* rtp common header */
         rtp_packetize_common( id, out, (i == i_count - 1)?1:0, in->i_pts );
-        /* unit count */
-        out->p_buffer[12] = 1;
-        /* unit header */
-        out->p_buffer[13] = 0x00;
         /* data */
+        memcpy( &out->p_buffer[12], hdr, 2 );
         memcpy( &out->p_buffer[14], p_data, i_payload );
 
         out->i_dts    = in->i_dts + i * in->i_length / i_count;
@@ -966,6 +1033,38 @@ static int rtp_packetize_ac3( sout_stream_id_sys_t *id, block_t *in )
 
         p_data += i_payload;
         i_data -= i_payload;
+        hdr[0] = 3; /* Fragment other than initial fragment */
+    }
+
+    block_Release(in);
+    return VLC_SUCCESS;
+}
+
+static int rtp_packetize_eac3(sout_stream_id_sys_t *id, block_t *in)
+{
+    size_t mtu = rtp_mtu(id) - 2;
+    uint_fast8_t frag_count = (in->i_buffer + mtu - 1) / mtu - 1;
+    uint8_t frame_type = frag_count > 0;
+
+    for (uint_fast8_t i = 0; i < frag_count; i++) {
+        bool last = i == (frag_count - 1);
+        size_t len = last ? in->i_buffer : mtu;
+        block_t *out = block_Alloc(14 + len);
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
+
+        rtp_packetize_common(id, out, false, in->i_pts);
+        out->p_buffer[12] = frame_type;
+        out->p_buffer[13] = frag_count;
+        memcpy(&out->p_buffer[14], in->p_buffer, len);
+        out->i_dts = in->i_dts + i * in->i_length / frag_count;
+
+        rtp_packetize_send(id, out);
+        in->p_buffer += len;
+        in->i_buffer -= len;
     }
 
     block_Release(in);
@@ -998,10 +1097,15 @@ static int rtp_packetize_split( sout_stream_id_sys_t *id, block_t *in )
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 12 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         /* rtp common header */
         rtp_packetize_common( id, out, (i == i_count - 1),
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
         memcpy( &out->p_buffer[12], p_data, i_payload );
 
         out->i_dts    = in->i_dts + i * in->i_length / i_count;
@@ -1055,7 +1159,7 @@ static int rtp_packetize_swab(sout_stream_id_sys_t *id, block_t *in)
     while (in->i_buffer > 0)
     {
         unsigned payload = (max < in->i_buffer) ? max : in->i_buffer;
-        unsigned duration = (in->i_length * payload) / in->i_buffer;
+        vlc_tick_t duration = (in->i_length * payload) / in->i_buffer;
         bool marker = (in->i_flags & BLOCK_FLAG_DISCONTINUITY) != 0;
 
         block_t *out = block_Alloc(12 + payload);
@@ -1099,10 +1203,15 @@ static int rtp_packetize_mp4a_latm( sout_stream_id_sys_t *id, block_t *in )
         if( i != 0 )
             latmhdrsize = 0;
         out = block_Alloc( 12 + latmhdrsize + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         /* rtp common header */
         rtp_packetize_common( id, out, ((i == i_count - 1) ? 1 : 0),
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
 
         if( i == 0 )
         {
@@ -1149,7 +1258,7 @@ static int rtp_packetize_mp4a( sout_stream_id_sys_t *id, block_t *in )
 
         /* rtp common header */
         rtp_packetize_common( id, out, ((i == i_count - 1)?1:0),
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
         /* AU headers */
         /* AU headers length (bits) */
         out->p_buffer[12] = 0;
@@ -1208,6 +1317,11 @@ static int rtp_packetize_h263( sout_stream_id_sys_t *id, block_t *in )
     {
         int      i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( RTP_H263_PAYLOAD_START + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
         b_p_bit = (i == 0) ? 1 : 0;
         h = ( b_p_bit << 10 )|
             ( b_v_bit << 9  )|
@@ -1217,7 +1331,7 @@ static int rtp_packetize_h263( sout_stream_id_sys_t *id, block_t *in )
         /* rtp common header */
         //b_m_bit = 1; // always contains end of frame
         rtp_packetize_common( id, out, (i == i_count - 1)?1:0,
-                          in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts );
+                          in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts );
 
         /* h263 header */
         SetWBE( out->p_buffer + 12, h );
@@ -1239,8 +1353,8 @@ static int rtp_packetize_h263( sout_stream_id_sys_t *id, block_t *in )
 /* rfc3984 */
 static int
 rtp_packetize_h264_nal( sout_stream_id_sys_t *id,
-                        const uint8_t *p_data, int i_data, int64_t i_pts,
-                        int64_t i_dts, bool b_last, int64_t i_length )
+                        const uint8_t *p_data, int i_data, vlc_tick_t i_pts,
+                        vlc_tick_t i_dts, bool b_last, vlc_tick_t i_length )
 {
     const int i_max = rtp_mtu (id); /* payload max in one packet */
     int i_nal_hdr;
@@ -1257,6 +1371,10 @@ rtp_packetize_h264_nal( sout_stream_id_sys_t *id,
     {
         /* Single NAL unit packet */
         block_t *out = block_Alloc( 12 + i_data );
+        if (unlikely(out == NULL))
+        {
+            return VLC_ENOMEM;
+        }
         out->i_dts    = i_dts;
         out->i_length = i_length;
 
@@ -1280,6 +1398,10 @@ rtp_packetize_h264_nal( sout_stream_id_sys_t *id,
         {
             const int i_payload = __MIN( i_data, i_max-2 );
             block_t *out = block_Alloc( 12 + 2 + i_payload );
+            if (unlikely(out == NULL))
+            {
+                return VLC_ENOMEM;
+            }
             out->i_dts    = i_dts + i * i_length / i_count;
             out->i_length = i_length / i_count;
 
@@ -1311,9 +1433,13 @@ static int rtp_packetize_h264( sout_stream_id_sys_t *id, block_t *in )
     while( hxxx_annexb_iterate_next( &it, &p_nal, &i_nal ) )
     {
         /* TODO add STAP-A to remove a lot of overhead with small slice/sei/... */
-        rtp_packetize_h264_nal( id, p_nal, i_nal,
-                (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts), in->i_dts,
-                it.p_head + 3 >= it.p_tail, in->i_length * i_nal / in->i_buffer );
+        if (rtp_packetize_h264_nal( id, p_nal, i_nal,
+                (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts), in->i_dts,
+                it.p_head + 3 >= it.p_tail, in->i_length * i_nal / in->i_buffer ))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
     }
 
     block_Release(in);
@@ -1323,8 +1449,8 @@ static int rtp_packetize_h264( sout_stream_id_sys_t *id, block_t *in )
 /* rfc7798 */
 static int
 rtp_packetize_h265_nal( sout_stream_id_sys_t *id,
-                        const uint8_t *p_data, size_t i_data, int64_t i_pts,
-                        int64_t i_dts, bool b_last, int64_t i_length )
+                        const uint8_t *p_data, size_t i_data, vlc_tick_t i_pts,
+                        vlc_tick_t i_dts, bool b_last, vlc_tick_t i_length )
 {
     const size_t i_max = rtp_mtu (id); /* payload max in one packet */
 
@@ -1336,6 +1462,10 @@ rtp_packetize_h265_nal( sout_stream_id_sys_t *id,
     {
         /* Single NAL unit packet */
         block_t *out = block_Alloc( 12 + i_data );
+        if (unlikely(out == NULL))
+        {
+            return VLC_ENOMEM;
+        }
         out->i_dts    = i_dts;
         out->i_length = i_length;
 
@@ -1361,6 +1491,10 @@ rtp_packetize_h265_nal( sout_stream_id_sys_t *id,
         {
             const size_t i_payload = __MIN( i_data, i_max-3 );
             block_t *out = block_Alloc( 12 + 3 + i_payload );
+            if (unlikely(out == NULL))
+            {
+                return VLC_ENOMEM;
+            }
             out->i_dts    = i_dts + i * i_length / i_count;
             out->i_length = i_length / i_count;
 
@@ -1392,9 +1526,13 @@ static int rtp_packetize_h265( sout_stream_id_sys_t *id, block_t *in )
     size_t i_nal;
     while( hxxx_annexb_iterate_next( &it, &p_nal, &i_nal ) )
     {
-        rtp_packetize_h265_nal( id, p_nal, i_nal,
-                (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts), in->i_dts,
-                it.p_head + 3 >= it.p_tail, in->i_length * i_nal / in->i_buffer );
+        if (rtp_packetize_h265_nal( id, p_nal, i_nal,
+                (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts), in->i_dts,
+                it.p_head + 3 >= it.p_tail, in->i_length * i_nal / in->i_buffer ))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
     }
 
     block_Release(in);
@@ -1415,10 +1553,15 @@ static int rtp_packetize_amr( sout_stream_id_sys_t *id, block_t *in )
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 14 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         /* rtp common header */
         rtp_packetize_common( id, out, ((i == i_count - 1)?1:0),
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
         /* Payload header */
         out->p_buffer[12] = 0xF0; /* CMR */
         out->p_buffer[13] = p_data[0]&0x7C; /* ToC */ /* FIXME: frame type */
@@ -1525,6 +1668,11 @@ static int rtp_packetize_spx( sout_stream_id_sys_t *id, block_t *in )
       Allow for 12 extra bytes of RTP header.
     */
     p_out = block_Alloc( 12 + i_payload_size );
+    if (unlikely(p_out == NULL))
+    {
+        block_Release(in);
+        return VLC_ENOMEM;
+    }
 
     if ( i_payload_padding )
     {
@@ -1555,7 +1703,7 @@ static int rtp_packetize_spx( sout_stream_id_sys_t *id, block_t *in )
 
     /* Add the RTP header to our p_output buffer. */
     rtp_packetize_common( id, p_out, 0,
-                        (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                        (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
     /* Copy the Speex payload to the p_output buffer */
     memcpy( &p_out->p_buffer[12], p_buffer, i_data_size );
 
@@ -1581,10 +1729,15 @@ static int rtp_packetize_g726( sout_stream_id_sys_t *id, block_t *in, int i_pad 
     {
         int           i_payload = __MIN( i_max, i_data );
         block_t *out = block_Alloc( 12 + i_payload );
+        if (unlikely(out == NULL))
+        {
+            block_Release(in);
+            return VLC_ENOMEM;
+        }
 
         /* rtp common header */
         rtp_packetize_common( id, out, 0,
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
 
         memcpy( &out->p_buffer[12], p_data, i_payload );
 
@@ -1657,7 +1810,7 @@ static int rtp_packetize_vp8( sout_stream_id_sys_t *id, block_t *in )
 
         /* rtp common header */
         rtp_packetize_common( id, out, (i == i_count - 1),
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
         memcpy( &out->p_buffer[RTP_VP8_PAYLOAD_START], p_data, i_payload );
 
         out->i_dts    = in->i_dts + i * in->i_length / i_count;
@@ -1677,12 +1830,18 @@ static int rtp_packetize_vp8( sout_stream_id_sys_t *id, block_t *in )
 static int rtp_packetize_rawvideo( sout_stream_id_sys_t *id, block_t *in, vlc_fourcc_t i_format  )
 {
     int i_width, i_height;
-    rtp_get_video_geometry( id, &i_width, &i_height );
+    if( rtp_get_video_geometry( id, &i_width, &i_height ) != VLC_SUCCESS )
+    {
+        block_Release( in );
+        return VLC_EGENERIC;
+    }
+
     int i_pgroup; /* Size of a group of pixels */
     int i_xdec, i_ydec; /* sub-sampling factor in x and y */
     switch( i_format )
     {
         case VLC_CODEC_RGB24:
+        case VLC_CODEC_BGR24:
             i_pgroup = 3;
             i_xdec = i_ydec = 1;
             break;
@@ -1781,7 +1940,7 @@ static int rtp_packetize_rawvideo( sout_stream_id_sys_t *id, block_t *in, vlc_fo
             uint16_t i_offs = GetWBE( p_headers + 4 ) & 0x7fff;
             i_cont = p_headers[4] & 0x80;
 
-            if( i_format == VLC_CODEC_RGB24 )
+            if( i_format == VLC_CODEC_RGB24  || i_format == VLC_CODEC_BGR24 )
             {
                 const int i_ystride = i_width * i_pgroup;
                 i_offs /= i_xdec;
@@ -1797,9 +1956,13 @@ static int rtp_packetize_rawvideo( sout_stream_id_sys_t *id, block_t *in, vlc_fo
             else vlc_assert_unreachable();
         }
 
+        /* Block was allocated before knowing how many (partial) lines fit,
+           so trim it to the bytes written. */
+        out->i_buffer = p_outdata - out->p_buffer;
+
         /* rtp common header */
         rtp_packetize_common( id, out, i_line_number >= i_height,
-                (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
 
         out->i_dts    = in->i_dts;
         out->i_length = in->i_length;
@@ -1818,7 +1981,12 @@ static int rtp_packetize_r420( sout_stream_id_sys_t *id, block_t *in )
 
 static int rtp_packetize_rgb24( sout_stream_id_sys_t *id, block_t *in )
 {
-    return rtp_packetize_rawvideo( id, in, VLC_CODEC_RGB24 );
+    return rtp_packetize_rawvideo( id, in, VLC_CODEC_RGB24  );
+}
+
+static int rtp_packetize_bgr24( sout_stream_id_sys_t *id, block_t *in )
+{
+    return rtp_packetize_rawvideo( id, in, VLC_CODEC_BGR24 );
 }
 
 static int rtp_packetize_jpeg( sout_stream_id_sys_t *id, block_t *in )
@@ -1830,7 +1998,7 @@ static int rtp_packetize_jpeg( sout_stream_id_sys_t *id, block_t *in )
     const uint8_t *qtables = NULL;
     int nb_qtables = 0;
     int off = 0; // fragment offset in frame
-    int y_sampling_factor;
+    int y_sampling_factor = 0;
     // type is set by pixel format (determined by y_sampling_factor):
     // 0 for yuvj422p
     // 1 for yuvj420p
@@ -1838,7 +2006,7 @@ static int rtp_packetize_jpeg( sout_stream_id_sys_t *id, block_t *in )
     int type;
     int w = 0; // Width in multiples of 8
     int h = 0; // Height in multiples of 8
-    int restart_interval;
+    int restart_interval = 0;
     int dri_found = 0;
 
     // Skip SOI
@@ -1990,7 +2158,7 @@ static int rtp_packetize_jpeg( sout_stream_id_sys_t *id, block_t *in )
 
         /* rtp common header */
         rtp_packetize_common( id, out, (i_payload == i_data),
-                      (in->i_pts > VLC_TS_INVALID ? in->i_pts : in->i_dts) );
+                      (in->i_pts != VLC_TICK_INVALID ? in->i_pts : in->i_dts) );
         memcpy( p, p_data, i_payload );
 
         out->i_dts    = in->i_dts;

@@ -1,20 +1,32 @@
 # srt
 
-SRT_VERSION := 1.2.2
+SRT_VERSION := 1.5.6
 SRT_URL := $(GITHUB)/Haivision/srt/archive/v$(SRT_VERSION).tar.gz
 
-ifndef HAVE_WIN32
+# gnutls (nettle/gmp) can't be used with the LGPLv2 license
+ifdef GPL
+SRT_PKG=1
+else
+ifdef GNUV3
+SRT_PKG=1
+endif
+endif
+
 ifdef BUILD_NETWORK
+ifdef SRT_PKG
 PKGS += srt
 endif
 endif
-ifeq ($(call need_pkg,"srt >= 1.2.2"),)
+
+ifeq ($(call need_pkg,"srt >= 1.3.2"),)
 PKGS_FOUND += srt
 endif
 
-ifdef HAVE_DARWIN_OS
-SRT_DARWIN=CFLAGS="$(CFLAGS) -Wno-error=partial-availability" CXXFLAGS="$(CXXFLAGS) -Wno-error=partial-availability"
+DEPS_srt = gnutls $(DEPS_gnutls)
+ifdef HAVE_WIN32
+DEPS_srt += winpthreads $(DEPS_winpthreads)
 endif
+
 
 $(TARBALLS)/srt-$(SRT_VERSION).tar.gz:
 	$(call download_pkg,$(SRT_URL),srt)
@@ -23,15 +35,15 @@ $(TARBALLS)/srt-$(SRT_VERSION).tar.gz:
 
 srt: srt-$(SRT_VERSION).tar.gz .sum-srt
 	$(UNPACK)
-	$(APPLY) $(SRC)/srt/fix-pc.patch
-	$(APPLY) $(SRC)/srt/add-implicit-link-libraries.patch
-	$(call pkg_static,"scripts/haisrt.pc.in")
-	mv srt-$(SRT_VERSION) $@ && touch $@
+	$(APPLY) $(SRC)/srt/0001-build-fix-implicit-libraries-set-using-Wl-l-libname..patch
+	$(call pkg_static,"scripts/srt.pc.in")
+	$(MOVE)
 
-DEPS_srt = gnutls $(DEPS_gnutls)
+SRT_CONF := -DENABLE_SHARED=OFF -DUSE_ENCLIB=gnutls -DENABLE_CXX11=OFF -DENABLE_APPS=OFF
 
 .srt: srt toolchain.cmake
-	cd $< && $(HOSTVARS_PIC) $(SRT_DARWIN) $(CMAKE) \
-		-DENABLE_SHARED=OFF -DUSE_GNUTLS=ON -DENABLE_CXX11=OFF
-	cd $< && $(MAKE) install
+	$(CMAKECLEAN)
+	$(HOSTVARS_CMAKE) $(CMAKE) $(SRT_CONF)
+	+$(CMAKEBUILD)
+	$(CMAKEINSTALL)
 	touch $@

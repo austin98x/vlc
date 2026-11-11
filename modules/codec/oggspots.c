@@ -2,7 +2,6 @@
  * oggspots.c: OggSpots decoder module.
  *****************************************************************************
  * Copyright (C) 2016 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Michael Taenzer <neo@nhng.de>
  *
@@ -39,7 +38,7 @@
 /*****************************************************************************
  * decoder_sys_t : oggspots decoder descriptor
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
     /* Module mode */
     bool b_packetizer;
@@ -57,8 +56,8 @@ struct decoder_sys_t
     /*
      * Common properties
      */
-    mtime_t i_pts;
-};
+    vlc_tick_t i_pts;
+} decoder_sys_t;
 
 /*****************************************************************************
  * Local prototypes
@@ -80,7 +79,6 @@ static picture_t* DecodePacket (decoder_t*, block_t*);
  *****************************************************************************/
 
 vlc_module_begin ()
-    set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_VCODEC)
     set_shortname("OggSpots")
     set_description(N_("OggSpots video decoder"))
@@ -90,20 +88,17 @@ vlc_module_begin ()
 
     add_submodule ()
     set_description(N_("OggSpots video packetizer"))
-    set_capability("packetizer", 10)
+    set_capability("video packetizer", 10)
     set_callbacks(OpenPacketizer, CloseDecoder)
     add_shortcut("oggspots")
 vlc_module_end ()
 
-/*****************************************************************************
- * OpenDecoder: probe the decoder and return score
- *****************************************************************************/
-static int OpenDecoder(vlc_object_t* p_this)
+static int OpenCommon(vlc_object_t* p_this, bool b_packetizer)
 {
     decoder_t* p_dec = (decoder_t*)p_this;
     decoder_sys_t* p_sys;
 
-    if (p_dec->fmt_in.i_codec != VLC_CODEC_OGGSPOTS) {
+    if (p_dec->fmt_in->i_codec != VLC_CODEC_OGGSPOTS) {
         return VLC_EGENERIC;
     }
 
@@ -113,9 +108,9 @@ static int OpenDecoder(vlc_object_t* p_this)
         return VLC_ENOMEM;
     }
     p_dec->p_sys = p_sys;
-    p_sys->b_packetizer = false;
+    p_sys->b_packetizer = b_packetizer;
     p_sys->b_has_headers = false;
-    p_sys->i_pts = VLC_TS_INVALID;
+    p_sys->i_pts = VLC_TICK_INVALID;
 
     /* Initialize image handler */
     p_sys->p_image = image_HandlerCreate(p_dec);
@@ -124,29 +119,33 @@ static int OpenDecoder(vlc_object_t* p_this)
         return VLC_ENOMEM;
     }
 
-    /* Set output properties */
-    p_dec->fmt_out.i_codec = VLC_CODEC_RGBA;
+    if( b_packetizer )
+    {
+        p_dec->fmt_out.i_codec = VLC_CODEC_OGGSPOTS;
+        p_dec->pf_packetize = Packetize;
+    }
+    else
+    {
+        p_dec->fmt_out.i_codec = VLC_CODEC_RGBA;
+        p_dec->pf_decode = DecodeVideo;
+    }
 
-    /* Set callbacks */
-    p_dec->pf_decode    = DecodeVideo;
-    p_dec->pf_packetize = Packetize;
-    p_dec->pf_flush     = Flush;
+    p_dec->pf_flush = Flush;
 
     return VLC_SUCCESS;
 }
 
+/*****************************************************************************
+ * OpenDecoder: probe the decoder and return score
+ *****************************************************************************/
+static int OpenDecoder(vlc_object_t* p_this)
+{
+    return OpenCommon(p_this, false);
+}
+
 static int OpenPacketizer(vlc_object_t* p_this)
 {
-    decoder_t* p_dec = (decoder_t*)p_this;
-
-    int i_ret = OpenDecoder(p_this);
-
-    if (i_ret == VLC_SUCCESS) {
-        p_dec->p_sys->b_packetizer = true;
-        p_dec->fmt_out.i_codec = VLC_CODEC_OGGSPOTS;
-    }
-
-    return i_ret;
+    return OpenCommon(p_this, true);
 }
 
 /****************************************************************************
@@ -204,10 +203,10 @@ static int ProcessHeader(decoder_t* p_dec)
     uint64_t i_granulerate_denominator;
 
     /* The OggSpots header is always 52 bytes */
-    if (p_dec->fmt_in.i_extra != 52) {
+    if (p_dec->fmt_in->i_extra != 52) {
         return VLC_EGENERIC;
     }
-    p_extra = p_dec->fmt_in.p_extra;
+    p_extra = p_dec->fmt_in->p_extra;
 
     /* Identification string */
     if ( memcmp(p_extra, "SPOTS\0\0", 8) ) {
@@ -237,8 +236,8 @@ static int ProcessHeader(decoder_t* p_dec)
     }
 
     /* Normalize granulerate */
-    vlc_ureduce(&p_dec->fmt_in.video.i_frame_rate,
-                &p_dec->fmt_in.video.i_frame_rate_base,
+    vlc_ureduce(&p_dec->fmt_out.video.i_frame_rate,
+                &p_dec->fmt_out.video.i_frame_rate_base,
                 i_granulerate_numerator, i_granulerate_denominator, 0);
 
     /* Image format */
@@ -267,15 +266,15 @@ static int ProcessHeader(decoder_t* p_dec)
      * latter are underspecified. */
 
     if (p_sys->b_packetizer) {
-        void* p_extra = realloc(p_dec->fmt_out.p_extra,
-                                p_dec->fmt_in.i_extra);
-        if (unlikely(p_extra == NULL)) {
+        void* p_new_extra = realloc(p_dec->fmt_out.p_extra,
+                                p_dec->fmt_in->i_extra);
+        if (unlikely(p_new_extra == NULL)) {
             return VLC_ENOMEM;
         }
-        p_dec->fmt_out.p_extra = p_extra;
-        p_dec->fmt_out.i_extra = p_dec->fmt_in.i_extra;
+        p_dec->fmt_out.p_extra = p_new_extra;
+        p_dec->fmt_out.i_extra = p_dec->fmt_in->i_extra;
         memcpy(p_dec->fmt_out.p_extra,
-               p_dec->fmt_in.p_extra, p_dec->fmt_out.i_extra);
+               p_dec->fmt_in->p_extra, p_dec->fmt_out.i_extra);
     }
 
     return VLC_SUCCESS;
@@ -288,7 +287,7 @@ static void Flush(decoder_t* p_dec)
 {
     decoder_sys_t* p_sys = p_dec->p_sys;
 
-    p_sys->i_pts = VLC_TS_INVALID;
+    p_sys->i_pts = VLC_TICK_INVALID;
 }
 
 /*****************************************************************************
@@ -309,7 +308,7 @@ static void* ProcessPacket(decoder_t* p_dec, block_t* p_block)
     }
 
     /* Date management */
-    if (p_block->i_pts > VLC_TS_INVALID && p_block->i_pts != p_sys->i_pts) {
+    if (p_block->i_pts != VLC_TICK_INVALID && p_block->i_pts != p_sys->i_pts) {
         p_sys->i_pts = p_block->i_pts;
     }
 
@@ -351,12 +350,19 @@ static picture_t* DecodePacket(decoder_t* p_dec, block_t* p_block)
         goto error;
     }
 
+    if (i_img_offset > p_block->i_buffer) {
+        msg_Dbg(p_dec, "Invalid byte offset: %u exceeds packet size %zu",
+                i_img_offset, p_block->i_buffer);
+        goto error;
+    }
+
     /* Image format */
+    es_format_t fmt_in = *p_dec->fmt_in;
     if ( !memcmp(&p_block->p_buffer[4], "PNG", 3) ) {
-        p_dec->fmt_in.video.i_chroma = VLC_CODEC_PNG;
+        fmt_in.video.i_chroma = VLC_CODEC_PNG;
     }
     else if ( !memcmp(&p_block->p_buffer[4], "JPEG", 4) ) {
-        p_dec->fmt_in.video.i_chroma = VLC_CODEC_JPEG;
+        fmt_in.video.i_chroma = VLC_CODEC_JPEG;
     }
     else {
         char psz_image_type[8+1];
@@ -374,7 +380,7 @@ static picture_t* DecodePacket(decoder_t* p_dec, block_t* p_block)
     p_block->p_buffer += i_img_offset;
 
     p_pic = image_Read(p_sys->p_image, p_block,
-                       &p_dec->fmt_in.video,
+                       &fmt_in,
                        &p_dec->fmt_out.video);
     if (p_pic == NULL) {
         return NULL;
@@ -382,7 +388,11 @@ static picture_t* DecodePacket(decoder_t* p_dec, block_t* p_block)
 
     p_pic->b_force = true;
     p_dec->fmt_out.i_codec = p_dec->fmt_out.video.i_chroma;
-    decoder_UpdateVideoFormat(p_dec);
+    if (decoder_UpdateVideoFormat(p_dec) != 0) {
+        msg_Dbg(p_dec, "Failed to update decoder format");
+        picture_Release(p_pic);
+        return NULL;
+    }
 
     return p_pic;
 

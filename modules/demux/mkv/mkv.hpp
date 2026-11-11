@@ -2,7 +2,6 @@
  * mkv.hpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2005, 2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -33,15 +32,10 @@
 # include "config.h"
 #endif
 
-#include <inttypes.h>
-
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 
-#include <time.h>
-
 #include <vlc_meta.h>
-#include <vlc_charset.h>
 #include <vlc_input.h>
 #include <vlc_demux.h>
 #include <vlc_aout.h> /* For reordering */
@@ -54,41 +48,46 @@
 #include <algorithm>
 #include <map>
 #include <stdexcept>
+#include <functional>
 
 /* libebml and matroska */
-#include "ebml/EbmlHead.h"
-#include "ebml/EbmlSubHead.h"
-#include "ebml/EbmlStream.h"
-#include "ebml/EbmlContexts.h"
-#include "ebml/EbmlVoid.h"
-#include "ebml/EbmlVersion.h"
-#include "ebml/StdIOCallback.h"
+#include <ebml/EbmlVersion.h>
+#include <ebml/EbmlHead.h>
+#include <ebml/EbmlSubHead.h>
+#include <ebml/EbmlStream.h>
+#include <ebml/EbmlContexts.h>
+#include <ebml/EbmlVoid.h>
 
-#include "matroska/KaxAttachments.h"
-#include "matroska/KaxAttached.h"
-#include "matroska/KaxBlock.h"
-#include "matroska/KaxBlockData.h"
-#include "matroska/KaxChapters.h"
-#include "matroska/KaxCluster.h"
-#include "matroska/KaxClusterData.h"
-#include "matroska/KaxContexts.h"
-#include "matroska/KaxCues.h"
-#include "matroska/KaxCuesData.h"
-#include "matroska/KaxInfo.h"
-#include "matroska/KaxInfoData.h"
-#include "matroska/KaxSeekHead.h"
-#include "matroska/KaxSegment.h"
-#include "matroska/KaxTag.h"
-#include "matroska/KaxTags.h"
-//#include "matroska/KaxTagMulti.h"
-#include "matroska/KaxTracks.h"
-#include "matroska/KaxTrackAudio.h"
-#include "matroska/KaxTrackVideo.h"
-#include "matroska/KaxTrackEntryData.h"
-#include "matroska/KaxContentEncoding.h"
-#include "matroska/KaxVersion.h"
+#include <matroska/KaxVersion.h>
+#include <matroska/KaxAttachments.h>
+#include <matroska/KaxAttached.h>
+#include <matroska/KaxBlock.h>
+#include <matroska/KaxBlockData.h>
+#include <matroska/KaxChapters.h>
+#include <matroska/KaxCluster.h>
+#include <matroska/KaxClusterData.h>
+#include <matroska/KaxContexts.h>
+#include <matroska/KaxCues.h>
+#include <matroska/KaxCuesData.h>
+#include <matroska/KaxInfo.h>
+#include <matroska/KaxInfoData.h>
+#include <matroska/KaxSeekHead.h>
+#include <matroska/KaxSegment.h>
+#include <matroska/KaxTag.h>
+#include <matroska/KaxTags.h>
+#include <matroska/KaxTracks.h>
+#include <matroska/KaxTrackAudio.h>
+#include <matroska/KaxTrackVideo.h>
+#include <matroska/KaxTrackEntryData.h>
+#include <matroska/KaxContentEncoding.h>
 
-#include "ebml/StdIOCallback.h"
+#define GlobalTimestamp()   GlobalTimecode()
+#define InitTimestamp(t,s)  InitTimecode(t,s)
+using KaxClusterTimestamp    = libmatroska::KaxClusterTimecode;
+using KaxTimestampScale      = libmatroska::KaxTimecodeScale;
+using KaxTrackTimestampScale = libmatroska::KaxTrackTimecodeScale;
+
+#include "stream_io_callback.hpp"
 
 #ifdef HAVE_ZLIB_H
 #   include <zlib.h>
@@ -97,6 +96,8 @@
 #ifndef NDEBUG
 //# define MKV_DEBUG 0
 #endif
+
+namespace mkv {
 
 #define MATROSKA_COMPRESSION_NONE  -1
 #define MATROSKA_COMPRESSION_ZLIB   0
@@ -111,64 +112,70 @@ enum
     MATROSKA_ENCODING_SCOPE_NEXT = 4 /* unsupported */
 };
 
+enum chapter_codec_id
+{
+    MATROSKA_CHAPTER_CODEC_NATIVE  = 0,
+    MATROSKA_CHAPTER_CODEC_DVD     = 1,
+};
+
 #define MKVD_TIMECODESCALE 1000000
 
-#define MKV_IS_ID( el, C ) ( el != NULL && typeid( *el ) == typeid( C ) )
+#define MKV_IS_ID( el, C ) ( el != NULL && (el->operator const EbmlId&()) == EBML_ID(C) && !el->IsDummy() )
 #define MKV_CHECKED_PTR_DECL( name, type, src ) type * name = MKV_IS_ID(src, type) ? static_cast<type*>(src) : NULL
+#define MKV_CHECKED_PTR_DECL_CONST( name, type, src ) const type * name = MKV_IS_ID(src, type) ? static_cast<const type*>(src) : NULL
 
-
-using namespace LIBMATROSKA_NAMESPACE;
-
-void BlockDecode( demux_t *p_demux, KaxBlock *block, KaxSimpleBlock *simpleblock,
-                  mtime_t i_pts, mtime_t i_duration, bool b_key_picture,
-                  bool b_discardable_picture );
-
-class attachment_c
+class MissingMandatory : public std::runtime_error
 {
 public:
-    attachment_c( const std::string& _psz_file_name, const std::string& _psz_mime_type, int _i_size )
-        :i_size(_i_size)
-        ,psz_file_name( _psz_file_name)
-        ,psz_mime_type( _psz_mime_type)
-    {
-        p_data = NULL;
-    }
-    ~attachment_c() { free( p_data ); }
-
-    /* Allocs the data space. Returns true if allocation went ok */
-    bool init()
-    {
-        p_data = malloc( i_size );
-        return (p_data != NULL);
-    }
-
-    const char* fileName() const { return psz_file_name.c_str(); }
-    const char* mimeType() const { return psz_mime_type.c_str(); }
-    int         size() const    { return i_size; }
-
-    void          *p_data;
-private:
-    int            i_size;
-    std::string    psz_file_name;
-    std::string    psz_mime_type;
+    MissingMandatory(const char * type_name)
+        :std::runtime_error(std::string("missing mandatory element without a default ") + type_name)
+    {}
 };
+
+template <typename Type>
+Type & GetMandatoryChild(const EbmlMaster & Master)
+{
+  auto p = static_cast<Type *>(Master.FindFirstElt(EBML_INFO(Type)));
+  if (p == nullptr)
+  {
+    throw MissingMandatory(EBML_INFO_NAME(EBML_INFO(Type)));
+  }
+  return *p;
+}
+#if LIBEBML_VERSION < 0x020000
+template <typename Type>
+Type * FindChild(const EbmlMaster & Master)
+{
+  return static_cast<Type *>(Master.FindFirstElt(EBML_INFO(Type)));
+}
+
+template <typename Type>
+Type * FindNextChild(const EbmlMaster & Master, const Type & PastElt)
+{
+  return static_cast<Type *>(Master.FindNextElt(PastElt));
+}
+#endif
+
+using namespace libmatroska;
 
 class matroska_segment_c;
 struct matroska_stream_c
 {
     matroska_stream_c(stream_t *s, bool owner);
-    ~matroska_stream_c()
-    {
-        delete io_callback;
-    }
+    ~matroska_stream_c() {}
 
     bool isUsed() const;
 
-    IOCallback         * io_callback;
-    EbmlStream         estream;
+    vlc_stream_io_callback io_callback;
+    matroska_iostream_c    estream;
 
     std::vector<matroska_segment_c*> segments;
 };
+
+class chapter_codec_cmds_c;
+using chapter_cmd_match = std::function<bool(const chapter_codec_cmds_c &)>;
+
+using chapter_uid = uint64_t;
 
 
 /*****************************************************************************
@@ -178,7 +185,7 @@ class PrivateTrackData
 {
 public:
     virtual ~PrivateTrackData() {}
-    virtual int32_t Init() { return 0; }
+    virtual bool Init() { return true; }
 };
 
 class mkv_track_t
@@ -194,7 +201,7 @@ class mkv_track_t
         bool         b_forced;
         track_id_t   i_number;
 
-        unsigned int i_extra_data;
+        size_t       i_extra_data;
         uint8_t      *p_extra_data;
 
         std::string  codec;
@@ -202,15 +209,16 @@ class mkv_track_t
         bool         b_pts_only;
 
         bool         b_no_duration;
-        uint64_t     i_default_duration;
+        vlc_tick_t   i_default_duration;
         float        f_timecodescale;
-        mtime_t      i_last_dts;
-        uint64_t     i_skip_until_fpos;
+        vlc_tick_t   i_last_dts;
+        uint64_t     i_skip_until_fpos; /*< any block before this fpos should be ignored */
 
         /* video */
         es_format_t fmt;
         float       f_fps;
         es_out_id_t *p_es;
+        vlc_fourcc_t uncompressed_fourcc = 0;
 
         /* audio */
         unsigned int i_original_rate;
@@ -218,10 +226,11 @@ class mkv_track_t
         uint8_t pi_chan_table[AOUT_CHAN_MAX];
 
 
-        /* Private track paramters */
+        /* Private track parameters */
         PrivateTrackData *p_sys;
 
         bool            b_discontinuity;
+        bool            b_has_alpha;
 
         /* informative */
         std::string str_codec_name;
@@ -232,9 +241,10 @@ class mkv_track_t
         KaxContentCompSettings *p_compression_data;
 
         /* Matroska 4 new elements used by Opus */
-        mtime_t i_seek_preroll;
-        mtime_t i_codec_delay;
+        vlc_tick_t i_seek_preroll;
+        vlc_tick_t i_codec_delay;
 };
 
+} // namespace
 
 #endif /* _MKV_HPP_ */

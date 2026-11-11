@@ -2,7 +2,6 @@
  * windows_audio_common.h: Windows Audio common code
  *****************************************************************************
  * Copyright (C) 2001-2009 VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *          Jean-Baptiste Kempf <jb@videolan.org>
@@ -24,6 +23,7 @@
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <mmreg.h>
 
 /*****************************************************************************
  * DirectSound GUIDs.
@@ -33,8 +33,6 @@
 
 #define INITGUID /* Doesn't define the DEFINE_GUID as extern */
 #include <initguid.h>
-
-#include <vlc_codecs.h>
 
 DEFINE_GUID( _KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 );
 DEFINE_GUID( _KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_PCM, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 );

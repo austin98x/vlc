@@ -2,7 +2,6 @@
  * rawdv.h : raw DV helpers
  *****************************************************************************
  * Copyright (C) 2001-2011 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@netcourrier.com>
  *          Paul Corke <paul dot corke at datatote dot co dot uk>
@@ -140,6 +139,8 @@ static inline block_t *dv_extract_audio( block_t *p_frame_block )
     i_samples = dv_get_audio_sample_count( &p_buf[1], i_dsf );
 
     p_block = block_Alloc( 4 * i_samples );
+    if( unlikely( p_block == NULL ) )
+        return NULL;
 
     /* for each DIF segment */
     p_frame = p_frame_block->p_buffer;
@@ -200,7 +201,7 @@ static inline block_t *dv_extract_audio( block_t *p_frame_block )
         }
     }
 
-    p_block->i_pts = p_frame_block->i_pts > VLC_TS_INVALID ? p_frame_block->i_pts
+    p_block->i_pts = p_frame_block->i_pts != VLC_TICK_INVALID ? p_frame_block->i_pts
                                                            : p_frame_block->i_dts;
     p_block->i_dts = p_frame_block->i_dts;
     return p_block;

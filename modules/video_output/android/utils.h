@@ -25,55 +25,167 @@
 # include "config.h"
 #endif
 
+#include <unistd.h>
+#include <assert.h>
+
 #include <jni.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <android/hardware_buffer.h>
 #include <android/input.h>
+#include <android/surface_control.h>
+#include <android/hdr_metadata.h>
+#include <android/data_space.h>
+#include <media/NdkImageReader.h>
 
 #include <vlc_vout_display.h>
 #include <vlc_common.h>
 
+/* AWH using a VideoLAN AWindow helpers */
+#define AWH_CAPS_SET_VIDEO_LAYOUT 0x1
+/* AWH backed by a Android SurfaceView */
+#define AWH_CAPS_SURFACE_VIEW 0x2
+
+/*
+ * AImageReader function pointers
+ */
+typedef int32_t (*pfn_AImageReader_newWithUsage)(
+    int32_t width, int32_t height, int32_t format, uint64_t usage,
+    int32_t maxImages, AImageReader **reader);
+typedef void (*pfn_AImageReader_delete)(AImageReader *reader);
+typedef int32_t (*pfn_AImageReader_getWindow)(
+    AImageReader *reader, ANativeWindow **window);
+typedef int32_t (*pfn_AImageReader_acquireNextImageAsync)(
+    AImageReader *reader, AImage **image, int *acquireFenceFd);
+typedef void (*pfn_AImage_deleteAsync)(AImage *image, int releaseFenceFd);
+typedef int32_t (*pfn_AImage_getHardwareBuffer)(
+    const AImage *image, struct AHardwareBuffer **buffer);
+typedef int32_t (*pfn_AImage_getTimestamp)(
+    const AImage *image, int64_t *timestampNs);
+typedef int32_t (*pfn_AImage_getCropRect)(
+    const AImage *image, AImageCropRect *rect);
+typedef int32_t (*pfn_AImage_getWidth)(
+    const AImage *image, int32_t *width);
+typedef int32_t (*pfn_AImage_getHeight)(
+    const AImage *image, int32_t *height);
+typedef int32_t (*pfn_AImageReader_setImageListener)(
+    AImageReader *reader, AImageReader_ImageListener *listener);
+typedef int (*pfn_sync_merge)(const char *name, int fd1, int fd2);
+
+typedef int32_t (*pfn_AHardwareBuffer_getId)(
+    const struct AHardwareBuffer *buffer, uint64_t *outId);
+typedef void (*pfn_AHardwareBuffer_describe)(
+    const struct AHardwareBuffer *buffer, AHardwareBuffer_Desc *outDesc);
+
+/*
+* ASurfaceControl function pointers
+*/
+typedef ASurfaceControl* (*pfn_ASurfaceControl_createFromWindow)(
+    ANativeWindow *parent, const char *debug_name);
+typedef void (*pfn_ASurfaceControl_release)(ASurfaceControl *surface_control);
+typedef ASurfaceTransaction* (*pfn_ASurfaceTransaction_create)(void);
+typedef void (*pfn_ASurfaceTransaction_delete)(ASurfaceTransaction *transaction);
+typedef void (*pfn_ASurfaceTransaction_apply)(ASurfaceTransaction *transaction);
+typedef void (*pfn_ASurfaceTransaction_setBuffer)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    struct AHardwareBuffer *buffer, int acquire_fence_fd);
+typedef void (*pfn_ASurfaceTransaction_setVisibility)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    int8_t visibility);
+typedef void (*pfn_ASurfaceTransaction_setBufferTransparency)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    int8_t transparency);
+typedef void (*pfn_ASurfaceTransaction_setBufferDataSpace)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    int32_t data_space);
+typedef void (*pfn_ASurfaceTransaction_setHdrMetadata_smpte2086)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    struct AHdrMetadata_smpte2086 *metadata);
+typedef void (*pfn_ASurfaceTransaction_setHdrMetadata_cta861_3)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    struct AHdrMetadata_cta861_3 *metadata);
+typedef void (*pfn_ASurfaceTransaction_setOnComplete)(
+    ASurfaceTransaction *transaction, void *context,
+    void (*func)(void *context, ASurfaceTransactionStats *stats));
+typedef void (*pfn_ASurfaceTransaction_setCrop)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    const ARect *crop);
+typedef void (*pfn_ASurfaceTransaction_setPosition)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    int32_t x, int32_t y);
+typedef void (*pfn_ASurfaceTransaction_setBufferTransform)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    int32_t transform);
+typedef void (*pfn_ASurfaceTransaction_setScale)(
+    ASurfaceTransaction *transaction, ASurfaceControl *surface_control,
+    float xScale, float yScale);
+typedef void (*pfn_ASurfaceTransaction_setDesiredPresentTime)(
+    ASurfaceTransaction* transaction,
+    int64_t desiredPresentTime);
+typedef int (*pfn_ASurfaceTransactionStats_getPreviousReleaseFenceFd)(
+    ASurfaceTransactionStats *stats, ASurfaceControl *surface_control);
+
+struct aimage_reader_api
+{
+    /* AImageReader, API 31+ (because AHardwareBuffer) */
+    struct {
+        pfn_AImageReader_newWithUsage newWithUsage;
+        pfn_AImageReader_delete delete;
+        pfn_AImageReader_getWindow getWindow;
+        pfn_AImageReader_acquireNextImageAsync acquireNextImageAsync;
+        pfn_AImageReader_setImageListener setImageListener;
+    } AImageReader;
+    struct {
+        pfn_AImage_deleteAsync deleteAsync;
+        pfn_AImage_getHardwareBuffer getHardwareBuffer;
+        pfn_AImage_getTimestamp getTimestamp;
+        pfn_AImage_getCropRect getCropRect;
+        pfn_AImage_getWidth getWidth;
+        pfn_AImage_getHeight getHeight;
+    } AImage;
+    pfn_sync_merge sync_merge;
+    struct {
+        pfn_AHardwareBuffer_getId getId;
+        pfn_AHardwareBuffer_describe describe;
+    } AHardwareBuffer;
+};
+
+struct asurface_control_api
+{
+    struct {
+        pfn_ASurfaceControl_createFromWindow createFromWindow;
+        pfn_ASurfaceControl_release release;
+    } ASurfaceControl;
+    struct {
+        pfn_ASurfaceTransaction_create create;
+        pfn_ASurfaceTransaction_delete delete;
+        pfn_ASurfaceTransaction_apply apply;
+        pfn_ASurfaceTransaction_setBuffer setBuffer;
+        pfn_ASurfaceTransaction_setVisibility setVisibility;
+        pfn_ASurfaceTransaction_setBufferTransparency setBufferTransparency;
+        pfn_ASurfaceTransaction_setBufferDataSpace setBufferDataSpace;
+        pfn_ASurfaceTransaction_setHdrMetadata_smpte2086 setHdrMetadata_smpte2086;
+        pfn_ASurfaceTransaction_setHdrMetadata_cta861_3 setHdrMetadata_cta861_3;
+        pfn_ASurfaceTransaction_setOnComplete setOnComplete;
+        pfn_ASurfaceTransaction_setCrop setCrop;
+        pfn_ASurfaceTransaction_setPosition setPosition;
+        pfn_ASurfaceTransaction_setBufferTransform setBufferTransform;
+        pfn_ASurfaceTransaction_setScale setScale;
+        pfn_ASurfaceTransaction_setDesiredPresentTime setDesiredPresentTime;
+    } ASurfaceTransaction;
+    struct {
+        pfn_ASurfaceTransactionStats_getPreviousReleaseFenceFd getPreviousReleaseFenceFd;
+    } ASurfaceTransactionStats;
+};
+
 typedef struct AWindowHandler AWindowHandler;
+typedef struct ASurfaceTexture ASurfaceTexture;
 
 enum AWindow_ID {
     AWindow_Video,
     AWindow_Subtitles,
-    AWindow_SurfaceTexture,
     AWindow_Max,
 };
-
-/**
- * native_window_api_t. See android/native_window.h in NDK
- */
-typedef struct
-{
-    int32_t (*winLock)(ANativeWindow*, ANativeWindow_Buffer*, ARect*);
-    void (*unlockAndPost)(ANativeWindow*);
-    int32_t (*setBuffersGeometry)(ANativeWindow*, int32_t, int32_t, int32_t); /* can be NULL */
-} native_window_api_t;
-
-/**
- * native_window_priv_api_t. See system/core/include/system/window.h in AOSP.
- */
-typedef struct native_window_priv native_window_priv;
-typedef struct
-{
-    native_window_priv *(*connect)(ANativeWindow *);
-    int (*disconnect) (native_window_priv *);
-    int (*setUsage) (native_window_priv *, bool, int );
-    int (*setBuffersGeometry) (native_window_priv *, int, int, int );
-    int (*getMinUndequeued) (native_window_priv *, unsigned int *);
-    int (*getMaxBufferCount) (native_window_priv *, unsigned int *);
-    int (*setBufferCount) (native_window_priv *, unsigned int );
-    int (*setCrop) (native_window_priv *, int, int, int, int);
-    int (*dequeue) (native_window_priv *, void **);
-    int (*lock) (native_window_priv *, void *);
-    int (*queue) (native_window_priv *, void *);
-    int (*cancel) (native_window_priv *, void *);
-    int (*lockData) (native_window_priv *, void **, ANativeWindow_Buffer *);
-    int (*unlockData) (native_window_priv *, void *, bool b_render);
-    int (*setOrientation) (native_window_priv *, int);
-} native_window_priv_api_t;
 
 struct awh_mouse_coords
 {
@@ -85,29 +197,95 @@ struct awh_mouse_coords
 
 typedef struct
 {
-    void (*on_new_window_size)(vout_window_t *wnd, unsigned i_width,
+    void (*on_new_window_size)(vlc_window_t *wnd, unsigned i_width,
                                unsigned i_height);
-    void (*on_new_mouse_coords)(vout_window_t *wnd,
+    void (*on_new_mouse_coords)(vlc_window_t *wnd,
                                 const struct awh_mouse_coords *coords);
 } awh_events_t;
 
-/**
- * Load a private native window API
- *
- * This can be used to access the private ANativeWindow API.
- * \param api doesn't need to be released
- * \return 0 on success, -1 on error.
- */
-int android_loadNativeWindowPrivApi(native_window_priv_api_t *api);
+typedef struct android_video_context_t android_video_context_t;
+
+struct android_video_context_t
+{
+    struct aimage_reader_api *air_api;
+    struct asurface_control_api *asc_api;
+    AImageReader *air;
+
+    struct vlc_asurfacetexture *texture;
+    void *dec_opaque;
+    bool (*render)(struct picture_context_t *ctx);
+    bool (*render_ts)(struct picture_context_t *ctx, vlc_tick_t ts);
+
+    struct vlc_asurfacetexture *
+        (*get_texture)(struct picture_context_t *ctx);
+};
+
+struct android_picture_ctx
+{
+    picture_context_t s;
+    AImage *image;
+    int fence_fd;
+    int read_fence_fd;
+    vlc_atomic_rc_t rc;
+    ASurfaceControl *sc;
+};
+
+static inline int
+android_picture_ctx_get_fence_fd(struct android_picture_ctx *apctx)
+{
+    return (apctx->fence_fd >= 0) ? dup(apctx->fence_fd) : -1;
+}
+
+static inline void
+android_picture_ctx_set_read_fence(struct android_picture_ctx *apctx, int fd)
+{
+    assert(fd >= 0);
+    if (apctx->read_fence_fd < 0)
+        apctx->read_fence_fd = fd;
+    else
+    {
+        android_video_context_t *avctx =
+            vlc_video_context_GetPrivate(apctx->s.vctx, VLC_VIDEO_CONTEXT_AWINDOW);
+
+        int merged = avctx->air_api->sync_merge("vlc_read_fence", apctx->read_fence_fd, fd);
+        close(apctx->read_fence_fd);
+        close(fd);
+        apctx->read_fence_fd = merged;
+    }
+}
+
+struct vlc_asurfacetexture
+{
+    struct ANativeWindow *window;
+    jobject              *jsurface;
+
+    const struct vlc_asurfacetexture_operations *ops;
+};
 
 /**
- * Attach or get a JNIEnv*
+ * Wrapper structure for Android SurfaceTexture object.
  *
- * The returned JNIEnv* is created from the android JavaVM attached to the VLC
- * object var.
- * \return a valid JNIEnv * or NULL. It doesn't need to be released.
+ * It can use either the NDK API or JNI API.
  */
-JNIEnv *android_getEnv(vlc_object_t *p_obj, const char *psz_thread_name);
+struct vlc_asurfacetexture_operations
+{
+    int (*attach_to_gl_context)(
+            struct vlc_asurfacetexture *surface,
+            uint32_t tex_name);
+
+    void (*detach_from_gl_context)(
+            struct vlc_asurfacetexture *surface);
+
+    int (*update_tex_image)(
+            struct vlc_asurfacetexture *surface,
+            const float **pp_transform_mtx);
+
+    void (*release_tex_image)(
+            struct vlc_asurfacetexture *st);
+
+    void (*destroy)(
+            struct vlc_asurfacetexture *surface);
+};
 
 /**
  * Create new AWindowHandler
@@ -117,24 +295,18 @@ JNIEnv *android_getEnv(vlc_object_t *p_obj, const char *psz_thread_name);
  * \return a valid AWindowHandler * or NULL. It must be released with
  * AWindowHandler_destroy.
  */
-AWindowHandler *AWindowHandler_new(vout_window_t *wnd, awh_events_t *p_events);
+AWindowHandler *AWindowHandler_new(vlc_object_t *obj, vlc_window_t *wnd, awh_events_t *p_events);
 void AWindowHandler_destroy(AWindowHandler *p_awh);
 
-/**
- * Get the public native window API
- *
- * Used to access the public ANativeWindow API.
- * \return a valid native_window_api_t. It doesn't need to be released.
- */
-native_window_api_t *AWindowHandler_getANativeWindowAPI(AWindowHandler *p_awh);
+AWindowHandler *
+AWindowHandler_newFromANWs(vlc_object_t *obj, ANativeWindow *video,
+                           ANativeWindow *subtitle);
 
-/**
- * Get the Video or the Subtitles Android Surface
- *
- * \return the surface in a jobject, or NULL. It should be released with
- * AWindowHandler_releaseANativeWindow() or AWindowHandler_destroy().
- */
-jobject AWindowHandler_getSurface(AWindowHandler *p_awh, enum AWindow_ID id);
+struct aimage_reader_api *
+AWindowHandler_getAImageReaderApi(AWindowHandler *p_awh);
+
+struct asurface_control_api *
+AWindowHandler_getASurfaceControlApi(AWindowHandler *p_awh);
 
 /**
  * Get the Video or the Subtitles ANativeWindow
@@ -150,31 +322,17 @@ ANativeWindow *AWindowHandler_getANativeWindow(AWindowHandler *p_awh,
  */
 void AWindowHandler_releaseANativeWindow(AWindowHandler *p_awh,
                                          enum AWindow_ID id);
-/**
- * Pre-ICS hack of ANativeWindow_setBuffersGeometry
- *
- * This function is a fix up of ANativeWindow_setBuffersGeometry that doesn't
- * work before Android ICS. It configures the Surface from the Android
- * MainThread via a SurfaceHolder. It returns VLC_SUCCESS if the Surface was
- * configured (it returns VLC_EGENERIC after Android ICS).
- */
-int AWindowHandler_setBuffersGeometry(AWindowHandler *p_awh, enum AWindow_ID id,
-                                      int i_width, int i_height, int i_format);
 
-/**
- * Returns true if the video layout can be changed
- */
-bool AWindowHandler_canSetVideoLayout(AWindowHandler *p_awh);
+int AWindowHandler_getCapabilities(AWindowHandler *p_awh);
 
 /**
  * Set the video layout
  *
- * Should be called only if AWindowHandler_canSetVideoLayout() returned true
+ * Should be called only if AWindowHandler_getCapabilities() has AWH_CAPS_SET_VIDEO_LAYOUT
  */
 int AWindowHandler_setVideoLayout(AWindowHandler *p_awh,
-                                  int i_width, int i_height,
-                                  int i_visible_width, int i_visible_height,
-                                  int i_sar_num, int i_sar_den);
+                                  int i_display_width, int i_display_height,
+                                  const vout_display_place_t *);
 
 /**
  * Attach a SurfaceTexture to the OpenGL ES context that is current on the
@@ -184,44 +342,35 @@ int AWindowHandler_setVideoLayout(AWindowHandler *p_awh,
  * \return 0 on success, -1 on error.
  */
 int
-SurfaceTexture_attachToGLContext(AWindowHandler *p_awh, int tex_name);
+SurfaceTexture_attachToGLContext(struct vlc_asurfacetexture *st, uint32_t tex_name);
 
 /**
  * Detach a SurfaceTexture from the OpenGL ES context that owns the OpenGL ES
  * texture object.
  */
 void
-SurfaceTexture_detachFromGLContext(AWindowHandler *p_awh);
+SurfaceTexture_detachFromGLContext(struct vlc_asurfacetexture *st);
 
 /**
- * Get a Java Surface from the attached SurfaceTexture
+ * Create a new SurfaceTexture object.
  *
- * This object can be used with mediacodec_jni.
+ * See Android SurfaceTexture
  */
-static inline jobject
-SurfaceTexture_getSurface(AWindowHandler *p_awh)
+struct vlc_asurfacetexture *
+vlc_asurfacetexture_New(AWindowHandler *p_awh, bool single_buffer);
+
+/**
+ * Delete a SurfaceTexture object created with SurfaceTexture_New.
+ */
+static inline void
+vlc_asurfacetexture_Delete(struct vlc_asurfacetexture *st)
 {
-    return AWindowHandler_getSurface(p_awh, AWindow_SurfaceTexture);
+    if (st->ops->destroy)
+        st->ops->destroy(st);
 }
 
 /**
- * Get a ANativeWindow from the attached SurfaceTexture
- *
- * This pointer can be used with mediacodec_ndk.
- */
-static inline ANativeWindow *
-SurfaceTexture_getANativeWindow(AWindowHandler *p_awh)
-{
-    return AWindowHandler_getANativeWindow(p_awh, AWindow_SurfaceTexture);
-}
-
-/**
- * Wait for a new frame and update it
- *
- * This function must be called from the OpenGL thread. This is an helper that
- * waits for a new frame via the Java SurfaceTexture.OnFrameAvailableListener
- * listener and update the frame via the SurfaceTexture.updateTexImage()
- * method.
+ * Update the SurfaceTexture to the most recent frame.
  *
  * \param pp_transform_mtx the transform matrix fetched from
  * SurfaceTexture.getTransformMatrix() after the
@@ -229,5 +378,7 @@ SurfaceTexture_getANativeWindow(AWindowHandler *p_awh)
  * \return VLC_SUCCESS or a VLC error
  */
 int
-SurfaceTexture_waitAndUpdateTexImage(AWindowHandler *p_awh,
-                                     const float **pp_transform_mtx);
+SurfaceTexture_updateTexImage(struct vlc_asurfacetexture *st, const float **pp_transform_mtx);
+
+void
+SurfaceTexture_releaseTexImage(struct vlc_asurfacetexture *st);

@@ -23,6 +23,7 @@
 #include "AbstractAdaptationLogic.h"
 #include "../tools/MovingAverage.hpp"
 #include <map>
+#include <vlc_threads.h>
 
 namespace adaptive
 {
@@ -38,10 +39,10 @@ namespace adaptive
 
             private:
                 size_t  segments_count;
-                mtime_t buffering_level;
-                mtime_t buffering_target;
+                vlc_tick_t buffering_level;
+                vlc_tick_t buffering_target;
                 unsigned last_download_rate;
-                unsigned last_duration;
+                vlc_tick_t last_duration;
                 MovingAverage<unsigned> average;
         };
 
@@ -51,15 +52,16 @@ namespace adaptive
                 PredictiveAdaptationLogic(vlc_object_t *);
                 virtual ~PredictiveAdaptationLogic();
 
-                virtual BaseRepresentation* getNextRepresentation(BaseAdaptationSet *, BaseRepresentation *);
-                virtual void                updateDownloadRate     (const ID &, size_t, mtime_t); /* reimpl */
-                virtual void                trackerEvent           (const SegmentTrackerEvent &); /* reimpl */
+                BaseRepresentation* getNextRepresentation(BaseAdaptationSet *,
+                                                          BaseRepresentation *) override;
+                void                updateDownloadRate     (const ID &, size_t,
+                                                            vlc_tick_t, vlc_tick_t) override;
+                void                trackerEvent           (const TrackerEvent &) override;
 
             private:
                 unsigned                    getAvailableBw(unsigned, const BaseRepresentation *) const;
                 std::map<adaptive::ID, PredictiveStats> streams;
                 unsigned                    usedBps;
-                vlc_object_t *              p_obj;
                 vlc_mutex_t                 lock;
         };
     }

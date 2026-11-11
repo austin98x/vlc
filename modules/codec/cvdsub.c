@@ -2,7 +2,6 @@
  * cvdsub.c : CVD Subtitle decoder
  *****************************************************************************
  * Copyright (C) 2003, 2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Rocky Bernstein
  *          Gildas Bazin <gbazin@videolan.org>
@@ -37,6 +36,8 @@
 
 #include <vlc_bits.h>
 
+#include "../demux/mpeg/timestamps.h"
+
 #define DEBUG_CVDSUB 1
 
 /*****************************************************************************
@@ -53,7 +54,7 @@ vlc_module_begin ()
 
     add_submodule ()
     set_description( N_("Chaoji VCD subtitle packetizer") )
-    set_capability( "packetizer", 50 )
+    set_capability( "spu packetizer", 50 )
     set_callbacks( PacketizerOpen, DecoderClose )
 vlc_module_end ()
 
@@ -64,18 +65,16 @@ static int Decode( decoder_t *, block_t * );
 static block_t *Packetize  ( decoder_t *, block_t ** );
 static block_t *Reassemble ( decoder_t *, block_t * );
 static void ParseMetaInfo  ( decoder_t *, block_t * );
-static void ParseHeader    ( decoder_t *, block_t * );
+static int  ParseHeader    ( decoder_t *, block_t * );
 static subpicture_t *DecodePacket( decoder_t *, block_t * );
-static void RenderImage( decoder_t *, block_t *, subpicture_region_t * );
+static int  RenderImage( decoder_t *, block_t *, picture_t * );
 
 #define SUBTITLE_BLOCK_EMPTY 0
 #define SUBTITLE_BLOCK_PARTIAL 1
 #define SUBTITLE_BLOCK_COMPLETE 2
 
-struct decoder_sys_t
+typedef struct
 {
-  int      b_packetizer;
-
   int      i_state;    /* data-gathering state for this subtitle */
 
   block_t  *p_spu;   /* Bytes of the packet. */
@@ -85,13 +84,12 @@ struct decoder_sys_t
 
   uint16_t i_image_offset;      /* offset from subtitle_data to compressed
                                    image data */
-  size_t i_image_length;           /* size of the compressed image data */
   size_t first_field_offset;       /* offset of even raster lines */
   size_t second_field_offset;      /* offset of odd raster lines */
   size_t metadata_offset;          /* offset to data describing the image */
   size_t metadata_length;          /* length of metadata */
 
-  mtime_t i_duration;   /* how long to display the image, 0 stands
+  vlc_tick_t i_duration;   /* how long to display the image, 0 stands
                            for "until next subtitle" */
 
   uint16_t i_x_start, i_y_start; /* position of top leftmost pixel of
@@ -100,34 +98,42 @@ struct decoder_sys_t
 
   uint8_t p_palette[4][4];       /* Palette of colors used in subtitle */
   uint8_t p_palette_highlight[4][4];
-};
+} decoder_sys_t;
 
-/*****************************************************************************
- * DecoderOpen: open/initialize the cvdsub decoder.
- *****************************************************************************/
-static int DecoderOpen( vlc_object_t *p_this )
+static int OpenCommon( vlc_object_t *p_this, bool b_packetizer )
 {
     decoder_t     *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
 
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_CVD )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_CVD )
         return VLC_EGENERIC;
 
     p_dec->p_sys = p_sys = malloc( sizeof( decoder_sys_t ) );
     if( !p_sys )
         return VLC_ENOMEM;
 
-    p_sys->b_packetizer  = false;
-
     p_sys->i_state = SUBTITLE_BLOCK_EMPTY;
     p_sys->p_spu   = NULL;
 
-    p_dec->pf_decode     = Decode;
-    p_dec->pf_packetize  = Packetize;
-
-    p_dec->fmt_out.i_codec = VLC_CODEC_YUVP;
+    if( b_packetizer )
+    {
+        p_dec->pf_packetize    = Packetize;
+        p_dec->fmt_out.i_codec = VLC_CODEC_CVD;
+    }
+    else
+    {
+        p_dec->pf_decode       = Decode;
+        p_dec->fmt_out.i_codec = VLC_CODEC_YUVP;
+    }
 
     return VLC_SUCCESS;
+}
+/*****************************************************************************
+ * DecoderOpen: open/initialize the cvdsub decoder.
+ *****************************************************************************/
+static int DecoderOpen( vlc_object_t *p_this )
+{
+    return OpenCommon( p_this, false );
 }
 
 /*****************************************************************************
@@ -135,14 +141,7 @@ static int DecoderOpen( vlc_object_t *p_this )
  *****************************************************************************/
 static int PacketizerOpen( vlc_object_t *p_this )
 {
-    decoder_t *p_dec = (decoder_t*)p_this;
-
-    if( DecoderOpen( p_this ) != VLC_SUCCESS ) return VLC_EGENERIC;
-
-    p_dec->fmt_out.i_codec = VLC_CODEC_CVD;
-    p_dec->p_sys->b_packetizer = true;
-
-    return VLC_SUCCESS;
+    return OpenCommon( p_this, true );
 }
 
 /*****************************************************************************
@@ -236,9 +235,10 @@ static block_t *Reassemble( decoder_t *p_dec, block_t *p_block )
      * to detect the first packet in a subtitle.  The first packet
      * seems to have a valid PTS while later packets for the same
      * image don't. */
-    if( p_sys->i_state == SUBTITLE_BLOCK_EMPTY && p_block->i_pts <= VLC_TS_INVALID )
+    if( p_sys->i_state == SUBTITLE_BLOCK_EMPTY && p_block->i_pts == VLC_TICK_INVALID )
     {
         msg_Warn( p_dec, "first packet expected but no PTS present");
+        block_Release( p_block );
         return NULL;
     }
 
@@ -246,10 +246,20 @@ static block_t *Reassemble( decoder_t *p_dec, block_t *p_block )
     p_block->i_buffer -= SPU_HEADER_LEN;
 
     /* First packet in the subtitle block */
-    if( p_sys->i_state == SUBTITLE_BLOCK_EMPTY ) ParseHeader( p_dec, p_block );
+    if( p_sys->i_state == SUBTITLE_BLOCK_EMPTY )
+    {
+        if( ParseHeader( p_dec, p_block ) != VLC_SUCCESS )
+        {
+            msg_Warn( p_dec, "Missing header data");
+            block_Release( p_block );
+            return NULL;
+        }
+    }
 
     block_ChainAppend( &p_sys->p_spu, p_block );
     p_sys->p_spu = block_ChainGather( p_sys->p_spu );
+    if( !p_sys->p_spu )
+        return NULL;
 
     if( p_sys->p_spu->i_buffer >= p_sys->i_spu_size )
     {
@@ -261,7 +271,7 @@ static block_t *Reassemble( decoder_t *p_dec, block_t *p_block )
                       p_spu->i_buffer, p_sys->i_spu_size );
         }
 
-        msg_Dbg( p_dec, "subtitle packet complete, size=%zuu", p_spu->i_buffer);
+        msg_Dbg( p_dec, "subtitle packet complete, size=%zu", p_spu->i_buffer);
 
         ParseMetaInfo( p_dec, p_spu );
 
@@ -304,24 +314,28 @@ static block_t *Reassemble( decoder_t *p_dec, block_t *p_block )
   this, so it may be untested.
 */
 
-static void ParseHeader( decoder_t *p_dec, block_t *p_block )
+static int ParseHeader( decoder_t *p_dec, block_t *p_block )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
     uint8_t *p = p_block->p_buffer;
+    if (p_block->i_buffer < 4)
+        return VLC_EINVAL; // not enough data
 
     p_sys->i_spu_size = (p[0] << 8) + p[1] + 4; p += 2;
 
-    /* FIXME: check data sanity */
     p_sys->metadata_offset = (p[0] <<  8) +   p[1]; p +=2;
-    p_sys->metadata_length = p_sys->i_spu_size - p_sys->metadata_offset;
+    if ( p_sys->i_spu_size > p_sys->metadata_offset )
+        p_sys->metadata_length = p_sys->i_spu_size - p_sys->metadata_offset;
+    else
+        p_sys->metadata_length = 0; // unusable metadata
 
     p_sys->i_image_offset = 4;
-    p_sys->i_image_length = p_sys->metadata_offset - p_sys->i_image_offset;
 
 #ifdef DEBUG_CVDSUB
-    msg_Dbg( p_dec, "total size: %zu  image size: %zu",
-             p_sys->i_spu_size, p_sys->i_image_length );
+    msg_Dbg( p_dec, "total size: %zu  metadata size: %zu",
+             p_sys->i_spu_size, p_sys->metadata_length );
 #endif
+    return VLC_SUCCESS;
 }
 
 /*
@@ -344,24 +358,24 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
     uint8_t       *p     = p_spu->p_buffer + p_sys->metadata_offset;
     uint8_t       *p_end = p + p_sys->metadata_length;
 
-    for( ; p < p_end; p += 4 )
+    for( ; &p[3] < p_end; p += 4 )
     {
         switch( p[0] )
         {
         case 0x04: /* subtitle duration in 1/90000ths of a second */
-            p_sys->i_duration = (p[1]<<16) + (p[2]<<8) + p[3];
+            p_sys->i_duration = FROM_SCALE_NZ( (p[1]<<16) + (p[2]<<8) + p[3] );
 
 #ifdef DEBUG_CVDSUB
-            msg_Dbg( p_dec, "subtitle display duration %lu secs",
-                     (long unsigned int)(p_sys->i_duration / 90000) );
+            msg_Dbg( p_dec, "subtitle display duration %"PRIu64" ms",
+                     MS_FROM_VLC_TICK(p_sys->i_duration) );
 #endif
-            p_sys->i_duration *= 100 / 9;
             break;
 
         case 0x0c: /* unknown */
 #ifdef DEBUG_CVDSUB
-            msg_Dbg( p_dec, "subtitle command unknown 0x%0x 0x%0x 0x%0x 0x%0x",
-                     (int)p[0], (int)p[1], (int)p[2], (int)p[3] );
+            msg_Dbg( p_dec, "subtitle command unknown "
+                     "0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8,
+                     p[0], p[1], p[2], p[3] );
 #endif
             break;
 
@@ -369,7 +383,7 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
             ExtractXY(p_sys->i_x_start, p_sys->i_y_start);
 
 #ifdef DEBUG_CVDSUB
-            msg_Dbg( p_dec, "start position (%d,%d)",
+            msg_Dbg( p_dec, "start position (%"PRIu16",%"PRIu16")",
                      p_sys->i_x_start, p_sys->i_y_start );
 #endif
             break;
@@ -379,11 +393,17 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
             int lastx;
             int lasty;
             ExtractXY(lastx, lasty);
-            p_sys->i_width  = lastx - p_sys->i_x_start + 1;
-            p_sys->i_height = lasty - p_sys->i_y_start + 1;
+            if( lastx >= p_sys->i_x_start )
+                p_sys->i_width = lastx - p_sys->i_x_start + 1;
+            else
+                p_sys->i_width = 0;
+            if( lasty >= p_sys->i_y_start )
+                p_sys->i_height = lasty - p_sys->i_y_start + 1;
+            else
+                p_sys->i_height = 0;
 
 #ifdef DEBUG_CVDSUB
-            msg_Dbg( p_dec, "end position (%d,%d), w x h: %dx%d",
+            msg_Dbg( p_dec, "end position (%d,%d), w x h: %"PRIu16"x%"PRIu16,
                      lastx, lasty, p_sys->i_width, p_sys->i_height );
 #endif
             break;
@@ -398,13 +418,14 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
 
 #ifdef DEBUG_CVDSUB
             /* Primary Palette */
-            msg_Dbg( p_dec, "primary palette %d (y,u,v): (0x%0x,0x%0x,0x%0x)",
-                     (int)v, (int)p[1], (int)p[2], (int)p[3] );
+            msg_Dbg( p_dec, "primary palette %"PRIu8" (y,u,v): "
+                     "(0x%02"PRIx8",0x%02"PRIx8",0x%02"PRIx8")",
+                     v, p[1], p[2], p[3] );
 #endif
 
             p_sys->p_palette[v][0] = p[1]; /* Y */
-            p_sys->p_palette[v][1] = p[3]; /* Cr / V */
-            p_sys->p_palette[v][2] = p[2]; /* Cb / U */
+            p_sys->p_palette[v][1] = p[2]; /* Cb / U */
+            p_sys->p_palette[v][2] = p[3]; /* Cr / V */
             break;
         }
 
@@ -416,14 +437,15 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
             uint8_t v = p[0] - 0x2c;
 
 #ifdef DEBUG_CVDSUB
-            msg_Dbg( p_dec,"highlight palette %d (y,u,v): (0x%0x,0x%0x,0x%0x)",
-                     (int)v, (int)p[1], (int)p[2], (int)p[3] );
+            msg_Dbg( p_dec,"highlight palette %"PRIu8" (y,u,v): "
+                     "(0x%02"PRIx8",0x%02"PRIx8",0x%02"PRIx8")",
+                     v, p[1], p[2], p[3] );
 #endif
 
             /* Highlight Palette */
             p_sys->p_palette_highlight[v][0] = p[1]; /* Y */
-            p_sys->p_palette_highlight[v][1] = p[3]; /* Cr / V */
-            p_sys->p_palette_highlight[v][2] = p[2]; /* Cb / U */
+            p_sys->p_palette_highlight[v][1] = p[2]; /* Cb / U */
+            p_sys->p_palette_highlight[v][2] = p[3]; /* Cr / V */
             break;
         }
 
@@ -436,9 +458,9 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
 
 #ifdef DEBUG_CVDSUB
             msg_Dbg( p_dec, "transparency for primary palette 0..3: "
-                     "0x%0x 0x%0x 0x%0x 0x%0x",
-                     (int)p_sys->p_palette[0][3], (int)p_sys->p_palette[1][3],
-                     (int)p_sys->p_palette[2][3], (int)p_sys->p_palette[3][3]);
+                     "0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8,
+                     p_sys->p_palette[0][3], p_sys->p_palette[1][3],
+                     p_sys->p_palette[2][3], p_sys->p_palette[3][3]);
 #endif
             break;
 
@@ -451,19 +473,22 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
 
 #ifdef DEBUG_CVDSUB
             msg_Dbg( p_dec, "transparency for highlight palette 0..3: "
-                     "0x%0x 0x%0x 0x%0x 0x%0x",
-                     (int)p_sys->p_palette_highlight[0][3],
-                     (int)p_sys->p_palette_highlight[1][3],
-                     (int)p_sys->p_palette_highlight[2][3],
-                     (int)p_sys->p_palette_highlight[3][3] );
+                     "0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8,
+                     p_sys->p_palette_highlight[0][3],
+                     p_sys->p_palette_highlight[1][3],
+                     p_sys->p_palette_highlight[2][3],
+                     p_sys->p_palette_highlight[3][3] );
 #endif
             break;
 
         case 0x47:
             /* offset to start of even rows of interlaced image, we correct
              * to make it relative to i_image_offset (usually 4) */
-            p_sys->first_field_offset =
-                (p[2] << 8) + p[3] - p_sys->i_image_offset;
+            p_sys->first_field_offset = (p[2] << 8) + p[3];
+            if( p_sys->first_field_offset < p_sys->i_image_offset )
+                p_sys->first_field_offset -= p_sys->i_image_offset;
+            else
+                p_sys->first_field_offset = 0;
 #ifdef DEBUG_CVDSUB
             msg_Dbg( p_dec, "1st_field_offset %zu",
                      p_sys->first_field_offset );
@@ -473,8 +498,11 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
         case 0x4f:
             /* offset to start of odd rows of interlaced image, we correct
              * to make it relative to i_image_offset (usually 4) */
-            p_sys->second_field_offset =
-                (p[2] << 8) + p[3] - p_sys->i_image_offset;
+            p_sys->second_field_offset = (p[2] << 8) + p[3];
+            if( p_sys->second_field_offset < p_sys->i_image_offset )
+                p_sys->second_field_offset -= p_sys->i_image_offset;
+            else
+                p_sys->second_field_offset = 0;
 #ifdef DEBUG_CVDSUB
             msg_Dbg( p_dec, "2nd_field_offset %zu",
                      p_sys->second_field_offset);
@@ -484,7 +512,8 @@ static void ParseMetaInfo( decoder_t *p_dec, block_t *p_spu  )
         default:
 #ifdef DEBUG_CVDSUB
             msg_Warn( p_dec, "unknown sequence in control header "
-                      "0x%0x 0x%0x 0x%0x 0x%0x", p[0], p[1], p[2], p[3]);
+                      "0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8" 0x%02"PRIx8,
+                      p[0], p[1], p[2], p[3]);
 #endif
         }
     }
@@ -523,12 +552,7 @@ static subpicture_t *DecodePacket( decoder_t *p_dec, block_t *p_data )
     fmt.p_palette = &palette;
     fmt.p_palette->i_entries = 4;
     for( i = 0; i < fmt.p_palette->i_entries; i++ )
-    {
-        fmt.p_palette->palette[i][0] = p_sys->p_palette[i][0];
-        fmt.p_palette->palette[i][1] = p_sys->p_palette[i][1];
-        fmt.p_palette->palette[i][2] = p_sys->p_palette[i][2];
-        fmt.p_palette->palette[i][3] = p_sys->p_palette[i][3];
-    }
+        memcpy( fmt.p_palette->palette[i], p_sys->p_palette[i], 4 );
 
     p_region = subpicture_region_New( &fmt );
     if( !p_region )
@@ -538,12 +562,18 @@ static subpicture_t *DecodePacket( decoder_t *p_dec, block_t *p_data )
         return NULL;
     }
 
-    p_spu->p_region = p_region;
+    vlc_spu_regions_push(&p_spu->regions, p_region);
+    p_region->b_absolute = true; p_region->b_in_window = false;
     p_region->i_x = p_sys->i_x_start;
     p_region->i_x = p_region->i_x * 3 / 4; /* FIXME: use aspect ratio for x? */
     p_region->i_y = p_sys->i_y_start;
 
-    RenderImage( p_dec, p_data, p_region );
+    if( RenderImage( p_dec, p_data, p_region->p_picture ) != VLC_SUCCESS )
+    {
+        msg_Err( p_dec, "cannot render SPU region" );
+        subpicture_Delete( p_spu );
+        return NULL;
+    }
 
     return p_spu;
 }
@@ -571,15 +601,17 @@ static subpicture_t *DecodePacket( decoder_t *p_dec, block_t *p_data )
  a 4-bit alpha (filling 8 bits), and 8-bit y, u, and v entry.
 
  *****************************************************************************/
-static void RenderImage( decoder_t *p_dec, block_t *p_data,
-                         subpicture_region_t *p_region )
+static int RenderImage( decoder_t *p_dec, block_t *p_data,
+                         picture_t *dst_pic )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
-    uint8_t *p_dest = p_region->p_picture->Y_PIXELS;
+    uint8_t *p_dest = dst_pic->Y_PIXELS;
     int i_field;            /* The subtitles are interlaced */
-    int i_row, i_column;    /* scanline row/column number */
-    uint8_t i_color, i_count;
+    size_t i_row, i_column; /* scanline row/column number */
     bs_t bs;
+
+    if( p_data->i_buffer <= p_sys->i_image_offset )
+        return VLC_EGENERIC;
 
     bs_init( &bs, p_data->p_buffer + p_sys->i_image_offset,
              p_data->i_buffer - p_sys->i_image_offset );
@@ -591,34 +623,31 @@ static void RenderImage( decoder_t *p_dec, block_t *p_data,
             for( i_column = 0; i_column < p_sys->i_width; i_column++ )
             {
                 uint8_t i_val = bs_read( &bs, 4 );
+                uint8_t *p = &p_dest[i_row * dst_pic->Y_PITCH + i_column];
+                size_t i_count;
+                uint8_t i_color;
 
                 if( i_val == 0 )
                 {
                     /* Fill the rest of the line with next color */
                     i_color = bs_read( &bs, 4 );
-
-                    memset( &p_dest[i_row * p_region->p_picture->Y_PITCH +
-                                    i_column], i_color,
-                            p_sys->i_width - i_column );
+                    i_count = p_sys->i_width - i_column;
                     i_column = p_sys->i_width;
-                    continue;
                 }
                 else
                 {
                     /* Normal case: get color and repeat count */
                     i_count = (i_val >> 2);
                     i_color = i_val & 0x3;
-
                     i_count = __MIN( i_count, p_sys->i_width - i_column );
-
-                    memset( &p_dest[i_row * p_region->p_picture->Y_PITCH +
-                                    i_column], i_color, i_count );
                     i_column += i_count - 1;
-                    continue;
                 }
+
+                memset( p, i_color, i_count );
             }
 
             bs_align( &bs );
         }
     }
+    return VLC_SUCCESS;
 }

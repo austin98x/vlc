@@ -30,7 +30,6 @@ typedef struct mc_api_out mc_api_out;
 
 typedef int (*pf_MediaCodecApi_init)(mc_api*);
 
-int MediaCodecJni_Init(mc_api*);
 int MediaCodecNdk_Init(mc_api*);
 
 #define MC_API_ERROR (-1)
@@ -47,6 +46,50 @@ int MediaCodecNdk_Init(mc_api*);
 
 /* MediaCodec only QUIRKS */
 #define MC_API_VIDEO_QUIRKS_ADAPTIVE 0x1000
+#define MC_API_VIDEO_QUIRKS_IGNORE_SIZE 0x2000
+
+/* cf. https://github.com/FFmpeg/FFmpeg/blob/00f5a34c9a5f0adee28aca11971918d6aca48745/libavcodec/mediacodec_wrapper.h#L348
+ * cf. https://developer.android.com/reference/android/media/MediaFormat#constants_1
+ * cf. https://github.com/AOSPA/android_frameworks_native/blob/vauxite/headers/media_plugin/media/hardware/VideoAPI.h*/
+enum mc_media_format_color_range_t
+{
+    MC_COLOR_RANGE_UNSPECIFIED = 0x0,
+    MC_COLOR_RANGE_FULL        = 0x1,
+    MC_COLOR_RANGE_LIMITED     = 0x2,
+};
+
+enum mc_media_format_color_standard_t
+{
+    MC_COLOR_STANDARD_UNSPECIFIED          = 0x0,
+    MC_COLOR_STANDARD_BT709                = 0x1,
+    MC_COLOR_STANDARD_BT601_625            = 0x2,
+    MC_COLOR_STANDARD_BT601_625_UNADJUSTED = 0x3,
+    MC_COLOR_STANDARD_BT601_525            = 0x4,
+    MC_COLOR_STANDARD_BT601_525_240M       = 0x5,
+    MC_COLOR_STANDARD_BT2020_NC            = 0x6,
+    MC_COLOR_STANDARD_BT2020               = 0x7,
+    MC_COLOR_STANDARD_BT470M               = 0x8,
+    MC_COLOR_STANDARD_FILM                 = 0x9,
+};
+
+enum mc_media_format_color_transfer_t
+{
+    MC_COLOR_TRANSFER_UNSPECIFIED = 0x0,
+    MC_COLOR_TRANSFER_LINEAR      = 0x1,
+    MC_COLOR_TRANSFER_SRGB        = 0x2,
+    MC_COLOR_TRANSFER_BT709       = 0x3,
+    MC_COLOR_TRANSFER_GAMMA22     = 0x4,
+    MC_COLOR_TRANSFER_GAMMA28     = 0x5,
+    MC_COLOR_TRANSFER_ST2084      = 0x6,
+    MC_COLOR_TRANSFER_HLG         = 0x7,
+};
+
+struct mc_video_color_info
+{
+    enum mc_media_format_color_range_t range;
+    enum mc_media_format_color_standard_t standard;
+    enum mc_media_format_color_transfer_t transfer;
+};
 
 struct mc_api_out
 {
@@ -60,7 +103,7 @@ struct mc_api_out
         struct
         {
             int i_index;
-            mtime_t i_ts;
+            vlc_tick_t i_ts;
             const uint8_t *p_ptr;
             size_t i_size;
         } buf;
@@ -76,6 +119,7 @@ struct mc_api_out
                 int crop_top;
                 int crop_right;
                 int crop_bottom;
+                struct mc_video_color_info color;
             } video;
             struct
             {
@@ -92,12 +136,13 @@ union mc_api_args
     struct
     {
         void *p_surface;
-        void *p_jsurface;
         int i_width;
         int i_height;
         int i_angle;
         bool b_tunneled_playback;
         bool b_adaptive_playback;
+        bool b_low_latency;
+        struct mc_video_color_info color;
     } video;
     struct
     {
@@ -116,7 +161,7 @@ struct mc_api
     enum es_format_category_e i_cat;
     vlc_fourcc_t    i_codec;
 
-    /* Set after configure */
+    /* Set after prepare */
     int  i_quirks;
     char *psz_name;
     bool b_support_rotation;
@@ -125,8 +170,9 @@ struct mc_api
     bool b_direct_rendering;
 
     void (*clean)(mc_api *);
-    int (*configure)(mc_api *, int i_profile);
-    int (*start)(mc_api *, union mc_api_args *p_args);
+    int (*prepare)(mc_api *, int i_profile);
+    int (*configure_decoder)(mc_api *, union mc_api_args* p_args);
+    int (*start)(mc_api *);
     int (*stop)(mc_api *);
     int (*flush)(mc_api *);
 
@@ -136,13 +182,13 @@ struct mc_api
      * - MC_API_INFO_OUTPUT_FORMAT_CHANGED if output format changed
      * - MC_API_INFO_OUTPUT_BUFFERS_CHANGED if buffers changed
      * - MC_API_ERROR in case of error. */
-    int (*dequeue_in)(mc_api *, mtime_t i_timeout);
-    int (*dequeue_out)(mc_api *, mtime_t i_timeout);
+    int (*dequeue_in)(mc_api *, vlc_tick_t i_timeout);
+    int (*dequeue_out)(mc_api *, vlc_tick_t i_timeout);
 
     /* i_index is the index returned by dequeue_in and should be >= 0
      * Returns 0 if buffer is successfully queued, or MC_API_ERROR */
     int (*queue_in)(mc_api *, int i_index, const void *p_buf, size_t i_size,
-                    mtime_t i_ts, bool b_config);
+                    vlc_tick_t i_ts, bool b_config);
 
     /* i_index is the index returned by dequeue_out and should be >= 0,
      * MC_API_INFO_OUTPUT_FORMAT_CHANGED, or MC_API_INFO_OUTPUT_BUFFERS_CHANGED.
@@ -154,10 +200,6 @@ struct mc_api
 
     /* render a buffer at a specified ts */
     int (*release_out_ts)(mc_api *, int i_index, int64_t i_ts_ns);
-
-    /* Dynamically sets the output surface
-     * Returns 0 on success, or MC_API_ERROR */
-    int (*set_output_surface)(mc_api*, void *p_surface, void *p_jsurface);
 };
 
 #endif

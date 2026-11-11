@@ -1,4 +1,4 @@
-// gcc -o gtk_player gtk_player.c `pkg-config --libs gtk+-2.0 libvlc` `pkg-config --cflags gtk+-2.0 libvlc`
+// gcc -o gtk_player gtk_player.c `pkg-config --libs gtk+-3.0 libvlc` `pkg-config --cflags gtk+-3.0 libvlc`
 
 /* License WTFPL http://sam.zoy.org/wtfpl/ */
 /* Written by Vincent Schüßler */
@@ -33,7 +33,7 @@ void player_widget_on_realize(GtkWidget *widget, gpointer data) {
 
 void on_open(GtkWidget *widget, gpointer data) {
     GtkWidget *dialog;
-    dialog = gtk_file_chooser_dialog_new("Choose Media", data, GTK_FILE_CHOOSER_ACTION_OPEN, GTK_STOCK_CANCEL,GTK_RESPONSE_CANCEL, GTK_STOCK_OPEN, GTK_RESPONSE_ACCEPT, NULL);
+    dialog = gtk_file_chooser_dialog_new("Choose Media", data, GTK_FILE_CHOOSER_ACTION_OPEN, "Cancel",GTK_RESPONSE_CANCEL, "Open", GTK_RESPONSE_ACCEPT, NULL);
     if(gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         char *uri;
         uri = gtk_file_chooser_get_uri(GTK_FILE_CHOOSER(dialog));
@@ -45,7 +45,7 @@ void on_open(GtkWidget *widget, gpointer data) {
 
 void open_media(const char* uri) {
     libvlc_media_t *media;
-    media = libvlc_media_new_location(vlc_inst, uri);
+    media = libvlc_media_new_location(uri);
     libvlc_media_player_set_media(media_player, media);
     play();
     libvlc_media_release(media);
@@ -62,17 +62,17 @@ void on_playpause(GtkWidget *widget, gpointer data) {
 
 void on_stop(GtkWidget *widget, gpointer data) {
     pause_player();
-    libvlc_media_player_stop(media_player);
+    libvlc_media_player_stop_async(media_player);
 }
 
 void play(void) {
     libvlc_media_player_play(media_player);
-    gtk_button_set_label(GTK_BUTTON(playpause_button), "gtk-media-pause");
+    gtk_button_set_label(GTK_BUTTON(playpause_button), "Pause");
 }
 
 void pause_player(void) {
     libvlc_media_player_pause(media_player);
-    gtk_button_set_label(GTK_BUTTON(playpause_button), "gtk-media-play");
+    gtk_button_set_label(GTK_BUTTON(playpause_button), "Play");
 }
 
 int main( int argc, char *argv[] ) {
@@ -86,6 +86,7 @@ int main( int argc, char *argv[] ) {
               *hbuttonbox,
               *stop_button;
     
+    XInitThreads();
     gtk_init (&argc, &argv);
     // setup window
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -95,7 +96,8 @@ int main( int argc, char *argv[] ) {
     gtk_window_set_title(GTK_WINDOW(window), "GTK+ libVLC Demo");
 
     //setup vbox
-    vbox = gtk_vbox_new(FALSE, 0);
+    vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_set_homogeneous (GTK_BOX (vbox), FALSE);
     gtk_container_add(GTK_CONTAINER(window), vbox);
 
     //setup menu
@@ -105,7 +107,7 @@ int main( int argc, char *argv[] ) {
     filemenu_openitem = gtk_menu_item_new_with_label("Open");
     gtk_menu_shell_append(GTK_MENU_SHELL(filemenu), filemenu_openitem);
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(fileitem), filemenu);
-    gtk_menu_bar_append(GTK_MENU_BAR(menubar), fileitem);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), fileitem);
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
     g_signal_connect(filemenu_openitem, "activate", G_CALLBACK(on_open), window);
 
@@ -115,12 +117,12 @@ int main( int argc, char *argv[] ) {
 
     //setup controls
     //playpause_button = gtk_button_new_from_stock(GTK_STOCK_MEDIA_PLAY);
-    playpause_button = gtk_button_new_with_label("gtk-media-play");
-    gtk_button_set_use_stock(GTK_BUTTON(playpause_button), TRUE);
-    stop_button = gtk_button_new_from_stock(GTK_STOCK_MEDIA_STOP);
+    playpause_button = gtk_button_new_with_label("Play");
+    // gtk_button_set_use_stock(GTK_BUTTON(playpause_button), TRUE);
+    stop_button = gtk_button_new_with_label ("Stop");
     g_signal_connect(playpause_button, "clicked", G_CALLBACK(on_playpause), NULL);
     g_signal_connect(stop_button, "clicked", G_CALLBACK(on_stop), NULL);
-    hbuttonbox = gtk_hbutton_box_new();
+    hbuttonbox = gtk_button_box_new (GTK_ORIENTATION_HORIZONTAL);
     gtk_container_set_border_width(GTK_CONTAINER(hbuttonbox), BORDER_WIDTH);
     gtk_button_box_set_layout(GTK_BUTTON_BOX(hbuttonbox), GTK_BUTTONBOX_START);
     gtk_box_pack_start(GTK_BOX(hbuttonbox), playpause_button, FALSE, FALSE, 0);
@@ -129,7 +131,7 @@ int main( int argc, char *argv[] ) {
 
     //setup vlc
     vlc_inst = libvlc_new(0, NULL);
-    media_player = libvlc_media_player_new(vlc_inst);
+    media_player = libvlc_media_player_new(vlc_inst, NULL, NULL);
     g_signal_connect(G_OBJECT(player_widget), "realize", G_CALLBACK(player_widget_on_realize), NULL);
 
     gtk_widget_show_all(window);

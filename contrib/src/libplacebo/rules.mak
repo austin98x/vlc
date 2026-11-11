@@ -1,22 +1,34 @@
 # libplacebo
 
-PLACEBO_VERSION := 0.2.0
-PLACEBO_URL := https://github.com/haasn/libplacebo/archive/v$(PLACEBO_VERSION).tar.gz
-PLACEBO_ARCHIVE = libplacebo-$(PLACEBO_VERSION).tar.gz
+PLACEBO_VERSION := 5.264.1
+PLACEBO_ARCHIVE = libplacebo-v$(PLACEBO_VERSION).tar.gz
+PLACEBO_URL := $(VIDEOLAN_GIT)/videolan/libplacebo/-/archive/v$(PLACEBO_VERSION)/$(PLACEBO_ARCHIVE)
 
-ifdef HAVE_WIN32
-LIBPLACEBO_WIN32 = HAVE_WIN32=1
-DEPS_libplacebo += pthreads $(DEPS_pthreads)
-endif
+PLACEBOCONF := -Dpython-path=$(PYTHON_VENV)/bin/python3 \
+	-Dglslang=enabled \
+	-Dshaderc=disabled \
+	-Ddemos=false \
+	-Dtests=false \
+	-Dfind_lib_path=$(PREFIX)/lib
 
+DEPS_libplacebo = glad $(DEPS_glad) jinja $(DEPS_jinja) glslang $(DEPS_glslang) vulkan-headers $(DEPS_vulkan-headers)
+ifndef HAVE_WINSTORE
 PKGS += libplacebo
-ifeq ($(call need_pkg,"libplacebo"),)
+endif
+ifeq ($(call need_pkg,"libplacebo >= 4.192"),)
 PKGS_FOUND += libplacebo
 endif
 
-PLACEBOCONF := --prefix="$(PREFIX)" \
-	--libdir lib \
-	--default-library static
+ifdef HAVE_WIN32
+DEPS_libplacebo += winpthreads $(DEPS_winpthreads)
+endif
+
+# We don't want vulkan on darwin for now
+ifndef HAVE_DARWIN_OS
+ifndef HAVE_EMSCRIPTEN
+DEPS_libplacebo += vulkan-loader $(DEPS_vulkan-loader) vulkan-headers $(DEPS_vulkan-headers)
+endif
+endif
 
 $(TARBALLS)/$(PLACEBO_ARCHIVE):
 	$(call download_pkg,$(PLACEBO_URL),libplacebo)
@@ -25,17 +37,18 @@ $(TARBALLS)/$(PLACEBO_ARCHIVE):
 
 libplacebo: $(PLACEBO_ARCHIVE) .sum-libplacebo
 	$(UNPACK)
-	$(APPLY) $(SRC)/libplacebo/0001-build-use-a-Makefile.patch
-ifdef HAVE_WIN32
-	$(APPLY) $(SRC)/libplacebo/0002-build-fix-win32-build.patch
-endif
-	$(APPLY) $(SRC)/libplacebo/0003-2.0-fixup.patch
+	$(APPLY) $(SRC)/libplacebo/0001-vulkan-meson-add-the-clang-gcc-C-runtime.patch
+	$(APPLY) $(SRC)/libplacebo/0001-meson-allow-overriding-python3-path.patch
+	$(APPLY) $(SRC)/libplacebo/0001-meson-allow-forcing-the-path-to-look-for-libraries.patch
+	$(APPLY) $(SRC)/libplacebo/0001-vulkan-utils_gen-fix-for-python-3.14.patch
+	$(APPLY) $(SRC)/libplacebo/0001-meson-add-glslang-lib-for-15.0.0-linking.patch
 	$(MOVE)
 
-.libplacebo: libplacebo
-	cd $< && rm -rf ./build
-# we don't want to depend on meson/ninja for VLC 3.0
-#cd $< && $(HOSTVARS) meson $(PLACEBOCONF) build
-#cd $< && cd build && ninja install
-	cd $< && $(HOSTVARS_PIC) PREFIX=$(PREFIX) $(LIBPLACEBO_WIN32) make install
+.libplacebo: libplacebo crossfile.meson .python-venv
+	$(MESONCLEAN)
+	$(MESON) $(PLACEBOCONF)
+	+$(MESONBUILD)
+# Work-around for full paths to static libraries, which libtool does not like
+# See https://github.com/mesonbuild/meson/issues/5479
+	(cd $(UNPACK_DIR) && $(SRC_BUILT)/pkg-rewrite-absolute.py -i "$(PREFIX)/lib/pkgconfig/libplacebo.pc")
 	touch $@

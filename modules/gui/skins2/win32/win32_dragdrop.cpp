@@ -2,7 +2,6 @@
  * win32_dragdrop.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -30,11 +29,21 @@
 #include <list>
 #include <shlobj.h>
 
+#include <vlc_charset.h>
+
+/// Wrapper around FromWide, to avoid the need to call free()
+static inline std::string sFromWide( const std::wstring &rWide )
+{
+    char *s = FromWide( rWide.c_str() );
+    std::string res = s;
+    free( s );
+    return res;
+}
 
 Win32DragDrop::Win32DragDrop( intf_thread_t *pIntf,
-                              bool playOnDrop, GenericWindow* pWin )
+                              GenericWindow* pWin )
     : SkinObject( pIntf ), IDropTarget(), m_references( 1 ),
-      m_playOnDrop( playOnDrop ), m_pWin( pWin), m_format( { 0, NULL} )
+      m_pWin( pWin), m_format( { 0, NULL} )
 {
 }
 

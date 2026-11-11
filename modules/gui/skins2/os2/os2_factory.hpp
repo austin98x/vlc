@@ -35,7 +35,7 @@
 #include <map>
 
 
-/// Class used to instanciate OS2 specific objects
+/// Class used to instantiate OS2 specific objects
 class OS2Factory: public OSFactory
 {
 public:
@@ -99,7 +99,7 @@ public:
     virtual int getScreenHeight() const;
 
     /// Get Monitor Information
-    virtual void getMonitorInfo( const GenericWindow &rWindow,
+    virtual void getMonitorInfo( OSWindow* pWindow,
                                  int* x, int* y,
                                  int* width, int* height ) const;
     virtual void getMonitorInfo( int numScreen,

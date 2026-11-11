@@ -2,7 +2,6 @@
  * win32_timer.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -26,6 +25,8 @@
 #define WIN32_TIMER_HPP
 
 #include "../src/os_timer.hpp"
+
+#include <windows.h>
 
 class CmdGeneric;
 
@@ -51,7 +52,7 @@ private:
     CmdGeneric &m_rCommand;
 
     /// Delay between two execute
-    mtime_t m_interval;
+    int m_interval;
 
     /// Flag to tell whether the timer must be stopped after the
     /// first execution

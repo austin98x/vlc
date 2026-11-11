@@ -55,6 +55,7 @@ See http://www.vdr-wiki.de/ and http://www.tvdr.de/ for more information.
 #include <errno.h>
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_plugin.h>
 #include <vlc_access.h>
 #include <vlc_input.h>
@@ -62,6 +63,7 @@ See http://www.vdr-wiki.de/ and http://www.tvdr.de/ for more information.
 #include <vlc_charset.h>
 #include <vlc_dialog.h>
 #include <vlc_configuration.h>
+#include <vlc_memstream.h>
 
 /*****************************************************************************
  * Module descriptor
@@ -80,15 +82,14 @@ static void Close( vlc_object_t * );
     "Default frame rate for chapter import." )
 
 vlc_module_begin ()
-    set_category( CAT_INPUT )
     set_shortname( N_("VDR") )
     set_help( HELP_TEXT )
     set_subcategory( SUBCAT_INPUT_ACCESS )
     set_description( N_("VDR recordings") )
     add_integer( "vdr-chapter-offset", 0,
-        CHAPTER_OFFSET_TEXT, CHAPTER_OFFSET_LONGTEXT, true )
+        CHAPTER_OFFSET_TEXT, CHAPTER_OFFSET_LONGTEXT )
     add_float_with_range( "vdr-fps", 25, 1, 1000,
-        FPS_TEXT, FPS_LONGTEXT, true )
+        FPS_TEXT, FPS_LONGTEXT )
     set_capability( "access", 60 )
     add_shortcut( "vdr" )
     add_shortcut( "directory" )
@@ -104,9 +105,9 @@ vlc_module_end ()
 /* minimum chapter size in seconds */
 #define MIN_CHAPTER_SIZE 5
 
-TYPEDEF_ARRAY( uint64_t, size_array_t );
+TYPEDEF_ARRAY( uint64_t, size_array_t )
 
-struct access_sys_t
+typedef struct
 {
     /* file sizes of all parts */
     size_array_t file_sizes;
@@ -128,7 +129,7 @@ struct access_sys_t
 
     /* file format: true=TS, false=PES */
     bool b_ts_format;
-};
+} access_sys_t;
 
 #define CURRENT_FILE_SIZE ARRAY_VAL(p_sys->file_sizes, p_sys->i_current_file)
 #define FILE_SIZE(pos)    ARRAY_VAL(p_sys->file_sizes, pos)
@@ -174,9 +175,9 @@ static int Open( vlc_object_t *p_this )
     if( b_strict )
     {
         char psz_extension[4];
-        int i_length = 0;
+        ptrdiff_t i_length = 0;
         const char *psz_name = BaseName( p_access->psz_filepath );
-        if( sscanf( psz_name, "%*u-%*u-%*u.%*u.%*u.%*u%*[-.]%*u.%3s%n",
+        if( sscanf( psz_name, "%*u-%*u-%*u.%*u.%*u.%*u%*[-.]%*u.%3s%tn",
             psz_extension, &i_length ) != 1 || strcasecmp( psz_extension, "rec" ) ||
             ( psz_name[i_length] != DIR_SEP_CHAR && psz_name[i_length] != '\0' ) )
             return VLC_EGENERIC;
@@ -267,7 +268,6 @@ static int Control( stream_t *p_access, int i_query, va_list args )
     access_sys_t *p_sys = p_access->p_sys;
     input_title_t ***ppp_title;
     int i;
-    int64_t *pi64;
     vlc_meta_t *p_meta;
 
     switch( i_query )
@@ -284,9 +284,8 @@ static int Control( stream_t *p_access, int i_query, va_list args )
             break;
 
         case STREAM_GET_PTS_DELAY:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = INT64_C(1000)
-                  * var_InheritInteger( p_access, "file-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS(var_InheritInteger( p_access, "file-caching" ));
             break;
 
         case STREAM_SET_PAUSE_STATE:
@@ -324,6 +323,8 @@ static int Control( stream_t *p_access, int i_query, va_list args )
 
         case STREAM_SET_SEEKPOINT:
             i = va_arg( args, int );
+            if( i < 0 || !p_sys->p_marks || i >= p_sys->p_marks->i_seekpoint )
+                return VLC_EGENERIC;
             return Seek( p_access, p_sys->offsets[i] );
 
         case STREAM_GET_META:
@@ -659,7 +660,6 @@ static void ImportMeta( stream_t *p_access )
 
     char *line = NULL;
     size_t line_len;
-    char *psz_title = NULL, *psz_smalltext = NULL, *psz_date = NULL;
 
     while( ReadLine( &line, &line_len, infofile ) )
     {
@@ -675,9 +675,9 @@ static void ImportMeta( stream_t *p_access )
             if( psz_name )
             {
                 *psz_name = '\0';
-                vlc_meta_AddExtra( p_meta, "Channel", psz_name + 1 );
+                vlc_meta_SetExtra( p_meta, "Channel", psz_name + 1 );
             }
-            vlc_meta_AddExtra( p_meta, "Transponder", text );
+            vlc_meta_SetExtra( p_meta, "Transponder", text );
         }
 
         else if( tag == 'E' )
@@ -692,29 +692,23 @@ static void ImportMeta( stream_t *p_access )
 
                 /* TODO: locale */
                 strftime( str, sizeof(str), "%Y-%m-%d %H:%M", &tm );
-                vlc_meta_AddExtra( p_meta, "Date", str );
-                free( psz_date );
-                psz_date = strdup( str );
+                vlc_meta_SetExtra( p_meta, "Date", str );
 
                 /* display in minutes */
                 i_length = ( i_length + 59 ) / 60;
                 snprintf( str, sizeof(str), "%u:%02u", i_length / 60, i_length % 60 );
-                vlc_meta_AddExtra( p_meta, "Duration", str );
+                vlc_meta_SetExtra( p_meta, "Duration", str );
             }
         }
 
         else if( tag == 'T' )
         {
-            free( psz_title );
-            psz_title = strdup( text );
-            vlc_meta_AddExtra( p_meta, "Title", text );
+            vlc_meta_SetExtra( p_meta, "Title", text );
         }
 
         else if( tag == 'S' )
         {
-            free( psz_smalltext );
-            psz_smalltext = strdup( text );
-            vlc_meta_AddExtra( p_meta, "Info", text );
+            vlc_meta_SetExtra( p_meta, "Info", text );
         }
 
         else if( tag == 'D' )
@@ -733,50 +727,45 @@ static void ImportMeta( stream_t *p_access )
             float fps = atof( text );
             if( fps >= 1 )
                 p_sys->fps = fps;
-            vlc_meta_AddExtra( p_meta, "Frame Rate", text );
+            vlc_meta_SetExtra( p_meta, "Frame Rate", text );
         }
 
         else if( tag == 'P' )
         {
-            vlc_meta_AddExtra( p_meta, "Priority", text );
+            vlc_meta_SetExtra( p_meta, "Priority", text );
         }
 
         else if( tag == 'L' )
         {
-            vlc_meta_AddExtra( p_meta, "Lifetime", text );
+            vlc_meta_SetExtra( p_meta, "Lifetime", text );
         }
     }
 
     /* create a meaningful title */
-    int i_len = 10 +
-        ( psz_title ? strlen( psz_title ) : 0 ) +
-        ( psz_smalltext ? strlen( psz_smalltext ) : 0 ) +
-        ( psz_date ? strlen( psz_date ) : 0 );
-    char *psz_display = malloc( i_len );
-
-    if( psz_display )
+    struct vlc_memstream memstream;
+    if( vlc_memstream_open( &memstream ) == 0 )
     {
-        *psz_display = '\0';
-        if( psz_title )
-            strcat( psz_display, psz_title );
-        if( psz_title && psz_smalltext )
-            strcat( psz_display, " - " );
-        if( psz_smalltext )
-            strcat( psz_display, psz_smalltext );
-        if( ( psz_title || psz_smalltext ) && psz_date )
-        {
-            strcat( psz_display, " (" );
-            strcat( psz_display, psz_date );
-            strcat( psz_display, ")" );
-        }
-        if( *psz_display )
-            vlc_meta_SetTitle( p_meta, psz_display );
-    }
+        const char *psz_title = vlc_meta_GetExtra( p_meta, "Title" );
+        const char *psz_smalltext = vlc_meta_GetExtra( p_meta, "Info" );
+        const char *psz_date = vlc_meta_GetExtra( p_meta, "Date" );
 
-    free( psz_display );
-    free( psz_title );
-    free( psz_smalltext );
-    free( psz_date );
+        if( psz_title )
+        {
+            vlc_memstream_puts( &memstream, psz_title );
+            if( psz_smalltext )
+                vlc_memstream_puts( &memstream, " - " );
+        }
+        if( psz_smalltext )
+            vlc_memstream_puts( &memstream, psz_smalltext );
+        if( ( psz_title || psz_smalltext ) && psz_date )
+            vlc_memstream_printf( &memstream, " (%s)", psz_date );
+        if( vlc_memstream_close( &memstream ) == 0 )
+        {
+            if( memstream.length )
+                vlc_meta_SetTitle( p_meta, memstream.ptr );
+            free( memstream.ptr );
+        }
+    }
 
     fclose( infofile );
 }
@@ -818,7 +807,7 @@ static void ImportMarks( stream_t *p_access )
         return;
     }
     p_marks->psz_name = strdup( _("VDR Cut Marks") );
-    p_marks->i_length = i_frame_count * (int64_t)( CLOCK_FREQ / p_sys->fps );
+    p_marks->i_length = i_frame_count * (vlc_tick_t)( CLOCK_FREQ / p_sys->fps );
 
     uint64_t *offsetv = NULL;
 
@@ -864,7 +853,7 @@ static void ImportMarks( stream_t *p_access )
         seekpoint_t *sp = vlc_seekpoint_New();
         if( !sp )
             continue;
-        sp->i_time_offset = i_frame * (int64_t)( CLOCK_FREQ / p_sys->fps );
+        sp->i_time_offset = i_frame * (vlc_tick_t)( CLOCK_FREQ / p_sys->fps );
         sp->psz_name = strdup( line );
 
         TAB_APPEND( p_marks->i_seekpoint, p_marks->seekpoint, sp );

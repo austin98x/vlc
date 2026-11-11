@@ -69,26 +69,25 @@ static void Close (vlc_object_t *);
 vlc_module_begin ()
     set_shortname (N_("Screen"))
     set_description (N_("Screen capture (with X11/XCB)"))
-    set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_ACCESS)
-    set_capability ("access_demux", 0)
+    set_capability ("access", 0)
     set_callbacks (Open, Close)
 
-    add_float ("screen-fps", 2.0, FPS_TEXT, FPS_LONGTEXT, true)
-    add_integer ("screen-left", 0, LEFT_TEXT, LEFT_LONGTEXT, true)
+    add_float ("screen-fps", 2.0, FPS_TEXT, FPS_LONGTEXT)
+    add_integer ("screen-left", 0, LEFT_TEXT, LEFT_LONGTEXT)
         change_integer_range (-32768, 32767)
         change_safe ()
-    add_integer ("screen-top", 0, TOP_TEXT, TOP_LONGTEXT, true)
+    add_integer ("screen-top", 0, TOP_TEXT, TOP_LONGTEXT)
         change_integer_range (-32768, 32767)
         change_safe ()
-    add_integer ("screen-width", 0, WIDTH_TEXT, WIDTH_LONGTEXT, true)
+    add_integer ("screen-width", 0, WIDTH_TEXT, WIDTH_LONGTEXT)
         change_integer_range (0, 65535)
         change_safe ()
-    add_integer ("screen-height", 0, HEIGHT_TEXT, HEIGHT_LONGTEXT, true)
+    add_integer ("screen-height", 0, HEIGHT_TEXT, HEIGHT_LONGTEXT)
         change_integer_range (0, 65535)
         change_safe ()
     add_bool ("screen-follow-mouse", false, FOLLOW_MOUSE_TEXT,
-              FOLLOW_MOUSE_LONGTEXT, true)
+              FOLLOW_MOUSE_LONGTEXT)
 
     add_shortcut ("screen", "window")
 vlc_module_end ()
@@ -101,7 +100,7 @@ static int Control (demux_t *, int, va_list);
 static es_out_id_t *InitES (demux_t *, uint_fast16_t, uint_fast16_t,
                             uint_fast8_t, uint8_t *);
 
-struct demux_sys_t
+typedef struct
 {
     /* All owned by timer thread while timer is armed: */
     xcb_connection_t *conn; /**< XCB connection */
@@ -109,7 +108,9 @@ struct demux_sys_t
     float             rate; /**< Frame rate */
     xcb_window_t      window; /**< Captured window XID  */
     xcb_pixmap_t      pixmap; /**< Pixmap for composited capture */
+#ifdef HAVE_SYS_SHM_H
     xcb_shm_seg_t     segment; /**< SHM segment XID */
+#endif
     int16_t           x, y; /**< Requested capture top-left coordinates */
     uint16_t          w, h; /**< Requested capture pixel dimensions */
     uint8_t           bpp; /**< Actual bytes per pixel *es */
@@ -118,7 +119,7 @@ struct demux_sys_t
     uint16_t          cur_w, cur_h; /**< Actual capture pixel dimensions */
     /* Timer does not use this, only input thread: */
     vlc_timer_t       timer;
-};
+} demux_sys_t;
 
 /** Checks MIT-SHM shared memory support */
 static bool CheckSHM (xcb_connection_t *conn)
@@ -142,8 +143,10 @@ static bool CheckSHM (xcb_connection_t *conn)
 static int Open (vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
-    demux_sys_t *p_sys = malloc (sizeof (*p_sys));
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
 
+    demux_sys_t *p_sys = malloc (sizeof (*p_sys));
     if (p_sys == NULL)
         return VLC_ENOMEM;
     demux->p_sys = p_sys;
@@ -216,7 +219,9 @@ static int Open (vlc_object_t *obj)
 
     /* Window properties */
     p_sys->pixmap = xcb_generate_id (conn);
+#ifdef HAVE_SYS_SHM_H
     p_sys->segment = xcb_generate_id (conn);
+#endif
     p_sys->shm = CheckSHM (conn);
     p_sys->w = var_InheritInteger (obj, "screen-width");
     p_sys->h = var_InheritInteger (obj, "screen-height");
@@ -235,7 +240,7 @@ static int Open (vlc_object_t *obj)
     if (!p_sys->rate)
         goto error;
 
-    mtime_t interval = (float)CLOCK_FREQ / p_sys->rate;
+    vlc_tick_t interval = (float)CLOCK_FREQ / p_sys->rate;
     if (!interval)
         goto error;
 
@@ -245,7 +250,7 @@ static int Open (vlc_object_t *obj)
     p_sys->es = NULL;
     if (vlc_timer_create (&p_sys->timer, Demux, demux))
         goto error;
-    vlc_timer_schedule (p_sys->timer, false, 1, interval);
+    vlc_timer_schedule_asap (p_sys->timer, interval);
 
     /* Initializes demux */
     demux->pf_demux   = NULL;
@@ -290,8 +295,7 @@ static int Control (demux_t *demux, int query, va_list args)
         case DEMUX_GET_LENGTH:
         case DEMUX_GET_TIME:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = 0;
+            *va_arg (args, vlc_tick_t *) = 0;
             return VLC_SUCCESS;
         }
 
@@ -299,8 +303,8 @@ static int Control (demux_t *demux, int query, va_list args)
 
         case DEMUX_GET_PTS_DELAY:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = INT64_C(1000) * var_InheritInteger (demux, "live-caching");
+            *va_arg (args, vlc_tick_t *) =
+                VLC_TICK_FROM_MS(var_InheritInteger (demux, "live-caching"));
             return VLC_SUCCESS;
         }
 
@@ -432,7 +436,7 @@ discard:
     free (geo);
 
     block_t *block = NULL;
-#if HAVE_SYS_SHM_H
+#ifdef HAVE_SYS_SHM_H
     if (sys->shm)
     {   /* Capture screen through shared memory */
         size_t size = w * h * sys->bpp;
@@ -500,7 +504,7 @@ noshm:
     /* Send block - zero copy */
     if (sys->es != NULL)
     {
-        block->i_pts = block->i_dts = mdate ();
+        block->i_pts = block->i_dts = vlc_tick_now ();
 
         es_out_SetPCR(demux->out, block->i_pts);
         es_out_Send (demux->out, sys->es, block);
@@ -515,7 +519,7 @@ static es_out_id_t *InitES (demux_t *demux, uint_fast16_t width,
 {
     demux_sys_t *p_sys = demux->p_sys;
     const xcb_setup_t *setup = xcb_get_setup (p_sys->conn);
-    uint32_t chroma = 0;
+    vlc_fourcc_t chroma = 0;
 
     for (const xcb_format_t *fmt = xcb_setup_pixmap_formats (setup),
              *end = fmt + xcb_setup_pixmap_formats_length (setup);
@@ -531,21 +535,21 @@ static es_out_id_t *InitES (demux_t *demux, uint_fast16_t width,
                 break;
             case 24:
                 if (fmt->bits_per_pixel == 32)
-                    chroma = VLC_CODEC_RGB32;
+                    chroma = VLC_CODEC_XRGB;
                 else if (fmt->bits_per_pixel == 24)
                     chroma = VLC_CODEC_RGB24;
                 break;
             case 16:
                 if (fmt->bits_per_pixel == 16)
-                    chroma = VLC_CODEC_RGB16;
+                    chroma = VLC_CODEC_RGB565;
                 break;
             case 15:
                 if (fmt->bits_per_pixel == 16)
-                    chroma = VLC_CODEC_RGB15;
+                    chroma = VLC_CODEC_RGB555;
                 break;
             case 8: /* XXX: screw grey scale! */
                 if (fmt->bits_per_pixel == 8)
-                    chroma = VLC_CODEC_RGB8;
+                    chroma = VLC_CODEC_RGB233;
                 break;
         }
         if (chroma != 0)
@@ -564,13 +568,9 @@ static es_out_id_t *InitES (demux_t *demux, uint_fast16_t width,
     es_format_t fmt;
 
     es_format_Init (&fmt, VIDEO_ES, chroma);
-    fmt.video.i_chroma = chroma;
-    fmt.video.i_bits_per_pixel = *bpp;
-    fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
+    video_format_Setup(&fmt.video, chroma, width, height, width, height, 1, 1);
     fmt.video.i_frame_rate = 1000 * p_sys->rate;
     fmt.video.i_frame_rate_base = 1000;
-    fmt.video.i_visible_width = fmt.video.i_width = width;
-    fmt.video.i_visible_height = fmt.video.i_height = height;
 
     return es_out_Add (demux->out, &fmt);
 }

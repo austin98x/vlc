@@ -2,7 +2,6 @@
  * util.cpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -24,12 +23,18 @@
 #include "mkv.hpp"
 #include "util.hpp"
 #include "demux.hpp"
+#include "virtual_segment.hpp"
+#include "../../codec/webvtt/helpers.h"
+
+#include "lzokay.hpp"
+
+namespace mkv {
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
 
-#ifdef HAVE_ZLIB_H
+#ifdef HAVE_ZLIB
 int32_t zlib_decompress_extra( demux_t * p_demux, mkv_track_t & tk )
 {
     int result;
@@ -87,6 +92,7 @@ int32_t zlib_decompress_extra( demux_t * p_demux, mkv_track_t & tk )
         msg_Err( p_demux, "Couldn't allocate buffer to inflate data, ignore track %u",
                  tk.i_number );
         inflateEnd( &d_stream );
+        tk.p_extra_data = NULL;
         return 1;
     }
 
@@ -147,6 +153,76 @@ block_t *block_zlib_decompress( vlc_object_t *p_this, block_t *p_in_block ) {
 }
 #endif
 
+bool lzo1x_decompress_extra( demux_t * p_demux, mkv_track_t & tk )
+{
+    lzokay::EResult result;
+    size_t n = 0, total_out = 0;
+    uint8_t * p_new_extra = nullptr;
+
+    msg_Dbg(p_demux,"Inflating private data");
+
+    do
+    {
+        n++;
+        void *alloc = realloc(p_new_extra, n * 1024);
+        if( alloc == nullptr )
+        {
+            msg_Err( p_demux, "Couldn't allocate buffer to inflate data, ignore track %u",
+                      tk.i_number );
+            free(p_new_extra);
+            return false;
+        }
+
+        p_new_extra = static_cast<uint8_t *>( alloc );
+        result = lzokay::decompress( tk.p_extra_data, tk.i_extra_data,
+                                     p_new_extra, n * 1024, total_out );
+    }
+    while ( result == lzokay::EResult::OutputOverrun );
+
+    if( result != lzokay::EResult::Success )
+    {
+        msg_Err( p_demux, "LZO1X private data decompression failed. Result: %d", (int)result );
+        free(p_new_extra);
+        return false;
+    }
+
+    free( tk.p_extra_data );
+    tk.i_extra_data = total_out;
+    tk.p_extra_data = p_new_extra;
+
+    return true;
+}
+
+block_t *block_lzo1x_decompress( vlc_object_t *p_this, block_t *p_in_block ) {
+    lzokay::EResult result;
+    size_t dstsize = 0, n;
+    block_t *p_block;
+
+    n = 0;
+    p_block = block_Alloc( 0 );
+    do
+    {
+        n++;
+        p_block = block_Realloc( p_block, 0, n * 1000 );
+        result = lzokay::decompress( p_in_block->p_buffer, p_in_block->i_buffer,
+                                     p_block->p_buffer, p_block->i_buffer, dstsize );
+    }
+    while( result == lzokay::EResult::OutputOverrun );
+
+    if( result != lzokay::EResult::Success )
+    {
+        msg_Err( p_this, "LZO1X decompression failed. Result: %d", (int)result );
+        block_Release( p_block );
+        return p_in_block;
+    }
+
+    p_block = block_Realloc( p_block, 0, dstsize );
+    p_block->i_buffer = dstsize;
+    block_Release( p_in_block );
+
+    return p_block;
+}
+
 /* Utility function for BlockDecode */
 block_t *MemToBlock( uint8_t *p_mem, size_t i_mem, size_t offset)
 {
@@ -162,15 +238,15 @@ block_t *MemToBlock( uint8_t *p_mem, size_t i_mem, size_t offset)
 }
 
 
-void handle_real_audio(demux_t * p_demux, mkv_track_t * p_tk, block_t * p_blk, mtime_t i_pts)
+void handle_real_audio(demux_t * p_demux, mkv_track_t * p_tk, block_t * p_blk, vlc_tick_t i_pts)
 {
     uint8_t * p_frame = p_blk->p_buffer;
-    Cook_PrivateTrackData * p_sys = (Cook_PrivateTrackData *) p_tk->p_sys;
+    Cook_PrivateTrackData * p_sys = static_cast<Cook_PrivateTrackData *>(p_tk->p_sys);
     size_t size = p_blk->i_buffer;
 
-    if( p_tk->i_last_dts == VLC_TS_INVALID )
+    if( p_tk->i_last_dts == VLC_TICK_INVALID )
     {
-        for( size_t i = 0; i < p_sys->i_subpackets; i++)
+        for( size_t i = 0; i < p_sys->p_subpackets.size(); i++)
             if( p_sys->p_subpackets[i] )
             {
                 block_Release(p_sys->p_subpackets[i]);
@@ -190,66 +266,179 @@ void handle_real_audio(demux_t * p_demux, mkv_track_t * p_tk, block_t * p_blk, m
         p_tk->fmt.i_codec == VLC_CODEC_ATRAC3 )
     {
         const uint16_t i_num = p_sys->i_frame_size / p_sys->i_subpacket_size;
-        const size_t y = p_sys->i_subpacket / ( p_sys->i_frame_size / p_sys->i_subpacket_size );
+        if ( i_num == 0 )
+            return;
+        const size_t y = p_sys->i_subpacket / i_num;
 
         for( uint16_t i = 0; i < i_num; i++ )
         {
             size_t i_index = (size_t) p_sys->i_sub_packet_h * i +
                           ((p_sys->i_sub_packet_h + 1) / 2) * (y&1) + (y>>1);
-            if( i_index >= p_sys->i_subpackets )
-                return;
-
-            block_t *p_block = block_Alloc( p_sys->i_subpacket_size );
-            if( !p_block )
+            if( unlikely(i_index >= p_sys->p_subpackets.size()) )
                 return;
 
             if( size < p_sys->i_subpacket_size )
                 return;
 
-            memcpy( p_block->p_buffer, p_frame, p_sys->i_subpacket_size );
-            p_block->i_dts = VLC_TS_INVALID;
-            p_block->i_pts = VLC_TS_INVALID;
-            if( !p_sys->i_subpacket )
+            if (likely(p_sys->p_subpackets[i_index] == nullptr))
             {
-                p_tk->i_last_dts =
-                p_block->i_pts = i_pts;
+                // the index was not used
+                block_t *p_block = block_Alloc( p_sys->i_subpacket_size );
+                if( !p_block )
+                    return;
+
+                memcpy( p_block->p_buffer, p_frame, p_sys->i_subpacket_size );
+                p_block->i_dts = VLC_TICK_INVALID;
+                p_block->i_pts = VLC_TICK_INVALID;
+                if( p_sys->i_subpacket == 0 )
+                {
+                    p_tk->i_last_dts =
+                    p_block->i_pts = i_pts;
+                }
+                p_sys->p_subpackets[i_index] = p_block;
             }
 
             p_frame += p_sys->i_subpacket_size;
             size -=  p_sys->i_subpacket_size;
 
             p_sys->i_subpacket++;
-            p_sys->p_subpackets[i_index] = p_block;
         }
     }
     else
     {
         /*TODO*/
     }
-    if( p_sys->i_subpacket == p_sys->i_subpackets )
+    if( p_sys->i_subpacket == p_sys->p_subpackets.size() )
     {
-        for( size_t i = 0; i < p_sys->i_subpackets; i++)
+        for( size_t i = 0; i < p_sys->p_subpackets.size(); i++)
         {
-            send_Block( p_demux, p_tk, p_sys->p_subpackets[i], 1, 0 );
-            p_sys->p_subpackets[i] = NULL;
+            if (likely(p_sys->p_subpackets[i]))
+            {
+                send_Block( p_demux, p_tk, p_sys->p_subpackets[i], 1, 0 );
+                p_sys->p_subpackets[i] = NULL;
+            }
         }
         p_sys->i_subpacket = 0;
     }
 }
 
-void send_Block( demux_t * p_demux, mkv_track_t * p_tk, block_t * p_block, unsigned int i_number_frames, mtime_t i_duration )
+block_t *WEBVTT_Repack_Sample(block_t *p_block, bool b_webm,
+                              const uint8_t *p_add, size_t i_add)
+{
+    struct webvtt_cueelements_s els;
+    memset(&els, 0, sizeof(els));
+    size_t newsize = 0;
+    block_t *newblock = nullptr;
+    /* Repack to ISOBMFF samples format */
+    if( !b_webm ) /* S_TEXT/WEBVTT */
+    {
+        /* process addition fields */
+        if( i_add )
+        {
+            const uint8_t *end = p_add + i_add;
+            const uint8_t *iden =
+                    reinterpret_cast<const uint8_t *>(std::memchr( p_add, '\n', i_add ));
+            if( iden && ++iden != end )
+            {
+                els.sttg.p_data = p_add;
+                els.sttg.i_data = &iden[-1] - p_add;
+                const uint8_t *comm =
+                        reinterpret_cast<const uint8_t *>(std::memchr( iden, '\n', end - iden ));
+                els.iden.p_data = iden;
+                if( comm )
+                    els.iden.i_data = comm - iden;
+                else
+                    els.iden.i_data = end - iden;
+            }
+        }
+        /* the payload being in the block */
+        els.payl.p_data = p_block->p_buffer;
+        els.payl.i_data = p_block->i_buffer;
+    }
+    else /* deprecated D_WEBVTT/ */
+    {
+        const uint8_t *start = p_block->p_buffer;
+        const uint8_t *end = p_block->p_buffer + p_block->i_buffer;
+        const uint8_t *sttg =
+                reinterpret_cast<const uint8_t *>(std::memchr( start, '\n', p_block->i_buffer ));
+        if( !sttg || ++sttg == end )
+            goto error;
+        const uint8_t *payl =
+                reinterpret_cast<const uint8_t *>(std::memchr( sttg, '\n', end - sttg ));
+        if( !payl || ++payl == end )
+            goto error;
+        els.iden.p_data = start;
+        els.iden.i_data = &sttg[-1] - start;
+        els.sttg.p_data = sttg;
+        els.sttg.i_data = &payl[-1] - sttg;
+        els.payl.p_data = payl;
+        els.payl.i_data = end - payl;
+    }
+
+    newsize = WEBVTT_Pack_CueElementsGetNewSize( &els );
+    newblock = block_Alloc( newsize );
+    if( !newblock )
+        goto error;
+    WEBVTT_Pack_CueElements( &els, newblock->p_buffer );
+    block_CopyProperties( newblock, p_block );
+    block_Release( p_block );
+    return newblock;
+
+error:
+    block_Release( p_block );
+    return NULL;
+}
+
+int UpdatePCR( demux_t * p_demux )
 {
     demux_sys_t *p_sys = (demux_sys_t *)p_demux->p_sys;
-    matroska_segment_c *p_segment = p_sys->p_current_vsegment->CurrentSegment();
+    matroska_segment_c *p_segment = p_sys->GetCurrentVSegment()->CurrentSegment();
+
+    vlc_tick_t i_pcr = VLC_TICK_INVALID;
+
+    for( const auto & it : p_segment->tracks )
+    {
+        const auto &track = it.second;
+
+        if( track->i_last_dts == VLC_TICK_INVALID )
+            continue;
+
+        if( track->fmt.i_cat != VIDEO_ES && track->fmt.i_cat != AUDIO_ES )
+            continue;
+
+        if( track->i_last_dts < i_pcr || i_pcr == VLC_TICK_INVALID )
+        {
+            i_pcr = track->i_last_dts;
+        }
+    }
+
+    if( i_pcr != VLC_TICK_INVALID && i_pcr > p_sys->i_pcr )
+    {
+        if( es_out_SetPCR( p_demux->out, i_pcr ) )
+        {
+            msg_Err( p_demux, "ES_OUT_SET_PCR failed, aborting." );
+            return VLC_EGENERIC;
+        }
+
+        p_sys->i_pcr = i_pcr;
+    }
+
+    return VLC_SUCCESS;
+}
+
+void send_Block( demux_t * p_demux, mkv_track_t * p_tk, block_t * p_block, unsigned int i_number_frames, uint64_t i_duration )
+{
+    demux_sys_t *p_sys = (demux_sys_t *)p_demux->p_sys;
+    matroska_segment_c *p_segment = p_sys->GetCurrentVSegment()->CurrentSegment();
 
     if( p_tk->fmt.i_cat == AUDIO_ES && p_tk->i_chans_to_reorder )
     {
         aout_ChannelReorder( p_block->p_buffer, p_block->i_buffer,
-                             p_tk->fmt.audio.i_channels,
+                             p_tk->i_chans_to_reorder,
                              p_tk->pi_chan_table, p_tk->fmt.i_codec );
     }
 
-    if( p_block->i_dts > VLC_TS_INVALID &&
+    if( p_block->i_dts != VLC_TICK_INVALID &&
         ( p_tk->fmt.i_cat == VIDEO_ES || p_tk->fmt.i_cat == AUDIO_ES ) )
     {
         p_tk->i_last_dts = p_block->i_dts;
@@ -257,8 +446,8 @@ void send_Block( demux_t * p_demux, mkv_track_t * p_tk, block_t * p_block, unsig
 
     if( !p_tk->b_no_duration )
     {
-        p_block->i_length = i_duration * p_tk->f_timecodescale *
-            (double) p_segment->i_timescale / ( 1000.0 * i_number_frames );
+        p_block->i_length = VLC_TICK_FROM_NS(i_duration * p_tk->f_timecodescale *
+                                             p_segment->i_timescale) / i_number_frames;
     }
 
     if( p_tk->b_discontinuity )
@@ -267,30 +456,104 @@ void send_Block( demux_t * p_demux, mkv_track_t * p_tk, block_t * p_block, unsig
         p_tk->b_discontinuity = false;
     }
 
+    if ( p_sys->i_pcr == VLC_TICK_INVALID )
+        UpdatePCR( p_demux );
+
     es_out_Send( p_demux->out, p_tk->p_es, p_block);
 }
 
-int32_t Cook_PrivateTrackData::Init()
+struct real_audio_private
 {
-    i_subpackets = (size_t) i_sub_packet_h * (size_t) i_frame_size / (size_t) i_subpacket_size;
-    p_subpackets = static_cast<block_t**> ( calloc(i_subpackets, sizeof(block_t*)) );
+    uint32_t fourcc;
+    uint16_t version;
+    uint16_t unknown1;
+    uint8_t  unknown2[12];
+    uint16_t unknown3;
+    uint16_t flavor;
+    uint32_t coded_frame_size;
+    uint32_t unknown4[3];
+    uint16_t sub_packet_h;
+    uint16_t frame_size;
+    uint16_t sub_packet_size;
+    uint16_t unknown5;
+};
 
-    if( unlikely( !p_subpackets ) )
+struct real_audio_private_v4
+{
+    real_audio_private header;
+    uint16_t sample_rate;
+    uint16_t unknown;
+    uint16_t sample_size;
+    uint16_t channels;
+};
+
+
+struct real_audio_private_v5
+{
+    real_audio_private header;
+    uint32_t unknown1;
+    uint16_t unknown2;
+    uint16_t sample_rate;
+    uint16_t unknown3;
+    uint16_t sample_size;
+    uint16_t channels;
+};
+
+bool Cook_PrivateTrackData::Init()
+{
+    // real_audio_private
+    bytes.skip(4);                      // fourcc
+
+    /* FIXME RALF and SIPR */
+    uint16_t version = bytes.GetBE16(); // version
+    bytes.skip(2);                      // unknown1
+    bytes.skip(12);                     // unknown2
+    bytes.skip(2);                      // unknown3
+    bytes.skip(2);                      // flavor
+    coded_frame_size = bytes.GetBE32(); // coded_frame_size
+    bytes.skip(3*4);                    // unknown4
+    i_sub_packet_h   = bytes.GetBE16(); // sub_packet_h
+    i_frame_size     = bytes.GetBE16(); // frame_size
+    i_subpacket_size = bytes.GetBE16(); // sub_packet_size
+    bytes.skip(2);                      // unknown5
+
+    if ( i_subpacket_size == 0 )
+        return false;
+
+    if( version == 4 )
     {
-        i_subpackets = 0;
-        return 1;
+        // real_audio_private_v4
+        i_rate          = bytes.GetBE16(); // sample_rate
+        bytes.skip(2);                     // unknown
+        i_bitspersample = bytes.GetBE16(); // sample_size
+        i_channels      = bytes.GetBE16(); // channels
     }
+    else if( version == 5 )
+    {
+        // real_audio_private_v5
+        bytes.skip(4);                     // unknown1
+        bytes.skip(2);                     // unknown2
+        i_rate          = bytes.GetBE16(); // sample_rate
+        bytes.skip(2);                     // unknown2
+        i_bitspersample = bytes.GetBE16(); // sample_size
+        i_channels      = bytes.GetBE16(); // channels
+    }
+    else
+        return false;
+    if (bytes.hasErrors())
+        return false;
 
-    return 0;
+    size_t i_subpackets = (size_t) i_sub_packet_h * (size_t) i_frame_size / (size_t) i_subpacket_size;
+    p_subpackets.resize(i_subpackets);
+
+    return true;
 }
 
 Cook_PrivateTrackData::~Cook_PrivateTrackData()
 {
-    for( size_t i = 0; i < i_subpackets; i++ )
+    for( size_t i = 0; i < p_subpackets.size(); i++ )
         if( p_subpackets[i] )
             block_Release( p_subpackets[i] );
-
-    free( p_subpackets );
 }
 
 static inline void fill_wvpk_block(uint16_t version, uint32_t block_samples, uint32_t flags,
@@ -386,15 +649,15 @@ block_t * packetize_wavpack( const mkv_track_t & tk, uint8_t * buffer, size_t  s
 
 void MkvTree_va( demux_t& demuxer, int i_level, const char* fmt, va_list args)
 {
-    static char const * indent = "|   ";
-    static char const * prefix = "+ ";
-    static int  const   indent_len = strlen( indent );
-    static int  const   prefix_len = strlen( prefix );
+    static const char indent[] = "|   ";
+    static const char prefix[] = "+ ";
+    static int  const   indent_len = sizeof( indent ) - 1;
+    static int  const   prefix_len = sizeof( prefix ) - 1;
 
     char   fixed_buffer[256] = {};
     size_t const  static_len = sizeof( fixed_buffer );
     char *            buffer = fixed_buffer;
-    size_t         total_len = indent_len * i_level + prefix_len + strlen( fmt );
+    size_t         total_len = indent_len * i_level + prefix_len + strlen( fmt ) + 1;
 
     if( total_len >= static_len ) {
         buffer = new (std::nothrow) char[total_len] ();
@@ -425,3 +688,5 @@ void MkvTree( demux_t & demuxer, int i_level, const char *psz_format, ... )
     MkvTree_va( demuxer, i_level, psz_format, args );
     va_end( args );
 }
+
+} // namespace

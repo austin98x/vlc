@@ -2,7 +2,6 @@
  * canvas.c : automatically resize and padd a video to fit in canvas
  *****************************************************************************
  * Copyright (C) 2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan dot org>
  *
@@ -32,6 +31,7 @@
 #include <limits.h>
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
@@ -39,15 +39,16 @@
 /*****************************************************************************
  * Local and extern prototypes.
  *****************************************************************************/
-static int  Activate( vlc_object_t * );
-static void Destroy( vlc_object_t * );
+static int  Activate( filter_t * );
+static void Destroy( filter_t * );
 static picture_t *Filter( filter_t *, picture_t * );
+static void Flush( filter_t * );
 
 /* This module effectively implements a form of picture-in-picture.
  *  - The outer picture is called the canvas.
  *  - The innter picture is callsed the subpicture.
  *
- * NB, all of the following operatons take into account aspect ratio
+ * NB, all of the following operations take into account aspect ratio
  *
  * A canvas is of canvas_{width,height}.
  * In Pad mode:
@@ -104,45 +105,55 @@ static picture_t *Filter( filter_t *, picture_t * );
 vlc_module_begin ()
     set_shortname( N_("Canvas") )
     set_description( N_("Canvas video filter") )
-    set_capability( "video filter", 0 )
     set_help( CANVAS_HELP )
-    set_callbacks( Activate, Destroy )
+    set_callback_video_filter( Activate )
 
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
     add_integer_with_range( CFG_PREFIX "width", 0, 0, INT_MAX,
-                            WIDTH_TEXT, WIDTH_LONGTEXT, false )
+                            WIDTH_TEXT, WIDTH_LONGTEXT )
     add_integer_with_range( CFG_PREFIX "height", 0, 0, INT_MAX,
-                            HEIGHT_TEXT, HEIGHT_LONGTEXT, false )
+                            HEIGHT_TEXT, HEIGHT_LONGTEXT )
 
     add_string( CFG_PREFIX "aspect", NULL,
-                ASPECT_TEXT, ASPECT_LONGTEXT, false )
+                ASPECT_TEXT, ASPECT_LONGTEXT )
 
     add_bool( CFG_PREFIX "padd", true,
-              PADD_TEXT, PADD_LONGTEXT, false )
+              PADD_TEXT, PADD_LONGTEXT )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
     "width", "height", "aspect", "padd", NULL
 };
 
-struct filter_sys_t
+typedef struct
 {
     filter_chain_t *p_chain;
+} filter_sys_t;
+
+static picture_t *video_chain_new( filter_t *p_filter )
+{
+    filter_t *p_chain_parent = p_filter->owner.sys;
+    // the last filter of the internal chain gets its pictures from the original
+    // filter source
+    return filter_NewPicture( p_chain_parent );
+}
+
+static const struct filter_video_callbacks canvas_cbs =
+{
+    video_chain_new, NULL,
 };
 
-static picture_t *video_new( filter_t *p_filter )
+static const struct vlc_filter_operations filter_ops =
 {
-    return filter_NewPicture( p_filter->owner.sys );
-}
+    .filter_video = Filter, .flush = Flush, .close = Destroy,
+};
 
 /*****************************************************************************
  *
  *****************************************************************************/
-static int Activate( vlc_object_t *p_this )
+static int Activate( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     unsigned i_canvas_width; /* visible width of output canvas */
     unsigned i_canvas_height; /* visible height of output canvas */
     unsigned i_canvas_aspect; /* canvas PictureAspectRatio */
@@ -159,7 +170,8 @@ static int Activate( vlc_object_t *p_this )
         return VLC_EGENERIC;
     }
 
-    if( p_filter->fmt_in.video.i_chroma != p_filter->fmt_out.video.i_chroma )
+    if( !video_format_IsSameChroma( &p_filter->fmt_in.video,
+                                    &p_filter->fmt_out.video ) )
     {
         msg_Err( p_filter, "Input and output chromas don't match" );
         return VLC_EGENERIC;
@@ -226,16 +238,14 @@ static int Activate( vlc_object_t *p_this )
 
     b_padd = var_CreateGetBool( p_filter, CFG_PREFIX "padd" );
 
-    filter_sys_t *p_sys = (filter_sys_t *)malloc( sizeof( filter_sys_t ) );
+    filter_sys_t *p_sys = malloc( sizeof( filter_sys_t ) );
     if( !p_sys )
         return VLC_ENOMEM;
     p_filter->p_sys = p_sys;
 
     filter_owner_t owner = {
+        .video = &canvas_cbs,
         .sys = p_filter,
-        .video = {
-            .buffer_new = video_new,
-        },
     };
 
     p_sys->p_chain = filter_chain_NewVideo( p_filter, true, &owner );
@@ -328,13 +338,16 @@ static int Activate( vlc_object_t *p_this )
     fmt.video.i_width = p_filter->fmt_in.video.i_width * fmt.video.i_visible_width / p_filter->fmt_in.video.i_visible_width;
     fmt.video.i_height = p_filter->fmt_in.video.i_height * fmt.video.i_visible_height / p_filter->fmt_in.video.i_visible_height;
 
-    filter_chain_Reset( p_sys->p_chain, &p_filter->fmt_in, &fmt );
+    filter_chain_Reset( p_sys->p_chain, &p_filter->fmt_in, p_filter->vctx_in, &fmt );
+    es_format_Clean( &fmt );
     /* Append scaling module */
-    if ( filter_chain_AppendConverter( p_sys->p_chain, NULL, NULL ) )
+    int ret = filter_chain_AppendConverter( p_sys->p_chain, NULL );
+    if ( ret != VLC_SUCCESS )
     {
         msg_Err( p_filter, "Could not append scaling filter" );
+        filter_chain_Delete( p_sys->p_chain );
         free( p_sys );
-        return VLC_EGENERIC;
+        return ret;
     }
 
     /* Append croppadd module if we actually do cropping or padding instead of just scaling*/
@@ -342,7 +355,7 @@ static int Activate( vlc_object_t *p_this )
     {
         if ( !filter_chain_AppendFromString( p_sys->p_chain, psz_croppadd ) )
         {
-            msg_Err( p_filter, "Could not append cropadd filter" );
+            msg_Err( p_filter, "Could not append croppadd filter" );
             filter_chain_Delete( p_sys->p_chain );
             free( p_sys );
             return VLC_EGENERIC;
@@ -368,7 +381,7 @@ static int Activate( vlc_object_t *p_this )
                   i_canvas_width, i_canvas_height );
     }
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 }
@@ -376,11 +389,11 @@ static int Activate( vlc_object_t *p_this )
 /*****************************************************************************
  *
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-    filter_chain_Delete( p_filter->p_sys->p_chain );
-    free( p_filter->p_sys );
+    filter_sys_t *p_sys = p_filter->p_sys;
+    filter_chain_Delete( p_sys->p_chain );
+    free( p_sys );
 }
 
 /*****************************************************************************
@@ -388,5 +401,13 @@ static void Destroy( vlc_object_t *p_this )
  *****************************************************************************/
 static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
 {
-    return filter_chain_VideoFilter( p_filter->p_sys->p_chain, p_pic );
+    filter_sys_t *p_sys = p_filter->p_sys;
+    return filter_chain_VideoFilter( p_sys->p_chain, p_pic );
 }
+
+static void Flush( filter_t *p_filter )
+{
+    filter_sys_t *p_sys = p_filter->p_sys;
+    filter_chain_VideoFlush( p_sys->p_chain );
+}
+

@@ -2,7 +2,6 @@
  * httpd.c: HTTPd wrapper
  *****************************************************************************
  * Copyright (C) 2007-2008 the VideoLAN team
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *
@@ -41,7 +40,7 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static uint8_t *vlclua_todata( lua_State *L, int narg, int *i_data );
+static uint8_t *vlclua_todata( lua_State *L, int narg, size_t *i_data );
 
 static int vlclua_httpd_host_delete( lua_State * );
 static int vlclua_httpd_handler_new( lua_State * );
@@ -72,9 +71,10 @@ static const char no_password_fmt[] = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML
 "<!-- VLC_PASSWORD_NOT_SET --></body></html>";
 
 static const char no_password_body[] = N_(
-"<p>Password for Web interface has not been set.</p>"
-"<p>Please use --http-password, or set a password in </p>"
-"<p>Preferences &gt; All &gt; Main interfaces &gt; Lua &gt; Lua HTTP &gt; Password.</p>"
+"<p>A password for the Web interface has not been set.</p>"
+"<p>Please either use the --http-password CLI option, or set a password in preferences.</p>"
+"<p>For the latter, the option can be found in the advanced view (&quot;all&quot;) under "
+"Interface → Main interfaces → Lua → Lua HTTP → Password.</p>"
 );
 
 static const char no_password_title[] = N_("VLC media player");
@@ -82,7 +82,10 @@ static const char no_password_title[] = N_("VLC media player");
 static int vlclua_httpd_tls_host_new( lua_State *L )
 {
     vlc_object_t *p_this = vlclua_get_this( L );
-    httpd_host_t *p_host = vlc_http_HostNew( p_this );
+    char *psz_cert = var_InheritString( p_this, "http-cert" );
+    httpd_host_t *p_host = psz_cert == NULL ? vlc_http_HostNew( p_this )
+                                            : vlc_https_HostNew( p_this );
+    free( psz_cert );
     if( !p_host )
         return luaL_error( L, "Failed to create HTTP host" );
 
@@ -123,7 +126,7 @@ static int vlclua_httpd_handler_callback(
      void *opaque, httpd_handler_t *p_handler, char *psz_url,
      uint8_t *psz_request, int i_type, uint8_t *p_in, int i_in,
      char *psz_remote_addr, char *psz_remote_host,
-     uint8_t **pp_data, int *pi_data )
+     uint8_t **pp_data, size_t *pi_data )
 {
     VLC_UNUSED(p_handler);
     httpd_handler_lua_t *p_sys = opaque;
@@ -152,6 +155,15 @@ static int vlclua_httpd_handler_callback(
         const char *psz_err = lua_tostring( L, -1 );
         msg_Err( p_this, "Error while running the lua HTTPd handler "
                  "callback: %s", psz_err );
+        char* psz_new;
+        if (asprintf(&psz_new, "Status: 500\n"
+                    "Content-Length: %zu\n\n%s", strlen(psz_err), psz_err) < 0)
+            *pi_data = 0;
+        else
+        {
+            *pp_data = (uint8_t*)psz_new;
+            *pi_data = strlen(psz_new);
+        }
         lua_settop( L, 2 );
         /* function data */
         return VLC_EGENERIC;
@@ -243,7 +255,7 @@ struct httpd_file_sys_t
 
 static int vlclua_httpd_file_callback(
     httpd_file_sys_t *p_sys, httpd_file_t *p_file, uint8_t *psz_request,
-    uint8_t **pp_data, int *pi_data )
+    uint8_t **pp_data, size_t *pi_data )
 {
     VLC_UNUSED(p_file);
     lua_State *L = p_sys->L;
@@ -368,18 +380,16 @@ static int vlclua_httpd_redirect_delete( lua_State *L )
 /*****************************************************************************
  * Utils
  *****************************************************************************/
-static uint8_t *vlclua_todata( lua_State *L, int narg, int *pi_data )
+static uint8_t *vlclua_todata( lua_State *L, int narg, size_t *pi_data )
 {
-    size_t i_data;
-    const char *psz_data = lua_tolstring( L, narg, &i_data );
-    uint8_t *p_data = vlc_alloc( i_data, sizeof(uint8_t) );
-    *pi_data = (int)i_data;
+    const char *psz_data = lua_tolstring( L, narg, pi_data );
+    uint8_t *p_data = malloc( *pi_data );
     if( !p_data )
     {
         luaL_error( L, "Error while allocating buffer." );
         return NULL; /* To please gcc even though luaL_error longjmp-ed out of here */
     }
-    memcpy( p_data, psz_data, i_data );
+    memcpy( p_data, psz_data, *pi_data );
     return p_data;
 }
 

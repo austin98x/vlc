@@ -2,7 +2,6 @@
  * cdg.c: CDG decoder module
  *****************************************************************************
  * Copyright (C) 2007 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir # via.ecp.fr>
  *
@@ -50,7 +49,7 @@
 
 #define CDG_SCREEN_PITCH CDG_SCREEN_WIDTH
 
-struct decoder_sys_t
+typedef struct
 {
     uint8_t  color[16][3];
     unsigned i_offseth;
@@ -59,7 +58,7 @@ struct decoder_sys_t
     uint8_t  *p_screen;
 
     int      i_packet;
-};
+} decoder_sys_t;
 
 #define CDG_PACKET_SIZE 24u
 
@@ -71,7 +70,6 @@ struct decoder_sys_t
  * Local prototypes
  *****************************************************************************/
 static int  Open ( vlc_object_t * );
-static void Close( vlc_object_t * );
 
 static int Decode( decoder_t *, block_t * );
 
@@ -83,11 +81,10 @@ static int Render( decoder_sys_t *p_cdg, picture_t *p_picture );
  * Module descriptor
  *****************************************************************************/
 vlc_module_begin ()
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_VCODEC )
     set_description( N_("CDG video decoder") )
     set_capability( "video decoder", 1000 )
-    set_callbacks( Open, Close )
+    set_callback( Open )
     add_shortcut( "cdg" )
 vlc_module_end ()
 
@@ -99,11 +96,11 @@ static int Open( vlc_object_t *p_this )
     decoder_t *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
 
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_CDG )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_CDG )
         return VLC_EGENERIC;
 
     /* Allocate the memory needed to store the decoder's structure */
-    p_dec->p_sys = p_sys = calloc( 1, sizeof(decoder_sys_t) );
+    p_dec->p_sys = p_sys = vlc_obj_calloc( p_this, 1, sizeof(decoder_sys_t) );
     if( !p_sys )
         return VLC_ENOMEM;
 
@@ -113,14 +110,12 @@ static int Open( vlc_object_t *p_this )
 
     /* Set output properties
      * TODO maybe it would be better to use RV16 or RV24 ? */
-    p_dec->fmt_out.i_codec = VLC_CODEC_RGB32;
+    p_dec->fmt_out.i_codec =
+    p_dec->fmt_out.video.i_chroma = VLC_CODEC_XBGR;
     p_dec->fmt_out.video.i_width = CDG_DISPLAY_WIDTH;
     p_dec->fmt_out.video.i_height = CDG_DISPLAY_HEIGHT;
     p_dec->fmt_out.video.i_sar_num = 1;
     p_dec->fmt_out.video.i_sar_den = 1;
-    p_dec->fmt_out.video.i_rmask = 0xff << CDG_COLOR_R_SHIFT;
-    p_dec->fmt_out.video.i_gmask = 0xff << CDG_COLOR_G_SHIFT;
-    p_dec->fmt_out.video.i_bmask = 0xff << CDG_COLOR_B_SHIFT;
 
     /* Set callbacks */
     p_dec->pf_decode = Decode;
@@ -177,7 +172,7 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
             goto exit;
 
         Render( p_sys, p_pic );
-        p_pic->date = p_block->i_pts > VLC_TS_INVALID ? p_block->i_pts : p_block->i_dts;
+        p_pic->date = p_block->i_pts != VLC_TICK_INVALID ? p_block->i_pts : p_block->i_dts;
     }
 
 exit:
@@ -185,17 +180,6 @@ exit:
     if( p_pic != NULL )
         decoder_QueueVideo( p_dec, p_pic );
     return VLCDEC_SUCCESS;
-}
-
-/*****************************************************************************
- * Close: decoder destruction
- *****************************************************************************/
-static void Close( vlc_object_t *p_this )
-{
-    decoder_t *p_dec = (decoder_t *)p_this;
-    decoder_sys_t *p_sys = p_dec->p_sys;
-
-    free( p_sys );
 }
 
 /*****************************************************************************

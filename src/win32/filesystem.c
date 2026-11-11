@@ -4,7 +4,7 @@
  * Copyright (C) 2005-2006 VLC authors and VideoLAN
  * Copyright © 2005-2008 Rémi Denis-Courmont
  *
- * Authors: Rémi Denis-Courmont <rem # videolan.org>
+ * Authors: Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -33,20 +33,20 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/types.h>
-#include <dirent.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <winsock2.h>
 #include <direct.h>
+#include <unistd.h>
+#include <stdckdint.h>
 
 #include <vlc_common.h>
 #include <vlc_charset.h>
 #include <vlc_fs.h>
-#include "libvlc.h" /* vlc_mkdir */
+#include "../libvlc.h" /* vlc_mkdir */
 
-#ifdef _MSC_VER
-# define __STDC__ 1
-# include <io.h> /* _pipe */
+#ifndef NTDDI_WIN10_RS3
+#define NTDDI_WIN10_RS3  0x0A000004
 #endif
 
 static wchar_t *widen_path (const char *path)
@@ -64,31 +64,48 @@ static wchar_t *widen_path (const char *path)
     return wpath;
 }
 
-#define CONVERT_PATH(path, wpath, err) \
-    wchar_t *wpath = wide_path(path); \
-    if (wpath == NULL) return (err)
-
-
 int vlc_open (const char *filename, int flags, ...)
 {
-    int mode = 0;
-    va_list ap;
+    DWORD dwDesiredAccess, dwCreationDisposition, dwFlagsAndAttributes;
 
     flags |= O_NOINHERIT; /* O_CLOEXEC */
     /* Defaults to binary mode */
     if ((flags & O_TEXT) == 0)
         flags |= O_BINARY;
 
-    va_start (ap, flags);
+    if (flags & O_WRONLY)
+    {
+        dwDesiredAccess = GENERIC_WRITE;
+    }
+    else if (flags & O_RDWR)
+    {
+        dwDesiredAccess = GENERIC_READ | GENERIC_WRITE;
+    }
+    else // if (flags & O_RDONLY)
+    {
+        dwDesiredAccess = GENERIC_READ;
+    }
+
     if (flags & O_CREAT)
     {
-        int unixmode = va_arg(ap, int);
-        if (unixmode & 0444)
-            mode |= _S_IREAD;
-        if (unixmode & 0222)
-            mode |= _S_IWRITE;
+        if (flags & O_EXCL)
+            dwCreationDisposition = CREATE_NEW;
+        else
+            dwCreationDisposition = CREATE_ALWAYS;
     }
-    va_end (ap);
+    else if (flags & O_TRUNC)
+    {
+        dwCreationDisposition = TRUNCATE_EXISTING;
+    }
+    else
+    {
+        dwCreationDisposition = OPEN_EXISTING;
+    }
+
+    dwFlagsAndAttributes = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+
+    // if (flags & O_NONBLOCK)
+    //     dwFlagsAndAttributes |= FILE_FLAG_OVERLAPPED;
 
     /*
      * open() cannot open files with non-“ANSI” characters on Windows.
@@ -98,8 +115,31 @@ int vlc_open (const char *filename, int flags, ...)
     if (wpath == NULL)
         return -1;
 
-    int fd = _wopen (wpath, flags, mode);
+    HANDLE h;
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+    h = CreateFileW(wpath, dwDesiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, dwCreationDisposition,
+        dwFlagsAndAttributes, NULL);
+#else
+    CREATEFILE2_EXTENDED_PARAMETERS params = { 0 };
+    params.dwSize = sizeof(params);
+    params.dwFileAttributes = dwFlagsAndAttributes & 0xFFFF;
+    params.dwFileFlags = dwFlagsAndAttributes & ~(0xFFFF | SECURITY_VALID_SQOS_FLAGS);
+    params.dwSecurityQosFlags = dwFlagsAndAttributes & SECURITY_VALID_SQOS_FLAGS;
+    h = CreateFile2(wpath, dwDesiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        dwCreationDisposition,
+        &params);
+#endif
     free (wpath);
+    if (h == INVALID_HANDLE_VALUE)
+        return -1;
+    int fd = _open_osfhandle((intptr_t)h, flags);
+    if (unlikely(fd == -1))
+    {
+        CloseHandle(h);
+    }
     return fd;
 }
 
@@ -149,9 +189,6 @@ int vlc_mkdir( const char *dirname, mode_t mode )
 
 char *vlc_getcwd (void)
 {
-#if VLC_WINSTORE_APP
-    return NULL;
-#else
     wchar_t *wdir = _wgetcwd (NULL, 0);
     if (wdir == NULL)
         return NULL;
@@ -159,65 +196,144 @@ char *vlc_getcwd (void)
     char *dir = FromWide (wdir);
     free (wdir);
     return dir;
-#endif
 }
+
+struct vlc_DIR
+{
+    wchar_t *wildcard;
+    HANDLE fHandle;
+    WIN32_FIND_DATAW wdir;
+    bool eol;
+
+    char *entry;
+    union
+    {
+        DWORD drives;
+        bool insert_dot_dot;
+    } u;
+};
 
 /* Under Windows, these wrappers return the list of drive letters
  * when called with an empty argument or just '\'. */
-DIR *vlc_opendir (const char *dirname)
+vlc_DIR *vlc_opendir (const char *dirname)
 {
-    wchar_t *wpath = widen_path (dirname);
-    if (wpath == NULL)
-        return NULL;
-
     vlc_DIR *p_dir = malloc (sizeof (*p_dir));
     if (unlikely(p_dir == NULL))
-    {
-        free(wpath);
         return NULL;
-    }
+    p_dir->entry = NULL;
+    p_dir->eol = false;
+    p_dir->fHandle = INVALID_HANDLE_VALUE;
+    p_dir->wildcard = NULL;
 
-#if !VLC_WINSTORE_APP
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP) || NTDDI_VERSION >= NTDDI_WIN10_RS3
     /* Special mode to list drive letters */
-    if (wpath[0] == L'\0' || (wcscmp (wpath, L"\\") == 0))
+    if (dirname[0] == '\0' || (strcmp (dirname, "\\") == 0))
     {
-        free (wpath);
-        p_dir->wdir = NULL;
         p_dir->u.drives = GetLogicalDrives ();
-        p_dir->entry = NULL;
-        return (void *)p_dir;
+        if (unlikely(p_dir->u.drives == 0))
+        {
+            free(p_dir);
+            return NULL;
+        }
+        p_dir->entry = strdup("C:\\");
+        if (unlikely(p_dir->entry == NULL))
+        {
+            free(p_dir);
+            return NULL;
+        }
+        return p_dir;
     }
 #endif
 
-    assert (wpath[0]); // wpath[1] is defined
-    p_dir->u.insert_dot_dot = !wcscmp (wpath + 1, L":\\");
+    assert (dirname[0]); // dirname[1] is defined
+    p_dir->u.insert_dot_dot = !strcmp (dirname + 1, ":\\");
 
-    _WDIR *wdir = _wopendir (wpath);
-    free (wpath);
-    if (wdir == NULL)
+    char *wildcard;
+    const size_t len = strlen(dirname);
+    if (p_dir->u.insert_dot_dot || strncmp(dirname + 1, ":\\", 2) != 0)
+    {
+        // Prepending the string "\\?\" does not allow access to the root directory.
+        // Don't use long path with relative pathes.
+        wildcard = malloc(len + 3);
+        if (unlikely(wildcard == NULL))
+        {
+            free (p_dir);
+            return NULL;
+        }
+        memcpy(wildcard, dirname, len);
+        size_t j = len;
+        wildcard[j++] = '\\';
+        wildcard[j++] = '*';
+        wildcard[j++] = '\0';
+    }
+    else
+    {
+        wildcard = malloc(4 + len + 3);
+        if (unlikely(wildcard == NULL))
+        {
+            free (p_dir);
+            return NULL;
+        }
+
+        // prepend "\\?\"
+        wildcard[0] = '\\';
+        wildcard[1] = '\\';
+        wildcard[2] = '?';
+        wildcard[3] = '\\';
+        size_t j = 4;
+        for (size_t i=0; i<len;i++)
+        {
+            // remove forward slashes from long pathes to please FindFirstFileExW
+            if (unlikely(dirname[i] == '/'))
+                wildcard[j++] = '\\';
+            else
+                wildcard[j++] = dirname[i];
+        }
+        // append "\*" or "*"
+        if (wildcard[j-1] != '\\')
+            wildcard[j++] = '\\';
+        wildcard[j++] = '*';
+        wildcard[j++] = '\0';
+    }
+    p_dir->wildcard = ToWide(wildcard);
+    free(wildcard);
+    if (unlikely(p_dir->wildcard == NULL))
     {
         free (p_dir);
         return NULL;
     }
-    p_dir->wdir = wdir;
-    p_dir->entry = NULL;
-    return (void *)p_dir;
+
+    p_dir->fHandle = FindFirstFileExW(p_dir->wildcard, FindExInfoBasic,
+                                      &p_dir->wdir, (FINDEX_SEARCH_OPS)0,
+                                      NULL, FIND_FIRST_EX_LARGE_FETCH);
+    if (p_dir->fHandle == INVALID_HANDLE_VALUE)
+    {
+        free(p_dir->wildcard);
+        free(p_dir);
+        return NULL;
+    }
+    return p_dir;
 }
 
-const char *vlc_readdir (DIR *dir)
+void vlc_closedir( vlc_DIR *vdir )
 {
-    vlc_DIR *p_dir = (vlc_DIR *)dir;
+    if (vdir->fHandle != INVALID_HANDLE_VALUE)
+        FindClose(vdir->fHandle);
 
-    free(p_dir->entry);
+    free( vdir->entry );
+    free( vdir->wildcard );
+    free( vdir );
+}
 
-#if !VLC_WINSTORE_APP
+const char *vlc_readdir (vlc_DIR *p_dir)
+{
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP) || NTDDI_VERSION >= NTDDI_WIN10_RS3
     /* Drive letters mode */
-    if (p_dir->wdir == NULL)
+    if (p_dir->fHandle ==  INVALID_HANDLE_VALUE)
     {
         DWORD drives = p_dir->u.drives;
         if (drives == 0)
         {
-            p_dir->entry = NULL;
             return NULL; /* end */
         }
 
@@ -227,23 +343,79 @@ const char *vlc_readdir (DIR *dir)
         p_dir->u.drives &= ~(1UL << i);
         assert (i < 26);
 
-        if (asprintf (&p_dir->entry, "%c:\\", 'A' + i) == -1)
-            p_dir->entry = NULL;
+        p_dir->entry[0] = 'A' + i;
+        return p_dir->entry;
     }
-    else
 #endif
+
+    free(p_dir->entry);
     if (p_dir->u.insert_dot_dot)
     {
         /* Adds "..", gruik! */
         p_dir->u.insert_dot_dot = false;
         p_dir->entry = strdup ("..");
     }
+    else if (p_dir->eol)
+        p_dir->entry = NULL;
     else
     {
-        struct _wdirent *ent = _wreaddir (p_dir->wdir);
-        p_dir->entry = (ent != NULL) ? FromWide (ent->d_name) : NULL;
+        p_dir->entry = FromWide(p_dir->wdir.cFileName);
+        p_dir->eol = !FindNextFileW(p_dir->fHandle, &p_dir->wdir);
     }
     return p_dir->entry;
+}
+
+void vlc_rewinddir( vlc_DIR *wdir )
+{
+    if (wdir->fHandle == INVALID_HANDLE_VALUE)
+    {
+        FindClose(wdir->fHandle);
+        wdir->fHandle = FindFirstFileExW(wdir->wildcard, FindExInfoBasic,
+                                         &wdir->wdir, (FINDEX_SEARCH_OPS)0,
+                                         NULL, FIND_FIRST_EX_LARGE_FETCH);
+    }
+    else
+    {
+        wdir->u.drives = GetLogicalDrives();
+    }
+}
+
+#define FILETIME_UNIX_EPOCH_TICKS UINT64_C(116444736000000000)
+#define FILETIME_TICKS_PER_SECOND INT64_C(10000000)
+
+static int filetime_to_time_t(const FILETIME *ft, time_t *result)
+{
+    ULARGE_INTEGER ticks = {
+        .HighPart = ft->dwHighDateTime,
+        .LowPart  = ft->dwLowDateTime,
+    };
+
+    int64_t delta, seconds;
+
+    if (ckd_sub(&delta, ticks.QuadPart, FILETIME_UNIX_EPOCH_TICKS))
+    {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    seconds = delta / FILETIME_TICKS_PER_SECOND;
+
+    if ( unlikely(delta < 0 && delta % FILETIME_TICKS_PER_SECOND != 0) )
+    {
+        if (ckd_sub(&seconds, seconds, INT64_C(1)))
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+
+    // ensure the value fits in the result
+    if ( unlikely(ckd_add(result, seconds, 0)) ) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    return 0;
 }
 
 int vlc_stat (const char *filename, struct stat *buf)
@@ -256,8 +428,49 @@ int vlc_stat (const char *filename, struct stat *buf)
                    "Mismatched struct stat definition.");
 
     int ret = _wstati64 (wpath, buf);
+    if ( ret != 0 )
+    {
+        free (wpath);
+        return ret;
+    }
+
+    // _wstati64() can give different st_mtime values for the same file if it
+    // was created in a different Daylight Saving Time as the current time.
+    // This is not the case in UCRT builds.
+    // GetFileAttributesExW() doesn't have this problem.
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    BOOL res = GetFileAttributesExW( wpath, GetFileExInfoStandard, &fad );
     free (wpath);
-    return ret;
+    if ( unlikely(!res) )
+    {
+        DWORD error = GetLastError();
+
+        switch (error) {
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
+            case ERROR_INVALID_NAME:
+                errno = ENOENT;
+                break;
+
+            case ERROR_ACCESS_DENIED:
+            case ERROR_SHARING_VIOLATION:
+                errno = EACCES;
+                break;
+
+            default:
+                errno = EIO;
+                break;
+        }
+
+        return -1;
+    }
+
+    if (filetime_to_time_t(&fad.ftCreationTime,   &buf->st_ctime) ||
+        filetime_to_time_t(&fad.ftLastAccessTime, &buf->st_atime) ||
+        filetime_to_time_t(&fad.ftLastWriteTime,  &buf->st_mtime))
+        return -1;
+
+    return 0;
 }
 
 int vlc_lstat (const char *filename, struct stat *buf)
@@ -309,13 +522,66 @@ int vlc_dup (int oldfd)
     return fd;
 }
 
+int vlc_dup2(int oldfd, int newfd)
+{
+    int fd = dup2(oldfd, newfd);
+    if (fd != -1)
+        setmode(fd, O_BINARY);
+    return fd;
+}
+
 int vlc_pipe (int fds[2])
 {
-#if VLC_WINSTORE_APP
+    /* Create the named pipe with FILE_FLAG_OVERLAPPED to enable asynchronous
+     * I/O. This is necessary because vlc_poll on Windows, only work with
+     * sockets.
+     * Using FILE_FLAG_OVERLAPPED allows us to perform non-blocking I/O,
+     * which is the correct approach for async operations in Windows. */
+# if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+    static atomic_uint_least64_t count = 0;
+
+    uint_least64_t c = atomic_fetch_add(&count, 1);
+
+    TCHAR pipeName[MAX_PATH] = {0};
+    if (wsprintf(pipeName, TEXT("\\\\.\\pipe\\AnonPipe_%lu"), c) < 0) {
+        return -1;
+    }
+
+    HANDLE hRead = CreateNamedPipe(pipeName,
+                            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                            1, 4096 * 8, 4096 * 8, 0, NULL);
+    if (hRead == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    HANDLE hWrite = CreateFile(pipeName, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                               NULL);
+    if (hWrite == INVALID_HANDLE_VALUE) {
+        CloseHandle(hRead);
+        return -1;
+    }
+
+
+    int fdReadPipe = _open_osfhandle((intptr_t)hRead, _O_RDONLY);
+    if (fdReadPipe == -1) {
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        return -1;
+    }
+    int fdWritePipe = _open_osfhandle((intptr_t)hWrite, _O_WRONLY);
+    if (fdWritePipe == -1) {
+        _close(fdReadPipe);
+        CloseHandle(hWrite);
+        return -1;
+    }
+    fds[0] = fdReadPipe;
+    fds[1] = fdWritePipe;
+    return 0;
+#else
     _set_errno(EPERM);
     return -1;
-#else
-    return _pipe (fds, 32768, O_NOINHERIT | O_BINARY);
 #endif
 }
 
@@ -326,7 +592,7 @@ ssize_t vlc_write(int fd, const void *buf, size_t len)
 
 ssize_t vlc_writev(int fd, const struct iovec *iov, int count)
 {
-    vlc_assert_unreachable();
+    return writev(fd, iov, count);
 }
 
 #include <vlc_network.h>
@@ -354,45 +620,31 @@ int vlc_accept (int lfd, struct sockaddr *addr, socklen_t *alen, bool nonblock)
     int fd = accept (lfd, addr, alen);
     if (fd != -1 && nonblock)
         ioctlsocket (fd, FIONBIO, &(unsigned long){ 1 });
+    else if (fd < 0 && WSAGetLastError() == WSAEWOULDBLOCK)
+        errno = EAGAIN;
     return fd;
 }
 
-#if !VLC_WINSTORE_APP
-FILE *vlc_win32_tmpfile(void)
+ssize_t vlc_send(int fd, const void *buf, size_t len, int flags)
 {
-    TCHAR tmp_path[MAX_PATH-14];
-    int i_ret = GetTempPath (MAX_PATH-14, tmp_path);
-    if (i_ret == 0)
-        return NULL;
+    WSABUF wsabuf = { .buf = (char *)buf, .len = len };
+    DWORD sent;
 
-    TCHAR tmp_name[MAX_PATH];
-    i_ret = GetTempFileName(tmp_path, TEXT("VLC"), 0, tmp_name);
-    if (i_ret == 0)
-        return NULL;
-
-    HANDLE hFile = CreateFile(tmp_name,
-            GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-    if (hFile == INVALID_HANDLE_VALUE)
-        return NULL;
-
-    int fd = _open_osfhandle((intptr_t)hFile, 0);
-    if (fd == -1) {
-        CloseHandle(hFile);
-        return NULL;
-    }
-
-    FILE *stream = _fdopen(fd, "w+b");
-    if (stream == NULL) {
-        _close(fd);
-        return NULL;
-    }
-    return stream;
+    return WSASend(fd, &wsabuf, 1, &sent, flags,
+                   NULL, NULL) ? -1 : (ssize_t)sent;
 }
-#else
-FILE *vlc_win32_tmpfile(void)
+
+ssize_t vlc_sendto(int fd, const void *buf, size_t len, int flags,
+                   const struct sockaddr *dst, socklen_t dstlen)
 {
-    return NULL;
-}
-#endif
+    WSABUF wsabuf = { .buf = (char *)buf, .len = len };
+    DWORD sent;
 
+    return WSASendTo(fd, &wsabuf, 1, &sent, flags, dst, dstlen,
+                     NULL, NULL) ? -1 : (ssize_t)sent;
+}
+
+ssize_t vlc_sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+    return sendmsg(fd, msg, flags);
+}

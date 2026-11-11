@@ -2,7 +2,6 @@
  * vlc_meta.h: Stream meta-data
  *****************************************************************************
  * Copyright (C) 2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -58,10 +57,18 @@ typedef enum vlc_meta_type_t
     vlc_meta_Actors,
     vlc_meta_AlbumArtist,
     vlc_meta_DiscNumber,
-    vlc_meta_DiscTotal
+    vlc_meta_DiscTotal,
+    vlc_meta_Compilation,
 } vlc_meta_type_t;
 
-#define VLC_META_TYPE_COUNT 27
+#define VLC_META_TYPE_COUNT 28
+
+typedef enum
+{
+    VLC_META_PRIORITY_BASIC,
+    VLC_META_PRIORITY_PLAYLIST,
+    VLC_META_PRIORITY_INBAND
+} vlc_meta_priority_t;
 
 #define ITEM_PREPARSED       1
 #define ITEM_ART_FETCHED     2
@@ -74,11 +81,20 @@ struct vlc_meta_t;
 
 VLC_API vlc_meta_t * vlc_meta_New( void ) VLC_USED;
 VLC_API void vlc_meta_Delete( vlc_meta_t *m );
-VLC_API void vlc_meta_Set( vlc_meta_t *p_meta, vlc_meta_type_t meta_type, const char *psz_val );
-VLC_API const char * vlc_meta_Get( const vlc_meta_t *p_meta, vlc_meta_type_t meta_type );
+VLC_API void vlc_meta_SetWithPriority( vlc_meta_t *p_meta, vlc_meta_type_t meta_type, const char *psz_val, vlc_meta_priority_t priority );
+VLC_API const char *vlc_meta_GetWithPriority(const vlc_meta_t *p_meta, vlc_meta_type_t meta_type, vlc_meta_priority_t *restrict priority);
 
-VLC_API void vlc_meta_AddExtra( vlc_meta_t *m, const char *psz_name, const char *psz_value );
-VLC_API const char * vlc_meta_GetExtra( const vlc_meta_t *m, const char *psz_name );
+/**
+ * set the meta extra
+ *
+ * \param m vlc_meta_t
+ * \param psz_name meta extra name (nonnullable)
+ * \param psz_value meta extra value (nullable)
+ *  Removed from meta extra if set to NULL
+ * \param priority metadata priority (in terms of vlc_meta_priority_t)
+ */
+VLC_API void vlc_meta_SetExtraWithPriority( vlc_meta_t *m, const char *psz_name, const char *psz_value, vlc_meta_priority_t priority );
+VLC_API const char *vlc_meta_GetExtraWithPriority(const vlc_meta_t *m, const char *name, vlc_meta_priority_t *priority);
 VLC_API unsigned vlc_meta_GetExtraCount( const vlc_meta_t *m );
 
 /**
@@ -89,8 +105,10 @@ VLC_API char ** vlc_meta_CopyExtraNames( const vlc_meta_t *m ) VLC_USED;
 
 VLC_API void vlc_meta_Merge( vlc_meta_t *dst, const vlc_meta_t *src );
 
-VLC_API int vlc_meta_GetStatus( vlc_meta_t *m );
+VLC_API int vlc_meta_GetStatus( const vlc_meta_t *m );
 VLC_API void vlc_meta_SetStatus( vlc_meta_t *m, int status );
+
+VLC_API const char *vlc_meta_TypeToString(vlc_meta_type_t meta_type);
 
 /**
  * Returns a localizes string describing the meta
@@ -99,12 +117,18 @@ VLC_API const char * vlc_meta_TypeToLocalizedString( vlc_meta_type_t meta_type )
 
 typedef struct meta_export_t
 {
-    struct vlc_common_members obj;
+    struct vlc_object_t obj;
     input_item_t *p_item;
     const char *psz_file;
 } meta_export_t;
 
 VLC_API int input_item_WriteMeta(vlc_object_t *, input_item_t *);
+
+#define vlc_meta_Set( meta, meta_type, b )             vlc_meta_SetWithPriority( meta, meta_type, b, VLC_META_PRIORITY_BASIC )
+#define vlc_meta_SetExtra( meta, psz_name, psz_value ) vlc_meta_SetExtraWithPriority( meta, psz_name, psz_value, VLC_META_PRIORITY_BASIC )
+
+#define vlc_meta_Get(meta, meta_type) vlc_meta_GetWithPriority(meta, meta_type, NULL)
+#define vlc_meta_GetExtra(meta, psz_name) vlc_meta_GetExtraWithPriority(meta, psz_name, NULL)
 
 /* Setters for meta.
  * Warning: Make sure to use the input_item meta setters (defined in vlc_input_item.h)
@@ -134,6 +158,7 @@ VLC_API int input_item_WriteMeta(vlc_object_t *, input_item_t *);
 #define vlc_meta_SetActors( meta, b )      vlc_meta_Set( meta, vlc_meta_Actors, b )
 #define vlc_meta_SetAlbumArtist( meta, b ) vlc_meta_Set( meta, vlc_meta_AlbumArtist, b )
 #define vlc_meta_SetDiscNumber( meta, b )  vlc_meta_Set( meta, vlc_meta_DiscNumber, b )
+#define vlc_meta_SetCompilation( meta, b ) vlc_meta_Set( meta, vlc_meta_Compilation, b )
 
 #define VLC_META_TITLE              vlc_meta_TypeToLocalizedString( vlc_meta_Title )
 #define VLC_META_ARTIST             vlc_meta_TypeToLocalizedString( vlc_meta_Artist )
@@ -159,6 +184,7 @@ VLC_API int input_item_WriteMeta(vlc_object_t *, input_item_t *);
 #define VLC_META_ACTORS             vlc_meta_TypeToLocalizedString( vlc_meta_Actors )
 #define VLC_META_ALBUMARTIST        vlc_meta_TypeToLocalizedString( vlc_meta_AlbumArtist )
 #define VLC_META_DISCNUMBER         vlc_meta_TypeToLocalizedString( vlc_meta_DiscNumber )
+#define VLC_META_COMPILATION        vlc_meta_TypeToLocalizedString( vlc_meta_Compilation )
 
 #define VLC_META_EXTRA_MB_ALBUMID   "MB_ALBUMID"
 

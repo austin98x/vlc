@@ -23,6 +23,8 @@
 #endif
 
 #include <assert.h>
+#include <stdalign.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <errno.h>
 #if !defined (HAVE_POSIX_MEMALIGN)
@@ -54,14 +56,11 @@ void *aligned_alloc(size_t align, size_t size)
 
 #elif defined(HAVE_MEMALIGN)
     return memalign(align, size);
-#elif defined (_WIN32) && defined(__MINGW32__)
-    return __mingw_aligned_malloc(size, align);
-#elif defined (_WIN32) && defined(_MSC_VER)
+#elif defined (_WIN32)
     return _aligned_malloc(size, align);
 #else
-#warning unsupported aligned allocation!
-    if (size > 0)
-        errno = ENOMEM;
-    return NULL;
+    /* align must be valid/supported */
+    assert(align <= alignof (max_align_t));
+    return malloc(((void) align, size));
 #endif
 }

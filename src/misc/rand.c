@@ -2,7 +2,6 @@
  * rand.c : non-predictible random bytes generator
  *****************************************************************************
  * Copyright © 2007 Rémi Denis-Courmont
- * $Id$
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -25,6 +24,7 @@
 
 #include <vlc_common.h>
 #include <vlc_rand.h>
+#include <vlc_threads.h>
 
 static struct
 {

@@ -33,7 +33,8 @@
 
 #define ASF_OBJECT_COMMON          \
     int          i_type;           \
-    guid_t       i_object_id;      \
+    unsigned     i_level; \
+    vlc_guid_t       i_object_id;      \
     uint64_t     i_object_size;    \
     uint64_t     i_object_pos;     \
     union asf_object_u *p_father;  \
@@ -71,7 +72,7 @@ typedef struct
 typedef struct
 {
     ASF_OBJECT_COMMON
-    guid_t      i_file_id;
+    vlc_guid_t      i_file_id;
     uint64_t    i_total_data_packets;
     uint16_t    i_reserved;
 
@@ -81,8 +82,8 @@ typedef struct
 typedef struct
 {
     ASF_OBJECT_COMMON
-    guid_t      i_file_id;
-    uint64_t    i_index_entry_time_interval;
+    vlc_guid_t      i_file_id;
+    msftime_t   i_index_entry_time_interval;
     uint32_t    i_max_packet_count;
     uint32_t    i_index_entry_count;
 
@@ -100,13 +101,13 @@ typedef struct
 {
     ASF_OBJECT_COMMON
 
-    guid_t  i_file_id;
+    vlc_guid_t  i_file_id;
     uint64_t     i_file_size;
     uint64_t     i_creation_date;
     uint64_t     i_data_packets_count;
-    uint64_t     i_play_duration;
-    uint64_t     i_send_duration;
-    uint64_t     i_preroll;
+    msftime_t    i_play_duration;
+    msftime_t    i_send_duration;
+    vlc_tick_t   i_preroll;
     uint32_t     i_flags;
     uint32_t     i_min_data_packet_size;
     uint32_t     i_max_data_packet_size;
@@ -119,13 +120,13 @@ typedef struct
 {
     ASF_OBJECT_COMMON
 
-    guid_t  i_stream_type;
-    guid_t  i_error_correction_type;
-    uint64_t     i_time_offset;
+    vlc_guid_t  i_stream_type;
+    vlc_guid_t  i_error_correction_type;
+    msftime_t    i_time_offset;
     uint32_t     i_type_specific_data_length;
     uint32_t     i_error_correction_data_length;
     uint16_t     i_flags;
-        /* extrated from flags */
+        /* extracted from flags */
         uint8_t i_stream_number;
     uint32_t    i_reserved;
     uint8_t     *p_type_specific_data;
@@ -136,7 +137,7 @@ typedef struct
 {
     ASF_OBJECT_COMMON
 
-    guid_t      i_reserved1;
+    vlc_guid_t      i_reserved1;
     uint16_t    i_reserved2;
     uint32_t    i_header_extension_size;
     uint8_t     *p_header_extension_data;
@@ -204,7 +205,7 @@ typedef struct asf_codec_entry
 typedef struct
 {
     ASF_OBJECT_COMMON
-    guid_t      i_reserved;
+    vlc_guid_t      i_reserved;
     asf_codec_entry_t *codecs;
 
 } asf_object_codec_list_t;
@@ -224,7 +225,7 @@ typedef struct
 typedef struct
 {
     ASF_OBJECT_COMMON
-    guid_t      i_reserved1;
+    vlc_guid_t      i_reserved1;
     uint32_t    i_count;
     uint16_t    i_reserved2;
     char        *name;
@@ -252,10 +253,32 @@ typedef struct
     } bitrate[ASF_MAX_STREAMNUMBER + 1];
 } asf_object_stream_bitrate_properties_t;
 
+typedef struct
+{
+    uint32_t i_packet_number;
+    uint32_t i_timecode; /* presentation time in milliseconds */
+} asf_timecode_entry_t;
 
 typedef struct
 {
-    guid_t   i_extension_id;
+    ASF_OBJECT_COMMON
+    uint32_t    i_index_entry_time_interval;
+    uint32_t    i_max_packet_count;
+    uint32_t    i_index_entry_count;
+    asf_timecode_entry_t *timecode_entry;
+} asf_object_timecode_index_t;
+
+typedef struct
+{
+    ASF_OBJECT_COMMON
+    uint32_t    i_index_entry_time_interval;
+    uint32_t    i_max_packet_count;
+    uint32_t    i_index_entry_count;
+} asf_object_timecode_index_parameters_t;
+
+typedef struct
+{
+    vlc_guid_t   i_extension_id;
     uint16_t i_data_size;
     uint32_t i_info_length;
     char     *pi_info;
@@ -281,7 +304,7 @@ typedef struct
     uint32_t i_flags;
     uint16_t i_stream_number;
     uint16_t i_language_index;
-    uint64_t i_average_time_per_frame;
+    msftime_t i_average_time_per_frame;
 
     uint16_t i_stream_name_count;
 
@@ -353,10 +376,11 @@ typedef struct
 
     /* from asf_object_header_t */
     asf_object_file_properties_t *p_fp;
-
+    asf_object_header_extension_t *p_he;
     /* from asf_object_header_extension_t */
     asf_object_metadata_t *p_metadata;
-
+    asf_object_timecode_index_t *p_timecode_index;
+    asf_object_timecode_index_parameters_t *p_timecode_index_parameters;
 } asf_object_root_t;
 
 /****************************************************************************
@@ -383,13 +407,14 @@ typedef union asf_object_u
     asf_object_stream_prioritization_t stream_prioritization;
     asf_object_bitrate_mutual_exclusion_t bitrate_mutual_exclusion;
     asf_object_extended_content_description_t extended_content_description;
-
+    asf_object_timecode_index_t     timecode_index;
+    asf_object_timecode_index_parameters_t timecode_index_parameters;
 } asf_object_t;
 
 asf_object_root_t *ASF_ReadObjectRoot( stream_t *, int b_seekable );
 void               ASF_FreeObjectRoot( stream_t *, asf_object_root_t *p_root );
 
-int ASF_CountObject ( void *p_obj, const guid_t *p_guid );
+int ASF_CountObject ( void *p_obj, const vlc_guid_t *p_guid );
 
-void *ASF_FindObject( void *p_obj, const guid_t *p_guid, int i_number );
+void *ASF_FindObject( void *p_obj, const vlc_guid_t *p_guid, int i_number );
 #endif

@@ -2,7 +2,6 @@
  * var_string.cpp
  *****************************************************************************
  * Copyright (C) 2010 the VideoLAN team
- * $Id$
  *
  * Author: Erwan Tulou      <erwan10 aT videolan DoT org>
  *
@@ -27,7 +26,7 @@
 const std::string VarString::m_type = "string";
 
 
-void VarString::set( std::string str )
+void VarString::set( const std::string &str )
 {
     // If the value has changed, notify the observers
     if( m_value != str )

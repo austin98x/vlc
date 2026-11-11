@@ -2,7 +2,6 @@
  * vlc.c: Generic lua interface functions
  *****************************************************************************
  * Copyright (C) 2007-2008 the VideoLAN team
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *          Pierre d'Herbemont <pdherbemont # videolan.org>
@@ -36,6 +35,7 @@
 
 #include "vlc.h"
 
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_arrays.h>
 #include <vlc_charset.h>
@@ -46,6 +46,8 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
+
+#define LUA_TEXT N_("Enable Lua plugins")
 #define INTF_TEXT N_("Lua interface")
 #define INTF_LONGTEXT N_("Lua interface module to load")
 
@@ -55,9 +57,22 @@
 #define PASS_LONGTEXT N_( "A single password restricts access " \
     "to this interface." )
 #define SRC_TEXT N_( "Source directory" )
-#define SRC_LONGTEXT N_( "Source directory" )
+#define SRC_LONGTEXT NULL
 #define INDEX_TEXT N_( "Directory index" )
 #define INDEX_LONGTEXT N_( "Allow to build directory index" )
+
+#define SOCKS_SERVER_TEXT N_("SOCKS server")
+#define SOCKS_SERVER_LONGTEXT N_( \
+    "SOCKS proxy server to use. This must be of the form " \
+    "address:port. It will be used for all TCP connections" )
+
+#define SOCKS_USER_TEXT N_("SOCKS user name")
+#define SOCKS_USER_LONGTEXT N_( \
+    "User name to be used for connection to the SOCKS proxy." )
+
+#define SOCKS_PASS_TEXT N_("SOCKS password")
+#define SOCKS_PASS_LONGTEXT N_( \
+    "Password to be used for connection to the SOCKS proxy." )
 
 #define TELNETHOST_TEXT N_( "Host" )
 #define TELNETHOST_LONGTEXT N_( "This is the host on which the " \
@@ -70,110 +85,6 @@
 #define TELNETPWD_TEXT N_( "Password" )
 #define TELNETPWD_LONGTEXT N_( "A single password restricts access " \
     "to this interface." )
-#define RCHOST_TEXT N_("TCP command input")
-#define RCHOST_LONGTEXT N_("Accept commands over a socket rather than stdin. " \
-            "You can set the address and port the interface will bind to." )
-#define CLIHOST_TEXT N_("CLI input")
-#define CLIHOST_LONGTEXT N_( "Accept commands from this source. " \
-    "The CLI defaults to stdin (\"*console\"), but can also bind to a " \
-    "plain TCP socket (\"localhost:4212\") or use the telnet protocol " \
-    "(\"telnet://0.0.0.0:4212\")" )
-
-static int vlc_sd_probe_Open( vlc_object_t * );
-
-vlc_module_begin ()
-        set_shortname( N_("Lua") )
-        set_description( N_("Lua interpreter") )
-        set_category( CAT_INTERFACE )
-        set_subcategory( SUBCAT_INTERFACE_MAIN )
-
-        add_string( "lua-intf", "dummy", INTF_TEXT, INTF_LONGTEXT, false )
-        add_string( "lua-config", "", CONFIG_TEXT, CONFIG_LONGTEXT, false )
-        set_capability( "interface", 0 )
-        set_callbacks( Open_LuaIntf, Close_LuaIntf )
-        add_shortcut( "luaintf" )
-
-    add_submodule ()
-        set_section( N_("Lua HTTP"), 0 )
-            add_password ( "http-password", NULL, PASS_TEXT, PASS_LONGTEXT, false )
-            add_string ( "http-src",  NULL, SRC_TEXT,  SRC_LONGTEXT,  true )
-            add_bool   ( "http-index", false, INDEX_TEXT, INDEX_LONGTEXT, true )
-        set_capability( "interface", 0 )
-        set_callbacks( Open_LuaHTTP, Close_LuaIntf )
-        add_shortcut( "luahttp", "http" )
-        set_description( N_("Lua HTTP") )
-
-    add_submodule ()
-        set_section( N_("Lua CLI"), 0 )
-            add_string( "rc-host", NULL, RCHOST_TEXT, RCHOST_LONGTEXT, true )
-            add_string( "cli-host", NULL, CLIHOST_TEXT, CLIHOST_LONGTEXT, true )
-        set_capability( "interface", 25 )
-        set_description( N_("Command-line interface") )
-        set_callbacks( Open_LuaCLI, Close_LuaIntf )
-#ifndef _WIN32
-        add_shortcut( "luacli", "luarc", "cli", "rc" )
-#else
-        add_shortcut( "luacli", "luarc" )
-#endif
-
-    add_submodule ()
-        set_section( N_("Lua Telnet"), 0 )
-            add_string( "telnet-host", "localhost", TELNETHOST_TEXT,
-                        TELNETHOST_LONGTEXT, true )
-            add_integer( "telnet-port", TELNETPORT_DEFAULT, TELNETPORT_TEXT,
-                         TELNETPORT_LONGTEXT, true )
-                change_integer_range( 1, 65535 )
-            add_password( "telnet-password", NULL, TELNETPWD_TEXT,
-
-                          TELNETPWD_LONGTEXT, true )
-        set_capability( "interface", 0 )
-        set_callbacks( Open_LuaTelnet, Close_LuaIntf )
-        set_description( N_("Lua Telnet") )
-        add_shortcut( "luatelnet", "telnet" )
-
-    add_submodule ()
-        set_shortname( N_( "Lua Meta Fetcher" ) )
-        set_description( N_("Fetch meta data using lua scripts") )
-        set_capability( "meta fetcher", 10 )
-        set_callbacks( FetchMeta, NULL )
-
-    add_submodule ()
-        set_shortname( N_( "Lua Meta Reader" ) )
-        set_description( N_("Read meta data using lua scripts") )
-        set_capability( "meta reader", 10 )
-        set_callbacks( ReadMeta, NULL )
-
-    add_submodule ()
-        add_shortcut( "luaplaylist" )
-        set_shortname( N_("Lua Playlist") )
-        set_description( N_("Lua Playlist Parser Interface") )
-        set_capability( "stream_filter", 2 )
-        set_callbacks( Import_LuaPlaylist, Close_LuaPlaylist )
-
-    add_submodule ()
-        set_shortname( N_( "Lua Art" ) )
-        set_description( N_("Fetch artwork using lua scripts") )
-        set_capability( "art finder", 10 )
-        set_callbacks( FindArt, NULL )
-
-    add_submodule ()
-        set_shortname( N_("Lua Extension") )
-        set_description( N_("Lua Extension") )
-        add_shortcut( "luaextension" )
-        set_capability( "extension", 1 )
-        set_callbacks( Open_Extension, Close_Extension )
-
-    add_submodule ()
-        set_description( N_("Lua SD Module") )
-        add_shortcut( "luasd" )
-        set_capability( "services_discovery", 0 )
-        add_string( "lua-sd", "", NULL, NULL, false )
-            change_volatile()
-        set_callbacks( Open_LuaSD, Close_LuaSD )
-
-    VLC_SD_PROBE_SUBMODULE
-
-vlc_module_end ()
 
 /*****************************************************************************
  *
@@ -195,6 +106,18 @@ static int file_select( const char *file )
 static int file_compare( const char **a, const char **b )
 {
     return strcmp( *a, *b );
+}
+
+/* Function to parse the trusted property of a file */
+static bool file_is_playlist( lua_State *L )
+{
+    bool trusted = false;
+    lua_getfield(L, -1, "trusted");
+    if( !lua_isnil(L, -1) && lua_isboolean(L, -1) )
+        trusted = lua_toboolean(L, -1);
+
+    lua_pop( L, 1 );
+    return trusted;
 }
 
 static char **vlclua_dir_list_append( char **restrict list, char *basedir,
@@ -220,19 +143,23 @@ int vlclua_dir_list(const char *luadirname, char ***restrict listp)
     *listp = list;
 
     /* Lua scripts in user-specific data directory */
-    list = vlclua_dir_list_append(list, config_GetUserDir(VLC_DATA_DIR),
-                                  luadirname);
+    char *userdir = config_GetUserDir(VLC_USERDATA_DIR);
+    if (likely(userdir != NULL))
+        list = vlclua_dir_list_append(list, userdir, luadirname);
 
-    char *libdir = config_GetLibDir();
-    char *datadir = config_GetDataDir();
+    char *libdir = config_GetSysPath(VLC_PKG_LIBEXEC_DIR, NULL);
+    char *datadir = config_GetSysPath(VLC_PKG_DATA_DIR, NULL);
     bool both = libdir != NULL && datadir != NULL && strcmp(libdir, datadir);
 
     /* Tokenized Lua scripts in architecture-specific data directory */
-    list = vlclua_dir_list_append(list, libdir, luadirname);
+    if (libdir != NULL)
+        list = vlclua_dir_list_append(list, libdir, luadirname);
 
     /* Source Lua Scripts in architecture-independent data directory */
     if (both || libdir == NULL)
         list = vlclua_dir_list_append(list, datadir, luadirname);
+    else
+        free(datadir);
 
     *list = NULL;
     return VLC_SUCCESS;
@@ -268,7 +195,7 @@ int vlclua_scripts_batch_execute( vlc_object_t *p_this,
         msg_Dbg( p_this, "Trying Lua scripts in %s", *ppsz_dir );
         int i_files = vlc_scandir( *ppsz_dir, &ppsz_filelist, file_select,
                                    file_compare );
-        if( i_files < 0 )
+        if( i_files <= 0 )
             continue;
 
         char **ppsz_file = ppsz_filelist;
@@ -344,6 +271,8 @@ char *vlclua_find_file( const char *psz_luadirname, const char *psz_name )
 void vlclua_read_meta_data( vlc_object_t *p_this, lua_State *L,
                             input_item_t *p_input )
 {
+    vlc_meta_priority_t priority = file_is_playlist( L )? VLC_META_PRIORITY_PLAYLIST:
+                                                          VLC_META_PRIORITY_BASIC;
 #define TRY_META( a, b )                                        \
     lua_getfield( L, -1, a );                                   \
     if( lua_isstring( L, -1 ) &&                                \
@@ -352,16 +281,20 @@ void vlclua_read_meta_data( vlc_object_t *p_this, lua_State *L,
         char *psz_value = strdup( lua_tostring( L, -1 ) );      \
         EnsureUTF8( psz_value );                                \
         msg_Dbg( p_this, #b ": %s", psz_value );                \
-        input_item_Set ## b ( p_input, psz_value );             \
+        vlc_meta_SetWithPriority( p_input->p_meta,              \
+                                  vlc_meta_ ## b,               \
+                                  psz_value,                    \
+                                  priority );                   \
         free( psz_value );                                      \
     }                                                           \
     lua_pop( L, 1 ); /* pop a */
+    vlc_mutex_lock( &p_input->lock );
     TRY_META( "title", Title );
     TRY_META( "artist", Artist );
     TRY_META( "genre", Genre );
     TRY_META( "copyright", Copyright );
     TRY_META( "album", Album );
-    TRY_META( "tracknum", TrackNum );
+    TRY_META( "tracknum", TrackNumber );
     TRY_META( "description", Description );
     TRY_META( "rating", Rating );
     TRY_META( "date", Date );
@@ -371,13 +304,14 @@ void vlclua_read_meta_data( vlc_object_t *p_this, lua_State *L,
     TRY_META( "nowplaying", NowPlaying );
     TRY_META( "publisher",  Publisher );
     TRY_META( "encodedby",  EncodedBy );
-    TRY_META( "arturl",     ArtURL );
+    TRY_META( "arturl",     ArtworkURL );
     TRY_META( "trackid",    TrackID );
     TRY_META( "director",   Director );
     TRY_META( "season",     Season );
     TRY_META( "episode",    Episode );
     TRY_META( "show_name",  ShowName );
     TRY_META( "actors",     Actors );
+    vlc_mutex_unlock( &p_input->lock );
 }
 
 #undef vlclua_read_custom_meta_data
@@ -409,7 +343,9 @@ void vlclua_read_custom_meta_data( vlc_object_t *p_this, lua_State *L,
             const char *psz_key = lua_tostring( L, -2 );
             const char *psz_value = lua_tostring( L, -1 );
 
-            vlc_meta_AddExtra( p_input->p_meta, psz_key, psz_value );
+            vlc_meta_priority_t priority = file_is_playlist( L )? VLC_META_PRIORITY_PLAYLIST:
+                                                                  VLC_META_PRIORITY_BASIC;
+            vlc_meta_SetExtraWithPriority( p_input->p_meta, psz_key, psz_value, priority );
 
             lua_pop( L, 1 ); /* pop "value" */
         }
@@ -485,11 +421,11 @@ input_item_t *vlclua_read_input_item(vlc_object_t *obj, lua_State *L)
         msg_Warn(obj, "Playlist item name should be a string" );
 
     /* Read duration */
-    mtime_t duration = -1;
+    vlc_tick_t duration = INPUT_DURATION_INDEFINITE;
 
     lua_getfield( L, -3, "duration" );
     if (lua_isnumber(L, -1))
-        duration = (mtime_t)(lua_tonumber(L, -1) * (CLOCK_FREQ * 1.));
+        duration = vlc_tick_from_sec( lua_tonumber(L, -1) );
     else if (!lua_isnil(L, -1))
         msg_Warn(obj, "Playlist item duration should be a number (seconds)");
     lua_pop( L, 1 ); /* pop "duration" */
@@ -713,3 +649,91 @@ int vlclua_dofile( vlc_object_t *p_this, lua_State *L, const char *curi )
     free( uri );
     return i_ret;
 }
+
+vlc_module_begin ()
+        set_shortname( N_("Lua") )
+        set_description( N_("Lua interpreter") )
+        set_subcategory( SUBCAT_INTERFACE_MAIN )
+
+        add_bool( "lua", true, LUA_TEXT, NULL )
+        add_string( "lua-intf", "dummy", INTF_TEXT, INTF_LONGTEXT )
+        add_string( "lua-config", "", CONFIG_TEXT, CONFIG_LONGTEXT )
+        set_capability( "interface", 0 )
+        set_callbacks( Open_LuaIntf, Close_LuaIntf )
+        add_shortcut( "luaintf" )
+
+        set_section( N_( "Socks proxy") , NULL )
+        add_string( "socks", NULL,
+                    SOCKS_SERVER_TEXT, SOCKS_SERVER_LONGTEXT )
+        add_string( "socks-user", NULL,
+                    SOCKS_USER_TEXT, SOCKS_USER_LONGTEXT )
+        add_password( "socks-pwd", NULL,
+                      SOCKS_PASS_TEXT, SOCKS_PASS_LONGTEXT )
+
+    add_submodule ()
+        set_section( N_("Lua HTTP"), 0 )
+            add_password("http-password", NULL, PASS_TEXT, PASS_LONGTEXT)
+            add_string ( "http-src",  NULL, SRC_TEXT,  SRC_LONGTEXT )
+            add_bool   ( "http-index", false, INDEX_TEXT, INDEX_LONGTEXT )
+        set_capability( "interface", 0 )
+        set_callbacks( Open_LuaHTTP, Close_LuaIntf )
+        add_shortcut( "luahttp", "http" )
+        set_description( N_("Lua HTTP") )
+
+    add_submodule ()
+        set_section( N_("Lua Telnet"), 0 )
+            add_string( "telnet-host", "localhost", TELNETHOST_TEXT,
+                        TELNETHOST_LONGTEXT )
+            add_integer( "telnet-port", TELNETPORT_DEFAULT, TELNETPORT_TEXT,
+                         TELNETPORT_LONGTEXT )
+                change_integer_range( 1, 65535 )
+            add_password("telnet-password", NULL, TELNETPWD_TEXT,
+                         TELNETPWD_LONGTEXT)
+        set_capability( "interface", 0 )
+        set_callbacks( Open_LuaTelnet, Close_LuaIntf )
+        set_description( N_("Lua Telnet") )
+        add_shortcut( "luatelnet", "telnet" )
+
+    add_submodule ()
+        set_shortname( N_( "Lua Meta Fetcher" ) )
+        set_description( N_("Fetch meta data using lua scripts") )
+        set_capability( "meta fetcher", 10 )
+        set_callback( FetchMeta )
+
+    add_submodule ()
+        set_shortname( N_( "Lua Meta Reader" ) )
+        set_description( N_("Read meta data using lua scripts") )
+        set_capability( "meta reader", 10 )
+        set_callback( ReadMeta )
+
+    add_submodule ()
+        add_shortcut( "luaplaylist" )
+        set_shortname( N_("Lua Playlist") )
+        set_description( N_("Lua Playlist Parser Interface") )
+        set_capability( "demux", 5 )
+        set_callbacks( Import_LuaPlaylist, Close_LuaPlaylist )
+
+    add_submodule ()
+        set_shortname( N_( "Lua Art" ) )
+        set_description( N_("Fetch artwork using lua scripts") )
+        set_capability( "art finder", 10 )
+        set_callback( FindArt )
+
+    add_submodule ()
+        set_shortname( N_("Lua Extension") )
+        set_description( N_("Lua Extension") )
+        add_shortcut( "luaextension" )
+        set_capability( "extension", 1 )
+        set_callbacks( Open_Extension, Close_Extension )
+
+    add_submodule ()
+        set_description( N_("Lua SD Module") )
+        add_shortcut( "luasd" )
+        set_capability( "services_discovery", 0 )
+        add_string( "lua-sd", "", NULL, NULL )
+            change_volatile()
+        set_callbacks( Open_LuaSD, Close_LuaSD )
+
+    VLC_SD_PROBE_SUBMODULE
+
+vlc_module_end ()

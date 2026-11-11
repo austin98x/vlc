@@ -82,33 +82,34 @@ static const char *const depth_texts[] = {
 vlc_module_begin ()
     set_shortname (N_("Framebuffer input"))
     set_description (N_("Shared memory framebuffer"))
-    set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_ACCESS)
-    set_capability ("access_demux", 0)
+    set_capability ("access", 0)
     set_callbacks (Open, Close)
 
-    add_float ("shm-fps", 10.0, FPS_TEXT, FPS_LONGTEXT, true)
-    add_integer ("shm-depth", 0, DEPTH_TEXT, DEPTH_LONGTEXT, true)
+    add_float ("shm-fps", 10.0, FPS_TEXT, FPS_LONGTEXT)
+    add_integer ("shm-depth", 0, DEPTH_TEXT, DEPTH_LONGTEXT)
         change_integer_list (depths, depth_texts)
         change_safe ()
-    add_integer ("shm-width", 800, WIDTH_TEXT, WIDTH_LONGTEXT, false)
+    add_integer ("shm-width", 800, WIDTH_TEXT, WIDTH_LONGTEXT)
         change_integer_range (0, 65535)
         change_safe ()
-    add_integer ("shm-height", 480, HEIGHT_TEXT, HEIGHT_LONGTEXT, false)
+    add_integer ("shm-height", 480, HEIGHT_TEXT, HEIGHT_LONGTEXT)
         change_integer_range (0, 65535)
         change_safe ()
 
     /* We need to "trust" the memory segment. If it were shrunk while we copy
      * its content our process may crash - or worse. So we pass the shared
      * memory location via an unsafe variable rather than the URL. */
-    add_string ("shm-file", NULL, FILE_TEXT, FILE_LONGTEXT, false)
+    add_string ("shm-file", NULL, FILE_TEXT, FILE_LONGTEXT)
         change_volatile ()
 #ifdef HAVE_SYS_SHM_H
-    add_integer ("shm-id", (int64_t)IPC_PRIVATE, ID_TEXT, ID_LONGTEXT, false)
+    add_integer ("shm-id", (int64_t)IPC_PRIVATE, ID_TEXT, ID_LONGTEXT)
         change_volatile ()
 #endif
     add_shortcut ("shm")
 vlc_module_end ()
+
+typedef struct demux_sys_t demux_sys_t;
 
 static int Control (demux_t *, int, va_list);
 static void DemuxFile (void *);
@@ -138,6 +139,9 @@ struct demux_sys_t
 static int Open (vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
+
     demux_sys_t *sys = vlc_obj_malloc(obj, sizeof (*sys));
     if (unlikely(sys == NULL))
         return VLC_ENOMEM;
@@ -148,19 +152,19 @@ static int Open (vlc_object_t *obj)
     switch (var_InheritInteger (demux, "shm-depth"))
     {
         case 32:
-            chroma = VLC_CODEC_RGB32; bpp = 32;
+            chroma = VLC_CODEC_XRGB; bpp = 32;
             break;
         case 24:
             chroma = VLC_CODEC_RGB24; bpp = 24;
             break;
         case 16:
-            chroma = VLC_CODEC_RGB16; bpp = 16;
+            chroma = VLC_CODEC_RGB565; bpp = 16;
             break;
         case 15:
-            chroma = VLC_CODEC_RGB15; bpp = 16;
+            chroma = VLC_CODEC_RGB555; bpp = 16;
             break;
         case 8:
-            chroma = VLC_CODEC_RGB8; bpp = 8;
+            chroma = VLC_CODEC_RGB233; bpp = 8;
             break;
         case 0:
             chroma = VLC_CODEC_XWD; bpp = 0;
@@ -221,26 +225,22 @@ static int Open (vlc_object_t *obj)
     if (rate <= 0.f)
         goto error;
 
-    mtime_t interval = llroundf((float)CLOCK_FREQ / rate);
+    vlc_tick_t interval = llroundf((float)CLOCK_FREQ / rate);
     if (!interval)
         goto error;
 
     es_format_t fmt;
     es_format_Init (&fmt, VIDEO_ES, chroma);
-    fmt.video.i_chroma = chroma;
-    fmt.video.i_bits_per_pixel = bpp;
-    fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
+    video_format_Setup(&fmt.video, chroma, width, height, width, height, 1, 1);
     fmt.video.i_frame_rate = 1000 * rate;
     fmt.video.i_frame_rate_base = 1000;
-    fmt.video.i_visible_width = fmt.video.i_width = width;
-    fmt.video.i_visible_height = fmt.video.i_height = height;
 
     sys->es = es_out_Add (demux->out, &fmt);
 
     /* Initializes demux */
     if (vlc_timer_create (&sys->timer, Demux, demux))
         goto error;
-    vlc_timer_schedule (sys->timer, false, 1, interval);
+    vlc_timer_schedule_asap (sys->timer, interval);
 
     demux->p_sys = sys;
     demux->pf_demux   = NULL;
@@ -282,15 +282,14 @@ static int Control (demux_t *demux, int query, va_list args)
         case DEMUX_GET_LENGTH:
         case DEMUX_GET_TIME:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = 0;
+            *va_arg (args, vlc_tick_t *) = 0;
             return VLC_SUCCESS;
         }
 
         case DEMUX_GET_PTS_DELAY:
         {
-            int64_t *v = va_arg (args, int64_t *);
-            *v = INT64_C(1000) * var_InheritInteger (demux, "live-caching");
+            *va_arg (args, vlc_tick_t *) =
+                VLC_TICK_FROM_MS( var_InheritInteger (demux, "live-caching") );
             return VLC_SUCCESS;
         }
 
@@ -323,7 +322,7 @@ static void DemuxFile (void *data)
     block_t *block = block_File(sys->fd, true);
     if (block == NULL)
         return;
-    block->i_pts = block->i_dts = mdate ();
+    block->i_pts = block->i_dts = vlc_tick_now ();
 
     /* Send block */
     es_out_SetPCR(demux->out, block->i_pts);
@@ -346,7 +345,7 @@ static void DemuxIPC (void *data)
     if (block == NULL)
         return;
     memcpy (block->p_buffer, sys->mem.addr, sys->mem.length);
-    block->i_pts = block->i_dts = mdate ();
+    block->i_pts = block->i_dts = vlc_tick_now ();
 
     /* Send block */
     es_out_SetPCR(demux->out, block->i_pts);

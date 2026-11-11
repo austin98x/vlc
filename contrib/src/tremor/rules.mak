@@ -1,25 +1,24 @@
 # tremor (fixed-point Vorbis)
 
+TREMOR_URL := https://gitlab.xiph.org/xiph/tremor.git
+TREMOR_HASH := b56ffce0
+
 ifndef HAVE_FPU
 PKGS += tremor
 endif
 
-$(TARBALLS)/tremor-svn.tar.xz:
-	rm -Rf tremor-svn
-	$(SVN) export http://svn.xiph.org/trunk/Tremor tremor-svn
-	tar cvJ tremor-svn > $@
+$(TARBALLS)/tremor-git.tar.xz:
+	$(call download_git,$(TREMOR_URL),master,$(TREMOR_HASH))
 
-.sum-tremor: tremor-svn.tar.xz
+.sum-tremor: tremor-git.tar.xz
 	$(warning Integrity check skipped.)
 	touch $@
 
-tremor: tremor-svn.tar.xz .sum-tremor
+tremor: tremor-git.tar.xz .sum-tremor
 	# Stuff that does not depend on libogg
 	$(UNPACK)
+	# $(call update_autoconfig,.)
 	$(APPLY) $(SRC)/tremor/tremor.patch
-	rm -f tremor-svn/ogg.h tremor-svn/os_types.h
-	echo '#include <ogg/ogg.h>' > tremor-svn/ogg.h
-	echo '#include <ogg/os_types.h>' > tremor-svn/os_types.h
 	$(MOVE)
 
 DEPS_tremor = ogg $(DEPS_ogg)
@@ -27,7 +26,8 @@ DEPS_tremor = ogg $(DEPS_ogg)
 .tremor: tremor
 	# Stuff that depends on libogg
 	$(RECONF)
-	cd $< && \
-	$(HOSTVARS) CFLAGS="$(CFLAGS) $(NOTHUMB)" ./configure $(HOSTCONF)
-	cd $< && $(MAKE) install
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE)
+	+$(MAKEBUILD)
+	+$(MAKEBUILD) install
 	touch $@

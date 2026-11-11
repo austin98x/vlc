@@ -2,7 +2,6 @@
  * mirror.c : Mirror video plugin for vlc
  *****************************************************************************
  * Copyright (C) 2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Branko Kokanovic <branko.kokanovic@gmail.com>
  *
@@ -33,6 +32,7 @@
 #include <stdatomic.h>
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
@@ -41,10 +41,8 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  Create      ( vlc_object_t * );
-static void Destroy     ( vlc_object_t * );
+static int  Create      ( filter_t * );
 
-static picture_t *Filter( filter_t *, picture_t * );
 static void VerticalMirror( picture_t *, picture_t *, int plane, bool );
 static void HorizontalMirror( picture_t *, picture_t *, int, bool );
 static void PlanarVerticalMirror( picture_t *, picture_t *, int plane, bool );
@@ -53,6 +51,7 @@ static void RV24VerticalMirror( picture_t *, picture_t *, int plane, bool );
 static void RV32VerticalMirror( picture_t *, picture_t *, int plane, bool );
 
 static void YUV422Mirror2Pixels( uint8_t *, uint8_t *, bool );
+VIDEO_FILTER_WRAPPER_CLOSE(Filter, Destroy)
 
 static const char *const ppsz_filter_options[] = {
     "split", "direction", NULL
@@ -80,17 +79,15 @@ vlc_module_begin ()
     set_description( N_("Mirror video filter") )
     set_shortname( N_("Mirror video" ))
     set_help( N_("Splits video in two same parts, like in a mirror") )
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
-    set_capability( "video filter", 0 )
     add_integer( CFG_PREFIX "split", 0, ORIENTATION_TEXT,
-                ORIENTATION_LONGTEXT, false )
+                ORIENTATION_LONGTEXT )
         change_integer_list( pi_orientation_values,
                             ppsz_orientation_descriptions )
     add_integer( CFG_PREFIX "direction", 0, DIRECTION_TEXT,
-                DIRECTION_LONGTEXT, false )
+                DIRECTION_LONGTEXT )
         change_integer_list( pi_direction_values, ppsz_direction_descriptions )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -102,20 +99,19 @@ static int FilterCallback( vlc_object_t *, char const *,
 /*****************************************************************************
  * filter_sys_t: adjust filter method descriptor
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
     atomic_int i_split;
     atomic_int i_direction;
-};
+} filter_sys_t;
 
 /*****************************************************************************
  * Create: allocates Mirror video thread output method
  *****************************************************************************
  * This function allocates and initializes a Mirror vout method.
  *****************************************************************************/
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     switch( p_filter->fmt_in.video.i_chroma )
@@ -124,8 +120,10 @@ static int Create( vlc_object_t *p_this )
             break;
         CASE_PACKED_YUV_422
             break;
+        CASE_PACKED_RGB32
+            break;
         case VLC_CODEC_RGB24:
-        case VLC_CODEC_RGB32:
+        case VLC_CODEC_BGR24:
             break;
 
         default:
@@ -134,7 +132,8 @@ static int Create( vlc_object_t *p_this )
             return VLC_EGENERIC;
     }
 
-    if( p_filter->fmt_in.video.i_chroma != p_filter->fmt_out.video.i_chroma )
+    if( !video_format_IsSameChroma( &p_filter->fmt_in.video,
+                                    &p_filter->fmt_out.video ) )
     {
         msg_Err( p_filter, "Input and output chromas don't match" );
         return VLC_EGENERIC;
@@ -156,7 +155,7 @@ static int Create( vlc_object_t *p_this )
     var_AddCallback( p_filter, CFG_PREFIX "split", FilterCallback, p_sys );
     var_AddCallback( p_filter, CFG_PREFIX "direction", FilterCallback, p_sys );
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
 
     return VLC_SUCCESS;
 }
@@ -166,9 +165,8 @@ static int Create( vlc_object_t *p_this )
  *****************************************************************************
  * Terminate an output method created by MirrorCreateOutputMethod
  *****************************************************************************/
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     var_DelCallback( p_filter, CFG_PREFIX "split", FilterCallback, p_sys );
@@ -183,24 +181,13 @@ static void Destroy( vlc_object_t *p_this )
  * until it is displayed and switch the two rendering buffers, preparing next
  * frame.
  *****************************************************************************/
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
 {
-    picture_t *p_outpic;
     bool b_vertical_split, b_left_to_right;
-
-    if( !p_pic ) return NULL;
 
     filter_sys_t *p_sys = p_filter->p_sys;
     b_vertical_split = !atomic_load( &p_sys->i_split );
     b_left_to_right = !atomic_load( &p_sys->i_direction );
-
-    p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        msg_Warn( p_filter, "can't get output picture" );
-        picture_Release( p_pic );
-        return NULL;
-    }
 
     for( int i_index = 0 ; i_index < p_pic->i_planes ; i_index++ )
     {
@@ -209,8 +196,6 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
         else
             HorizontalMirror( p_pic, p_outpic, i_index, b_left_to_right );
     }
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }
 
 /*****************************************************************************
@@ -235,9 +220,10 @@ static void VerticalMirror( picture_t *p_pic, picture_t *p_outpic, int i_plane,
         case VLC_CODEC_UYVY:
             break;
         case VLC_CODEC_RGB24:
+        case VLC_CODEC_BGR24:
             RV24VerticalMirror( p_pic, p_outpic, i_plane, b_left_to_right );
             break;
-        case VLC_CODEC_RGB32:
+        CASE_PACKED_RGB32
             RV32VerticalMirror( p_pic, p_outpic, i_plane, b_left_to_right );
             break;
         default:

@@ -24,7 +24,8 @@
 #include "ConnectionParams.hpp"
 
 #include <vlc_url.h>
-#include <sstream>
+#include <ctype.h>
+#include <algorithm>
 
 using namespace adaptive::http;
 
@@ -60,20 +61,26 @@ const std::string & ConnectionParams::getPath() const
 
 void ConnectionParams::setPath(const std::string &path_)
 {
-    path = path_;
+    vlc_url_t url_components{};
+    char *uri_str;
 
-    std::ostringstream os;
-    os.imbue(std::locale("C"));
-    os << scheme << "://";
-    if(!hostname.empty())
-    {
-        os << hostname;
-        if( (port != 80 && scheme != "http") ||
-            (port != 443 && scheme != "https") )
-            os << ":" << port;
+    url_components.psz_protocol = scheme.c_str();
+    url_components.psz_path = const_cast<char *>(path_.c_str());
+    url_components.i_port = 0;
+
+    if (!hostname.empty()) {
+        url_components.psz_host = const_cast<char *>(hostname.c_str());
+        if ((port != 80 && scheme == "http") ||
+            (port != 443 && scheme == "https"))
+            url_components.i_port = port;
     }
-    os << path;
-    uri = os.str();
+
+    uri_str = vlc_uri_compose(&url_components);
+    if (uri_str != nullptr) {
+        path = path_;
+        uri.assign(uri_str);
+    }
+    free(uri_str);
 }
 
 uint16_t ConnectionParams::getPort() const
@@ -81,17 +88,21 @@ uint16_t ConnectionParams::getPort() const
     return port;
 }
 
+bool ConnectionParams::isLocal() const
+{
+    return scheme != "http" && scheme != "https";
+}
+
 void ConnectionParams::parse()
 {
-    std::size_t pos = uri.find("://");
-    if(pos != std::string::npos)
-    {
-        scheme = uri.substr(0, pos);
-    }
-
     vlc_url_t url_components;
     vlc_UrlParse(&url_components, uri.c_str());
 
+    if(url_components.psz_protocol)
+    {
+        scheme = url_components.psz_protocol;
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(), tolower);
+    }
     if(url_components.psz_path)
         path = url_components.psz_path;
     if(url_components.psz_option)

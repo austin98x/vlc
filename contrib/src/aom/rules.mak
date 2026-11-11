@@ -1,40 +1,36 @@
 # aom
-AOM_VERSION := git
-AOM_HASH := HEAD
-AOM_GITURL := https://aomedia.googlesource.com/aom/+archive/$(AOM_HASH).tar.gz
+AOM_VERSION := 3.15.3
+AOM_URL := https://storage.googleapis.com/aom-releases/libaom-$(AOM_VERSION).tar.gz
 
-# Default disabled for now
-# PKGS += aom
+PKGS += aom
 ifeq ($(call need_pkg,"aom"),)
 PKGS_FOUND += aom
 endif
 
-$(TARBALLS)/aom-$(AOM_VERSION).tar.gz:
-	$(call download,$(AOM_GITURL))
+$(TARBALLS)/libaom-$(AOM_VERSION).tar.gz:
+	$(call download_pkg,$(AOM_URL),aom)
 
-.sum-aom: aom-$(AOM_VERSION).tar.gz
-	$(warning $@ not implemented)
-	touch $@
+.sum-aom: libaom-$(AOM_VERSION).tar.gz
 
-aom: aom-$(AOM_VERSION).tar.gz .sum-aom
-	rm -Rf $@-$(AOM_VERSION) $@
-	mkdir -p $@-$(AOM_VERSION)
-	tar xvzf "$<" -C $@-$(AOM_VERSION)
+aom: libaom-$(AOM_VERSION).tar.gz .sum-aom
+	$(UNPACK)
+	$(APPLY) $(SRC)/aom/0001-Do-not-force-_WIN32_WINNT.patch
 	$(MOVE)
 
 DEPS_aom =
-
-AOM_LDFLAGS := $(LDFLAGS)
+ifdef HAVE_WIN32
+DEPS_aom += winpthreads $(DEPS_winpthreads)
+endif
 
 AOM_CONF := \
 	-DCONFIG_RUNTIME_CPU_DETECT=1 \
+	-DCONFIG_MULTITHREAD=1 \
 	-DENABLE_DOCS=OFF \
+	-DENABLE_APPS=OFF \
 	-DENABLE_EXAMPLES=OFF \
 	-DENABLE_TOOLS=OFF \
-	-DCONFIG_UNIT_TESTS=0 \
-	-DCONFIG_INSTALL_BINS=0 \
-	-DCONFIG_INSTALL_DOCS=0 \
-	-DCONFIG_DEPENDENCY_TRACKING=0
+	-DENABLE_TESTS=OFF \
+	-DCONFIG_LIBYUV:STRING=0
 
 ifndef BUILD_ENCODERS
 AOM_CONF += -DCONFIG_AV1_ENCODER=0
@@ -44,11 +40,42 @@ ifndef HAVE_WIN32
 AOM_CONF += -DCONFIG_PIC=1
 endif
 
+ifdef HAVE_WIN32
+ifneq ($(filter arm aarch64, $(ARCH)),)
+# These targets don't have runtime cpu detection.
+AOM_CONF += -DCONFIG_RUNTIME_CPU_DETECT=0
+endif
+ifeq ($(ARCH),arm)
+# armv7, not just plain arm
+AOM_CONF += -DAOM_ADS2GAS_REQUIRED=1 -DAOM_ADS2GAS=../build/make/ads2gas.pl -DAOM_ADS2GAS_OPTS="-thumb;-noelf" -DAOM_GAS_EXT=S
+endif
+endif
+
+ifdef HAVE_DARWIN_OS
+ifneq ($(filter arm aarch64, $(ARCH)),)
+# These targets don't have runtime cpu detection.
+AOM_CONF += -DCONFIG_RUNTIME_CPU_DETECT=0
+endif
+endif
+
+# Force cpu detection
+ifdef HAVE_ANDROID
+ifeq ($(ARCH),aarch64)
+AOM_CONF += -DAOM_TARGET_CPU=arm64
+endif
+endif
+
+ifeq ($(ARCH),arm)
+# armv7, not just plain arm
+AOM_CONF += -DAOM_TARGET_CPU=armv7
+endif
+
 # libaom doesn't allow in-tree builds
 .aom: aom toolchain.cmake
-	cd $< && mkdir -p aom_build
-	cd $</aom_build && LDFLAGS="$(AOM_LDFLAGS)" $(HOSTVARS) $(CMAKE) ../ $(AOM_CONF)
-	cd $</aom_build && $(MAKE)
-	cd $</aom_build && ../../../../contrib/src/pkg-static.sh aom.pc
-	cd $</aom_build && $(MAKE) install
+	rm -rf $(PREFIX)/include/aom
+	$(CMAKECLEAN)
+	$(HOSTVARS_CMAKE) $(CMAKE) $(AOM_CONF)
+	+$(CMAKEBUILD)
+	$(call pkg_static,"$(BUILD_DIRUNPACK)/aom.pc")
+	$(CMAKEINSTALL)
 	touch $@

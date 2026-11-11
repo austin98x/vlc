@@ -13,11 +13,9 @@ Name: VLC plugin API
 Description: VLC media player plugin interface
 Version: @VERSION@
 Cflags: -I${includedir} -I${pkgincludedir}/plugins \
-	-D__PLUGIN__ \
+	-DVLC_DYNAMIC_PLUGIN \
 	-D_FILE_OFFSET_BITS=64 \
-	@DEFS_BIGENDIAN@ \
-	-D_REENTRANT \
-	-D_THREAD_SAFE
+	@DEFS_BIGENDIAN@
 Libs: -L${libdir} -lvlccore
 Libs.private: @LIBS_libvlccore@ \
 	@LTLIBINTL@ @LTLIBICONV@ \

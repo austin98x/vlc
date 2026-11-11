@@ -25,13 +25,15 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdlib.h>
-#ifdef HAVE_POLL
+#ifdef HAVE_POLL_H
 # include <poll.h>
 #endif
 #ifdef HAVE_SYS_UIO_H
 # include <sys/uio.h>
 #endif
 #include <vlc_common.h>
+#include <vlc_threads.h>
+#include <vlc_poll.h>
 #include <vlc_tls.h>
 #include "h2frame.h"
 #include "h2output.h"
@@ -192,19 +194,16 @@ static void vlc_h2_output_flush_unlocked(struct vlc_h2_output *out)
  */
 static ssize_t vlc_https_send(vlc_tls_t *tls, const void *buf, size_t len)
 {
-    struct pollfd ufd;
     struct iovec iov;
     size_t count = 0;
 
-    ufd.fd = vlc_tls_GetFD(tls);
-    ufd.events = POLLOUT;
     iov.iov_base = (void *)buf;
     iov.iov_len = len;
 
     while (count < len)
     {
         int canc = vlc_savecancel();
-        ssize_t val = tls->writev(tls, &iov, 1);
+        ssize_t val = tls->ops->writev(tls, &iov, 1);
 
         vlc_restorecancel(canc);
 
@@ -222,6 +221,10 @@ static ssize_t vlc_https_send(vlc_tls_t *tls, const void *buf, size_t len)
         if (errno != EINTR && errno != EAGAIN)
             return count ? (ssize_t)count : -1;
 
+        struct pollfd ufd;
+
+        ufd.events = POLLOUT;
+        ufd.fd = vlc_tls_GetPollFD(tls, &ufd.events);
         poll(&ufd, 1, -1);
     }
 
@@ -259,6 +262,8 @@ static void *vlc_h2_output_thread(void *data)
     struct vlc_h2_output *out = data;
     struct vlc_h2_frame *frame;
 
+    vlc_thread_set_name("vlc-h2-send");
+
     while ((frame = vlc_h2_output_dequeue(out)) != NULL)
     {
         if (vlc_h2_frame_send(out->tls, frame))
@@ -286,6 +291,8 @@ static void *vlc_h2_client_output_thread(void *data)
 {
     static const char http2_hello[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     struct vlc_h2_output *out = data;
+
+    vlc_thread_set_name("vlc-h2-csend");
 
     if (vlc_https_send(out->tls, http2_hello, 24) < 24)
     {
@@ -319,10 +326,8 @@ struct vlc_h2_output *vlc_h2_output_create(struct vlc_tls *tls, bool client)
 
     void *(*cb)(void *) = client ? vlc_h2_client_output_thread
                                  : vlc_h2_output_thread;
-    if (vlc_clone(&out->thread, cb, out, VLC_THREAD_PRIORITY_INPUT))
+    if (vlc_clone(&out->thread, cb, out))
     {
-        vlc_cond_destroy(&out->wait);
-        vlc_mutex_destroy(&out->lock);
         free(out);
         out = NULL;
     }
@@ -339,8 +344,6 @@ void vlc_h2_output_destroy(struct vlc_h2_output *out)
     vlc_cancel(out->thread);
     vlc_join(out->thread, NULL);
 
-    vlc_cond_destroy(&out->wait);
-    vlc_mutex_destroy(&out->lock);
     /* Flush queues in case the thread was terminated within poll() and some
      * packets were still queued. */
     vlc_h2_output_flush_unlocked(out);

@@ -34,9 +34,11 @@ namespace adaptive
         class AlwaysBestAdaptationLogic : public AbstractAdaptationLogic
         {
             public:
-                AlwaysBestAdaptationLogic           ();
+                AlwaysBestAdaptationLogic           (vlc_object_t *);
+                virtual ~AlwaysBestAdaptationLogic() = default;
 
-                virtual BaseRepresentation *getNextRepresentation(BaseAdaptationSet *, BaseRepresentation *);
+                BaseRepresentation *getNextRepresentation(BaseAdaptationSet *,
+                                                          BaseRepresentation *) override;
         };
     }
 }

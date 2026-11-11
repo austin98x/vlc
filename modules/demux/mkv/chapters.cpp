@@ -2,7 +2,6 @@
  * chapters.cpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -26,8 +25,12 @@
 
 #include "chapter_command.hpp"
 
+#include <vlc_arrays.h>
+
 #include <functional>
 #include <algorithm>
+
+namespace mkv {
 
 chapter_item_c::~chapter_item_c()
 {
@@ -37,19 +40,15 @@ chapter_item_c::~chapter_item_c()
     vlc_delete_all( sub_chapters );
 }
 
-chapter_item_c *chapter_item_c::BrowseCodecPrivate( unsigned int codec_id,
-                                    bool (*match)(const chapter_codec_cmds_c &data, const void *p_cookie, size_t i_cookie_size ),
-                                    const void *p_cookie,
-                                    size_t i_cookie_size )
+chapter_item_c *chapter_item_c::BrowseCodecPrivate( chapter_codec_id codec_id,
+                                                    chapter_cmd_match match )
 {
-    VLC_UNUSED( codec_id );
     // this chapter
-    std::vector<chapter_codec_cmds_c*>::const_iterator index = codecs.begin();
-    while ( index != codecs.end() )
+    for (const mkv::chapter_codec_cmds_c *index : codecs)
     {
-        if ( match( **index ,p_cookie, i_cookie_size ) )
+        if ( index->i_codec_id == codec_id &&
+             match( *index ) )
             return this;
-        ++index;
     }
     return NULL;
 }
@@ -74,7 +73,7 @@ void chapter_item_c::Append( const chapter_item_c & chapter )
     }
 }
 
-chapter_item_c * chapter_item_c::FindChapter( int64_t i_find_uid )
+chapter_item_c * chapter_item_c::FindChapter( chapter_uid i_find_uid )
 {
     size_t i;
     chapter_item_c *p_result = NULL;
@@ -95,29 +94,25 @@ std::string chapter_item_c::GetCodecName( bool f_for_title ) const
 {
     std::string result;
 
-    std::vector<chapter_codec_cmds_c*>::const_iterator index = codecs.begin();
-    while ( index != codecs.end() )
+    for (const mkv::chapter_codec_cmds_c *index : codecs)
     {
-        result = (*index)->GetCodecName( f_for_title );
+        result = index->GetCodecName( f_for_title );
         if ( !result.empty () )
             break;
-        ++index;
     }
 
     return result;
 }
 
-int16 chapter_item_c::GetTitleNumber( ) const
+int16_t chapter_item_c::GetTitleNumber( ) const
 {
     int result = -1;
 
-    std::vector<chapter_codec_cmds_c*>::const_iterator index = codecs.begin();
-    while ( index != codecs.end() )
+    for (const mkv::chapter_codec_cmds_c *index : codecs)
     {
-        result = (*index)->GetTitleNumber( );
+        result = index->GetTitleNumber( );
         if ( result >= 0 )
             break;
-        ++index;
     }
 
     return result;
@@ -146,13 +141,14 @@ bool chapter_item_c::EnterLeaveHelper_ ( bool do_subs,
     bool f_result = false;
 
     f_result |= std::count_if ( codecs.begin (), codecs.end (),
-      std::mem_fun (co_cb)
+      std::mem_fn (co_cb)
     );
 
     if ( do_subs )
     {
+        using std::placeholders::_1;
         f_result |= count_if ( sub_chapters.begin (), sub_chapters.end (),
-          std::bind2nd( std::mem_fun( ch_cb ), true )
+          std::bind( std::mem_fn( ch_cb ), _1, true )
         );
     }
 
@@ -233,3 +229,4 @@ std::string chapter_edition_c::GetMainName() const
     return "";
 }
 
+} // namespace

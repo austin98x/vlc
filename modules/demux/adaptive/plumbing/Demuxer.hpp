@@ -20,30 +20,44 @@
 #ifndef DEMUXER_HPP
 #define DEMUXER_HPP
 
+#include "../tools/Macros.hpp"
+
 #include <vlc_common.h>
+#include <vlc_tick.h>
 #include <string>
 
 namespace adaptive
 {
     class AbstractSourceStream;
+    class DemuxerFactoryInterface;
+    class StreamFormat;
 
     class AbstractDemuxer
     {
+        PREREQ_VIRTUAL(AbstractDemuxer);
+
         public:
+            enum class Status
+            {
+                Success,
+                Error,
+                Eof,
+            };
             AbstractDemuxer();
             virtual ~AbstractDemuxer();
-            virtual int demux(mtime_t) = 0;
+            virtual Status demux(vlc_tick_t) = 0;
             virtual void drain() = 0;
             virtual bool create() = 0;
             virtual void destroy() = 0;
             bool alwaysStartsFromZero() const;
             bool needsRestartOnSeek() const;
-            bool needsRestartOnSwitch() const;
+            bool bitstreamSwitchCompatible() const;
             bool needsRestartOnEachSegment() const;
-            void setCanDetectSwitches(bool);
+            void setBitstreamSwitchCompatible(bool);
             void setRestartsOnEachSegment(bool);
 
         protected:
+            static Status returnCode(int);
             bool b_startsfromzero;
             bool b_reinitsonseek;
             bool b_alwaysrestarts;
@@ -53,16 +67,16 @@ namespace adaptive
     class Demuxer : public AbstractDemuxer
     {
         public:
-            Demuxer(demux_t *, const std::string &, es_out_t *, AbstractSourceStream *);
+            Demuxer(vlc_object_t *, const std::string &, es_out_t *, AbstractSourceStream *);
             virtual ~Demuxer();
-            virtual int demux(mtime_t); /* impl */
-            virtual void drain(); /* impl */
-            virtual bool create(); /* impl */
-            virtual void destroy(); /* impl */
+            Status demux(vlc_tick_t) override;
+            void drain() override;
+            bool create() override;
+            void destroy() override;
 
         protected:
             AbstractSourceStream *sourcestream;
-            demux_t *p_realdemux;
+            vlc_object_t *p_obj;
             demux_t *p_demux;
             std::string name;
             es_out_t *p_es_out;
@@ -72,15 +86,23 @@ namespace adaptive
     class SlaveDemuxer : public Demuxer
     {
         public:
-            SlaveDemuxer(demux_t *, const std::string &, es_out_t *, AbstractSourceStream *);
+            SlaveDemuxer(vlc_object_t *, const std::string &, es_out_t *, AbstractSourceStream *);
             virtual ~SlaveDemuxer();
-            virtual bool create(); /* reimpl */
-            virtual int demux(mtime_t); /* reimpl */
+            bool create() override;
+            Status demux(vlc_tick_t) override;
 
         private:
-            mtime_t length;
+            vlc_tick_t length;
     };
 
+    class DemuxerFactoryInterface
+    {
+        PREREQ_INTERFACE(DemuxerFactoryInterface);
+
+        public:
+            virtual AbstractDemuxer * newDemux(vlc_object_t *, const StreamFormat &,
+                                               es_out_t *, AbstractSourceStream *) const = 0;
+    };
 }
 
 #endif // DEMUXER_HPP

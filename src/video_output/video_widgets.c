@@ -2,7 +2,6 @@
  * video_widgets.c : OSD widgets manipulation functions
  *****************************************************************************
  * Copyright (C) 2004-2010 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Yoann Peronneau <yoann@videolan.org>
  *         Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
@@ -42,11 +41,13 @@
 #define STYLE_FILLED 1
 
 #define RGB_BLUE        0x2badde
+#define RGB_ORANGE      0xf48b00
+#define RGB_FILL        RGB_ORANGE
 
 #define COL_TRANSPARENT 0
 #define COL_WHITE       1
-#define COL_BLUE        2
-#define COL_BLUE_SHADE  3
+#define COL_FILL        2
+#define COL_FILL_SHADE  3
 
 #define SET_PALETTE_COLOR(id, rgb, alpha) \
 {\
@@ -115,14 +116,14 @@ static void DrawTriangle(subpicture_region_t *r, int fill, uint8_t color,
  */
 static subpicture_region_t *OSDRegion(int x, int y, int width, int height)
 {
-    if( width == 0 || height == 0 )
+    if( unlikely( width == 0 || height == 0 ) )
         return NULL;
 
     video_palette_t palette;
     SET_PALETTE_COLOR(COL_WHITE,       0xffffff, STYLE_ALPHA_OPAQUE)
     SET_PALETTE_COLOR(COL_TRANSPARENT, 0xffffff, STYLE_ALPHA_TRANSPARENT)
-    SET_PALETTE_COLOR(COL_BLUE,        RGB_BLUE, STYLE_ALPHA_OPAQUE)
-    SET_PALETTE_COLOR(COL_BLUE_SHADE,  RGB_BLUE, 0x40)
+    SET_PALETTE_COLOR(COL_FILL,        RGB_FILL, 0xA0)
+    SET_PALETTE_COLOR(COL_FILL_SHADE,  RGB_FILL, 0x25)
     palette.i_entries = 4;
 
     video_format_t fmt;
@@ -149,26 +150,28 @@ static subpicture_region_t *OSDRegion(int x, int y, int width, int height)
  * Types are: OSD_HOR_SLIDER and OSD_VERT_SLIDER.
  */
 #define SLIDER_MARGIN_BASE 0.10
-static subpicture_region_t *OSDSlider(int type, int position,
-                                      const video_format_t *fmt)
+static subpicture_region_t *OSDSlider(vlc_osd_widget_type type, int position,
+                                      const unsigned i_visible_width,
+                                      const unsigned i_visible_height)
 {
-    const int size = __MAX(fmt->i_visible_width, fmt->i_visible_height);
-    const int margin = size * SLIDER_MARGIN_BASE;
-    const int marginbottom = size * SLIDER_MARGIN_BASE * 0.6;
-    uint8_t i_padding = __MIN(5, size * 0.25); /* small sizes */
+    const unsigned size = __MAX(i_visible_width, i_visible_height);
+    const unsigned margin = size * SLIDER_MARGIN_BASE;
+    const unsigned marginbottom = margin * 0.2;
+    const unsigned marginright = margin * 0.5;
+    unsigned i_padding = __MIN(1, size * 0.25); /* small sizes */
 
-    int x, y;
-    int width, height;
+    unsigned x, y;
+    unsigned width, height;
     if (type == OSD_HOR_SLIDER) {
-        width  = __MAX(fmt->i_visible_width - 2 * margin, 1);
-        height = __MAX(fmt->i_visible_height * 0.05,      1);
-        x      = __MIN(fmt->i_x_offset + margin, fmt->i_visible_width - width);
-        y      = __MAX(fmt->i_y_offset + fmt->i_visible_height - marginbottom, 0);
+        width  = __MAX(i_visible_width - 2 * margin, 1);
+        height = __MAX(i_visible_height * 0.01,      1);
+        x      = __MIN(margin, i_visible_width - width);
+        y      = __MAX(i_visible_height - marginbottom, 0);
     } else {
-        width  = __MAX(fmt->i_visible_width * 0.025,       1);
-        height = __MAX(fmt->i_visible_height - 2 * margin, 1);
-        x      = __MAX(fmt->i_x_offset + fmt->i_visible_width - margin, 0);
-        y      = __MIN(fmt->i_y_offset + margin, fmt->i_visible_height - height);
+        width  = __MAX(i_visible_width * 0.010,       1);
+        height = __MAX(i_visible_height - 2 * margin, 1);
+        x      = __MAX(i_visible_width - marginright, 0);
+        y      = __MIN(margin, i_visible_height - height);
     }
 
     if( (width < 1 + 2 * i_padding) || (height < 1 + 2 * i_padding) )
@@ -191,8 +194,8 @@ static subpicture_region_t *OSDSlider(int type, int position,
     }
 
     /* one full fill is faster than drawing outline */
-    DrawRect(r, STYLE_FILLED, COL_BLUE_SHADE, 0, 0, width - 1, height - 1);
-    DrawRect(r, STYLE_FILLED, COL_BLUE, pos_x, pos_y, pos_xend, pos_yend);
+    DrawRect(r, STYLE_FILLED, COL_FILL_SHADE, 0, 0, width - 1, height - 1);
+    DrawRect(r, STYLE_FILLED, COL_FILL, pos_x, pos_y, pos_xend, pos_yend);
 
     return r;
 }
@@ -201,24 +204,30 @@ static subpicture_region_t *OSDSlider(int type, int position,
  * Create the region for an OSD slider.
  * Types are: OSD_PLAY_ICON, OSD_PAUSE_ICON, OSD_SPEAKER_ICON, OSD_MUTE_ICON
  */
-static subpicture_region_t *OSDIcon(int type, const video_format_t *fmt)
+static subpicture_region_t *OSDIcon(vlc_osd_widget_type type,
+                                    const unsigned i_visible_width,
+                                    const unsigned i_visible_height)
 {
-    const float size_ratio   = 0.05;
-    const float margin_ratio = 0.07;
+    const unsigned int size_ratio = 20;
+    const unsigned int margin_ratio = 14;
 
-    const int size   = __MAX(fmt->i_visible_width, fmt->i_visible_height);
-    const int width  = size * size_ratio;
-    const int height = size * size_ratio;
-    const int x      = fmt->i_x_offset + fmt->i_visible_width - margin_ratio * size - width;
-    const int y      = fmt->i_y_offset                        + margin_ratio * size;
+    const unsigned int size   = __MAX(i_visible_width, i_visible_height);
+    if( size < size_ratio )
+        return NULL;
+
+    const unsigned int width  = size / size_ratio;
+    const unsigned int height = width;
+    const unsigned int margin = size / margin_ratio;
+    const int x      = i_visible_width - margin - width;
+    const int y      =                   margin;
 
     subpicture_region_t *r = OSDRegion(__MAX(x, 0),
-                                       __MIN(y, (int)fmt->i_visible_height - height),
+                                       __MIN(y, (int)i_visible_height - (int)height),
                                        width, height);
     if (!r)
         return NULL;
 
-    DrawRect(r, STYLE_FILLED, COL_TRANSPARENT, 0, 0, width, height);
+    DrawRect(r, STYLE_FILLED, COL_TRANSPARENT, 0, 0, width - 1, height - 1);
 
     if (type == OSD_PAUSE_ICON) {
         int bar_width = width / 3;
@@ -236,78 +245,67 @@ static subpicture_region_t *OSDIcon(int type, const video_format_t *fmt)
         DrawRect(r, STYLE_FILLED, COL_WHITE, delta, mid / 2, width - delta, height - 1 - mid / 2);
         DrawTriangle(r, STYLE_FILLED, COL_WHITE, width - delta, 0, delta, y2);
         if (type == OSD_MUTE_ICON) {
-            for(int y1 = 0; y1 <= height -1; y1++)
-                DrawRect(r, STYLE_FILLED, COL_BLUE, y1, y1, __MIN(y1 + delta, width - 1), y1);
+            for(unsigned y1 = 0; y1 < height; y1++)
+                DrawRect(r, STYLE_FILLED, COL_FILL, y1, y1, __MIN(y1 + delta, width - 1), y1);
         }
     }
     return r;
 }
 
-struct subpicture_updater_sys_t {
-    int type;
-    int position;
-};
-
-static int OSDWidgetValidate(subpicture_t *subpic,
-                           bool has_src_changed, const video_format_t *fmt_src,
-                           bool has_dst_changed, const video_format_t *fmt_dst,
-                           mtime_t ts)
-{
-    VLC_UNUSED(subpic); VLC_UNUSED(ts);
-    VLC_UNUSED(fmt_src); VLC_UNUSED(has_src_changed);
-    VLC_UNUSED(fmt_dst);
-
-    if (!has_dst_changed)
-        return VLC_SUCCESS;
-    return VLC_EGENERIC;
-}
+typedef struct {
+    vlc_osd_widget_type type;
+    int value;
+} osdwidget_spu_updater_sys_t;
 
 static void OSDWidgetUpdate(subpicture_t *subpic,
-                          const video_format_t *fmt_src,
-                          const video_format_t *fmt_dst,
-                          mtime_t ts)
+                            const struct vlc_spu_updater_configuration *cfg)
 {
-    subpicture_updater_sys_t *sys = subpic->updater.p_sys;
-    VLC_UNUSED(fmt_src); VLC_UNUSED(ts);
+    osdwidget_spu_updater_sys_t *sys = subpic->updater.sys;
+    subpicture_region_t *p_region;
 
-    video_format_t fmt = *fmt_dst;
-    fmt.i_width         = fmt.i_width         * fmt.i_sar_num / fmt.i_sar_den;
-    fmt.i_visible_width = fmt.i_visible_width * fmt.i_sar_num / fmt.i_sar_den;
-    fmt.i_x_offset      = fmt.i_x_offset      * fmt.i_sar_num / fmt.i_sar_den;
-    fmt.i_sar_num       = 1;
-    fmt.i_sar_den       = 1;
+    vlc_spu_regions_Clear( &subpic->regions );
 
-    subpic->i_original_picture_width  = fmt.i_visible_width;
-    subpic->i_original_picture_height = fmt.i_visible_height;
+    subpic->i_original_picture_width  = cfg->current.display_width;
+    subpic->i_original_picture_height = cfg->current.display_height;
     if (sys->type == OSD_HOR_SLIDER || sys->type == OSD_VERT_SLIDER)
-        subpic->p_region = OSDSlider(sys->type, sys->position, &fmt);
+        p_region = OSDSlider(sys->type, sys->value, cfg->current.display_width, cfg->current.display_height);
     else
-        subpic->p_region = OSDIcon(sys->type, &fmt);
+        p_region = OSDIcon(sys->type, cfg->current.display_width, cfg->current.display_height);
+    if (p_region)
+    {
+        p_region->b_absolute = true;
+        p_region->b_in_window = true;
+        vlc_spu_regions_push(&subpic->regions, p_region);
+    }
 }
 
 static void OSDWidgetDestroy(subpicture_t *subpic)
 {
-    free(subpic->updater.p_sys);
+    free(subpic->updater.sys);
 }
 
-static void OSDWidget(vout_thread_t *vout, int channel, int type, int position)
+static void OSDWidget(vout_thread_t *vout, int channel, vlc_osd_widget_type type, int position)
 {
     if (!var_InheritBool(vout, "osd"))
         return;
     if (type == OSD_HOR_SLIDER || type == OSD_VERT_SLIDER)
         position = VLC_CLIP(position, 0, 100);
 
-    subpicture_updater_sys_t *sys = malloc(sizeof(*sys));
+    osdwidget_spu_updater_sys_t *sys = malloc(sizeof(*sys));
     if (!sys)
         return;
     sys->type     = type;
-    sys->position = position;
+    sys->value    = position;
+
+    static const struct vlc_spu_updater_ops spu_ops =
+    {
+        .update   = OSDWidgetUpdate,
+        .destroy  = OSDWidgetDestroy,
+    };
 
     subpicture_updater_t updater = {
-        .pf_validate = OSDWidgetValidate,
-        .pf_update   = OSDWidgetUpdate,
-        .pf_destroy  = OSDWidgetDestroy,
-        .p_sys       = sys,
+        .sys = sys,
+        .ops = &spu_ops,
     };
     subpicture_t *subpic = subpicture_New(&updater);
     if (!subpic) {
@@ -316,22 +314,20 @@ static void OSDWidget(vout_thread_t *vout, int channel, int type, int position)
     }
 
     subpic->i_channel  = channel;
-    subpic->i_start    = mdate();
-    subpic->i_stop     = subpic->i_start + 1200000;
+    subpic->i_start    = vlc_tick_now();
+    subpic->i_stop     = subpic->i_start + VLC_TICK_FROM_MS(1200);
     subpic->b_ephemer  = true;
-    subpic->b_absolute = true;
     subpic->b_fade     = true;
 
     vout_PutSubpicture(vout, subpic);
 }
 
-void vout_OSDSlider(vout_thread_t *vout, int channel, int position, short type)
+void vout_OSDSlider(vout_thread_t *vout, int channel, int position, vlc_osd_widget_type type)
 {
     OSDWidget(vout, channel, type, position);
 }
 
-void vout_OSDIcon(vout_thread_t *vout, int channel, short type )
+void vout_OSDIcon(vout_thread_t *vout, int channel, vlc_osd_widget_type type )
 {
     OSDWidget(vout, channel, type, 0);
 }
-

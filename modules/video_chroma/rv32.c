@@ -2,7 +2,6 @@
  * rv32.c: conversion plugin to RV32 format.
  *****************************************************************************
  * Copyright (C) 2005 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Cyril Deguet <asmax@videolan.org>
  *
@@ -32,33 +31,41 @@
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
+#include <vlc_chroma_probe.h>
 
 /****************************************************************************
  * Local prototypes
  ****************************************************************************/
-static int  OpenFilter ( vlc_object_t * );
+static int  OpenFilter ( filter_t * );
 static picture_t *Filter( filter_t *, picture_t * );
 
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
+static void ProbeChroma(vlc_chroma_conv_vec *vec)
+{
+    vlc_chroma_conv_add(vec, 1, VLC_CODEC_BGR24, VLC_CODEC_RGBA, false);
+}
+
 vlc_module_begin ()
     set_description( N_("RV32 conversion filter") )
-    set_capability( "video converter", 1 )
-    set_callbacks( OpenFilter, NULL )
+    set_callback_video_converter( OpenFilter, 1 )
+    add_submodule()
+        set_callback_chroma_conv_probe(ProbeChroma)
 vlc_module_end ()
+
+static const struct vlc_filter_operations filter_ops = {
+    .filter_video = Filter,
+};
 
 /*****************************************************************************
  * OpenFilter: probe the filter and return score
  *****************************************************************************/
-static int OpenFilter( vlc_object_t *p_this )
+static int OpenFilter( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t*)p_this;
-
     /* XXX Only support RV24 -> RV32 conversion */
-    if( p_filter->fmt_in.video.i_chroma != VLC_CODEC_RGB24 ||
-        (p_filter->fmt_out.video.i_chroma != VLC_CODEC_RGB32 &&
-        p_filter->fmt_out.video.i_chroma != VLC_CODEC_RGBA) )
+    if( p_filter->fmt_in.video.i_chroma != VLC_CODEC_BGR24 ||
+        p_filter->fmt_out.video.i_chroma != VLC_CODEC_RGBA )
     {
         return VLC_EGENERIC;
     }
@@ -68,7 +75,7 @@ static int OpenFilter( vlc_object_t *p_this )
      || p_filter->fmt_in.video.orientation != p_filter->fmt_out.video.orientation)
         return -1;
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 }

@@ -20,6 +20,9 @@
 #ifndef VLC_MPEG4_IOD_H
 #define VLC_MPEG4_IOD_H
 
+#include <vlc_tick.h>
+#include <vlc_arrays.h>
+
 #define ES_DESCRIPTOR_COUNT 255
 typedef enum
 {
@@ -59,8 +62,8 @@ typedef struct
     unsigned i_size;
     bool b_au_start;
     bool b_au_end;
-    mtime_t i_dts;
-    mtime_t i_pts;
+    vlc_tick_t i_dts;
+    vlc_tick_t i_pts;
 } sl_header_data;
 
 typedef struct es_mpeg4_descriptor_t es_mpeg4_descriptor_t;

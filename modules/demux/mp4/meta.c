@@ -21,15 +21,17 @@
 # include "config.h"
 #endif
 
-#include "mp4.h"
-#include "../meta_engine/ID3Genres.h"  /* for ATOM_gnre */
+#include "libmp4.h"
+#include "../../meta_engine/ID3Genres.h"  /* for ATOM_gnre */
 #include "languages.h"
 
 #include <vlc_meta.h>
 #include <vlc_charset.h>
 
-#include "../meta_engine/ID3Tag.h"
-#include "../meta_engine/ID3Meta.h"
+#include "meta.h"
+
+#include "../../meta_engine/ID3Tag.h"
+#include "../../meta_engine/ID3Meta.h"
 
 #include <assert.h>
 
@@ -63,7 +65,7 @@ static const struct
 static const struct
 {
     const uint32_t xa9_type;
-    const char metadata[25];
+    const char metadata[26];
 } xa9typetoextrameta[] = {
     { ATOM_0xa9wrt, N_("Writer") },
     { ATOM_0xa9com, N_("Composer") },
@@ -108,6 +110,7 @@ static const struct
     { ATOM_gssd,    "YouTube Source Data" },
     { ATOM_gsst,    "YouTube Start Time" },
     { ATOM_gstd,    "YouTube Track Duration" },
+    { ATOM_purl,    "Podcast URL" },
 };
 
 static const struct
@@ -159,12 +162,12 @@ inline static char * StringConvert( const MP4_Box_data_data_t *p_data )
     }
 }
 
-static char * ExtractString( MP4_Box_t *p_box )
+static char * ExtractString( const MP4_Box_t *p_box )
 {
     if ( p_box->i_type == ATOM_data )
         return StringConvert( p_box->data.p_data );
 
-    MP4_Box_t *p_data = MP4_BoxGet( p_box, "data" );
+    const MP4_Box_t *p_data = MP4_BoxGet( p_box, "data" );
     if ( p_data )
         return StringConvert( BOXDATA(p_data) );
     else if ( p_box->data.p_binary && p_box->data.p_binary->p_blob )
@@ -219,15 +222,20 @@ static bool AtomXA9ToMeta( uint32_t i_type,
     return *meta_type || *meta_key;
 }
 
-static bool SetMeta( vlc_meta_t* p_meta, int i_type, char const* name, MP4_Box_t* p_box )
+static bool SetMeta( vlc_meta_t* p_meta, int i_type, char const* name, const MP4_Box_t* p_box )
 {
     vlc_meta_type_t const* type;
     char const* key;
 
-    if( ( name != NULL && !AppleNameToMeta( name, &type, &key ) ) ||
-        ( name == NULL && !AtomXA9ToMeta( i_type, &type, &key ) ) )
+    if( name != NULL)
     {
-        return false;
+        if ( !AppleNameToMeta( name, &type, &key ) )
+            return false;
+    }
+    else
+    {
+        if ( !AtomXA9ToMeta( i_type, &type, &key ) )
+            return false;
     }
 
     char* psz_utf = ExtractString( p_box );
@@ -235,7 +243,7 @@ static bool SetMeta( vlc_meta_t* p_meta, int i_type, char const* name, MP4_Box_t
     if( psz_utf )
     {
         if( type ) vlc_meta_Set( p_meta, *type, psz_utf );
-        else       vlc_meta_AddExtra( p_meta, key, psz_utf );
+        else       vlc_meta_SetExtra( p_meta, key, psz_utf );
 
         free( psz_utf );
     }
@@ -243,7 +251,7 @@ static bool SetMeta( vlc_meta_t* p_meta, int i_type, char const* name, MP4_Box_t
     return true;
 }
 
-static int ExtractIntlStrings( vlc_meta_t *p_meta, MP4_Box_t *p_box )
+static int ExtractIntlStrings( vlc_meta_t *p_meta, const MP4_Box_t *p_box )
 {
     if( MP4_BoxGet( p_box, "data" ) )
         return false;
@@ -305,7 +313,7 @@ static int ExtractIntlStrings( vlc_meta_t *p_meta, MP4_Box_t *p_box )
                 char* key;
                 if( asprintf( &key, "%s (%s)", meta_key, charset+11 ) != -1 )
                 {
-                    vlc_meta_AddExtra( p_meta_intl, key, data );
+                    vlc_meta_SetExtra( p_meta_intl, key, data );
                     free( key );
                 }
             }
@@ -323,32 +331,110 @@ static int ExtractIntlStrings( vlc_meta_t *p_meta, MP4_Box_t *p_box )
     return i_read == 0;
 }
 
-static void ExtractItunesInfoTriplets( vlc_meta_t *p_meta, MP4_Box_t *p_box )
+static void ParseTriplet( const MP4_Box_t *p_box,
+                          const char *psz_ns,
+                          const char *psz_key,
+                          void (*pf_callback)(const char *psz_key,
+                                              const MP4_Box_data_data_t *, void *),
+                          void *p_priv )
 {
-    if( p_box->i_type != ATOM_ITUN )
-        return;
-    MP4_Box_t *p_mean = MP4_BoxGet( p_box, "mean" );
-    MP4_Box_t *p_name = MP4_BoxGet( p_box, "name" );
-    MP4_Box_t *p_data = MP4_BoxGet( p_box, "data" );
-    if( !p_mean || p_mean->data.p_binary->i_blob < 4 + 16 ||
-        !p_name || p_name->data.p_binary->i_blob < 5 ||
+    size_t i_ns = psz_ns ? strlen(psz_ns) : 0;
+    size_t i_key = psz_key ? strlen(psz_key) : 0;
+    const MP4_Box_t *p_mean = MP4_BoxGet( p_box, "mean" );
+    const MP4_Box_t *p_name = MP4_BoxGet( p_box, "name" );
+    const MP4_Box_t *p_data = MP4_BoxGet( p_box, "data" );
+    if( !p_mean || p_mean->data.p_binary->i_blob < 4 + i_ns ||
+        !p_name || p_name->data.p_binary->i_blob < 4 + i_key ||
         !p_data || !BOXDATA(p_data) )
         return;
 
-    if( !strncmp( &((char*)p_mean->data.p_binary->p_blob)[4], "com.apple.iTunes",
-                  p_mean->data.p_binary->i_blob - 4 ) )
+    if( p_name->data.p_binary->i_blob - 4 != i_ns &&
+        strncmp( &((const char*)p_mean->data.p_binary->p_blob)[4], psz_ns, i_ns ) )
+        return;
+
+    if( psz_key != NULL &&
+        p_name->data.p_binary->i_blob - 4 != i_key &&
+        strncmp( &((const char*)p_name->data.p_binary->p_blob)[4], psz_key, i_key ) )
+            return;
+
+    char *psz_name = strndup( &((const char*)p_name->data.p_binary->p_blob)[4],
+                              p_name->data.p_binary->i_blob - 4 );
+    if( psz_name )
+        pf_callback( psz_name, p_data->data.p_data, p_priv );
+    free( psz_name );
+}
+
+struct itunprivcallbackctx
+{
+    vlc_meta_t *p_meta;
+    qt_itunes_callback ituncb;
+    void *priv;
+};
+
+static void iTUNTripletCallback( const char *psz_key,
+                                 const MP4_Box_data_data_t *p_data, void *priv )
+{
+    struct itunprivcallbackctx *ctx = priv;
+
+    if( !strcmp(psz_key, "iTunSMPB") )
     {
-        char *psz_name = strndup( &((char*)p_name->data.p_binary->p_blob)[4],
-                                 p_name->data.p_binary->i_blob - 4 );
-        char *psz_value = ExtractString( p_data );
-        if( psz_name && psz_value )
-            vlc_meta_AddExtra( p_meta, psz_name, psz_value );
-        free( psz_name );
-        free( psz_value );
+        struct qt_itunes_triplet_data data = {.type = iTunSMPB };
+        char *psz_val = StringConvert( p_data );
+        if( psz_val && sscanf(psz_val, "%*"PRIX32" %"PRIX32" %"PRIX32" %"PRIX64,
+                                       &data.SMPB.delay, &data.SMPB.padding,
+                                       &data.SMPB.original_samplescount) == 3 )
+            ctx->ituncb( &data, ctx->priv );
+        free( psz_val );
+    }
+    else if( !strcmp(psz_key, "iTunNORM") )
+    {
+        struct qt_itunes_triplet_data data = {.type = iTunNORM };
+        char *psz_val = StringConvert( p_data );
+        uint32_t values[4];
+        if( psz_val && sscanf(psz_val, "%"PRIX32" %"PRIX32" %*"PRIX32" %*"PRIX32
+                              "%*"PRIX32" %*"PRIX32" %"PRIX32" %"PRIX32,
+                              &values[0], &values[1], &values[2], &values[3] ) == 4 )
+        {
+            values[0] = __MAX(values[0], values[1]); /* left / right volume */
+            if( values[0] )
+                data.NORM.volume_adjust = -10.0 * log10( values[0] / 1000.0 );
+
+            values[2] = __MAX(values[2], values[3]); /* left / right peak */
+            if( values[2] )
+                data.NORM.peak = values[2] / 32768.0;
+            if( values[0] && values[2] )
+                ctx->ituncb( &data, ctx->priv );
+        }
+        free( psz_val );
+    }
+    else if( !strcmp(psz_key, "Encoding Params"))
+    {
+        struct qt_itunes_triplet_data data = {.type = iTunEncodingParams,
+                                               .EncodingParams = { 0 } };
+        const uint8_t *p_blob = p_data->p_blob;
+        size_t i_blob = p_data->i_blob;
+        while( i_blob >= 8 )
+        {
+            const char *id = (const char*) &p_blob[0];
+            const uint8_t *val = &p_blob[4];
+            if( !strncmp(id, "brat", 4) )
+                data.EncodingParams.target_bitrate = GetDWBE(val);
+            else if( !strncmp(id, "vbrq", 4) )
+                data.EncodingParams.target_quality = GetDWBE(val);
+            p_blob += 8; i_blob -= 8;
+        }
+        ctx->ituncb( &data, ctx->priv );
+    }
+    else if( !strncasecmp(psz_key, "REPLAYGAIN_", 11) )
+    {
+        char *psz_val = StringConvert( p_data );
+        if( psz_val )
+            vlc_meta_SetExtra( ctx->p_meta, psz_key, psz_val );
+        free( psz_val );
     }
 }
 
-static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
+static void SetupmdirMeta( vlc_meta_t *p_meta, const MP4_Box_t *p_box, void *priv )
 {
     const MP4_Box_t *p_data = MP4_BoxGet( p_box, "data" );
 
@@ -372,7 +458,7 @@ static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
             char psz_utf[11];
             snprintf( psz_utf, sizeof( psz_utf ), "%"PRId32,
                       GetDWBE(BOXDATA(p_data)->p_blob) );
-            vlc_meta_AddExtra( p_meta, "iTunes Account ID", psz_utf );
+            vlc_meta_SetExtra( p_meta, "iTunes Account ID", psz_utf );
         }
         break;
     }
@@ -384,7 +470,17 @@ static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
             char psz_utf[11];
             snprintf( psz_utf, sizeof( psz_utf ), "%"PRId32,
                       GetDWBE(BOXDATA(p_data)->p_blob) );
-            vlc_meta_AddExtra( p_meta, "iTunes Catalog ID", psz_utf );
+            vlc_meta_SetExtra( p_meta, "iTunes Catalog ID", psz_utf );
+        }
+        break;
+    }
+    case ATOM_cpil:
+    {
+        if ( BOXDATA(p_data)->i_blob >= 1 &&
+             BOXDATA(p_data)->e_wellknowntype == DATA_WKT_BE_SIGNED )
+        {
+            vlc_meta_SetCompilation( p_meta,
+                                     *BOXDATA(p_data)->p_blob ? "1" : "0" );
         }
         break;
     }
@@ -393,7 +489,7 @@ static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
         if ( BOXDATA(p_data)->i_blob >= 6 &&
              BOXDATA(p_data)->e_wellknowntype == DATA_WKT_RESERVED )
         {
-            char psz_number[5];
+            char psz_number[6];
             snprintf( psz_number, sizeof( psz_number ), "%"PRIu16, GetWBE(&BOXDATA(p_data)->p_blob[2]) );
             vlc_meta_Set( p_meta, vlc_meta_DiscNumber, psz_number );
             snprintf( psz_number, sizeof( psz_number ), "%"PRIu16, GetWBE(&BOXDATA(p_data)->p_blob[4]) );
@@ -430,7 +526,7 @@ static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
                 psz_rating = N_("None");
                 break;
             }
-            vlc_meta_AddExtra( p_meta, N_("Rating"), psz_rating );
+            vlc_meta_SetExtra( p_meta, N_("Rating"), psz_rating );
         }
         break;
     }
@@ -451,7 +547,7 @@ static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
         break;
     }
     case ATOM_ITUN:
-        ExtractItunesInfoTriplets( p_meta, p_box );
+        ParseTriplet( p_box, "com.apple.iTunes", NULL, iTUNTripletCallback, priv );
         break;
     default:
         SetMeta( p_meta, p_box->i_type, NULL, p_box );
@@ -459,7 +555,7 @@ static void SetupmdirMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
     }
 }
 
-static void SetupmdtaMeta( vlc_meta_t *p_meta, MP4_Box_t *p_box, MP4_Box_t *p_keys )
+static void SetupmdtaMeta( vlc_meta_t *p_meta, const MP4_Box_t *p_box, const MP4_Box_t *p_keys )
 {
     if ( !p_keys || !BOXDATA(p_keys) || BOXDATA(p_keys)->i_entry_count == 0 )
         return;
@@ -501,7 +597,7 @@ static int ID3TAG_Parse_Handler( uint32_t i_tag, const uint8_t *p_payload,
     return VLC_SUCCESS;
 }
 
-static void SetupID3v2Meta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
+static void SetupID3v2Meta( vlc_meta_t *p_meta, const MP4_Box_t *p_box )
 {
     const MP4_Box_t *p_binary = MP4_BoxGet( p_box, "ID32" );
     if( p_binary == NULL || !BOXDATA(p_binary) || BOXDATA(p_binary)->i_blob < 6 + 20 + 1 )
@@ -512,19 +608,20 @@ static void SetupID3v2Meta( vlc_meta_t *p_meta, MP4_Box_t *p_box )
                   ID3TAG_Parse_Handler, p_meta );
 }
 
-void SetupMeta( vlc_meta_t *p_meta, MP4_Box_t *p_udta )
+void SetupMeta( vlc_meta_t *p_meta, const MP4_Box_t *p_udta,
+                qt_itunes_callback ituncb, void *priv )
 {
     uint32_t i_handler = 0;
     if ( p_udta->p_father )
         i_handler = p_udta->i_handler;
 
-    for( MP4_Box_t *p_box = p_udta->p_first; p_box; p_box = p_box->p_next )
+    for( const MP4_Box_t *p_box = p_udta->p_first; p_box; p_box = p_box->p_next )
     {
         switch( i_handler )
         {
             case HANDLER_mdta:
             {
-                MP4_Box_t *p_keys = MP4_BoxGet( p_udta->p_father, "keys" );
+                const MP4_Box_t *p_keys = MP4_BoxGet( p_udta->p_father, "keys" );
                 SetupmdtaMeta( p_meta, p_box, p_keys );
                 break;
             }
@@ -535,9 +632,11 @@ void SetupMeta( vlc_meta_t *p_meta, MP4_Box_t *p_udta )
 
             case HANDLER_mdir:
             default:
-                SetupmdirMeta( p_meta, p_box );
+            {
+                struct itunprivcallbackctx ctx = { .priv = priv, .p_meta = p_meta, .ituncb = ituncb };
+                SetupmdirMeta( p_meta, p_box, &ctx );
                 break;
+            }
         }
     }
 }
-

@@ -2,7 +2,6 @@
  * ctrl_image.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -209,7 +208,6 @@ void CtrlImage::draw( OSGraphics &rImage, int xDest, int yDest, int w, int h )
 
         // new image scaled with aspect ratio preserved
         // and centered inside the control boundaries
-        int w, h;
         if( scaled_height > height )
         {
             w = scaled_width;

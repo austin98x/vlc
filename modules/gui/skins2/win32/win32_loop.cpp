@@ -2,7 +2,6 @@
  * win32_loop.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -59,6 +58,18 @@ Win32Loop::Win32Loop( intf_thread_t *pIntf ): OSLoop( pIntf )
     virtKeyToVlcKey[VK_F10] = KEY_F10;
     virtKeyToVlcKey[VK_F11] = KEY_F11;
     virtKeyToVlcKey[VK_F12] = KEY_F12;
+    virtKeyToVlcKey[VK_F13] = KEY_F(13);
+    virtKeyToVlcKey[VK_F14] = KEY_F(14);
+    virtKeyToVlcKey[VK_F15] = KEY_F(15);
+    virtKeyToVlcKey[VK_F16] = KEY_F(16);
+    virtKeyToVlcKey[VK_F17] = KEY_F(17);
+    virtKeyToVlcKey[VK_F18] = KEY_F(18);
+    virtKeyToVlcKey[VK_F19] = KEY_F(19);
+    virtKeyToVlcKey[VK_F20] = KEY_F(20);
+    virtKeyToVlcKey[VK_F21] = KEY_F(21);
+    virtKeyToVlcKey[VK_F22] = KEY_F(22);
+    virtKeyToVlcKey[VK_F23] = KEY_F(23);
+    virtKeyToVlcKey[VK_F24] = KEY_F(24);
     virtKeyToVlcKey[VK_RETURN] = KEY_ENTER;
     virtKeyToVlcKey[VK_SPACE] = ' ';
     virtKeyToVlcKey[VK_ESCAPE] = KEY_ESC;
@@ -88,27 +99,19 @@ Win32Loop::Win32Loop( intf_thread_t *pIntf ): OSLoop( pIntf )
     virtKeyToVlcKey[VK_MEDIA_PLAY_PAUSE] = KEY_MEDIA_PLAY_PAUSE;
 }
 
-
-Win32Loop::~Win32Loop()
-{
-}
-
-
 OSLoop *Win32Loop::instance( intf_thread_t *pIntf )
 {
+
     if( pIntf->p_sys->p_osLoop == NULL )
-    {
-        OSLoop *pOsLoop = new Win32Loop( pIntf );
-        pIntf->p_sys->p_osLoop = pOsLoop;
-    }
-    return pIntf->p_sys->p_osLoop;
+        pIntf->p_sys->p_osLoop = std::make_unique<Win32Loop>(pIntf);
+    return pIntf->p_sys->p_osLoop.get();
 }
 
 
 void Win32Loop::destroy( intf_thread_t *pIntf )
 {
-    delete pIntf->p_sys->p_osLoop;
-    pIntf->p_sys->p_osLoop = NULL;
+    assert(pIntf->p_sys->p_osLoop);
+    pIntf->p_sys->p_osLoop.reset();
 }
 
 
@@ -302,7 +305,7 @@ LRESULT CALLBACK Win32Loop::processEvent( HWND hwnd, UINT msg,
         default:
             break;
     }
-    return DefWindowProc( hwnd, msg, wParam, lParam );;
+    return DefWindowProc( hwnd, msg, wParam, lParam );
 }
 
 

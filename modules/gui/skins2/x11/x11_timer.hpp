@@ -2,7 +2,6 @@
  * x11_timer.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -48,7 +47,7 @@ public:
     /// Stop the timer
     virtual void stop();
 
-    mtime_t getNextDate() const;
+    vlc_tick_t getNextDate() const;
 
     /// Execute the callback.
     /// Returns false if the timer must be removed after
@@ -60,9 +59,9 @@ private:
     /// Timer loop
     X11TimerLoop *m_pTimerLoop;
     /// Delay between two execute
-    mtime_t m_interval;
+    vlc_tick_t m_interval;
     /// Next date at which the timer must be executed
-    mtime_t m_nextDate;
+    vlc_tick_t m_nextDate;
     /// Flag to tell if the timer must be stopped after the first execution
     bool m_oneShot;
 };
@@ -93,7 +92,7 @@ private:
     std::list<X11Timer*> m_timers;
 
     /// Sleep for delay milliseconds, unless an X11 event is received.
-    /// Returns true if the sleep has been interupted.
+    /// Returns true if the sleep has been interrupted.
     bool sleep( int delay );
 };
 

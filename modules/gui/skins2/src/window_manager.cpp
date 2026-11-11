@@ -2,7 +2,6 @@
  * window_manager.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -34,7 +33,7 @@
 WindowManager::WindowManager( intf_thread_t *pIntf ):
     SkinObject( pIntf ), m_magnet( 0 ), m_alpha( 255 ), m_moveAlpha( 255 ),
     m_opacityEnabled( false ), m_opacity( 255 ), m_direction( kNone ),
-    m_maximizeRect(0, 0, 50, 50), m_pTooltip( NULL ), m_pPopup( NULL )
+    m_maximizeRect(0, 0, 50, 50), m_pPopup( NULL )
 {
     // Create and register a variable for the "on top" status
     VarManager *pVarManager = VarManager::instance( getIntf() );
@@ -45,15 +44,13 @@ WindowManager::WindowManager( intf_thread_t *pIntf ):
     m_opacityEnabled = var_InheritBool( getIntf(), "skins2-transparency" );
 
     // opacity overridden by user
-    m_opacity = 255 * var_InheritFloat( getIntf(), "qt-opacity" );
+    if( config_FindConfig( "qt-opacity" ) )
+        m_opacity = 255 * var_InheritFloat( getIntf(), "qt-opacity" );
+    else
+        m_opacity = 255;
 }
 
-
-WindowManager::~WindowManager()
-{
-    delete m_pTooltip;
-}
-
+WindowManager::~WindowManager() = default;
 
 void WindowManager::registerWindow( TopWindow &rWindow )
 {
@@ -157,11 +154,8 @@ void WindowManager::move( TopWindow &rWindow, int left, int top ) const
     checkAnchors( &rWindow, xOffset, yOffset );
 
     // Move all the windows
-    WinSet_t::const_iterator it;
-    for( it = m_movingWindows.begin(); it != m_movingWindows.end(); ++it )
-    {
-        (*it)->move( (*it)->getLeft() + xOffset, (*it)->getTop() + yOffset );
-    }
+    for( auto *window : m_movingWindows )
+        window->move( window->getLeft() + xOffset, window->getTop() + yOffset );
 }
 
 
@@ -184,29 +178,27 @@ void WindowManager::startResize( GenericLayout &rLayout, Direction_t direction )
     const AncList_t &ancList1 = rLayout.getAnchorList();
 
     // Iterate through all the hanged windows
-    for( itWin = m_dependencies[rLayout.getWindow()].begin();
-         itWin != m_dependencies[rLayout.getWindow()].end(); ++itWin )
+    for( auto *window : m_dependencies[rLayout.getWindow()] )
     {
         // Now, check for anchoring between the 2 windows
         const AncList_t &ancList2 =
-            (*itWin)->getActiveLayout().getAnchorList();
-        for( itAnc1 = ancList1.begin(); itAnc1 != ancList1.end(); ++itAnc1 )
+            window->getActiveLayout().getAnchorList();
+        for( auto *anc1 : ancList1 )
         {
-            for( itAnc2 = ancList2.begin();
-                 itAnc2 != ancList2.end(); ++itAnc2 )
+            for( auto *anc2 : ancList2 )
             {
-                if( (*itAnc1)->isHanging( **itAnc2 ) )
+                if( anc1->isHanging( *anc2 ) )
                 {
                     // Add the dependencies of the hanged window to one of the
                     // lists of moving windows
                     Position::Ref_t aRefPos =
-                        (*itAnc1)->getPosition().getRefLeftTop();
+                        anc1->getPosition().getRefLeftTop();
                     if( aRefPos == Position::kRightTop )
-                        buildDependSet( m_resizeMovingE, *itWin );
+                        buildDependSet( m_resizeMovingE, window );
                     else if( aRefPos == Position::kLeftBottom )
-                        buildDependSet( m_resizeMovingS, *itWin );
+                        buildDependSet( m_resizeMovingS, window );
                     else if( aRefPos == Position::kRightBottom )
-                        buildDependSet( m_resizeMovingSE, *itWin );
+                        buildDependSet( m_resizeMovingSE, window );
                     break;
                 }
             }
@@ -286,33 +278,32 @@ void WindowManager::resize( GenericLayout &rLayout,
     rLayout.refreshAll();
 
     // Move all the anchored windows
-    WinSet_t::const_iterator it;
     if( m_direction == kResizeE ||
         m_direction == kResizeSE )
     {
-        for( it = m_resizeMovingE.begin(); it != m_resizeMovingE.end(); ++it )
+        for( auto *window : m_resizeMovingE )
         {
-            (*it)->move( (*it)->getLeft() + xNewOffset,
-                         (*it)->getTop() );
+            window->move( window->getLeft() + xNewOffset,
+                          window->getTop() );
         }
     }
     if( m_direction == kResizeS ||
         m_direction == kResizeSE )
     {
-        for( it = m_resizeMovingS.begin(); it != m_resizeMovingS.end(); ++it )
+        for( auto *window : m_resizeMovingS )
         {
-            (*it)->move( (*it)->getLeft(),
-                         (*it)->getTop( )+ yNewOffset );
+            window->move( window->getLeft(),
+                          window->getTop( )+ yNewOffset );
         }
     }
     if( m_direction == kResizeE ||
         m_direction == kResizeS ||
         m_direction == kResizeSE )
     {
-        for( it = m_resizeMovingSE.begin(); it != m_resizeMovingSE.end(); ++it )
+        for( auto *window : m_resizeMovingSE )
         {
-            (*it)->move( (*it)->getLeft() + xNewOffset,
-                         (*it)->getTop() + yNewOffset );
+            window->move( window->getLeft() + xNewOffset,
+                          window->getTop() + yNewOffset );
         }
     }
 }
@@ -366,13 +357,12 @@ void WindowManager::unmaximize( TopWindow &rWindow )
 
 void WindowManager::synchVisibility() const
 {
-    WinSet_t::const_iterator it;
-    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    for( auto *window : m_allWindows )
     {
         // Show the window if it has to be visible
-        if( (*it)->getVisibleVar().get() )
+        if( window->getVisibleVar().get() )
         {
-            (*it)->innerShow();
+            window->innerShow();
         }
     }
 }
@@ -380,14 +370,13 @@ void WindowManager::synchVisibility() const
 
 void WindowManager::saveVisibility()
 {
-    WinSet_t::const_iterator it;
     m_savedWindows.clear();
-    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    for( auto *window : m_allWindows )
     {
         // Remember the window if it is visible
-        if( (*it)->getVisibleVar().get() )
+        if( window->getVisibleVar().get() )
         {
-            m_savedWindows.insert( *it );
+            m_savedWindows.insert( window );
         }
     }
 }
@@ -401,10 +390,9 @@ void WindowManager::restoreVisibility() const
         msg_Warn( getIntf(), "restoring visibility for no window" );
     }
 
-    WinSet_t::const_iterator it;
-    for( it = m_savedWindows.begin(); it != m_savedWindows.end(); ++it )
+    for( auto *window : m_savedWindows )
     {
-        (*it)->show();
+        window->show();
     }
 }
 
@@ -412,10 +400,9 @@ void WindowManager::restoreVisibility() const
 void WindowManager::raiseAll() const
 {
     // Raise all the windows
-    WinSet_t::const_iterator it;
-    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    for( auto *window : m_allWindows )
     {
-        (*it)->raise();
+        window->raise();
     }
 }
 
@@ -423,14 +410,13 @@ void WindowManager::raiseAll() const
 void WindowManager::showAll( bool firstTime ) const
 {
     // Show all the windows
-    WinSet_t::const_iterator it;
-    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    for( auto *window : m_allWindows )
     {
         // When the theme is opened for the first time,
         // only show the window if set as visible in the XML
-        if( (*it)->getInitialVisibility() || !firstTime )
+        if( window->getInitialVisibility() || !firstTime )
         {
-            (*it)->show();
+            window->show();
         }
     }
 }
@@ -438,19 +424,18 @@ void WindowManager::showAll( bool firstTime ) const
 
 void WindowManager::show( TopWindow &rWindow ) const
 {
-    rWindow.show();
-
     if( isOpacityNeeded() )
         rWindow.setOpacity( m_alpha );
+
+    rWindow.show();
 }
 
 
 void WindowManager::hideAll() const
 {
-    WinSet_t::const_iterator it;
-    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    for( auto *window : m_allWindows )
     {
-        (*it)->hide();
+        window->hide();
     }
 }
 
@@ -462,10 +447,9 @@ void WindowManager::setOnTop( bool b_ontop )
     pVarOnTop->set( b_ontop );
 
     // set/unset the "on top" status
-    WinSet_t::const_iterator it;
-    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    for( auto *window : m_allWindows )
     {
-        (*it)->toggleOnTop( b_ontop );
+        window->toggleOnTop( b_ontop );
     }
 }
 
@@ -486,13 +470,12 @@ void WindowManager::buildDependSet( WinSet_t &rWinSet,
 
     // Iterate through the anchored windows
     const WinSet_t &anchored = m_dependencies[pWindow];
-    WinSet_t::const_iterator iter;
-    for( iter = anchored.begin(); iter != anchored.end(); ++iter )
+    for( auto *window : anchored )
     {
         // Check that the window isn't already in the set before adding it
-        if( rWinSet.find( *iter ) == rWinSet.end() )
+        if( rWinSet.find( window ) == rWinSet.end() )
         {
-            buildDependSet( rWinSet, *iter );
+            buildDependSet( rWinSet, window );
         }
     }
 }
@@ -502,85 +485,78 @@ void WindowManager::checkAnchors( TopWindow *pWindow,
                                   int &xOffset, int &yOffset ) const
 {
     (void)pWindow;
-    WinSet_t::const_iterator itMov, itSta;
-    AncList_t::const_iterator itAncMov, itAncSta;
 
     // Check magnetism with screen edges first (actually it is the work area)
     SkinsRect workArea = OSFactory::instance( getIntf() )->getWorkArea();
     // Iterate through the moving windows
-    for( itMov = m_movingWindows.begin();
-         itMov != m_movingWindows.end(); ++itMov )
+    for( auto *moving : m_movingWindows )
     {
         // Skip the invisible windows
-        if( ! (*itMov)->getVisibleVar().get() )
+        if( !moving->getVisibleVar().get() )
         {
             continue;
         }
 
-        int newLeft = (*itMov)->getLeft() + xOffset;
-        int newTop = (*itMov)->getTop() + yOffset;
+        int newLeft = moving->getLeft() + xOffset;
+        int newTop = moving->getTop() + yOffset;
         if( newLeft > workArea.getLeft() - m_magnet &&
             newLeft < workArea.getLeft() + m_magnet )
         {
-            xOffset = workArea.getLeft() - (*itMov)->getLeft();
+            xOffset = workArea.getLeft() - moving->getLeft();
         }
         if( newTop > workArea.getTop() - m_magnet &&
             newTop < workArea.getTop() + m_magnet )
         {
-            yOffset = workArea.getTop() - (*itMov)->getTop();
+            yOffset = workArea.getTop() - moving->getTop();
         }
         int right = workArea.getLeft() + workArea.getWidth();
-        if( newLeft + (*itMov)->getWidth() > right - m_magnet &&
-            newLeft + (*itMov)->getWidth() < right + m_magnet )
+        if( newLeft + moving->getWidth() > right - m_magnet &&
+            newLeft + moving->getWidth() < right + m_magnet )
         {
-            xOffset = right - (*itMov)->getLeft() - (*itMov)->getWidth();
+            xOffset = right - moving->getLeft() - moving->getWidth();
         }
         int bottom = workArea.getTop() + workArea.getHeight();
-        if( newTop + (*itMov)->getHeight() > bottom - m_magnet &&
-            newTop + (*itMov)->getHeight() <  bottom + m_magnet )
+        if( newTop + moving->getHeight() > bottom - m_magnet &&
+            newTop + moving->getHeight() <  bottom + m_magnet )
         {
-            yOffset =  bottom - (*itMov)->getTop() - (*itMov)->getHeight();
+            yOffset =  bottom - moving->getTop() - moving->getHeight();
         }
     }
 
     // Iterate through the moving windows
-    for( itMov = m_movingWindows.begin();
-         itMov != m_movingWindows.end(); ++itMov )
+    for( auto *moving : m_movingWindows )
     {
         // Skip the invisible windows
-        if( ! (*itMov)->getVisibleVar().get() )
+        if( !moving->getVisibleVar().get() )
         {
             continue;
         }
 
         // Get the anchors in the main layout of this moving window
         const AncList_t &movAnchors =
-            (*itMov)->getActiveLayout().getAnchorList();
+            moving->getActiveLayout().getAnchorList();
 
         // Iterate through the static windows
-        for( itSta = m_allWindows.begin();
-             itSta != m_allWindows.end(); ++itSta )
+        for( auto *window : m_allWindows )
         {
             // Skip the moving windows and the invisible ones
-            if( m_movingWindows.find( (*itSta) ) != m_movingWindows.end() ||
-                ! (*itSta)->getVisibleVar().get() )
+            if( m_movingWindows.find( window ) != m_movingWindows.end() ||
+                ! window->getVisibleVar().get() )
             {
                 continue;
             }
 
             // Get the anchors in the main layout of this static window
             const AncList_t &staAnchors =
-                (*itSta)->getActiveLayout().getAnchorList();
+                window->getActiveLayout().getAnchorList();
 
             // Check if there is an anchoring between one of the movAnchors
             // and one of the staAnchors
-            for( itAncMov = movAnchors.begin();
-                 itAncMov != movAnchors.end(); ++itAncMov )
+            for( auto *movAnchor : movAnchors )
             {
-                for( itAncSta = staAnchors.begin();
-                     itAncSta != staAnchors.end(); ++itAncSta )
+                for( auto *staAnchor : staAnchors )
                 {
-                    if( (*itAncSta)->canHang( **itAncMov, xOffset, yOffset ) )
+                    if( staAnchor->canHang( *movAnchor, xOffset, yOffset ) )
                     {
                         // We have found an anchoring!
                         // There is nothing to do here, since xOffset and
@@ -594,8 +570,8 @@ void WindowManager::checkAnchors( TopWindow *pWindow,
                         // Temporary variables
                         int xOffsetTemp = -xOffset;
                         int yOffsetTemp = -yOffset;
-                        if( (*itAncMov)->canHang( **itAncSta, xOffsetTemp,
-                                                  yOffsetTemp ) )
+                        if( movAnchor->canHang( *staAnchor, xOffsetTemp,
+                                                yOffsetTemp ) )
                         {
                             // We have found an anchoring!
                             // xOffsetTemp and yOffsetTemp have been updated,
@@ -619,7 +595,7 @@ void WindowManager::createTooltip( const GenericFont &rTipFont )
     // Create the tooltip window
     if( !m_pTooltip )
     {
-        m_pTooltip = new Tooltip( getIntf(), rTipFont, 500 );
+        m_pTooltip = std::make_unique<Tooltip>( getIntf(), rTipFont, 500 );
     }
     else
     {
@@ -660,3 +636,19 @@ void WindowManager::setActiveLayout( TopWindow &rWindow,
     stopMove();
 }
 
+void WindowManager::onWindowHidden()
+{
+    WinSet_t::const_iterator it;
+    for( it = m_allWindows.begin(); it != m_allWindows.end(); ++it )
+    {
+        if( (*it)->getType() != GenericWindow::TopWindow) {
+            continue;
+        }
+        if( (*it)->getVisibleVar().get() ) {
+            return;
+        }
+    }
+
+    // Last window closed
+    libvlc_Quit( vlc_object_instance(getIntf()) );
+}

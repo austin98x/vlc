@@ -2,7 +2,6 @@
  * matroska_segment.hpp : matroska demuxer
  *****************************************************************************
  * Copyright (C) 2003-2004 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Steve Lhomme <steve.lhomme@free.fr>
@@ -25,6 +24,7 @@
 #ifndef VLC_MKV_MATROSKA_SEGMENT_HPP_
 #define VLC_MKV_MATROSKA_SEGMENT_HPP_
 
+#include "demux.hpp"
 #include "mkv.hpp"
 #include "matroska_segment_seeker.hpp"
 #include <vector>
@@ -35,6 +35,8 @@
 #include <memory>
 
 #include "Ebml_parser.hpp"
+
+namespace mkv {
 
 class EbmlParser;
 
@@ -74,28 +76,31 @@ public:
     simple_tags_t   simple_tags;
 };
 
+struct demux_sys_t;
+
 class matroska_segment_c
 {
 public:
     typedef std::map<mkv_track_t::track_id_t, std::unique_ptr<mkv_track_t>> tracks_map_t;
     typedef std::vector<Tag>            tags_t;
 
-    matroska_segment_c( demux_sys_t &, EbmlStream &, KaxSegment * );
+    matroska_segment_c( demux_sys_t &, matroska_iostream_c &, KaxSegment * );
     virtual ~matroska_segment_c();
 
     KaxSegment              *segment;
-    EbmlStream              & es;
+    matroska_iostream_c     & es;
 
     /* time scale */
     uint64_t                i_timescale;
 
     /* duration of the segment */
-    mtime_t                 i_duration;
-    mtime_t                 i_mk_start_time;
+    vlc_tick_t              i_duration;
+    vlc_tick_t              i_mk_start_time;
 
     /* all tracks */
     tracks_map_t tracks;
     SegmentSeeker::track_ids_t priority_tracks;
+    vlc_tick_t                 pcr_shift = 0;
 
     /* from seekhead */
     int                     i_seekhead_count;
@@ -107,7 +112,7 @@ public:
     int64_t                 i_attachments_position;
 
     KaxCluster              *cluster;
-    uint64                  i_block_pos;
+    uint64_t                i_block_pos;
     KaxSegmentUID           *p_segment_uid;
     KaxPrevUID              *p_prev_segment_uid;
     KaxNextUID              *p_next_segment_uid;
@@ -117,9 +122,7 @@ public:
     /* info */
     char                    *psz_muxing_application;
     char                    *psz_writing_application;
-    char                    *psz_segment_filename;
     char                    *psz_title;
-    char                    *psz_date_utc;
 
     /* !!!!! GCC 3.3 bug on Darwin !!!!! */
     /* when you remove this variable the compiler issues an atomicity error */
@@ -138,13 +141,13 @@ public:
 
     bool Preload();
     bool PreloadFamily( const matroska_segment_c & segment );
-    bool PreloadClusters( uint64 i_cluster_position );
+    bool PreloadClusters( uint64_t i_cluster_position );
     void InformationCreate();
 
-    bool FastSeek( demux_t &, mtime_t i_mk_date, mtime_t i_mk_time_offset );
-    bool Seek( demux_t &, mtime_t i_mk_date, mtime_t i_mk_time_offset );
+    bool Seek( demux_t &, vlc_tick_t i_mk_date, vlc_tick_t i_mk_time_offset, bool b_accurate );
 
-    int BlockGet( KaxBlock * &, KaxSimpleBlock * &, bool *, bool *, int64_t *);
+    int BlockGet( KaxBlock * &, KaxSimpleBlock * &, KaxBlockAdditions * &,
+                  bool *, bool *, uint64_t *);
 
     mkv_track_t * FindTrackByBlock(const KaxBlock *, const KaxSimpleBlock * );
 
@@ -154,6 +157,34 @@ public:
     static bool CompareSegmentUIDs( const matroska_segment_c * item_a, const matroska_segment_c * item_b );
 
     bool SameFamily( const matroska_segment_c & of_segment ) const;
+
+    // read a whole EBML master element at once
+    bool ReadMaster(EbmlMaster & m, ScopeMode scope = SCOPE_ALL_DATA)
+    {
+        if( unlikely( m.IsFiniteSize() && m.GetSize() >= SIZE_MAX ) )
+        {
+            msg_Err( VLC_OBJECT(&sys.demuxer), "%s too big, aborting", EBML_NAME(&m) );
+            return false;
+        }
+        try
+        {
+            EbmlElement *el = nullptr;
+            int i_upper_level = 0;
+            m.Read( es, EBML_CONTEXT(&m), i_upper_level, el, true, scope );
+            if (i_upper_level != 0)
+            {
+                assert(el != nullptr);
+                delete el;
+            }
+        }
+        catch(...)
+        {
+            msg_Err( VLC_OBJECT(&sys.demuxer), "Couldn't read %s", EBML_NAME(&m) );
+            return false;
+        }
+
+        return true;
+    }
 
 private:
     void LoadCues( KaxCues *cues );
@@ -170,12 +201,13 @@ private:
     bool ParseSimpleTags( SimpleTag* out, KaxTagSimple *tag, int level = 50 );
     bool TrackInit( mkv_track_t * p_tk );
     void ComputeTrackPriority();
-    void EnsureDuration();
+    bool EnsureDuration(KaxCluster &);
 
     SegmentSeeker _seeker;
 
     friend SegmentSeeker;
 };
 
+} // namespace
 
 #endif

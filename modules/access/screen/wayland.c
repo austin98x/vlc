@@ -37,11 +37,12 @@
 #include "screenshooter-client-protocol.h"
 
 #include <vlc_common.h>
+#include <vlc_threads.h>
 #include <vlc_demux.h>
 #include <vlc_fs.h>
 #include <vlc_plugin.h>
 
-struct demux_sys_t
+typedef struct
 {
     struct wl_display *display;
     struct wl_output *output;
@@ -59,10 +60,10 @@ struct demux_sys_t
     int32_t height; /*< Actual height */
 
     bool done;
-    mtime_t start;
+    vlc_tick_t start;
 
     vlc_thread_t thread;
-};
+} demux_sys_t;
 
 static bool DisplayError(vlc_object_t *obj, struct wl_display *display)
 {
@@ -120,9 +121,9 @@ static void output_mode_cb(void *data, struct wl_output *output,
 
     es_format_t fmt;
 
-    es_format_Init(&fmt, VIDEO_ES, VLC_CODEC_RGB32);
-    fmt.video.i_chroma = VLC_CODEC_RGB32;
-    fmt.video.i_bits_per_pixel = 32;
+    vlc_fourcc_t i_chroma = VLC_CODEC_BGRX;
+    es_format_Init(&fmt, VIDEO_ES, i_chroma);
+    fmt.video.i_chroma = i_chroma;
     fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
     fmt.video.i_frame_rate = lroundf(1000.f * sys->rate);
     fmt.video.i_frame_rate_base = 1000;
@@ -152,6 +153,12 @@ const struct wl_output_listener output_cbs =
     output_mode_cb,
     NULL,
     NULL,
+#ifdef WL_OUTPUT_NAME_SINCE_VERSION
+    NULL,
+#endif
+#ifdef WL_OUTPUT_DESCRIPTION_SINCE_VERSION
+    NULL,
+#endif
 };
 
 static void screenshooter_done_cb(void *data,
@@ -238,6 +245,8 @@ static void *Thread(void *data)
     struct pollfd ufd[1];
     unsigned interval = lroundf(CLOCK_FREQ / (sys->rate * 1000.f));
 
+    vlc_thread_set_name("vlc-scr-wayland");
+
     int canc = vlc_savecancel();
     vlc_cleanup_push(cleanup_wl_display_read, display);
 
@@ -253,7 +262,7 @@ static void *Thread(void *data)
         {
             block_t *block = Shoot(demux);
 
-            block->i_pts = block->i_dts = mdate();
+            block->i_pts = block->i_dts = vlc_tick_now();
             es_out_SetPCR(demux->out, block->i_pts);
             es_out_Send(demux->out, sys->es, block);
         }
@@ -285,11 +294,11 @@ static int Control(demux_t *demux, int query, va_list args)
             break;
 
         case DEMUX_GET_LENGTH:
-            *va_arg(args, int64_t *) = 0;
+            *va_arg(args, vlc_tick_t *) = 0;
             break;
 
         case DEMUX_GET_TIME:
-            *va_arg(args, int64_t *) = mdate() - sys->start;
+            *va_arg(args, vlc_tick_t *) = vlc_tick_now() - sys->start;
             break;
 
         case DEMUX_GET_FPS:
@@ -303,8 +312,8 @@ static int Control(demux_t *demux, int query, va_list args)
         //    break;
 
         case DEMUX_GET_PTS_DELAY:
-            *va_arg(args, int64_t *) = INT64_C(1000)
-                * var_InheritInteger(demux, "live-caching");
+            *va_arg(args, vlc_tick_t *) = VLC_TICK_FROM_MS(
+                var_InheritInteger(demux, "live-caching") );
             break;
 
         case DEMUX_CAN_CONTROL_PACE:
@@ -358,6 +367,9 @@ static const struct wl_registry_listener registry_cbs =
 static int Open(vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
+    if (demux->out == NULL)
+        return VLC_EGENERIC;
+
     demux_sys_t *sys = malloc(sizeof (*sys));
     if (unlikely(sys == NULL))
         return VLC_ENOMEM;
@@ -413,9 +425,9 @@ static int Open(vlc_object_t *obj)
         goto error;
 
     /* Initializes demux */
-    sys->start = mdate();
+    sys->start = vlc_tick_now();
 
-    if (vlc_clone(&sys->thread, Thread, demux, VLC_THREAD_PRIORITY_INPUT))
+    if (vlc_clone(&sys->thread, Thread, demux))
         goto error;
 
     demux->pf_demux = NULL;
@@ -472,25 +484,24 @@ static void Close(vlc_object_t *obj)
 vlc_module_begin ()
     set_shortname (N_("Screen"))
     set_description (N_("Screen capture (with Wayland)"))
-    set_category (CAT_INPUT)
     set_subcategory (SUBCAT_INPUT_ACCESS)
-    set_capability ("access_demux", 0)
+    set_capability ("access", 0)
     set_callbacks (Open, Close)
 
     /* XXX: VLC core does not support multiple configuration items with the
      * same name. So all default values and ranges must be the same as for XCB
      * for the time being. */
-    add_float ("screen-fps", 2.0, FPS_TEXT, FPS_LONGTEXT, true)
-    add_integer ("screen-left", 0, LEFT_TEXT, LEFT_LONGTEXT, true)
+    add_float ("screen-fps", 2.0, FPS_TEXT, FPS_LONGTEXT)
+    add_integer ("screen-left", 0, LEFT_TEXT, LEFT_LONGTEXT)
         change_integer_range (-32768, 32767)
         change_safe ()
-    add_integer ("screen-top", 0, TOP_TEXT, TOP_LONGTEXT, true)
+    add_integer ("screen-top", 0, TOP_TEXT, TOP_LONGTEXT)
         change_integer_range (-32768, 32767)
         change_safe ()
-    add_integer ("screen-width", 0, WIDTH_TEXT, WIDTH_LONGTEXT, true)
+    add_integer ("screen-width", 0, WIDTH_TEXT, WIDTH_LONGTEXT)
         change_integer_range (0, 65535)
         change_safe ()
-    add_integer ("screen-height", 0, HEIGHT_TEXT, HEIGHT_LONGTEXT, true)
+    add_integer ("screen-height", 0, HEIGHT_TEXT, HEIGHT_LONGTEXT)
         change_integer_range (0, 65535)
         change_safe ()
     add_shortcut ("screen")

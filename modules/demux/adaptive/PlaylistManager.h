@@ -23,47 +23,56 @@
 #define PLAYLISTMANAGER_H_
 
 #include "logic/AbstractAdaptationLogic.h"
+#include "tools/Macros.hpp"
 #include "Streams.hpp"
 #include <vector>
+
+#include <vlc_threads.h>
+#include <vlc_cxx_helpers.hpp>
 
 namespace adaptive
 {
     namespace playlist
     {
-        class AbstractPlaylist;
+        class BasePlaylist;
         class BasePeriod;
     }
 
     namespace http
     {
         class AbstractConnectionManager;
-        class AuthStorage;
     }
 
     using namespace playlist;
     using namespace logic;
-    using namespace http;
+
+    using StreamPosition = AbstractStream::StreamPosition;
 
     class PlaylistManager
     {
+        PREREQ_VIRTUAL(PlaylistManager);
+
         public:
             PlaylistManager( demux_t *,
-                             AuthStorage *,
-                             AbstractPlaylist *,
+                             SharedResources *,
+                             BasePlaylist *,
                              AbstractStreamFactory *,
                              AbstractAdaptationLogic::LogicType type );
             virtual ~PlaylistManager    ();
 
+            bool    init(bool = false);
             bool    start();
+            bool    started() const;
             void    stop();
 
-            AbstractStream::buffering_status bufferize(mtime_t, unsigned, unsigned);
-            AbstractStream::status dequeue(mtime_t, mtime_t *);
-            void drain();
+            AbstractStream::BufferingStatus bufferize(Times, vlc_tick_t,
+                                                      vlc_tick_t, vlc_tick_t);
+            AbstractStream::Status dequeue(Times, Times *);
 
             virtual bool needsUpdate() const;
             virtual bool updatePlaylist();
             virtual void scheduleNextUpdate();
+            virtual void preparsePlaylist();
 
             /* static callbacks */
             static int control_callback(demux_t *, int, va_list);
@@ -72,44 +81,53 @@ namespace adaptive
         protected:
             /* Demux calls */
             virtual int doControl(int, va_list);
-            virtual int doDemux(int64_t);
+            virtual int doDemux(vlc_tick_t);
 
-            virtual bool    setPosition(mtime_t);
-            virtual mtime_t getDuration() const;
-            mtime_t getPCR() const;
-            mtime_t getFirstDTS() const;
+            void    setLivePause(bool);
+            virtual bool setPosition(vlc_tick_t, double pos = -1, bool accurate = false);
+            StreamPosition getResumePosition() const;
+            Times getFirstTimes() const;
+            unsigned getActiveStreamsCount() const;
 
-            virtual mtime_t getFirstPlaybackTime() const;
-            mtime_t getCurrentPlaybackTime() const;
+            Times getTimes(bool = false) const;
+            vlc_tick_t getMinAheadTime() const;
+            bool isBufferingSufficient(Times, vlc_tick_t) const;
 
-            void pruneLiveStream();
             virtual bool reactivateStream(AbstractStream *);
             bool setupPeriod();
             void unsetPeriod();
 
             void updateControlsPosition();
-            void updateControlsContentType();
 
             /* local factories */
             virtual AbstractAdaptationLogic *createLogic(AbstractAdaptationLogic::LogicType,
                                                          AbstractConnectionManager *);
+            virtual AbstractBufferingLogic *createBufferingLogic() const;
 
-            AuthStorage                         *authStorage;
-            AbstractConnectionManager           *conManager;
+            SharedResources                     *resources;
             AbstractAdaptationLogic::LogicType  logicType;
             AbstractAdaptationLogic             *logic;
-            AbstractPlaylist                    *playlist;
+            AbstractBufferingLogic              *bufferingLogic;
+            BasePlaylist                    *playlist;
             AbstractStreamFactory               *streamFactory;
             demux_t                             *p_demux;
             std::vector<AbstractStream *>        streams;
             BasePeriod                          *currentPeriod;
+            bool                                 b_preparsing;
+
+            enum class TimestampSynchronizationPoint
+            {
+                RandomAccess,
+                Discontinuity,
+            };
 
             /* shared with demux/buffering */
             struct
             {
-                mtime_t     i_nzpcr;
-                mtime_t     i_firstpcr;
-                vlc_mutex_t lock;
+                TimestampSynchronizationPoint pcr_syncpoint;
+                Times times, firsttimes;
+                bool rebuffering;
+                mutable vlc_mutex_t lock;
                 vlc_cond_t  cond;
             } demux;
 
@@ -121,21 +139,29 @@ namespace adaptive
             struct
             {
                 bool        b_live;
-                mtime_t     i_length;
-                mtime_t     i_time;
+                vlc_tick_t  i_time;
+                vlc_tick_t  i_normaltime;
                 double      f_position;
-                vlc_mutex_t lock;
+                mutable vlc_mutex_t lock;
+                vlc_tick_t  playlistStart;
+                vlc_tick_t  playlistEnd;
+                vlc_tick_t  playlistLength;
+                time_t      lastupdate;
             } cached;
+
+            SynchronizationReferences synchronizationReferences;
 
         private:
             void setBufferingRunState(bool);
             void Run();
             static void * managerThread(void *);
-            vlc_mutex_t  lock;
+            vlc::threads::mutex  lock;
+            vlc::threads::condition_variable waitcond;
             vlc_thread_t thread;
             bool         b_thread;
-            vlc_cond_t   waitcond;
             bool         b_buffering;
+            bool         b_canceled;
+            vlc_tick_t   pause_start;
     };
 
 }

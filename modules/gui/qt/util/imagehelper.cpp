@@ -2,7 +2,6 @@
  * input_slider.cpp : VolumeSlider and SeekSlider
  ****************************************************************************
  * Copyright (C) 2006-2017 the VideoLAN team
- * $Id$
  *
  * Authors: Pierre Lamot <pierre@videolabs.io>
  *
@@ -29,32 +28,87 @@
 #include <QApplication>
 #include <QPainter>
 #include <QScreen>
-#include <QSvgRenderer>
+#include <QImageIOHandler>
+#include <QPluginLoader>
+#include <QFile>
+#include <QThread>
 #include "imagehelper.hpp"
 
 
 QPixmap ImageHelper::loadSvgToPixmap( const QString &path, qint32 i_width, qint32 i_height )
 {
-#if HAS_QT56
     qreal ratio = QApplication::primaryScreen()->devicePixelRatio();
 
-    QPixmap pixmap( QSize( i_width, i_height ) * ratio );
+    const auto svgHandler = QScopedPointer<QImageIOHandler>(createSvgImageIOHandler());
+
+    QImage image;
+    const auto size = QSize( i_width, i_height ) * ratio;
+
+    if (svgHandler)
+    {
+        QFile file(path);
+
+        if (file.open(QFile::ReadOnly))
+        {
+            svgHandler->setDevice(&file);
+            svgHandler->setOption(QImageIOHandler::ScaledSize, size);
+
+            if (svgHandler->canRead())
+                svgHandler->read(&image);
+            else
+                qWarning() << "ImageHelper: svg image handler can not read file " << path << ".";
+        }
+        else
+        {
+            qWarning() << "ImageHelper: can not open file " << path << ".";
+        }
+    }
+
+    if (Q_UNLIKELY(image.isNull()))
+    {
+        image = QImage(size, QImage::Format_RGB32);
+        image.fill(QColor("purple"));
+    }
+
+    image.setDevicePixelRatio(ratio);
+    return QPixmap::fromImage(image);
+}
+
+QImageIOHandler *ImageHelper::createSvgImageIOHandler()
+{
+    static const auto plugin = []() {
+        QPointer<QImageIOPlugin> plugin;
+
+        const auto retrieve = [&plugin]() {
+#ifdef QT_STATIC
+            const auto& staticPlugins = QPluginLoader::staticInstances();
+            const auto it = std::find_if(staticPlugins.begin(), staticPlugins.end(), [](QObject *obj) -> bool {
+                return obj->inherits("QSvgPlugin");
+            });
+
+            if (it != staticPlugins.end())
+                plugin = qobject_cast<QImageIOPlugin*>(*it);
 #else
-    QPixmap pixmap( QSize( i_width, i_height ) );
+            QPluginLoader loader(QStringLiteral("imageformats/qsvg")); // Official Qt plugin
+            // No need to check the metadata (or inherits `QSvgPlugin`), a plugin named "qsvg" should already support svg.
+            plugin = qobject_cast<QImageIOPlugin*>(loader.instance());
 #endif
+        };
 
-    pixmap.fill( Qt::transparent );
+        assert(qApp); // do not call before QApplication is constructed.
+        if (QThread::currentThread() == qApp->thread())
+            retrieve();
+        else
+            QMetaObject::invokeMethod(qApp, retrieve, Qt::BlockingQueuedConnection);
 
-    QSvgRenderer renderer( path );
-    QPainter painter;
+        return plugin;
+    }();
 
-    painter.begin( &pixmap );
-    renderer.render( &painter );
-    painter.end();
+    if (!plugin)
+    {
+        qWarning() << "ImageHelper: svg image plugin is not found.";
+        return nullptr;
+    }
 
-#if HAS_QT56
-    pixmap.setDevicePixelRatio( ratio );
-#endif
-
-    return pixmap;
+    return plugin->create(nullptr);
 }

@@ -2,7 +2,6 @@
  * skin_parser.hpp
  *****************************************************************************
  * Copyright (C) 2004 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *
@@ -44,7 +43,7 @@ public:
     };
 
     SkinParser( intf_thread_t *pIntf, const std::string &rFileName,
-                const std::string &rPath, BuilderData *pData = NULL );
+                const std::string &rPath, BuilderData *pData = NULL, unsigned = 0 );
     virtual ~SkinParser();
 
     const BuilderData &getData() const { return *m_pData; }
@@ -76,6 +75,8 @@ private:
     int m_curLayer;
     /// Set of used id
     std::set<std::string> m_idSet;
+    /// recursive depth control
+    unsigned m_instanceCount;
 
     /// Callbacks
     virtual void handleBeginElement( const std::string &rName,
@@ -92,22 +93,22 @@ private:
     //@}
 
     /// Generate a new id
-    const std::string generateId() const;
+    std::string generateId() const;
 
     /// Check if the id is unique, and if not generate a new one
-    const std::string uniqueId( const std::string &id );
+    std::string uniqueId( const std::string &id );
 
     /// Management of relative positions
-    void getRefDimensions( int &rWidth, int &rHeight, bool toScreen );
-    int getDimension( std::string value, int refDimension );
-    int getPosition( std::string value );
+    void getRefDimensions( int &rWidth, int &rHeight, bool toScreen ) const;
+    static int getDimension( const std::string &value, int refDimension );
+    int getPosition( const std::string &value ) const;
     void updateWindowPos( int width, int height );
 
-    void convertPosition( std::string position,
-                          std::string xOffset, std::string yOffset,
-                          std::string xMargin, std::string yMargin,
+    void convertPosition( const std::string &position,
+                          const std::string &xOffset, const std::string &yOffset,
+                          const std::string &xMargin, const std::string &yMargin,
                           int width, int height, int refWidth, int refHeight,
-                          int* p_x, int* p_y );
+                          int* p_x, int* p_y ) const;
 
     /// Helper for handleBeginElement: Provide default attribute if missing.
     static void DefaultAttr( AttrList_t &attr, const char *a, const char *b )

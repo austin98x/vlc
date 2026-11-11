@@ -2,7 +2,6 @@
  * ctrl_slider.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -53,7 +52,6 @@ CtrlSliderCursor::CtrlSliderCursor( intf_thread_t *pIntf,
     CtrlGeneric( pIntf, rHelp, pVisible ), m_fsm( pIntf ),
     m_rVariable( rVariable ), m_tooltip( rTooltip ),
     m_width( rCurve.getWidth() ), m_height( rCurve.getHeight() ),
-    m_xPosition( 0 ), m_yPosition( 0 ),
     m_cmdOverDown( this ), m_cmdDownOver( this ),
     m_cmdOverUp( this ), m_cmdUpOver( this ),
     m_cmdMove( this ), m_cmdScroll( this ),
@@ -487,8 +485,8 @@ void CtrlSliderBg::notifyLayout( int width, int height,
         float factorX, factorY;
         getResizeFactors( factorX, factorY );
         // real background size
-        int width = m_bgWidth - (int)(m_padHoriz * factorX);
-        int height = m_bgHeight - (int)(m_padVert * factorY);
+        width = m_bgWidth - (int)(m_padHoriz * factorX);
+        height = m_bgHeight - (int)(m_padVert * factorY);
         CtrlGeneric::notifyLayout( width, height );
     }
 }

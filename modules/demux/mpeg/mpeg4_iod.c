@@ -31,6 +31,9 @@
 
 #include "mpeg4_iod.h"
 
+#include <stdlib.h>
+#include <assert.h>
+
 //#define OD_DEBUG 1
 static void od_debug( vlc_object_t *p_object, const char *format, ... )
 {
@@ -50,25 +53,19 @@ static void od_debug( vlc_object_t *p_object, const char *format, ... )
  *****************************************************************************/
 static unsigned ODDescriptorLength( unsigned *pi_data, const uint8_t **pp_data )
 {
-    unsigned int i_b;
+    unsigned int i_b = 0x80;
     unsigned int i_len = 0;
 
-    if(*pi_data == 0)
-        return 0;
-
-    do
+    unsigned bytes = __MIN(*pi_data, 4);
+    for(unsigned i=0; i<bytes && (i_b&0x80); i++)
     {
         i_b = **pp_data;
         (*pp_data)++;
         (*pi_data)--;
         i_len = ( i_len << 7 ) + ( i_b&0x7f );
+    }
 
-    } while( i_b&0x80 && *pi_data > 0 );
-
-    if (i_len > *pi_data)
-        i_len = *pi_data;
-
-    return i_len;
+    return __MIN(i_len, *pi_data);
 }
 
 static unsigned ODGetBytes( unsigned *pi_data, const uint8_t **pp_data, size_t bytes )
@@ -133,13 +130,25 @@ static bool OD_SLDesc_Read( vlc_object_t *p_object, unsigned i_data, const uint8
         sl_descr->i_timestamp_resolution = ODGetBytes( &i_data, &p_data, 4 );
         sl_descr->i_OCR_resolution = ODGetBytes( &i_data, &p_data, 4 );
         sl_descr->i_timestamp_length = ODGetBytes( &i_data, &p_data, 1 );
+        if( sl_descr->i_timestamp_length > 64 )
+            return false;
         sl_descr->i_OCR_length = ODGetBytes( &i_data, &p_data, 1 );
+        if( sl_descr->i_OCR_length > 32 )
+            return false;
         sl_descr->i_AU_length = ODGetBytes( &i_data, &p_data, 1 );
+        if( sl_descr->i_AU_length > 32 )
+            return false;
         sl_descr->i_instant_bitrate_length = ODGetBytes( &i_data, &p_data, 1 );
+        if( sl_descr->i_instant_bitrate_length > 64 )
+            return false;
         uint16_t i16 = ODGetBytes( &i_data, &p_data, 2 );
         sl_descr->i_degradation_priority_length = i16 >> 12;
         sl_descr->i_AU_seqnum_length = (i16 >> 7) & 0x1f;
+        if( sl_descr->i_AU_seqnum_length > 16 )
+            return false;
         sl_descr->i_packet_seqnum_length = (i16 >> 2) & 0x1f;
+        if( sl_descr->i_packet_seqnum_length > 16 )
+            return false;
         break;
     case SL_Predefined_NULL:
         memset( sl_descr, 0, sizeof(*sl_descr) );
@@ -188,6 +197,7 @@ static bool OD_DecSpecificDesc_Read( vlc_object_t *p_object, unsigned i_data, co
         p_dec_config->i_extra = i_data;
         memcpy( p_dec_config->p_extra, p_data, p_dec_config->i_extra );
     }
+    else p_dec_config->i_extra = 0;
 
     return !!p_dec_config->i_extra;
 }
@@ -382,7 +392,10 @@ static uint8_t OD_Desc_Read( vlc_object_t *p_object, unsigned *pi_data, const ui
                 /* od_descriptor_t *p_iod = (od_descriptor_t *) param; */
                 if ( !ODObjectDescriptorRead( p_object, i_descriptor_data,
                                                p_descriptor_data, childparams ) )
-                {};
+                {
+                    free( p_od );
+                    return i_read_count;
+                };
                 break;
             }
 
@@ -396,7 +409,10 @@ static uint8_t OD_Desc_Read( vlc_object_t *p_object, unsigned *pi_data, const ui
                 /* od_descriptor_t *p_iod = (od_descriptor_t *) param; */
                 if ( !OD_InitialObjectDesc_Read( p_object, i_descriptor_data,
                                                   p_descriptor_data, childparams ) )
-                {};
+                {
+                    free( p_iod );
+                    return i_read_count;
+                };
                 break;
             }
 
@@ -407,7 +423,7 @@ static uint8_t OD_Desc_Read( vlc_object_t *p_object, unsigned *pi_data, const ui
                 childparams.es_descr = &p_iod->es_descr[i_read_count];
                 if ( !OD_ESDesc_Read( p_object, i_descriptor_data,
                                        p_descriptor_data, childparams ) )
-                {};
+                    return i_read_count;
                 break;
             }
 
@@ -415,7 +431,7 @@ static uint8_t OD_Desc_Read( vlc_object_t *p_object, unsigned *pi_data, const ui
             {
                 if ( !OD_DecConfigDesc_Read( p_object, i_descriptor_data,
                                               p_descriptor_data, params ) )
-                {};
+                    return i_read_count;
                 break;
             }
 
@@ -423,7 +439,7 @@ static uint8_t OD_Desc_Read( vlc_object_t *p_object, unsigned *pi_data, const ui
             {
                 if ( !OD_DecSpecificDesc_Read( p_object, i_descriptor_data,
                                                 p_descriptor_data, params ) )
-                {};
+                    return i_read_count;
                 break;
             }
 
@@ -431,13 +447,14 @@ static uint8_t OD_Desc_Read( vlc_object_t *p_object, unsigned *pi_data, const ui
             {
                 if ( !OD_SLDesc_Read( p_object, i_descriptor_data,
                                        p_descriptor_data, params ) )
-                {};
+                    return i_read_count;
                 break;
             }
 
             default:
-                od_debug( p_object, "trying to read unsupported descriptor" );
-                break;
+                /* invalid i_target_tag from caller */
+                vlc_assert_unreachable();
+                return 0;
         }
 
         *pp_data += i_length;
@@ -490,10 +507,7 @@ od_descriptor_t *IODNew( vlc_object_t *p_object, unsigned i_data, const uint8_t 
     od_descriptor_t * ods[1];
     uint8_t i_count = ODInit( p_object, i_data, p_data, ODTag_InitialObjectDescr, 1, 1, ods );
     if( !i_count )
-    {
-        ODFree( ods[0] );
         return NULL;
-    }
     return ods[0];
 }
 
@@ -506,7 +520,7 @@ void ODFree( od_descriptor_t *p_iod )
         return;
     }
 
-    for( int i = 0; i < 255; i++ )
+    for( size_t i = 0; i < ES_DESCRIPTOR_COUNT; i++ )
     {
 #define es_descr p_iod->es_descr[i]
         if( es_descr.b_ok )
@@ -563,23 +577,23 @@ sl_header_data DecodeSLHeader( unsigned i_data, const uint8_t *p_data,
         struct
         {
             bool *p_b;
-            mtime_t *p_t;
+            vlc_tick_t *p_t;
         } const timestamps[2] = { { &b_has_dts, &ret.i_dts }, { &b_has_cts, &ret.i_pts } };
 
-        bs_read( &s, sl->i_packet_seqnum_length );
+        bs_skip( &s, sl->i_packet_seqnum_length );
 
         if( sl->i_degradation_priority_length && bs_read1( &s ) )
-            bs_read( &s, sl->i_degradation_priority_length );
+            bs_skip( &s, sl->i_degradation_priority_length );
 
         if( b_has_ocr )
-            bs_read( &s, sl->i_OCR_length );
+            bs_skip( &s, sl->i_OCR_length );
 
         if ( ret.b_au_start )
         {
             if( sl->i_flags & USE_RANDOM_ACCESS_POINT_FLAG )
                 bs_read1( &s );
 
-            bs_read( &s, sl->i_AU_seqnum_length );
+            bs_skip( &s, sl->i_AU_seqnum_length );
 
             if ( sl->i_flags & USE_TIMESTAMPS_FLAG )
             {
@@ -602,20 +616,21 @@ sl_header_data DecodeSLHeader( unsigned i_data, const uint8_t *p_data,
                     i_read |= bs_read( &s, i_bits );
                 }
                 if( sl->i_timestamp_resolution )
-                    *(timestamps[i].p_t) = VLC_TS_0 + CLOCK_FREQ * i_read / sl->i_timestamp_resolution;
+                    *(timestamps[i].p_t) = VLC_TICK_0 +
+                        vlc_tick_from_samples(i_read, sl->i_timestamp_resolution);
             }
 
-            bs_read( &s, sl->i_AU_length );
+            bs_skip( &s, sl->i_AU_length );
 
             if( b_has_instant_bitrate )
-                bs_read( &s, sl->i_instant_bitrate_length );
+                bs_skip( &s, sl->i_instant_bitrate_length );
         }
 
         /* more to read if ExtSLConfigDescrTag */
     }
 
-    if ( b_has_padding && !i_padding ) /* all padding */
-        ret.i_size =  i_data;
+    if ( ( b_has_padding && !i_padding ) /* all padding */ || bs_error( &s ) /* overread bits/truncated header */ )
+        ret.i_size = i_data;
     else
         ret.i_size = (bs_pos( &s ) + 7) / 8;
 
@@ -628,6 +643,25 @@ sl_header_data DecodeSLHeader( unsigned i_data, const uint8_t *p_data,
 #define ODTag_ObjectDescrUpdate 0x01
 #define ODTag_ObjectDescrRemove 0x02
 
+struct bsearch_key
+{
+    uint16_t id;
+    const od_descriptor_t ***ppp_lowerbest;
+};
+
+static int bsearch_cmp( const void *key_, const void *el_ )
+{
+    const struct bsearch_key *key = key_;
+    const od_descriptor_t *el = *((const od_descriptor_t **) el_);
+    if( key->id < el->i_ID )
+        return -1;
+    if( key->ppp_lowerbest )
+        *key->ppp_lowerbest = (const od_descriptor_t **) el_;
+    if( key->id > el->i_ID )
+        return 1;
+    return 0;
+}
+
 static void ObjectDescrUpdateCommandRead( vlc_object_t *p_object, od_descriptors_t *p_ods,
                                           unsigned i_data, const uint8_t *p_data )
 {
@@ -636,16 +670,21 @@ static void ObjectDescrUpdateCommandRead( vlc_object_t *p_object, od_descriptors
     for( int i=0; i<i_count; i++ )
     {
         od_descriptor_t *p_od = p_odsread[i];
-        int i_pos = -1;
-        ARRAY_BSEARCH( p_ods->objects, ->i_ID, int, p_od->i_ID, i_pos );
-        if ( i_pos > -1 )
+        const od_descriptor_t **pp_lowerbest = NULL;
+        struct bsearch_key key = { .id = p_od->i_ID, .ppp_lowerbest = &pp_lowerbest };
+        od_descriptor_t **pp_cur = bsearch( &key, p_ods->objects.p_elems,
+                                            p_ods->objects.i_size, sizeof(*pp_cur),
+                                            bsearch_cmp );
+        if ( pp_cur )
         {
-            ODFree( p_ods->objects.p_elems[i_pos] );
+            int i_pos = pp_cur - p_ods->objects.p_elems;
+            ODFree( *pp_cur );
             p_ods->objects.p_elems[i_pos] = p_od;
         }
         else
         {
-            ARRAY_APPEND( p_ods->objects, p_od );
+            int i_pos = pp_lowerbest ? pp_lowerbest - (const od_descriptor_t **) p_ods->objects.p_elems + 1 : 0;
+            ARRAY_INSERT( p_ods->objects, p_od, i_pos );
         }
     }
 }
@@ -658,11 +697,13 @@ static void ObjectDescrRemoveCommandRead( vlc_object_t *p_object, od_descriptors
     bs_init( &s, p_data, i_data );
     for( unsigned i=0; i< (i_data * 8 / 10); i++ )
     {
-        uint16_t i_id = bs_read( &s, 10 );
-        int i_pos = -1;
-        ARRAY_BSEARCH( p_ods->objects, ->i_ID, int, i_id, i_pos );
-        if( i_pos > -1 )
-            ARRAY_REMOVE( p_ods->objects, i_pos );
+        struct bsearch_key key = { 0 };
+        key.id = bs_read( &s, 10 );
+        od_descriptor_t **pp_cur = bsearch( &key, p_ods->objects.p_elems,
+                                            p_ods->objects.i_size, sizeof(*pp_cur),
+                                            bsearch_cmp );
+        if( pp_cur )
+            ARRAY_REMOVE( p_ods->objects, pp_cur - p_ods->objects.p_elems );
     }
 }
 

@@ -1,7 +1,7 @@
 # speexdsp
 
-SPEEXDSP_VERSION := 1.2rc3
-SPEEXDSP_URL := http://downloads.us.xiph.org/releases/speex/speexdsp-$(SPEEXDSP_VERSION).tar.gz
+SPEEXDSP_VERSION := 1.2.1
+SPEEXDSP_URL := $(XIPH)/speex/speexdsp-$(SPEEXDSP_VERSION).tar.gz
 
 PKGS += speexdsp
 ifeq ($(call need_pkg,"speexdsp"),)
@@ -15,14 +15,15 @@ $(TARBALLS)/speexdsp-$(SPEEXDSP_VERSION).tar.gz:
 
 speexdsp: speexdsp-$(SPEEXDSP_VERSION).tar.gz .sum-speexdsp
 	$(UNPACK)
+	$(call update_autoconfig,.)
+	$(call pkg_static,"speexdsp.pc.in")
+	$(APPLY) $(SRC)/speexdsp/missing-stdint-for-aarch.patch
 	$(MOVE)
 
 SPEEXDSP_CONF := --enable-resample-full-sinc-table --disable-examples
-ifeq ($(ARCH),aarch64)
-# old neon, not compatible with aarch64
-SPEEXDSP_CONF += --disable-neon
-endif
-ifndef HAVE_NEON
+ifeq ($(filter arm aarch64, $(ARCH)),)
+# The configure script checks for NEON C intrinsics only.
+# This leads to false positives on Android-x86.
 SPEEXDSP_CONF += --disable-neon
 endif
 ifndef HAVE_FPU
@@ -33,9 +34,8 @@ endif
 endif
 
 .speexdsp: speexdsp
-	$(RECONF)
-	cd $< && $(HOSTVARS) ./configure $(HOSTCONF) $(SPEEXDSP_CONF)
-	cd $< && $(MAKE)
-	cd $< && ../../../contrib/src/pkg-static.sh speexdsp.pc
-	cd $< && $(MAKE) install
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE) $(SPEEXDSP_CONF)
+	+$(MAKEBUILD)
+	+$(MAKEBUILD) install
 	touch $@

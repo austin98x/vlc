@@ -41,15 +41,14 @@ vlc_module_begin ()
     set_description(N_("SCTE-18 decoder"))
     set_shortname(N_("SCTE-18"))
     set_capability( "spu decoder", 51)
-    set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_SCODEC)
     set_callbacks(Open, Close)
 vlc_module_end ()
 
-struct decoder_sys_t
+typedef struct
 {
     atsc_a65_handle_t *p_handle;
-};
+} decoder_sys_t;
 
 //#define GPS_UTC_EPOCH_OFFSET 315964800
 //#define GPS_CUR_UTC_LEAP_OFFSET  16 /* 1 Jul 2015 */
@@ -74,7 +73,7 @@ typedef struct scte18_cea_t
  ****************************************************************************/
 #define BUF_ADVANCE(n) p_buffer += n; i_buffer -= n;
 
-static inline scte18_cea_t * scte18_cea_New()
+static inline scte18_cea_t * scte18_cea_New(void)
 {
     return calloc( 1, sizeof(scte18_cea_t) );
 }
@@ -178,23 +177,25 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
     if (p_block->i_flags & (BLOCK_FLAG_CORRUPTED))
         goto exit;
 
-    scte18_cea_t *p_cea = scte18_cea_Decode( p_dec->p_sys->p_handle, p_block );
+    decoder_sys_t *p_sys = p_dec->p_sys;
+
+    scte18_cea_t *p_cea = scte18_cea_Decode( p_sys->p_handle, p_block );
     if( p_cea )
     {
         p_spu = decoder_NewSubpictureText( p_dec );
         if( p_spu )
         {
-            subpicture_updater_sys_t *p_spu_sys = p_spu->updater.p_sys;
+            subtext_updater_sys_t *p_spu_sys = p_spu->updater.sys;
 
             p_spu->i_start = p_block->i_pts;
             if( p_cea->alert_message_time_remaining )
-                p_spu->i_stop = p_spu->i_start + CLOCK_FREQ * p_cea->alert_message_time_remaining;
+                p_spu->i_stop = p_spu->i_start + vlc_tick_from_sec( p_cea->alert_message_time_remaining );
             else
-                p_spu->i_stop = VLC_TS_INVALID;
+                p_spu->i_stop = VLC_TICK_INVALID;
 
             p_spu->b_ephemer  = true;
-            p_spu->b_absolute = false;
 
+            p_spu_sys->region.b_absolute = false; p_spu_sys->region.b_in_window = false;
             p_spu_sys->region.inner_align = SUBPICTURE_ALIGN_TOP;
             p_spu_sys->p_default_style->i_style_flags = STYLE_BOLD | STYLE_BACKGROUND;
             p_spu_sys->p_default_style->i_features |= STYLE_HAS_FLAGS;
@@ -220,7 +221,7 @@ static int Open( vlc_object_t *object )
 {
     decoder_t *dec = (decoder_t *)object;
 
-    if ( dec->fmt_in.i_codec != VLC_CODEC_SCTE_18 )
+    if ( dec->fmt_in->i_codec != VLC_CODEC_SCTE_18 )
         return VLC_EGENERIC;
 
     decoder_sys_t *p_sys = malloc( sizeof(decoder_sys_t) );
@@ -248,4 +249,3 @@ static void Close( vlc_object_t *p_object )
     atsc_a65_handle_Release( p_sys->p_handle );
     free( p_sys );
 }
-

@@ -23,6 +23,7 @@
 #include <vlc_common.h>
 #include <vlc_demux.h>
 
+#include "timestamps.h"
 #include "ts_pid.h"
 #include "ts.h"
 
@@ -119,6 +120,10 @@ bool ts_arib_inject_png_palette( const uint8_t *p_in, size_t i_in, uint8_t **pp_
 {
     const uint8_t *p_data = p_in;
     const uint8_t *p_idat = NULL;
+
+    if( i_in < 16+11 )
+        return false;
+
     size_t i_data = i_in - 8;
     p_data += 8;
     i_data -= 8;
@@ -171,42 +176,39 @@ ts_arib_logo_dr_t * ts_arib_logo_dr_Decode( const uint8_t *p_data, size_t i_data
         return NULL;
 
     ts_arib_logo_dr_t *p_dr = calloc( 1, sizeof(*p_dr) );
-    if( p_dr )
+    if( unlikely( p_dr == NULL ) )
+        return NULL;
+
+    p_dr->i_logo_version = p_data[0];
+    switch( p_data[0] )
     {
-        p_dr->i_logo_version = p_data[0];
-        switch( p_data[0] )
-        {
-            case 1:
-                if( i_data == 7 )
-                {
-                    p_dr->i_logo_id = ((p_data[1] & 0x01) << 8) | p_data[2];
-                    p_dr->i_logo_version = ((p_data[3] & 0x0F) << 8) | p_data[4];
-                    p_dr->i_download_data_id = (p_data[5] << 8) | p_data[6];
-                    return p_dr;
-                }
+        case 1:
+            if( i_data != 7 )
                 break;
-            case 2:
-                if( i_data == 3 )
-                {
-                    p_dr->i_logo_id = ((p_data[1] & 0x01) << 8) | p_data[2];
-                    return p_dr;
-                }
+            p_dr->i_logo_id = ((p_data[1] & 0x01) << 8) | p_data[2];
+            p_dr->i_logo_version = ((p_data[3] & 0x0F) << 8) | p_data[4];
+            p_dr->i_download_data_id = (p_data[5] << 8) | p_data[6];
+            return p_dr;
+        case 2:
+            if( i_data != 3 )
                 break;
-            case 3:
-                if( i_data > 2 )
-                {
-                    p_dr->p_logo_char = malloc( i_data - 1 );
-                    if( p_dr->p_logo_char )
-                    {
-                        p_dr->i_logo_char = i_data - 1;
-                        memcpy( p_dr->p_logo_char, &p_data[1], p_dr->i_logo_char );
-                        return p_dr;
-                    }
-                }
-            default:
+            p_dr->i_logo_id = ((p_data[1] & 0x01) << 8) | p_data[2];
+            return p_dr;
+        case 3:
+            if( i_data <= 2 )
                 break;
-        }
-        ts_arib_logo_dr_Delete( p_dr );
+
+            p_dr->p_logo_char = malloc( i_data - 1 );
+            if( unlikely( p_dr->p_logo_char == NULL ) )
+                break;
+
+            p_dr->i_logo_char = i_data - 1;
+            memcpy( p_dr->p_logo_char, &p_data[1], p_dr->i_logo_char );
+            return p_dr;
+        default:
+            break;
     }
+
+    ts_arib_logo_dr_Delete( p_dr );
     return NULL;
 }

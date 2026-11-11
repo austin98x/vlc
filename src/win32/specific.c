@@ -1,5 +1,5 @@
 /*****************************************************************************
- * specific.c: Win32 specific initilization
+ * specific.c: Win32 specific initialization
  *****************************************************************************
  * Copyright (C) 2001-2004, 2010 VLC authors and VideoLAN
  *
@@ -29,15 +29,10 @@
 # define UNICODE
 #endif
 #include <vlc_common.h>
-#include "libvlc.h"
+#include "../libvlc.h"
 #include "../lib/libvlc_internal.h"
-#include "config/vlc_getopt.h"
 
-#include <mmsystem.h>
-#include <winsock.h>
-#if VLC_WINSTORE_APP && !defined(__MINGW32__)
-typedef UINT MMRESULT;
-#endif
+#include <winsock2.h>
 
 static int system_InitWSA(int hi, int lo)
 {
@@ -54,7 +49,7 @@ static int system_InitWSA(int hi, int lo)
 }
 
 /**
- * Initializes MME timer, Winsock.
+ * Initializes Winsock.
  */
 void system_Init(void)
 {
@@ -76,7 +71,7 @@ typedef struct
 
 void system_Configure( libvlc_int_t *p_this, int i_argc, const char *const ppsz_argv[] )
 {
-#if !VLC_WINSTORE_APP
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
     if( var_InheritBool( p_this, "one-instance" )
      || ( var_InheritBool( p_this, "one-instance-when-started-from-file" )
        && var_InheritBool( p_this, "started-from-file" ) ) )
@@ -143,9 +138,7 @@ void system_Configure( libvlc_int_t *p_this, int i_argc, const char *const ppsz_
                 for( i_opt = 0; i_opt < i_argc; i_opt++ )
                 {
                     size_t i_len = strlen( ppsz_argv[ i_opt ] ) + 1;
-                    /* Windows will never switch to an architecture
-                     * with stronger alignment requirements, right. */
-                    *((size_t *)(p_data->data + i_data)) = i_len;
+                    memcpy( &p_data->data[i_data], &i_len, sizeof (size_t) );
                     i_data += sizeof (size_t);
                     memcpy( &p_data->data[i_data], ppsz_argv[ i_opt ], i_len );
                     i_data += i_len;

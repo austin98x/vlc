@@ -2,7 +2,6 @@
  * bluescreen.c : Bluescreen (weather channel like) video filter for vlc
  *****************************************************************************
  * Copyright (C) 2005-2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea at videolan tod org>
  *
@@ -30,6 +29,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
@@ -64,8 +64,8 @@
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static int  Create      ( vlc_object_t * );
-static void Destroy     ( vlc_object_t * );
+static int  Create      ( filter_t * );
+static void Destroy     ( filter_t * );
 
 static picture_t *Filter( filter_t *, picture_t * );
 static int BluescreenCallback( vlc_object_t *, char const *,
@@ -78,38 +78,38 @@ vlc_module_begin ()
     set_description( N_("Bluescreen video filter") )
     set_shortname( N_("Bluescreen" ))
     set_help( BLUESCREEN_HELP )
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
-    set_capability( "video filter", 0 )
     add_shortcut( "bluescreen" )
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 
     add_integer_with_range( CFG_PREFIX "u", 120, 0, 255,
-                            BLUESCREENU_TEXT, BLUESCREENU_LONGTEXT, false )
+                            BLUESCREENU_TEXT, BLUESCREENU_LONGTEXT )
     add_integer_with_range( CFG_PREFIX "v", 90, 0, 255,
-                            BLUESCREENV_TEXT, BLUESCREENV_LONGTEXT, false )
+                            BLUESCREENV_TEXT, BLUESCREENV_LONGTEXT )
     add_integer_with_range( CFG_PREFIX "ut", 17, 0, 255,
-                            BLUESCREENUTOL_TEXT, BLUESCREENUTOL_LONGTEXT,
-                            false )
+                            BLUESCREENUTOL_TEXT, BLUESCREENUTOL_LONGTEXT )
     add_integer_with_range( CFG_PREFIX "vt", 17, 0, 255,
-                            BLUESCREENVTOL_TEXT, BLUESCREENVTOL_LONGTEXT,
-                            false )
+                            BLUESCREENVTOL_TEXT, BLUESCREENVTOL_LONGTEXT )
 vlc_module_end ()
 
 static const char *const ppsz_filter_options[] = {
     "u", "v", "ut", "vt", NULL
 };
 
-struct filter_sys_t
+typedef struct
 {
     vlc_mutex_t lock;
     int i_u, i_v, i_ut, i_vt;
     uint8_t *p_at;
+} filter_sys_t;
+
+static const struct vlc_filter_operations filter_ops =
+{
+    .filter_video = Filter, .close = Destroy,
 };
 
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys;
 
     if( p_filter->fmt_in.video.i_chroma != VLC_CODEC_YUVA )
@@ -144,14 +144,13 @@ static int Create( vlc_object_t *p_this )
     p_sys->p_at = NULL;
 #undef GET_VAR
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &filter_ops;
 
     return VLC_SUCCESS;
 }
 
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
     var_DelCallback( p_filter, CFG_PREFIX "u", BluescreenCallback, p_sys );
@@ -160,7 +159,6 @@ static void Destroy( vlc_object_t *p_this )
     var_DelCallback( p_filter, CFG_PREFIX "vt", BluescreenCallback, p_sys );
 
     free( p_sys->p_at );
-    vlc_mutex_destroy( &p_sys->lock );
     free( p_sys );
 }
 
@@ -185,8 +183,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
         return NULL;
     }
 
-    p_sys->p_at = xrealloc( p_sys->p_at,
-                            i_lines * i_pitch * sizeof( uint8_t ) );
+    p_sys->p_at = xrealloc( p_sys->p_at, i_lines * i_pitch );
     p_at = p_sys->p_at;
 
     vlc_mutex_lock( &p_sys->lock );
@@ -262,7 +259,7 @@ static int BluescreenCallback( vlc_object_t *p_this, char const *psz_var,
                                void *p_data )
 {
     VLC_UNUSED(p_this); VLC_UNUSED(oldval);
-    filter_sys_t *p_sys = (filter_sys_t *) p_data;
+    filter_sys_t *p_sys = p_data;
 
     vlc_mutex_lock( &p_sys->lock );
 #define VAR_IS( a ) !strcmp( psz_var, CFG_PREFIX a )

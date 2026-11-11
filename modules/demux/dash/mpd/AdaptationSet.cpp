@@ -27,13 +27,13 @@
 
 #include "AdaptationSet.h"
 #include "Representation.h"
-#include "Period.h"
 #include "MPD.h"
 
 using namespace dash::mpd;
+using namespace adaptive::playlist;
 
-AdaptationSet::AdaptationSet(Period *period) :
-    adaptive::playlist::BaseAdaptationSet( period ),
+AdaptationSet::AdaptationSet(BasePeriod *period) :
+    BaseAdaptationSet( period ),
     DASHCommonAttributesElements(),
     subsegmentAlignmentFlag( false )
 {
@@ -46,7 +46,7 @@ AdaptationSet::~AdaptationSet()
 StreamFormat AdaptationSet::getStreamFormat() const
 {
     if(!getMimeType().empty())
-        return MPD::mimeToFormat(getMimeType());
+        return StreamFormat(getMimeType());
     else
         return BaseAdaptationSet::getStreamFormat();
 }

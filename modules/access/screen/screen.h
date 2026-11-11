@@ -2,7 +2,6 @@
  * screen.h: Screen capture module.
  *****************************************************************************
  * Copyright (C) 2004-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *          Antoine Cellerier <dionoea at videolan dot org>
@@ -26,29 +25,31 @@
 #include <vlc_access.h>
 #include <vlc_demux.h>
 
-#ifdef __APPLE__
-#   define SCREEN_DISPLAY_ID
-#endif
-
 #define SCREEN_SUBSCREEN
+#ifdef _WIN32
 #define SCREEN_MOUSE
-
-#ifdef SCREEN_MOUSE
-#   include <vlc_image.h>
 #endif
 
-typedef struct screen_data_t screen_data_t;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-struct demux_sys_t
+struct screen_capture_operations
+{
+    block_t* (*capture)( demux_t * );
+    void (*close)( void * );
+};
+
+typedef struct
 {
     es_format_t fmt;
     es_out_id_t *es;
 
     float f_fps;
-    mtime_t i_next_date;
-    int i_incr;
+    vlc_tick_t i_next_date;
+    vlc_tick_t i_incr;
 
-    mtime_t i_start;
+    vlc_tick_t i_start;
 
 #ifdef SCREEN_SUBSCREEN
     bool b_follow_mouse;
@@ -63,25 +64,22 @@ struct demux_sys_t
 
 #ifdef SCREEN_MOUSE
     picture_t *p_mouse;
-    filter_t *p_blend;
     picture_t dst;
 #endif
 
-#ifdef SCREEN_DISPLAY_ID
-  unsigned int i_display_id;
-  unsigned int i_screen_index;
-#endif
-
-    screen_data_t *p_data;
-};
+    void *p_data;
+    const struct screen_capture_operations *ops;
+} demux_sys_t;
 
 int      screen_InitCapture ( demux_t * );
-int      screen_CloseCapture( demux_t * );
-block_t *screen_Capture( demux_t * );
+#if defined(_WIN32)
+int      screen_InitCaptureGDI ( demux_t * );
+#endif
 
 #ifdef SCREEN_SUBSCREEN
 void FollowMouse( demux_sys_t *, int, int );
 #endif
-#ifdef SCREEN_MOUSE
-void RenderCursor( demux_t *, int, int, uint8_t * );
+
+#ifdef __cplusplus
+}
 #endif

@@ -277,15 +277,16 @@ typedef const uint8_t * (*block_startcode_helper_t)( const uint8_t *, const uint
 typedef bool (*block_startcode_matcher_t)( uint8_t, size_t, const uint8_t * );
 
 static inline int block_FindStartcodeFromOffset(
-    block_bytestream_t *p_bytestream, size_t *pi_offset,
-    const uint8_t *p_startcode, int i_startcode_length,
+    const block_bytestream_t *p_bytestream, size_t *pi_offset,
+    const uint8_t *p_startcode, size_t i_startcode_length,
     block_startcode_helper_t p_startcode_helper,
     block_startcode_matcher_t p_startcode_matcher )
 {
-    block_t *p_block, *p_block_backup = 0;
-    ssize_t i_size = 0;
+    block_t *p_block, *p_block_backup = NULL;
+    ssize_t i_size;
     size_t i_offset, i_offset_backup = 0;
-    int i_caller_offset_backup = 0, i_match;
+    size_t i_caller_offset_backup = 0;
+    size_t i_match;
 
     /* Find the right place */
     i_size = *pi_offset + p_bytestream->i_block_offset;
@@ -314,7 +315,7 @@ static inline int block_FindStartcodeFromOffset(
         {
             /* Use optimized helper when possible */
             if( p_startcode_helper && !i_match &&
-               (p_block->i_buffer - i_offset) > ((size_t)i_startcode_length - 1) )
+               (p_block->i_buffer - i_offset + 1) > i_startcode_length )
             {
                 const uint8_t *p_res = p_startcode_helper( &p_block->p_buffer[i_offset],
                                                            &p_block->p_buffer[p_block->i_buffer] );
@@ -324,7 +325,7 @@ static inline int block_FindStartcodeFromOffset(
                     return VLC_SUCCESS;
                 }
                 /* Then parsing boundary with legacy code */
-                i_offset = p_block->i_buffer - (i_startcode_length - 1);
+                i_offset = p_block->i_buffer + 1 - i_startcode_length;
             }
 
             bool b_matched = ( p_startcode_matcher )
@@ -348,7 +349,7 @@ static inline int block_FindStartcodeFromOffset(
 
                 i_match++;
             }
-            else if ( i_match > 0 )
+            else if ( i_match != 0 )
             {
                 /* False positive */
                 p_block = p_block_backup;

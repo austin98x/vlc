@@ -33,6 +33,7 @@
 
 #include <vlc_common.h>
 #include <vlc_http.h>
+#include <vlc_block.h>
 #include <vlc_strings.h>
 #include <vlc_memstream.h>
 #include "message.h"
@@ -265,7 +266,9 @@ struct vlc_http_msg *vlc_http_msg_iterate(struct vlc_http_msg *m)
 {
     struct vlc_http_msg *next = vlc_http_stream_read_headers(m->payload);
 
-    m->payload = NULL;
+    if (next != NULL)
+        m->payload = NULL;
+
     vlc_http_msg_destroy(m);
     return next;
 }
@@ -293,10 +296,40 @@ block_t *vlc_http_msg_read(struct vlc_http_msg *m)
     return vlc_http_stream_read(m->payload);
 }
 
+int vlc_http_msg_write(struct vlc_http_msg *m, block_t *block, bool eos)
+{
+    if (m->payload == NULL)
+        return -1;
+
+    /* Ideally, we'd send the end-of-stream with the last block of data.
+     * But if there are zero blocks, then we have to send it separately.
+     */
+    if (block == NULL && eos)
+        return vlc_http_stream_write(m->payload, NULL, 0, true);
+
+    while (block != NULL)
+    {
+        block_t *next = block->p_next;
+        bool end = eos && next == NULL;
+
+        if (vlc_http_stream_write(m->payload, block->p_buffer, block->i_buffer,
+                                  end) < (ssize_t)block->i_buffer)
+            goto error;
+
+        block_Release(block);
+        block = next;
+    }
+
+    return 0;
+error:
+    block_ChainRelease(block);
+    return -1;
+}
+
 /* Serialization and deserialization */
 
 char *vlc_http_msg_format(const struct vlc_http_msg *m, size_t *restrict lenp,
-                          bool proxied)
+                          bool proxied, bool chunked)
 {
     struct vlc_memstream stream;
 
@@ -316,6 +349,9 @@ char *vlc_http_msg_format(const struct vlc_http_msg *m, size_t *restrict lenp,
     for (unsigned i = 0; i < m->count; i++)
         vlc_memstream_printf(&stream, "%s: %s\r\n",
                              m->headers[i][0], m->headers[i][1]);
+
+    if (chunked)
+        vlc_memstream_puts(&stream, "Transfer-Encoding: chunked\r\n");
 
     vlc_memstream_puts(&stream, "\r\n");
 
@@ -406,8 +442,8 @@ struct vlc_h2_frame *vlc_http_msg_h2_frame(const struct vlc_http_msg *m,
 
     if (m->status >= 0)
     {
-        assert(m->status < 1000);
-        sprintf(status, "%hd", m->status);
+        if (m->status >= 1000) vlc_assert_unreachable();
+        snprintf(status, ARRAY_SIZE(status), "%hd", m->status);
         headers[i][0] = ":status";
         headers[i][1] = status;
         i++;
@@ -533,6 +569,18 @@ error:
 }
 
 /* Header helpers */
+
+char *vlc_http_authority(const char *host, unsigned port)
+{
+    static const char *const formats[4] = { "%s", "[%s]", "%s:%u", "[%s]:%u" };
+    const bool brackets = strchr(host, ':') != NULL;
+    const char *fmt = formats[brackets + 2 * (port != 0)];
+    char *authority;
+
+    if (unlikely(asprintf(&authority, fmt, host, port) == -1))
+        return NULL;
+    return authority;
+}
 
 static int vlc_http_istoken(int c)
 {   /* IETF RFC7230 §3.2.6 */
@@ -783,7 +831,7 @@ int vlc_http_msg_add_atime(struct vlc_http_msg *m)
     return vlc_http_msg_add_time(m, "Date", &now);
 }
 
-static time_t vlc_http_mktime(const char *str)
+time_t vlc_http_mktime(const char *str)
 {   /* IETF RFC7231 §7.1.1.1 */
     struct tm tm;
     char mon[4];
@@ -876,7 +924,7 @@ uintmax_t vlc_http_msg_get_size(const struct vlc_http_msg *m)
 
     uintmax_t length;
 
-    if (sscanf(str, "%ju", &length) == 1)
+    if (sscanf(str, "%" SCNuMAX, &length) == 1)
         return length;
 
     errno = EINVAL;

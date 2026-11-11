@@ -1,14 +1,26 @@
 # GnuTLS
 
-GNUTLS_VERSION := 3.5.16
-GNUTLS_URL := ftp://ftp.gnutls.org/gcrypt/gnutls/v3.5/gnutls-$(GNUTLS_VERSION).tar.xz
+GNUTLS_MAJVERSION := 3.8
+GNUTLS_VERSION := $(GNUTLS_MAJVERSION).13
+GNUTLS_URL := $(GNUGPG)/gnutls/v$(GNUTLS_MAJVERSION)/gnutls-$(GNUTLS_VERSION).tar.xz
+
+# nettle/gmp can't be used with the LGPLv2 license
+ifdef GPL
+GNUTLS_PKG=1
+else
+ifdef GNUV3
+GNUTLS_PKG=1
+endif
+endif
 
 ifdef BUILD_NETWORK
 ifndef HAVE_DARWIN_OS
+ifdef GNUTLS_PKG
 PKGS += gnutls
 endif
 endif
-ifeq ($(call need_pkg,"gnutls >= 3.3.6"),)
+endif
+ifeq ($(call need_pkg,"gnutls >= 3.5.0"),)
 PKGS_FOUND += gnutls
 endif
 
@@ -19,27 +31,15 @@ $(TARBALLS)/gnutls-$(GNUTLS_VERSION).tar.xz:
 
 gnutls: gnutls-$(GNUTLS_VERSION).tar.xz .sum-gnutls
 	$(UNPACK)
-	$(APPLY) $(SRC)/gnutls/32b5628-upstream.patch
-	$(APPLY) $(SRC)/gnutls/gnutls-pkgconfig-static.patch
-ifdef HAVE_WIN32
-	$(APPLY) $(SRC)/gnutls/gnutls-win32.patch
-	$(APPLY) $(SRC)/gnutls/gnutls-loadlibrary.patch
-ifdef HAVE_WINSTORE
-	$(APPLY) $(SRC)/gnutls/gnutls-winrt.patch
-	$(APPLY) $(SRC)/gnutls/winrt-topendir.patch
-endif
-endif
-ifdef HAVE_ANDROID
-	$(APPLY) $(SRC)/gnutls/no-create-time-h.patch
-endif
-	$(APPLY) $(SRC)/gnutls/read-file-limits.h.patch
-ifdef HAVE_MACOSX
-	$(APPLY) $(SRC)/gnutls/gnutls-disable-getentropy-osx.patch
-	$(APPLY) $(SRC)/gnutls/gnutls-disable-connectx-macos.patch
-endif
-	$(APPLY) $(SRC)/gnutls/gnutls-libidn.patch
-	$(call pkg_static,"lib/gnutls.pc.in")
-	$(UPDATE_AUTOCONFIG)
+	$(call update_autoconfig,build-aux)
+	# disable the dllimport in static linking (pkg-config --static doesn't handle Cflags.private)
+	sed -i.orig -e s/"_SYM_EXPORT __declspec(dllimport)"/"_SYM_EXPORT"/g $(UNPACK_DIR)/lib/includes/gnutls/gnutls.h.in
+
+	# backport build fix for some Apple targets
+	$(APPLY) $(SRC)/gnutls/0001-Fix-CRAU_MAYBE_UNUSED-definition-for-old-compilers.patch
+	# use CreateFile2 in Win8 as CreateFileW is forbidden in UWP
+	$(APPLY) $(SRC)/gnutls/0001-Use-CreateFile2-in-UWP-builds.patch
+
 	$(MOVE)
 
 GNUTLS_CONF := \
@@ -47,38 +47,41 @@ GNUTLS_CONF := \
 	--without-p11-kit \
 	--disable-cxx \
 	--disable-srp-authentication \
-	--disable-psk-authentication-FIXME \
 	--disable-anon-authentication \
-	--disable-openpgp-authentication \
 	--disable-openssl-compatibility \
 	--disable-guile \
 	--disable-nls \
 	--without-libintl-prefix \
 	--disable-doc \
+	--disable-tools \
 	--disable-tests \
 	--with-included-libtasn1 \
-	--with-included-unistring \
-	$(HOSTCONF)
-
-GNUTLS_ENV := $(HOSTVARS)
+	--with-included-unistring
 
 DEPS_gnutls = nettle $(DEPS_nettle)
-
-ifdef HAVE_ANDROID
-GNUTLS_ENV += gl_cv_header_working_stdint_h=yes
-endif
-ifdef HAVE_TIZEN
-	GNUTLS_CONF += --with-default-trust-store-dir=/etc/ssl/certs/
-endif
 ifdef HAVE_WINSTORE
-ifeq ($(ARCH),x86_64)
+# gnulib uses GetFileInformationByHandle / SecureZeroMemory
+DEPS_gnutls += alloweduwp $(DEPS_alloweduwp)
+endif
+
+ifdef HAVE_WIN32
+	GNUTLS_CONF += --without-idn
+ifeq ($(ARCH),aarch64)
+	# Gnutls' aarch64 assembly unconditionally uses ELF specific directives
 	GNUTLS_CONF += --disable-hardware-acceleration
 endif
 endif
 
 .gnutls: gnutls
-	$(RECONF)
-	cd $< && $(GNUTLS_ENV) ./configure $(GNUTLS_CONF)
-	cd $</gl && $(MAKE) install
-	cd $</lib && $(MAKE) install
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE) $(GNUTLS_CONF)
+ifdef HAVE_DARWIN_OS
+	# Add missing frameworks to Libs.private for Darwin
+	cd $< && sed -i.orig -e s/"Libs.private:"/"Libs.private: -framework Security -framework CoreFoundation"/g $(BUILD_DIRUNPACK)/lib/gnutls.pc
+endif
+	$(call pkg_static,"$(BUILD_DIRUNPACK)/lib/gnutls.pc")
+	+$(MAKEBUILD) -C gl
+	+$(MAKEBUILD) -C lib
+	+$(MAKEBUILD) -C gl install
+	+$(MAKEBUILD) -C lib install
 	touch $@

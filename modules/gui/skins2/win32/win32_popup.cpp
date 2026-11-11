@@ -2,7 +2,6 @@
  * win32_popup.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Olivier Teulière <ipkiss@via.ecp.fr>
  *
@@ -25,6 +24,8 @@
 
 #include "win32_popup.hpp"
 #include "win32_factory.hpp"
+
+#include <vlc_charset.h>
 
 #ifndef TPM_NOANIMATION
 const UINT TPM_NOANIMATION = 0x4000L;
@@ -74,10 +75,11 @@ void Win32Popup::addItem( const std::string &rLabel, int pos )
 //     menuItem.fType = MFT_STRING;
     menuItem.fMask = MIIM_ID | MIIM_STRING;
     menuItem.wID = pos;
-    menuItem.dwTypeData = ToT(rLabel.c_str());
+    menuItem.dwTypeData = ToWide(rLabel.c_str());
     menuItem.cch = rLabel.size();
 
     InsertMenuItem( m_hMenu, findInsertionPoint( pos ), TRUE, &menuItem );
+    free(menuItem.dwTypeData);
 }
 
 

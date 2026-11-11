@@ -3,7 +3,6 @@
  * Also contains some internal utility functions
  *****************************************************************************
  * Copyright (C) 2005-2009 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Clément Stenac <zorglub@videolan.org>
  *
@@ -25,47 +24,55 @@
 #ifndef _LIBVLC_MEDIA_PLAYER_INTERNAL_H
 #define _LIBVLC_MEDIA_PLAYER_INTERNAL_H 1
 
-#ifdef HAVE_CONFIG_H
-# include "config.h"
-#endif
-
 #include <vlc/vlc.h>
 #include <vlc/libvlc_media.h>
 #include <vlc_input.h>
+#include <vlc_player.h>
 #include <vlc_viewpoint.h>
+#include "media_internal.h"
 
 #include "../modules/audio_filter/equalizer_presets.h"
 
+typedef void (*libvlc_media_player_vout_detach_cb)(libvlc_media_player_t *player);
 struct libvlc_media_player_t
 {
-    struct vlc_common_members obj;
+    struct vlc_object_t obj;
+    vlc_atomic_rc_t    rc;
 
-    int                i_refcount;
-    vlc_mutex_t        object_lock;
+    const struct libvlc_media_player_cbs *cbs;
+    void *cbs_opaque;
 
-    struct
-    {
-        input_thread_t   *p_thread;
-        input_resource_t *p_resource;
-        vlc_renderer_item_t *p_renderer;
-        vlc_mutex_t       lock;
-    } input;
+    vlc_player_t *player;
+    vlc_player_listener_id *listener;
+    vlc_player_aout_listener_id *aout_listener;
+    vlc_cond_t wait;
 
     struct libvlc_instance_t * p_libvlc_instance; /* Parent instance */
-    libvlc_media_t * p_md; /* current media descriptor */
-    libvlc_event_manager_t event_manager;
-    libvlc_state_t state;
-    vlc_viewpoint_t viewpoint;
-    int selected_es[3];
+
+    struct {
+        vlc_player_timer_id *id;
+        const struct libvlc_media_player_watch_time_cbs *cbs;
+        void *cbs_data;
+        bool seeking;
+    } timer;
+
+    struct {
+        /*
+         * Tracks the active libvlc window/output integration and the default
+         * values to restore when switching integrations. Each setter installs
+         * a detach callback that resets the variables it touched (vout, gl,
+         * gles2, dec-dev, window, vmem-*, vout-cb-*). The next setter calls the
+         * current detach callback before configuring its own state, so callers
+         * can safely switch between window providers and output/video callbacks
+         * without leaving stale configuration behind.
+         */
+        libvlc_media_player_vout_detach_cb window_detach;
+        char *default_dec_dev;
+        char *default_vout;
+        char *default_gl;
+        char *default_gles2;
+    } vout;
 };
-
-/* Media player - audio, video */
-input_thread_t *libvlc_get_input_thread(libvlc_media_player_t * );
-
-
-libvlc_track_description_t * libvlc_get_track_description(
-        libvlc_media_player_t *p_mi,
-        const char *psz_variable );
 
 /**
  * Internal equalizer structure.

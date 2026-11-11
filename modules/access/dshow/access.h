@@ -3,7 +3,6 @@
  * access_sys_t definition
  *****************************************************************************
  * Copyright (C) 2002, 2004, 2010-2011 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Gildas Bazin <gbazin@videolan.org>
  *
@@ -26,12 +25,24 @@
  * Preamble
  *****************************************************************************/
 
+#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR < 12
+// before 1ec7fa221644b6d02a617a47f6e80f5069cdc893 using strcpy
+// is replaced by strcpy_instead_use_StringCbCopyA_or_StringCchCopyA
+#define STRSAFE_NO_DEPRECATE
+#endif
+
 #include <dshow.h>
 
 #include <vector>
 
+#include <vlc_threads.h>
+
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
+
+typedef struct demux_sys_t demux_sys_t;
+
+namespace dshow {
 
 /****************************************************************************
  * Crossbar stuff
@@ -47,9 +58,11 @@ struct CrossbarRoute
     LONG        AudioOutputIndex;
 };
 
+struct access_sys_t;
+
 void DeleteCrossbarRoutes( access_sys_t * );
 HRESULT FindCrossbarRoutes( vlc_object_t *, access_sys_t *,
-                            IPin *, LONG, int = 0 );
+                            ComPtr<IPin> &, LONG, int = 0 );
 
 /****************************************************************************
  * Access descriptor declaration
@@ -74,7 +87,9 @@ struct access_sys_t
     /* misc properties */
     int            i_width;
     int            i_height;
-    int            i_chroma;
-    mtime_t        i_start;
+    vlc_fourcc_t   i_chroma;
+    vlc_tick_t     i_start;
 };
+
+}
 

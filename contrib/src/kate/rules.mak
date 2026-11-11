@@ -1,7 +1,7 @@
 # Kate
 
-KATE_VERSION := 0.4.1
-KATE_URL := http://libkate.googlecode.com/files/libkate-$(KATE_VERSION).tar.gz
+KATE_VERSION := 0.4.3
+KATE_URL := $(XIPH)/kate/libkate-$(KATE_VERSION).tar.gz
 
 PKGS += kate
 ifeq ($(call need_pkg,"kate >= 0.1.5"),)
@@ -15,15 +15,16 @@ $(TARBALLS)/libkate-$(KATE_VERSION).tar.gz:
 
 libkate: libkate-$(KATE_VERSION).tar.gz .sum-kate
 	$(UNPACK)
-	$(UPDATE_AUTOCONFIG)
+	$(call update_autoconfig,misc/autotools)
 	$(MOVE)
-	mv libkate/config.sub libkate/config.guess libkate/misc/autotools
 
 DEPS_kate = ogg $(DEPS_ogg)
 
+KATE_CONF := --disable-valgrind --disable-doc
+
 .kate: libkate
-	cd $< && $(HOSTVARS) ./configure $(HOSTCONF) \
-		--disable-valgrind \
-		--disable-doc
-	cd $< && $(MAKE) SUBDIRS=. install
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE) $(KATE_CONF)
+	+$(MAKEBUILD) SUBDIRS=.
+	+$(MAKEBUILD) SUBDIRS=. install
 	touch $@

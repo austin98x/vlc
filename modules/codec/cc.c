@@ -25,7 +25,7 @@
 /*****************************************************************************
  * Preamble
  *****************************************************************************/
-/* The EIA 608 decoder part has been initialy based on ccextractor (GPL)
+/* The EIA 608 decoder part has been initially based on ccextractor (GPL)
  * and rewritten */
 
 #ifdef HAVE_CONFIG_H
@@ -42,6 +42,12 @@
 #include "substext.h"
 #include "cea708.h"
 
+#if 0
+#define Debug(code) code
+#else
+#define Debug(code)
+#endif
+
 /*****************************************************************************
  * Module descriptor.
  *****************************************************************************/
@@ -56,12 +62,11 @@ vlc_module_begin ()
     set_shortname( N_("CC 608/708"))
     set_description( N_("Closed Captions decoder") )
     set_capability( "spu decoder", 50 )
-    set_category( CAT_INPUT )
-        set_subcategory( SUBCAT_INPUT_SCODEC )
+    set_subcategory( SUBCAT_INPUT_SCODEC )
     set_callbacks( Open, Close )
 
     add_bool( "cc-opaque", true,
-                 OPAQUE_TEXT, OPAQUE_LONGTEXT, false )
+                 OPAQUE_TEXT, OPAQUE_LONGTEXT )
 vlc_module_end ()
 
 /*****************************************************************************
@@ -100,8 +105,8 @@ typedef enum
 #define EIA608_SCREEN_ROWS 15
 #define EIA608_SCREEN_COLUMNS 32
 
-#define EIA608_MARGIN  0.10
-#define EIA608_VISIBLE (1.0 - EIA608_MARGIN * 2)
+#define EIA608_MARGIN  0.10f
+#define EIA608_VISIBLE (1.0f - EIA608_MARGIN * 2)
 #define FONT_TO_LINE_HEIGHT_RATIO 1.06
 
 struct eia608_screen // A CC buffer
@@ -164,7 +169,7 @@ static const struct {
 
 #define EIA608_COLOR_DEFAULT EIA608_COLOR_WHITE
 
-static const int rgi_eia608_colors[] = {
+static const uint32_t rgi_eia608_colors[] = {
     0xffffff,  // white
     0x00ff00,  // green
     0x0000ff,  // blue
@@ -206,12 +211,12 @@ typedef struct
 
 static void         Eia608Init( eia608_t * );
 static eia608_status_t Eia608Parse( eia608_t *h, int i_channel_selected, const uint8_t data[2] );
-static void         Eia608FillUpdaterRegions( subpicture_updater_sys_t *p_updater, eia608_t *h );
+static void         Eia608FillUpdaterRegions( subtext_updater_sys_t *p_updater, eia608_t *h );
 
 /* It will be enough up to 63 B frames, which is far too high for
  * broadcast environment */
 #define CC_MAX_REORDER_SIZE (64)
-struct decoder_sys_t
+typedef struct
 {
     int      i_queue;
     block_t *p_queue;
@@ -226,18 +231,18 @@ struct decoder_sys_t
     cea708_t *p_cea708;
     eia608_t *p_eia608;
     bool b_opaque;
-};
+} decoder_sys_t;
 
 static int Decode( decoder_t *, block_t * );
 static void Flush( decoder_t * );
 
-static void DTVCC_ServiceData_Handler( void *priv, uint8_t i_sid, mtime_t i_time,
+static void DTVCC_ServiceData_Handler( void *priv, uint8_t i_sid, vlc_tick_t i_time,
                                        const uint8_t *p_data, size_t i_data )
 {
     decoder_t *p_dec = priv;
     decoder_sys_t *p_sys = p_dec->p_sys;
     //msg_Err( p_dec, "DTVCC_ServiceData_Handler sid %d bytes %ld", i_sid, i_data );
-    if( i_sid == 1 )
+    if( i_sid == 1 + p_dec->fmt_in->subs.cc.i_channel )
         CEA708_Decoder_Push( p_sys->p_cea708, i_time, p_data, i_data );
 }
 
@@ -252,10 +257,10 @@ static int Open( vlc_object_t *p_this )
     decoder_t     *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
 
-    if( ( p_dec->fmt_in.i_codec != VLC_CODEC_CEA608 ||
-          p_dec->fmt_in.subs.cc.i_channel > 3 ) &&
-        ( p_dec->fmt_in.i_codec != VLC_CODEC_CEA708 ||
-          p_dec->fmt_in.subs.cc.i_channel > 63 ) )
+    if( ( p_dec->fmt_in->i_codec != VLC_CODEC_CEA608 ||
+          p_dec->fmt_in->subs.cc.i_channel > 3 ) &&
+        ( p_dec->fmt_in->i_codec != VLC_CODEC_CEA708 ||
+          p_dec->fmt_in->subs.cc.i_channel > 63 ) )
         return VLC_EGENERIC;
 
     p_dec->pf_decode = Decode;
@@ -266,14 +271,14 @@ static int Open( vlc_object_t *p_this )
     if( p_sys == NULL )
         return VLC_ENOMEM;
 
-    if( p_dec->fmt_in.i_codec == VLC_CODEC_CEA608 )
+    if( p_dec->fmt_in->i_codec == VLC_CODEC_CEA608 )
     {
         /*  0 -> i_field = 0; i_channel = 1;
             1 -> i_field = 0; i_channel = 2;
             2 -> i_field = 1; i_channel = 1;
             3 -> i_field = 1; i_channel = 2; */
-        p_sys->i_field = p_dec->fmt_in.subs.cc.i_channel >> 1;
-        p_sys->i_channel = 1 + (p_dec->fmt_in.subs.cc.i_channel & 1);
+        p_sys->i_field = p_dec->fmt_in->subs.cc.i_channel >> 1;
+        p_sys->i_channel = 1 + (p_dec->fmt_in->subs.cc.i_channel & 1);
 
         p_sys->p_eia608 = malloc(sizeof(*p_sys->p_eia608));
         if( !p_sys->p_eia608 )
@@ -300,11 +305,11 @@ static int Open( vlc_object_t *p_this )
             return VLC_ENOMEM;
         }
 
-         p_sys->i_channel = p_dec->fmt_in.subs.cc.i_channel;
+         p_sys->i_channel = p_dec->fmt_in->subs.cc.i_channel;
     }
 
     p_sys->b_opaque = var_InheritBool( p_dec, "cc-opaque" );
-    p_sys->i_reorder_depth = p_dec->fmt_in.subs.cc.i_reorder_depth;
+    p_sys->i_reorder_depth = p_dec->fmt_in->subs.cc.i_reorder_depth;
 
     p_dec->fmt_out.i_codec = VLC_CODEC_TEXT;
 
@@ -340,7 +345,7 @@ static void Flush( decoder_t *p_dec )
  ****************************************************************************/
 static void     Push( decoder_t *, block_t * );
 static block_t *Pop( decoder_t *, bool );
-static void     Convert( decoder_t *, mtime_t, const uint8_t *, size_t );
+static void     Convert( decoder_t *, vlc_tick_t, const uint8_t *, size_t );
 
 static bool DoDecode( decoder_t *p_dec, bool b_drain )
 {
@@ -398,7 +403,7 @@ static int Decode( decoder_t *p_dec, block_t *p_block )
         Push( p_dec, p_block );
     }
 
-    const bool b_no_reorder = (p_dec->fmt_in.subs.cc.i_reorder_depth < 0);
+    const bool b_no_reorder = (p_dec->fmt_in->subs.cc.i_reorder_depth < 0);
     for( ; DoDecode( p_dec, (p_block == NULL) || b_no_reorder ); );
 
     return VLCDEC_SUCCESS;
@@ -440,7 +445,7 @@ static void Push( decoder_t *p_dec, block_t *p_block )
     /* find insertion point */
     for( pp_block = &p_sys->p_queue; *pp_block ; pp_block = &((*pp_block)->p_next) )
     {
-        if( p_block->i_pts == VLC_TS_INVALID || (*pp_block)->i_pts == VLC_TS_INVALID )
+        if( p_block->i_pts == VLC_TICK_INVALID || (*pp_block)->i_pts == VLC_TICK_INVALID )
             continue;
         if( p_block->i_pts < (*pp_block)->i_pts )
         {
@@ -482,13 +487,13 @@ static block_t *Pop( decoder_t *p_dec, bool b_forced )
     return p_block;
 }
 
-static subpicture_t *Subtitle( decoder_t *p_dec, eia608_t *h, mtime_t i_pts )
+static subpicture_t *Subtitle( decoder_t *p_dec, eia608_t *h, vlc_tick_t i_pts )
 {
     //decoder_sys_t *p_sys = p_dec->p_sys;
     subpicture_t *p_spu = NULL;
 
     /* We cannot display a subpicture with no date */
-    if( i_pts <= VLC_TS_INVALID )
+    if( i_pts == VLC_TICK_INVALID )
         return NULL;
 
     /* Create the subpicture unit */
@@ -497,24 +502,25 @@ static subpicture_t *Subtitle( decoder_t *p_dec, eia608_t *h, mtime_t i_pts )
         return NULL;
 
     p_spu->i_start    = i_pts;
-    p_spu->i_stop     = i_pts + 10000000;   /* 10s max */
+    p_spu->i_stop     = i_pts + VLC_TICK_FROM_SEC(10);   /* 10s max */
     p_spu->b_ephemer  = true;
-    p_spu->b_absolute = false;
 
-    subpicture_updater_sys_t *p_spu_sys = p_spu->updater.p_sys;
+    subtext_updater_sys_t *p_spu_sys = p_spu->updater.sys;
+    decoder_sys_t *p_dec_sys = p_dec->p_sys;
 
     /* Set first region defaults */
     /* The "leavetext" alignment is a special mode where the subpicture
        region itself gets aligned, but the text inside it does not */
+    p_spu_sys->region.b_absolute = false; p_spu_sys->region.b_in_window = false;
     p_spu_sys->region.align = SUBPICTURE_ALIGN_TOP|SUBPICTURE_ALIGN_LEFT;
     p_spu_sys->region.inner_align = SUBPICTURE_ALIGN_BOTTOM|SUBPICTURE_ALIGN_LEFT;
     p_spu_sys->region.flags = UPDT_REGION_IGNORE_BACKGROUND | UPDT_REGION_USES_GRID_COORDINATES;
 
     /* Set style defaults (will be added to segments if none set) */
     p_spu_sys->p_default_style->i_style_flags |= STYLE_MONOSPACED;
-    if( p_dec->p_sys->b_opaque )
+    if( p_dec_sys->b_opaque )
     {
-        p_spu_sys->p_default_style->i_background_alpha = STYLE_ALPHA_OPAQUE >> 1;
+        p_spu_sys->p_default_style->i_background_alpha = STYLE_ALPHA_OPAQUE;
         p_spu_sys->p_default_style->i_features |= STYLE_HAS_BACKGROUND_ALPHA;
         p_spu_sys->p_default_style->i_style_flags |= STYLE_BACKGROUND;
     }
@@ -530,7 +536,7 @@ static subpicture_t *Subtitle( decoder_t *p_dec, eia608_t *h, mtime_t i_pts )
     return p_spu;
 }
 
-static void Convert( decoder_t *p_dec, mtime_t i_pts,
+static void Convert( decoder_t *p_dec, vlc_tick_t i_pts,
                      const uint8_t *p_buffer, size_t i_buffer )
 {
     decoder_sys_t *p_sys = p_dec->p_sys;
@@ -540,7 +546,7 @@ static void Convert( decoder_t *p_dec, mtime_t i_pts,
     {
         if( (p_buffer[0] & 0x04) /* Valid bit */ )
         {
-            const mtime_t i_spupts = i_pts + i_ticks * CLOCK_FREQ / (1200/3);
+            const vlc_tick_t i_spupts = i_pts + vlc_tick_from_samples(i_ticks, 1200/3);
             /* Mask off the specific i_field bit, else some sequences can be lost. */
             if ( p_sys->p_eia608 &&
                 (p_buffer[0] & 0x03) == p_sys->i_field )
@@ -557,6 +563,7 @@ static void Convert( decoder_t *p_dec, mtime_t i_pts,
                  * see CEAv1.2zero.trp tests */
                 if( i_status & (EIA608_STATUS_DISPLAY | EIA608_STATUS_CHANGED) )
                 {
+                    Debug(printf("\n"));
                     subpicture_t *p_spu = Subtitle( p_dec, p_sys->p_eia608, i_spupts );
                     if( p_spu )
                         decoder_QueueSub( p_dec, p_spu );
@@ -762,6 +769,7 @@ static eia608_status_t Eia608ParseTextAttribute( eia608_t *h, uint8_t d2 )
     const int i_index = d2 - 0x20;
     assert( d2 >= 0x20 && d2 <= 0x2f );
 
+    Debug(printf("[TA %d]", i_index));
     h->color = pac2_attribs[i_index].i_color;
     h->font  = pac2_attribs[i_index].i_font;
     Eia608Cursor( h, 1 );
@@ -777,7 +785,8 @@ static eia608_status_t Eia608ParseSingle( eia608_t *h, const uint8_t dx )
 static eia608_status_t Eia608ParseDouble( eia608_t *h, uint8_t d2 )
 {
     assert( d2 >= 0x30 && d2 <= 0x3f );
-    Eia608Write( h, d2 + 0x50 ); /* We use charaters 0x80...0x8f */
+    Debug(printf("\033[0;33m%s\033[0m", d2 + 0x50));
+    Eia608Write( h, d2 + 0x50 ); /* We use characters 0x80...0x8f */
     return EIA608_STATUS_CHANGED;
 }
 static eia608_status_t Eia608ParseExtended( eia608_t *h, uint8_t d1, uint8_t d2 )
@@ -785,10 +794,11 @@ static eia608_status_t Eia608ParseExtended( eia608_t *h, uint8_t d1, uint8_t d2 
     assert( d2 >= 0x20 && d2 <= 0x3f );
     assert( d1 == 0x12 || d1 == 0x13 );
     if( d1 == 0x12 )
-        d2 += 0x70; /* We use charaters 0x90-0xaf */
+        d2 += 0x70; /* We use characters 0x90-0xaf */
     else
-        d2 += 0x90; /* We use charaters 0xb0-0xcf */
+        d2 += 0x90; /* We use characters 0xb0-0xcf */
 
+    Debug(printf("[EXT %x->'%c']", d2, d2));
     /* The extended characters replace the previous one with a more
      * advanced one */
     Eia608Cursor( h, -1 );
@@ -798,25 +808,31 @@ static eia608_status_t Eia608ParseExtended( eia608_t *h, uint8_t d1, uint8_t d2 
 static eia608_status_t Eia608ParseCommand0x14( eia608_t *h, uint8_t d2 )
 {
     eia608_status_t i_status = EIA608_STATUS_DEFAULT;
+    eia608_mode_t proposed_mode;
 
     switch( d2 )
     {
     case 0x20:  /* Resume caption loading */
+        Debug(printf("[RCL]"));
         h->mode = EIA608_MODE_POPUP;
         break;
     case 0x21:  /* Backspace */
+        Debug(printf("[BS]"));
         Eia608Erase( h );
         i_status = EIA608_STATUS_CHANGED;
         break;
     case 0x22:  /* Reserved */
     case 0x23:
+        Debug(printf("[ALARM %d]", d2 - 0x22));
         break;
     case 0x24:  /* Delete to end of row */
+        Debug(printf("[DER]"));
         Eia608EraseToEndOfRow( h );
         break;
     case 0x25:  /* Rollup 2 */
     case 0x26:  /* Rollup 3 */
     case 0x27:  /* Rollup 4 */
+        Debug(printf("[RU%d]", d2 - 0x23));
         if( h->mode == EIA608_MODE_POPUP || h->mode == EIA608_MODE_PAINTON )
         {
             Eia608EraseScreen( h, true );
@@ -825,41 +841,53 @@ static eia608_status_t Eia608ParseCommand0x14( eia608_t *h, uint8_t d2 )
         }
 
         if( d2 == 0x25 )
-            h->mode = EIA608_MODE_ROLLUP_2;
+            proposed_mode = EIA608_MODE_ROLLUP_2;
         else if( d2 == 0x26 )
-            h->mode = EIA608_MODE_ROLLUP_3;
+            proposed_mode = EIA608_MODE_ROLLUP_3;
         else
-            h->mode = EIA608_MODE_ROLLUP_4;
+            proposed_mode = EIA608_MODE_ROLLUP_4;
 
-        h->cursor.i_column = 0;
-        h->cursor.i_row = h->i_row_rollup;
+        if ( proposed_mode != h->mode )
+        {
+            h->mode = proposed_mode;
+            h->cursor.i_column = 0;
+            h->cursor.i_row = h->i_row_rollup;
+        }
         break;
     case 0x28:  /* Flash on */
+        Debug(printf("[FON]"));
         /* TODO */
         break;
     case 0x29:  /* Resume direct captionning */
+        Debug(printf("[RDC]"));
         h->mode = EIA608_MODE_PAINTON;
         break;
     case 0x2a:  /* Text restart */
+        Debug(printf("[TR]"));
         /* TODO */
         break;
 
     case 0x2b: /* Resume text display */
+        Debug(printf("[RTD]"));
         h->mode = EIA608_MODE_TEXT;
         break;
 
     case 0x2c: /* Erase displayed memory */
+        Debug(printf("[EDM]"));
         Eia608EraseScreen( h, true );
         i_status = EIA608_STATUS_CHANGED | EIA608_STATUS_CAPTION_CLEARED;
         break;
     case 0x2d: /* Carriage return */
+        Debug(printf("[CR]"));
         Eia608RollUp(h);
         i_status = EIA608_STATUS_CHANGED;
         break;
     case 0x2e: /* Erase non displayed memory */
+        Debug(printf("[ENM]"));
         Eia608EraseScreen( h, false );
         break;
     case 0x2f: /* End of caption (flip screen if not paint on) */
+        Debug(printf("[EOC]"));
         if( h->mode != EIA608_MODE_PAINTON )
             h->i_screen = 1 - h->i_screen;
         h->mode = EIA608_MODE_POPUP;
@@ -877,13 +905,10 @@ static bool Eia608ParseCommand0x17( eia608_t *h, uint8_t d2 )
     switch( d2 )
     {
     case 0x21:  /* Tab offset 1 */
-        Eia608Cursor( h, 1 );
-        break;
     case 0x22:  /* Tab offset 2 */
-        Eia608Cursor( h, 2 );
-        break;
     case 0x23:  /* Tab offset 3 */
-        Eia608Cursor( h, 3 );
+        Debug(printf("[TO%d]", d2 - 0x20));
+        Eia608Cursor( h, d2 - 0x20 );
         break;
     }
     return false;
@@ -895,6 +920,7 @@ static bool Eia608ParsePac( eia608_t *h, uint8_t d1, uint8_t d2 )
     };
     const int i_row_index = ( (d1<<1) & 0x0e) | ( (d2>>5) & 0x01 );
 
+    Debug(printf("[PAC,%d]", i_row_index));
     assert( d2 >= 0x40 && d2 <= 0x7f );
 
     if( pi_row[i_row_index] <= 0 )
@@ -948,12 +974,17 @@ static eia608_status_t Eia608ParseData( eia608_t *h, uint8_t d1, uint8_t d2 )
 #undef ON
     if( d1 >= 0x20 )
     {
+        Debug(printf("\033[0;33m%c", d1));
         i_status = Eia608ParseSingle( h, d1 );
         if( d2 >= 0x20 )
+        {
+            Debug(printf("%c", d2));
             i_status |= Eia608ParseSingle( h, d2 );
+        }
+        Debug(printf("\033[0m"));
     }
 
-    /* Ignore changes occuring to doublebuffer */
+    /* Ignore changes occurring to doublebuffer */
     if( h->mode == EIA608_MODE_POPUP && i_status == EIA608_STATUS_CHANGED )
         i_status = EIA608_STATUS_DEFAULT;
 
@@ -1003,7 +1034,7 @@ static void Eia608TextUtf8( char *psz_utf8, uint8_t c ) // Returns number of byt
         E2( 0x91, 0xc3,0x89), // capital letter E with acute
         E2( 0x92, 0xc3,0x93), // capital letter O with acute
         E2( 0x93, 0xc3,0x9a), // capital letter U with acute
-        E2( 0x94, 0xc3,0x9c), // capital letter U with diaresis
+        E2( 0x94, 0xc3,0x9c), // capital letter U with diaeresis
         E2( 0x95, 0xc3,0xbc), // lowercase letter U with diaeresis
         E1( 0x96, 0x27), // apostrophe
         E2( 0x97, 0xc2,0xa1), // inverted exclamation mark
@@ -1020,11 +1051,11 @@ static void Eia608TextUtf8( char *psz_utf8, uint8_t c ) // Returns number of byt
         E2( 0xa2, 0xc3,0x87), // uppercase C with cedilla
         E2( 0xa3, 0xc3,0x88), // uppercase E, grave accent
         E2( 0xa4, 0xc3,0x8a), // uppercase E, circumflex
-        E2( 0xa5, 0xc3,0x8b), // capital letter E with diaresis
-        E2( 0xa6, 0xc3,0xab), // lowercase letter e with diaresis
+        E2( 0xa5, 0xc3,0x8b), // capital letter E with diaeresis
+        E2( 0xa6, 0xc3,0xab), // lowercase letter e with diaeresis
         E2( 0xa7, 0xc3,0x8e), // uppercase I, circumflex
-        E2( 0xa8, 0xc3,0x8f), // uppercase I, with diaresis
-        E2( 0xa9, 0xc3,0xaf), // lowercase i, with diaresis
+        E2( 0xa8, 0xc3,0x8f), // uppercase I, with diaeresis
+        E2( 0xa9, 0xc3,0xaf), // lowercase i, with diaeresis
         E2( 0xaa, 0xc3,0x94), // uppercase O, circumflex
         E2( 0xab, 0xc3,0x99), // uppercase U, grave accent
         E2( 0xac, 0xc3,0xb9), // lowercase u, grave accent
@@ -1090,7 +1121,7 @@ static void Eia608Strlcat( char *d, const char *s, int i_max )
         d[i_max-1] = '\0';
 }
 
-#define CAT(t) Eia608Strlcat( psz_text, t, i_text_max )
+#define CAT(t) Eia608Strlcat( psz_text, t, ARRAY_SIZE(psz_text) )
 
 static text_segment_t * Eia608TextLine( struct eia608_screen *screen, int i_row )
 {
@@ -1104,8 +1135,7 @@ static text_segment_t * Eia608TextLine( struct eia608_screen *screen, int i_row 
     eia608_font_t prev_font = EIA608_FONT_REGULAR;
 
     char utf8[4];
-    const unsigned i_text_max = 4 * EIA608_SCREEN_COLUMNS + 1;
-    char psz_text[i_text_max + 1];
+    char psz_text[(4 * EIA608_SCREEN_COLUMNS + 1) + 1];
     psz_text[0] = '\0';
 
     /* Search the start */
@@ -1203,10 +1233,10 @@ static text_segment_t * Eia608TextLine( struct eia608_screen *screen, int i_row 
     return p_segments_head;
 }
 
-static void Eia608FillUpdaterRegions( subpicture_updater_sys_t *p_updater, eia608_t *h )
+static void Eia608FillUpdaterRegions( subtext_updater_sys_t *p_updater, eia608_t *h )
 {
     struct eia608_screen *screen = &h->screen[h->i_screen];
-    subpicture_updater_sys_region_t *p_region = &p_updater->region;
+    substext_updater_region_t *p_region = &p_updater->region;
     text_segment_t **pp_last = &p_region->p_segments;
     bool b_newregion = false;
 
@@ -1220,7 +1250,7 @@ static void Eia608FillUpdaterRegions( subpicture_updater_sys_t *p_updater, eia60
         {
             if( b_newregion )
             {
-                subpicture_updater_sys_region_t *p_newregion;
+                substext_updater_region_t *p_newregion;
                 p_newregion = SubpictureUpdaterSysRegionNew();
                 if( !p_newregion )
                 {

@@ -32,11 +32,10 @@ static int Open (vlc_object_t *);
 vlc_module_begin ()
     set_shortname (N_("Karaoke"))
     set_description (N_("Simple Karaoke filter"))
-    set_category (CAT_AUDIO)
     set_subcategory (SUBCAT_AUDIO_AFILTER)
 
     set_capability ("audio filter", 0)
-    set_callbacks (Open, NULL)
+    set_callback(Open)
 vlc_module_end ()
 
 static block_t *Process (filter_t *, block_t *);
@@ -54,7 +53,12 @@ static int Open (vlc_object_t *obj)
     filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
     aout_FormatPrepare(&filter->fmt_in.audio);
     filter->fmt_out.audio = filter->fmt_in.audio;
-    filter->pf_audio_filter = Process;
+
+    static const struct vlc_filter_operations filter_ops =
+    {
+        .filter_audio = Process,
+    };
+    filter->ops = &filter_ops;
     return VLC_SUCCESS;
 }
 

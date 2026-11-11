@@ -2,7 +2,6 @@
  * tta.c : The Lossless True Audio parser
  *****************************************************************************
  * Copyright (C) 2006 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Derk-Jan Hartman <hartman at videolan dot org>
  *
@@ -44,7 +43,6 @@ static void Close ( vlc_object_t * );
 vlc_module_begin ()
     set_shortname( "TTA" )
     set_description( N_("TTA demuxer") )
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_DEMUX )
     set_capability( "demux", 145 )
 
@@ -60,7 +58,7 @@ vlc_module_end ()
 static int Demux  ( demux_t * );
 static int Control( demux_t *, int, va_list );
 
-struct demux_sys_t
+typedef struct
 {
     /* */
     es_out_id_t *p_es;
@@ -75,7 +73,7 @@ struct demux_sys_t
     /* */
     vlc_meta_t     *p_meta;
     int64_t        i_start;
-};
+} demux_sys_t;
 
 /*****************************************************************************
  * Open: initializes ES structures
@@ -135,10 +133,10 @@ static int Open( vlc_object_t * p_this )
     p_sys->i_totalframes = p_sys->i_datalength / p_sys->i_framelength +
                           ((p_sys->i_datalength % p_sys->i_framelength) != 0);
     p_sys->i_currentframe = 0;
-    if( (INT_MAX - 22 - 4) / sizeof(uint32_t) < p_sys->i_totalframes )
+    if( (INT_MAX - 22 - 4) / sizeof(*p_sys->pi_seektable) < p_sys->i_totalframes )
         goto error;
 
-    i_seektable_size = sizeof(uint32_t)*p_sys->i_totalframes;
+    i_seektable_size = sizeof(*p_sys->pi_seektable)*p_sys->i_totalframes;
 
     /* Store the header and Seektable for avcodec */
     fmt.i_extra = 22 + i_seektable_size + 4;
@@ -155,7 +153,7 @@ static int Open( vlc_object_t * p_this )
              != i_seektable_size )
         goto error;
 
-    p_sys->pi_seektable = calloc( p_sys->i_totalframes, sizeof(uint32_t) );
+    p_sys->pi_seektable = calloc( p_sys->i_totalframes, sizeof(*p_sys->pi_seektable) );
     if( !p_sys->pi_seektable )
         goto error;
     for( uint32_t i = 0; i < p_sys->i_totalframes; i++ )
@@ -169,6 +167,9 @@ static int Open( vlc_object_t * p_this )
     p_fullheader += 4;
 
     p_sys->p_es = es_out_Add( p_demux->out, &fmt );
+    if( unlikely(!p_sys->p_es) )
+        goto error;
+
     p_sys->i_start = p_fullheader - (uint8_t *)fmt.p_extra;
     es_format_Clean( &fmt );
 
@@ -202,12 +203,13 @@ static int Demux( demux_t *p_demux )
     block_t     *p_data;
 
     if( p_sys->i_currentframe >= p_sys->i_totalframes )
-        return 0;
+        return VLC_DEMUXER_EOF;
 
     p_data = vlc_stream_Block( p_demux->s,
                                p_sys->pi_seektable[p_sys->i_currentframe] );
-    if( p_data == NULL ) return 0;
-    p_data->i_dts = p_data->i_pts = VLC_TS_0 + (int64_t)(INT64_C(1000000) * p_sys->i_currentframe) * TTA_FRAMETIME;
+    if( p_data == NULL )
+        return VLC_DEMUXER_EOF;
+    p_data->i_dts = p_data->i_pts = VLC_TICK_0 + vlc_tick_from_sec( p_sys->i_currentframe * TTA_FRAMETIME );
 
     p_sys->i_currentframe++;
 
@@ -215,7 +217,7 @@ static int Demux( demux_t *p_demux )
     if( p_sys->p_es )
         es_out_Send( p_demux->out, p_sys->p_es, p_data );
 
-    return 1;
+    return VLC_DEMUXER_SUCCESS;
 }
 
 /*****************************************************************************
@@ -225,7 +227,7 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
 {
     demux_sys_t *p_sys = p_demux->p_sys;
     double   f, *pf;
-    int64_t i64, *pi64;
+    int64_t i64;
 
     switch( i_query )
     {
@@ -264,13 +266,12 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
             return VLC_EGENERIC;
 
         case DEMUX_GET_LENGTH:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = INT64_C(1000000) * p_sys->i_totalframes * TTA_FRAMETIME;
+            *va_arg( args, vlc_tick_t * ) =
+                vlc_tick_from_sec( p_sys->i_totalframes * TTA_FRAMETIME );
             return VLC_SUCCESS;
 
         case DEMUX_GET_TIME:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = INT64_C(1000000) * p_sys->i_currentframe * TTA_FRAMETIME;
+            *va_arg( args, vlc_tick_t * ) = vlc_tick_from_sec( p_sys->i_currentframe * TTA_FRAMETIME );
             return VLC_SUCCESS;
 
         case DEMUX_CAN_PAUSE:

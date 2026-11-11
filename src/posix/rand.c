@@ -2,7 +2,6 @@
  * rand.c : non-predictible random bytes generator
  *****************************************************************************
  * Copyright © 2007 Rémi Denis-Courmont
- * $Id$
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -31,12 +30,36 @@
 #include <stdlib.h>
 
 #include <sys/types.h>
+#ifdef HAVE_GETRANDOM
+#include <sys/random.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <vlc_fs.h>
 
-#include <vlc_md5.h>
+#include <vlc_hash.h>
+#include <vlc_tick.h>
+#include <vlc_threads.h>
+
+static ssize_t vlc_getrandom(unsigned char *buf, size_t len)
+{
+    ssize_t val;
+
+#ifdef HAVE_GETRANDOM
+    val = getrandom(buf, len, 0);
+    if (val >= 0)
+        return val;
+
+    /* ENOSYS fallback */
+#endif
+    int fd = vlc_open("/dev/urandom", O_RDONLY);
+    if (fd < 0)
+        return -1;
+
+    val = read(fd, buf, len);
+    vlc_close(fd);
+    return val;
+}
 
 /*
  * Pseudo-random number generator using a HMAC-MD5 in counter mode.
@@ -49,18 +72,12 @@ static uint8_t okey[BLOCK_SIZE], ikey[BLOCK_SIZE];
 
 static void vlc_rand_init (void)
 {
-    uint8_t key[BLOCK_SIZE];
+    uint8_t key[BLOCK_SIZE] = { };
+    ssize_t val = 0;
 
     /* Get non-predictible value as key for HMAC */
-    int fd = vlc_open ("/dev/urandom", O_RDONLY);
-    if (fd == -1)
-        return; /* Uho! */
-
-    for (size_t i = 0; i < sizeof (key);)
-    {
-         ssize_t val = read (fd, key + i, sizeof (key) - i);
-         if (val > 0)
-             i += val;
+    for (size_t i = 0; i < sizeof (key) && val > 0; i += val) {
+        val = vlc_getrandom(key + i, sizeof (key) - i);
     }
 
     /* Precompute outer and inner keys for HMAC */
@@ -69,49 +86,48 @@ static void vlc_rand_init (void)
         okey[i] = key[i] ^ 0x5c;
         ikey[i] = key[i] ^ 0x36;
     }
-
-    vlc_close (fd);
 }
 
 
 void vlc_rand_bytes (void *buf, size_t len)
 {
-    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static vlc_mutex_t lock = VLC_STATIC_MUTEX;
     static uint64_t counter = 0;
+    struct timespec ts;
 
-    uint64_t stamp = NTPtime64 ();
+    timespec_get(&ts, TIME_UTC);
 
     while (len > 0)
     {
         uint64_t val;
-        struct md5_s mdi, mdo;
+        vlc_hash_md5_t mdi, mdo;
+        uint8_t mdi_buf[VLC_HASH_MD5_DIGEST_SIZE];
+        uint8_t mdo_buf[VLC_HASH_MD5_DIGEST_SIZE];
 
-        InitMD5 (&mdi);
-        InitMD5 (&mdo);
+        vlc_hash_md5_Init (&mdi);
+        vlc_hash_md5_Init (&mdo);
 
-        pthread_mutex_lock (&lock);
+        vlc_mutex_lock (&lock);
         if (counter == 0)
             vlc_rand_init ();
         val = counter++;
 
-        AddMD5 (&mdi, ikey, sizeof (ikey));
-        AddMD5 (&mdo, okey, sizeof (okey));
-        pthread_mutex_unlock (&lock);
+        vlc_hash_md5_Update (&mdi, ikey, sizeof (ikey));
+        vlc_hash_md5_Update (&mdo, okey, sizeof (okey));
+        vlc_mutex_unlock (&lock);
 
-        AddMD5 (&mdi, &stamp, sizeof (stamp));
-        AddMD5 (&mdi, &val, sizeof (val));
-        EndMD5 (&mdi);
-        AddMD5 (&mdo, mdi.buf, 16);
-        EndMD5 (&mdo);
+        vlc_hash_md5_Update (&mdi, &ts, sizeof (ts));
+        vlc_hash_md5_Update (&mdi, &val, sizeof (val));
+        vlc_hash_md5_Finish (&mdi, mdi_buf, sizeof(mdi_buf));
+        vlc_hash_md5_Update (&mdo, mdi_buf, sizeof(mdi_buf));
+        vlc_hash_md5_Finish (&mdo, mdo_buf, sizeof(mdo_buf));
 
-        if (len < 16)
-        {
-            memcpy (buf, mdo.buf, len);
+        memcpy (buf, mdo_buf, (len < sizeof(mdo_buf)) ? len : sizeof(mdo_buf));
+
+        if (len < sizeof(mdo_buf))
             break;
-        }
 
-        memcpy (buf, mdo.buf, 16);
-        len -= 16;
-        buf = ((uint8_t *)buf) + 16;
+        len -= sizeof(mdo_buf);
+        buf = ((uint8_t *)buf) + sizeof(mdo_buf);
     }
 }

@@ -2,7 +2,6 @@
  * file_bitmap.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -36,7 +35,7 @@ public:
     /// Load a bitmap from a file. aColor is the transparency
     /// color, in the format 0xRRGGBB
     FileBitmap( intf_thread_t *pIntf, image_handler_t *pImageHandler,
-                std::string fileName, uint32_t aColor, int nbFrames = 1,
+                const std::string &fileName, uint32_t aColor, int nbFrames = 1,
                 int fps = 0, int nbLoops = 0 );
 
     virtual ~FileBitmap();

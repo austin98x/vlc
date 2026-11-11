@@ -2,7 +2,6 @@
  * anaglyph.c : Create an image compatible with anaglyph glasses from a 3D video
  *****************************************************************************
  * Copyright (C) 2000-2012 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea .t videolan d@t org>
  *
@@ -26,14 +25,13 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
 #include "filter_picture.h"
 
-static int Create(vlc_object_t *);
-static void Destroy(vlc_object_t *);
-static picture_t *Filter(filter_t *, picture_t *);
+static int Create(filter_t *);
 static void combine_side_by_side_yuv420(picture_t *, picture_t *, int, int);
 
 #define SCHEME_TEXT N_("Color scheme")
@@ -60,42 +58,38 @@ static const char *const ppsz_scheme_values[] = {
     "magenta-cyan",
     };
 static const char *const ppsz_scheme_descriptions[] = {
-    "pure red (left)  pure green (right)",
-    "pure red (left)  pure blue (right)",
-    "pure red (left)  pure cyan (right)",
-    "pure green (left)  pure magenta (right)",
-    "magenta (left)  cyan (right)",
+    N_("pure red (left)  pure green (right)"),
+    N_("pure red (left)  pure blue (right)"),
+    N_("pure red (left)  pure cyan (right)"),
+    N_("pure green (left)  pure magenta (right)"),
+    N_("magenta (left)  cyan (right)"),
     };
 
 vlc_module_begin()
-    set_description(N_("Convert 3D picture to anaglyph image video filter"));
+    set_description(N_("Convert 3D picture to anaglyph image video filter"))
     set_shortname(N_("Anaglyph"))
-    set_category(CAT_VIDEO)
     set_subcategory(SUBCAT_VIDEO_VFILTER)
-    set_capability("video filter", 0)
-    add_string(FILTER_PREFIX "scheme", "red-cyan", SCHEME_TEXT, SCHEME_LONGTEXT, false)
+    add_string(FILTER_PREFIX "scheme", "red-cyan", SCHEME_TEXT, SCHEME_LONGTEXT)
         change_string_list(ppsz_scheme_values, ppsz_scheme_descriptions)
-    set_callbacks(Create, Destroy)
+    set_callback_video_filter(Create)
 vlc_module_end()
 
 static const char *const ppsz_filter_options[] = {
     "scheme", NULL
 };
 
-struct filter_sys_t
+typedef struct
 {
     int left, right;
-};
+} filter_sys_t;
 
+VIDEO_FILTER_WRAPPER(Filter)
 
-static int Create(vlc_object_t *p_this)
+static int Create(filter_t *p_filter)
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     switch (p_filter->fmt_in.video.i_chroma)
     {
         case VLC_CODEC_I420:
-        case VLC_CODEC_J420:
         case VLC_CODEC_YV12:
             break;
 
@@ -105,8 +99,8 @@ static int Create(vlc_object_t *p_this)
             return VLC_EGENERIC;
     }
 
-    p_filter->p_sys = malloc(sizeof(filter_sys_t));
-    if (!p_filter->p_sys)
+    p_filter->p_sys = vlc_obj_malloc(VLC_OBJECT(p_filter), sizeof(filter_sys_t));
+    if (unlikely(!p_filter->p_sys))
         return VLC_ENOMEM;
     filter_sys_t *p_sys = p_filter->p_sys;
 
@@ -157,48 +151,25 @@ static int Create(vlc_object_t *p_this)
             break;
     }
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
     return VLC_SUCCESS;
 }
 
-static void Destroy(vlc_object_t *p_this)
-{
-    filter_t *p_filter = (filter_t *)p_this;
-    filter_sys_t *p_sys = p_filter->p_sys;
-    free(p_sys);
-}
-
-static picture_t *Filter(filter_t *p_filter, picture_t *p_pic)
+static void Filter(filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic)
 {
     filter_sys_t *p_sys = p_filter->p_sys;
-
-    if (!p_pic)
-        return NULL;
-
-    picture_t *p_outpic = filter_NewPicture(p_filter);
-    if (!p_outpic)
-    {
-        picture_Release(p_pic);
-        return NULL;
-    }
 
     switch (p_pic->format.i_chroma)
     {
         case VLC_CODEC_I420:
-        case VLC_CODEC_J420:
         case VLC_CODEC_YV12:
             combine_side_by_side_yuv420(p_pic, p_outpic,
                                         p_sys->left, p_sys->right);
             break;
 
         default:
-            msg_Warn(p_filter, "Unsupported input chroma (%4.4s)",
-                     (char*)&(p_pic->format.i_chroma));
-            picture_Release(p_pic);
-            return NULL;
+            vlc_assert_unreachable();
     }
-
-    return CopyInfoAndRelease(p_outpic, p_pic);
 }
 
 
@@ -302,4 +273,3 @@ static void combine_side_by_side_yuv420(picture_t *p_inpic, picture_t *p_outpic,
         vout += p_outpic->p[V_PLANE].i_pitch - uv_visible_pitch;
     }
 }
-

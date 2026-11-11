@@ -30,24 +30,26 @@
 # include "config.h"
 #endif
 
+#ifdef HAVE_LIBVORBIS
+  #include <vorbis/codec.h>
+#endif
+
 #include <vlc_common.h>
 #include <vlc_demux.h>
 
 #include <ogg/ogg.h>
 #include <limits.h>
-
+#include <math.h>
 #include <assert.h>
 
 #include "ogg.h"
 #include "oggseek.h"
-
-/* Theora spec 7.1 */
-#define THEORA_FTYPE_NOTDATA       0x80
-#define THEORA_FTYPE_INTERFRAME    0x40
+#include "ogg_granule.h"
 
 #define SEGMENT_NOT_FOUND -1
 
 #define MAX_PAGE_SIZE 65307
+#define MIN_PAGE_SIZE 27
 typedef struct packetStartCoordinates
 {
     int64_t i_pos;
@@ -55,14 +57,6 @@ typedef struct packetStartCoordinates
     int64_t i_skip;
 } packetStartCoordinates;
 
-//#define OGG_SEEK_DEBUG 1
-#ifdef OGG_SEEK_DEBUG
-  #define OggDebug(code) code
-  #define OggNoDebug(code)
-#else
-  #define OggDebug(code)
-  #define OggNoDebug(code) code
-#endif
 /************************************************************
 * index entries
 *************************************************************/
@@ -84,75 +78,52 @@ void oggseek_index_entries_free ( demux_index_entry_t *idx )
 
 /* internal function to create a new list member */
 
-static demux_index_entry_t *index_entry_new( void )
+static demux_index_entry_t *index_entry_new( vlc_tick_t i_timestamp, int64_t i_pagepos )
 {
-    demux_index_entry_t *idx = xmalloc( sizeof( demux_index_entry_t ) );
-    if ( !idx ) return NULL;
-    idx->p_next = idx->p_prev = NULL;
-    idx->i_pagepos_end = -1;
+    if ( i_timestamp == VLC_TICK_INVALID || i_pagepos < 1 )
+        return NULL;
+
+    demux_index_entry_t *idx = malloc( sizeof(*idx) );
+    if ( idx )
+    {
+        idx->i_value = i_timestamp;
+        idx->i_pagepos = i_pagepos;
+        idx->p_next = NULL;
+    }
     return idx;
 }
 
 /* We insert into index, sorting by pagepos (as a page can match multiple
    time stamps) */
 const demux_index_entry_t *OggSeek_IndexAdd ( logical_stream_t *p_stream,
-                                             int64_t i_timestamp,
+                                             vlc_tick_t i_timestamp,
                                              int64_t i_pagepos )
 {
-    demux_index_entry_t *idx;
-    demux_index_entry_t *last_idx = NULL;
-
-    if ( p_stream == NULL ) return NULL;
-
-    idx = p_stream->idx;
-
-    if ( i_timestamp < 1 || i_pagepos < 1 ) return NULL;
-
-    if ( idx == NULL )
+    demux_index_entry_t **pp_next = &p_stream->idx;
+    for( ; *pp_next; )
     {
-        demux_index_entry_t *ie = index_entry_new();
-        if ( !ie ) return NULL;
-        ie->i_value = i_timestamp;
-        ie->i_pagepos = i_pagepos;
-        p_stream->idx = ie;
-        return ie;
+        if( (*pp_next)->i_pagepos >= i_pagepos )
+        {
+            if( (*pp_next)->i_pagepos == i_pagepos )
+                return NULL;
+            break;
+        }
+        pp_next = &((*pp_next)->p_next);
     }
 
-    while ( idx != NULL )
+    demux_index_entry_t *ie = index_entry_new( i_timestamp, i_pagepos );
+    if ( ie )
     {
-        if ( idx->i_pagepos > i_pagepos ) break;
-        last_idx = idx;
-        idx = idx->p_next;
+        ie->p_next = *pp_next;
+        *pp_next = ie;
     }
 
-    /* new entry; insert after last_idx */
-    idx = index_entry_new();
-    if ( !idx ) return NULL;
-    if ( last_idx != NULL )
-    {
-        idx->p_next = last_idx->p_next;
-        last_idx->p_next = idx;
-        idx->p_prev = last_idx;
-    }
-    else
-    {
-        idx->p_next = p_stream->idx;
-        p_stream->idx = idx;
-    }
-
-    if ( idx->p_next != NULL )
-    {
-        idx->p_next->p_prev = idx;
-    }
-
-    idx->i_value = i_timestamp;
-    idx->i_pagepos = i_pagepos;
-
-    return idx;
+    return ie;
 }
 
-static bool OggSeekIndexFind ( logical_stream_t *p_stream, int64_t i_timestamp,
-                               int64_t *pi_pos_lower, int64_t *pi_pos_upper )
+static bool OggSeekIndexFind ( logical_stream_t *p_stream, vlc_tick_t i_timestamp,
+                               int64_t *pi_pos_lower, int64_t *pi_pos_upper,
+                               vlc_tick_t *pi_lower_timestamp )
 {
     demux_index_entry_t *idx = p_stream->idx;
 
@@ -163,11 +134,13 @@ static bool OggSeekIndexFind ( logical_stream_t *p_stream, int64_t i_timestamp,
             if ( !idx->p_next ) /* found on last index */
             {
                 *pi_pos_lower = idx->i_pagepos;
+                *pi_lower_timestamp = idx->i_value;
                 return true;
             }
             if ( idx->p_next->i_value > i_timestamp )
             {
                 *pi_pos_lower = idx->i_pagepos;
+                *pi_lower_timestamp = idx->i_value;
                 *pi_pos_upper = idx->p_next->i_pagepos;
                 return true;
             }
@@ -208,11 +181,11 @@ static int64_t get_data( demux_t *p_demux, int64_t i_bytes_to_read )
     char *buf;
     int64_t i_result;
 
-    if ( p_sys->i_total_length > 0 )
+    if ( p_sys->i_total_bytes > 0 )
     {
-        if ( p_sys->i_input_position + i_bytes_to_read > p_sys->i_total_length )
+        if ( p_sys->i_input_position + i_bytes_to_read > p_sys->i_total_bytes )
         {
-            i_bytes_to_read = p_sys->i_total_length - p_sys->i_input_position;
+            i_bytes_to_read = p_sys->i_total_bytes - p_sys->i_input_position;
             if ( i_bytes_to_read <= 0 ) {
                 return 0;
             }
@@ -224,6 +197,8 @@ static int64_t get_data( demux_t *p_demux, int64_t i_bytes_to_read )
     seek_byte ( p_demux, p_sys->i_input_position );
 
     buf = ogg_sync_buffer( &p_sys->oy, i_bytes_to_read );
+    if( !buf )
+        return 0;
 
     i_result = vlc_stream_Read( p_demux->s, buf, i_bytes_to_read );
 
@@ -289,27 +264,38 @@ void Oggseek_ProbeEnd( demux_t *p_demux )
                     if ( p_sys->pp_stream[i]->i_serial_no != ogg_page_serialno( &page ) )
                         continue;
 
-                    i_length = Oggseek_GranuleToAbsTimestamp( p_sys->pp_stream[i], i_granule, false );
-                    p_sys->i_length = __MAX( p_sys->i_length, i_length / 1000000 );
+                    i_length = Ogg_GranuleToTime( p_sys->pp_stream[i], i_granule,
+                                                  !p_sys->pp_stream[i]->b_contiguous, false );
+                    if( i_length != VLC_TICK_INVALID )
+                    {
+                        /* We found at least a page with valid granule */
+                        p_sys->i_length = __MAX( p_sys->i_length, i_length - VLC_TICK_0 );
+                    }
                     break;
                 }
             }
-            if ( i_length > 0 ) break;
         }
 
-        /* We found at least a page with valid granule */
-        if ( i_length > 0 ) break;
+        if( i_startpos == i_lowerbound ||
+            p_sys->i_length != VLC_TICK_INVALID )
+            goto clean;
+
+        int64_t i_next_upperbound = __MIN(i_startpos + MIN_PAGE_SIZE, i_upperbound);
 
         /* Otherwise increase read size, starting earlier */
-        if ( i_backoffset <= ( UINT_MAX >> 1 ) )
+        if ( i_backoffset <= MAX_PAGE_SIZE )
         {
             i_backoffset <<= 1;
             i_startpos = i_upperbound - i_backoffset;
         }
         else
         {
-            i_startpos -= i_backoffset;
+            i_startpos = i_upperbound - MAX_PAGE_SIZE;
         }
+
+        i_upperbound = i_next_upperbound;
+
+        i_startpos = __MAX( i_startpos, i_lowerbound );
         i_pos = i_startpos;
 
         if ( vlc_stream_Seek( p_demux->s, i_pos ) )
@@ -323,6 +309,15 @@ clean:
     ogg_stream_clear( &os );
 }
 
+static void update_page_type( logical_stream_t *p_stream, int64_t i_granule )
+{
+    if( i_granule == 0 )
+        p_stream->page_type = OGGPAGE_HEADER;
+    else if( p_stream->page_type == OGGPAGE_HEADER )
+        p_stream->page_type = OGGPAGE_FIRST;
+    else
+        p_stream->page_type = OGGPAGE_OTHER;
+}
 
 static int64_t find_first_page_granule( demux_t *p_demux,
                                 int64_t i_pos1, int64_t i_pos2,
@@ -340,9 +335,6 @@ static int64_t find_first_page_granule( demux_t *p_demux,
     ogg_packet op;
 
     seek_byte( p_demux, i_pos1 );
-
-    if ( i_pos1 == p_stream->i_data_start )
-        return p_sys->i_input_position;
 
     if ( i_bytes_to_read > OGGSEEK_BYTES_TO_READ ) i_bytes_to_read = OGGSEEK_BYTES_TO_READ;
 
@@ -388,6 +380,10 @@ static int64_t find_first_page_granule( demux_t *p_demux,
     seek_byte( p_demux, p_sys->i_input_position );
     ogg_stream_reset( &p_stream->os );
 
+    /* prevent reading the whole file if stream is gone */
+    if( i_pos2 > p_sys->i_input_position + OGGSEEK_SERIALNO_MAX_LOOKUP_BYTES )
+        i_pos2 = p_sys->i_input_position + OGGSEEK_SERIALNO_MAX_LOOKUP_BYTES;
+
     while( 1 )
     {
 
@@ -415,6 +411,7 @@ static int64_t find_first_page_granule( demux_t *p_demux,
 
         if ( ogg_page_granulepos( &p_sys->current_page ) <= 0 )
         {
+            update_page_type( p_stream, ogg_page_granulepos(( &p_sys->current_page )) );
             /* A negative granulepos means that the packet continues on the
              * next page => read the next page */
             p_sys->i_input_position += i_result;
@@ -431,56 +428,12 @@ static int64_t find_first_page_granule( demux_t *p_demux,
         if ( i_packets_checked )
         {
             *i_granulepos = ogg_page_granulepos( &p_sys->current_page );
-            return i_pos1;
+            return p_sys->i_input_position;
         }
 
         /*  -> start of next page */
         p_sys->i_input_position += i_result;
-        i_pos1 = p_sys->i_input_position;
     }
-}
-
-/* Checks if current packet matches codec keyframe */
-bool Ogg_IsKeyFrame( logical_stream_t *p_stream, ogg_packet *p_packet )
-{
-    if ( p_stream->b_oggds )
-    {
-        return ( p_packet->bytes > 0 && p_packet->packet[0] & PACKET_IS_SYNCPOINT );
-    }
-    else switch ( p_stream->fmt.i_codec )
-    {
-    case VLC_CODEC_THEORA:
-    case VLC_CODEC_DAALA: /* Same convention used in daala */
-        if ( p_packet->bytes <= 0 || p_packet->packet[0] & THEORA_FTYPE_NOTDATA )
-            return false;
-        else
-            return !( p_packet->packet[0] & THEORA_FTYPE_INTERFRAME );
-    case VLC_CODEC_VP8:
-        return ( ( ( p_packet->granulepos >> 3 ) & 0x07FFFFFF ) == 0 );
-    case VLC_CODEC_DIRAC:
-        return ( p_packet->granulepos & 0xFF8000FF );
-    default:
-        return true;
-    }
-}
-
-int64_t Ogg_GetKeyframeGranule( logical_stream_t *p_stream, int64_t i_granule )
-{
-    if ( p_stream->b_oggds )
-    {
-           return -1; /* We have no way to know */
-    }
-    else if( p_stream->fmt.i_codec == VLC_CODEC_THEORA ||
-             p_stream->fmt.i_codec == VLC_CODEC_DAALA )
-    {
-        return ( i_granule >> p_stream->i_granule_shift ) << p_stream->i_granule_shift;
-    }
-    else if( p_stream->fmt.i_codec == VLC_CODEC_DIRAC )
-    {
-        return ( i_granule >> 31 ) << 31;
-    }
-    /* No change, that's keyframe or it can't be shifted out (oggds) */
-    return i_granule;
 }
 
 static bool OggSeekToPacket( demux_t *p_demux, logical_stream_t *p_stream,
@@ -493,6 +446,8 @@ static bool OggSeekToPacket( demux_t *p_demux, logical_stream_t *p_stream,
         return false;
     p_sys->b_page_waiting = true;
     int i=0;
+
+    update_page_type( p_stream, ogg_page_granulepos( &p_sys->current_page ) );
 
     int64_t itarget_frame = Ogg_GetKeyframeGranule( p_stream, i_granulepos );
     int64_t iframe = Ogg_GetKeyframeGranule( p_stream, ogg_page_granulepos( &p_sys->current_page ) );
@@ -521,7 +476,6 @@ static bool OggSeekToPacket( demux_t *p_demux, logical_stream_t *p_stream,
                 msg_Dbg(p_demux, "** KEYFRAME PACKET START pageno %"PRId64" OFFSET %"PRId64" skip %"PRId64" **", p_lastpacketcoords->i_pageno, p_lastpacketcoords->i_pos, p_lastpacketcoords->i_skip );
                 msg_Dbg(p_demux, "KEYFRAME PACKET IS at pageno %"PRId64" OFFSET %"PRId64" with skip %d packet (%d / %d) ",
                     ogg_page_pageno( &p_sys->current_page ), p_sys->i_input_position, i, i+1, ogg_page_packets( &p_sys->current_page ) );
-                DemuxDebug( p_sys->b_seeked = true; )
             );
 
             if ( i != 0 ) /* Not continued packet */
@@ -673,86 +627,9 @@ restart:
     return i_result;
 }
 
-/* Dont use b_presentation with frames granules ! */
-int64_t Oggseek_GranuleToAbsTimestamp( logical_stream_t *p_stream,
-                                       int64_t i_granule, bool b_presentation )
-{
-    int64_t i_timestamp = -1;
-    if ( i_granule < 1 )
-        return -1;
-
-    if ( p_stream->b_oggds )
-    {
-        if ( b_presentation ) i_granule--;
-        i_timestamp = i_granule * CLOCK_FREQ / p_stream->f_rate;
-    }
-    else  switch( p_stream->fmt.i_codec )
-    {
-    case VLC_CODEC_THEORA:
-    case VLC_CODEC_DAALA:
-    case VLC_CODEC_KATE:
-    {
-        ogg_int64_t iframe = i_granule >> p_stream->i_granule_shift;
-        ogg_int64_t pframe = i_granule - ( iframe << p_stream->i_granule_shift );
-        /* See Theora A.2.3 */
-        if ( b_presentation ) pframe -= p_stream->i_keyframe_offset;
-        i_timestamp = ( iframe + pframe ) * CLOCK_FREQ / p_stream->f_rate;
-        break;
-    }
-    case VLC_CODEC_VP8:
-    {
-        ogg_int64_t frame = i_granule >> p_stream->i_granule_shift;
-        if ( b_presentation ) frame--;
-        i_timestamp = frame * CLOCK_FREQ / p_stream->f_rate;
-        break;
-    }
-    case VLC_CODEC_DIRAC:
-    {
-        ogg_int64_t i_dts = i_granule >> 31;
-        ogg_int64_t delay = (i_granule >> 9) & 0x1fff;
-        /* NB, OggDirac granulepos values are in units of 2*picturerate */
-        double f_rate = p_stream->f_rate;
-        if ( !p_stream->special.dirac.b_interlaced ) f_rate *= 2;
-        if ( b_presentation ) i_dts += delay;
-        i_timestamp = i_dts * CLOCK_FREQ / f_rate;
-        break;
-    }
-    case VLC_CODEC_OPUS:
-    {
-        if ( b_presentation ) return VLC_TS_INVALID;
-        i_timestamp = ( i_granule - p_stream->i_pre_skip ) * CLOCK_FREQ / 48000;
-        break;
-    }
-    case VLC_CODEC_VORBIS:
-    case VLC_CODEC_FLAC:
-    {
-        if ( b_presentation ) return VLC_TS_INVALID;
-        i_timestamp = i_granule * CLOCK_FREQ / p_stream->f_rate;
-        break;
-    }
-    case VLC_CODEC_SPEEX:
-    {
-        if ( b_presentation )
-            i_granule -= p_stream->special.speex.i_framesize *
-                         p_stream->special.speex.i_framesperpacket;
-        i_timestamp = i_granule * CLOCK_FREQ / p_stream->f_rate;
-        break;
-    }
-    case VLC_CODEC_OGGSPOTS:
-    {
-        if ( b_presentation ) return VLC_TS_INVALID;
-        i_timestamp = ( i_granule >> p_stream->i_granule_shift )
-                * CLOCK_FREQ / p_stream->f_rate;
-        break;
-    }
-    }
-
-    return i_timestamp;
-}
-
 /* returns pos */
 static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stream,
-            int64_t i_targettime, int64_t i_pos_lower, int64_t i_pos_upper)
+            vlc_tick_t i_targettime, int64_t i_pos_lower, int64_t i_pos_upper, int64_t *pi_seek_time)
 {
     int64_t i_start_pos;
     int64_t i_end_pos;
@@ -761,17 +638,17 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
     struct
     {
         int64_t i_pos;
-        int64_t i_timestamp;
+        vlc_tick_t i_timestamp;
         int64_t i_granule;
-    } bestlower = { p_stream->i_data_start, -1, -1 },
-      current = { -1, -1, -1 },
-      lowestupper = { -1, -1, -1 };
+    } bestlower = { p_stream->i_data_start, VLC_TICK_INVALID, -1 },
+      current = { -1, VLC_TICK_INVALID, -1 },
+      lowestupper = { -1, VLC_TICK_INVALID, -1 };
 
     demux_sys_t *p_sys  = p_demux->p_sys;
 
     i_pos_lower = __MAX( i_pos_lower, p_stream->i_data_start );
-    i_pos_upper = __MIN( i_pos_upper, p_sys->i_total_length );
-    if ( i_pos_upper < 0 ) i_pos_upper = p_sys->i_total_length;
+    i_pos_upper = __MIN( i_pos_upper, p_sys->i_total_bytes );
+    if ( i_pos_upper < 0 ) i_pos_upper = p_sys->i_total_bytes;
 
     i_start_pos = i_pos_lower;
     i_end_pos = i_pos_upper;
@@ -781,6 +658,22 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
 
     OggDebug( msg_Dbg(p_demux, "Bisecting for time=%"PRId64" between %"PRId64" and %"PRId64,
             i_targettime, i_pos_lower, i_pos_upper ) );
+
+    /* Check lowest possible bound that will never be checked in bisection */
+    current.i_pos = find_first_page_granule( p_demux,
+                                             i_pos_lower,
+                                             __MIN(i_start_pos + PAGE_HEADER_BYTES, i_end_pos),
+                                             p_stream,
+                                             &current.i_granule );
+    if( current.i_granule != -1 )
+    {
+        current.i_timestamp = Ogg_GranuleToTime( p_stream, current.i_granule,
+                                                 !p_stream->b_contiguous, false );
+        if( current.i_timestamp <= i_targettime )
+            bestlower = current;
+        else
+            lowestupper = current;
+    }
 
     do
     {
@@ -803,15 +696,15 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
                                                  p_stream,
                                                  &current.i_granule );
 
-        current.i_timestamp = Oggseek_GranuleToAbsTimestamp( p_stream,
-                                                             current.i_granule, false );
+        current.i_timestamp = Ogg_GranuleToTime( p_stream, current.i_granule,
+                                                 !p_stream->b_contiguous, false );
 
-        if ( current.i_timestamp == -1 && current.i_granule > 0 )
+        if ( current.i_timestamp == VLC_TICK_INVALID && current.i_granule > 0 )
         {
             msg_Err( p_demux, "Unmatched granule. New codec ?" );
             return -1;
         }
-        else if ( current.i_timestamp < -1 )  /* due to preskip with some codecs */
+        else if ( current.i_timestamp < 0 )  /* due to preskip with some codecs */
         {
             current.i_timestamp = 0;
         }
@@ -827,9 +720,10 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
                     bestlower = current;
                 i_start_pos = current.i_pos;
             }
-            else if ( current.i_timestamp > i_targettime )
+            else
             {
-                if ( lowestupper.i_timestamp == -1 || current.i_timestamp < lowestupper.i_timestamp )
+                if ( lowestupper.i_timestamp == VLC_TICK_INVALID ||
+                     current.i_timestamp < lowestupper.i_timestamp )
                     lowestupper = current;
                 /* check lower half of segment */
                 i_start_pos -= i_segsize;
@@ -850,7 +744,7 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
         i_segsize = ( i_end_pos - i_start_pos + 1 ) >> 1;
         i_start_pos += i_segsize;
 
-    } while ( i_segsize > 64 );
+    } while ( i_segsize > PAGE_HEADER_BYTES );
 
     if ( bestlower.i_granule == -1 )
     {
@@ -866,6 +760,7 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
                 __MAX ( bestlower.i_pos - OGGSEEK_BYTES_TO_READ, p_stream->i_data_start ),
                 bestlower.i_pos,
                 p_stream, bestlower.i_granule /* unused */ );
+        *pi_seek_time = bestlower.i_timestamp;
         return a;
     }
     /* If not each packet is usable as keyframe, query the codec for keyframe */
@@ -877,16 +772,19 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
                            i_keyframegranule >> p_stream->i_granule_shift,
                            bestlower.i_granule,
                            i_pos_upper,
-                           Oggseek_GranuleToAbsTimestamp( p_stream, i_keyframegranule, false ) ) );
+                           Ogg_GranuleToTime( p_stream, i_keyframegranule, !p_stream->b_contiguous, false ) ) );
 
         OggDebug( msg_Dbg( p_demux, "Seeking back to %"PRId64, __MAX ( bestlower.i_pos - OGGSEEK_BYTES_TO_READ, p_stream->i_data_start ) ) );
 
         int64_t a = OggBackwardSeekToFrame( p_demux,
             __MAX ( bestlower.i_pos - OGGSEEK_BYTES_TO_READ, p_stream->i_data_start ),
             stream_Size( p_demux->s ), p_stream, i_keyframegranule );
+       *pi_seek_time = Ogg_GranuleToTime( p_stream, i_keyframegranule,
+                                          !p_stream->b_contiguous, false );
         return a;
     }
 
+    *pi_seek_time = bestlower.i_timestamp;
     return bestlower.i_pos;
 }
 
@@ -896,7 +794,7 @@ static int64_t OggBisectSearchByTime( demux_t *p_demux, logical_stream_t *p_stre
  *************************************************************************/
 
 int Oggseek_BlindSeektoAbsoluteTime( demux_t *p_demux, logical_stream_t *p_stream,
-                                     int64_t i_time, bool b_fastseek )
+                                     vlc_tick_t i_time, bool b_fastseek )
 {
     demux_sys_t *p_sys  = p_demux->p_sys;
     int64_t i_lowerpos = -1;
@@ -908,32 +806,27 @@ int Oggseek_BlindSeektoAbsoluteTime( demux_t *p_demux, logical_stream_t *p_strea
     if ( i_lowerpos != -1 ) b_found = true;
 
     /* And also search in our own index */
-    if ( !b_found && OggSeekIndexFind( p_stream, i_time, &i_lowerpos, &i_upperpos ) )
+    vlc_tick_t foo;
+    if ( !b_found && OggSeekIndexFind( p_stream, i_time, &i_lowerpos, &i_upperpos, &foo ) )
     {
         b_found = true;
     }
 
-    /* Or try to be smart with audio fixed bitrate streams */
-    if ( !b_found && p_stream->fmt.i_cat == AUDIO_ES && p_sys->i_streams == 1
-         && p_sys->i_bitrate && Ogg_GetKeyframeGranule( p_stream, 0xFF00FF00 ) == 0xFF00FF00 )
-    {
-        /* But only if there's no keyframe/preload requirements */
-        /* FIXME: add function to get preload time by codec, ex: opus */
-        i_lowerpos = i_time * p_sys->i_bitrate / INT64_C(8000000);
-        b_found = true;
-    }
+    /* FIXME: add function to get preload time by codec, ex: opus */
 
     /* or search */
     if ( !b_found && b_fastseek )
     {
+        int64_t i_sync_time;
         i_lowerpos = OggBisectSearchByTime( p_demux, p_stream, i_time,
-                                            p_stream->i_data_start, p_sys->i_total_length );
+                                            p_stream->i_data_start, p_sys->i_total_bytes,
+                                            &i_sync_time );
         b_found = ( i_lowerpos != -1 );
     }
 
     if ( !b_found ) return -1;
 
-    if ( i_lowerpos < p_stream->i_data_start || i_upperpos > p_sys->i_total_length )
+    if ( i_lowerpos < p_stream->i_data_start || i_upperpos > p_sys->i_total_bytes )
         return -1;
 
     /* And really do seek */
@@ -950,6 +843,7 @@ int Oggseek_BlindSeektoPosition( demux_t *p_demux, logical_stream_t *p_stream,
     demux_sys_t *p_sys = p_demux->p_sys;
     OggDebug( msg_Dbg( p_demux, "=================== Seeking To Blind Pos" ) );
     int64_t i_size = stream_Size( p_demux->s );
+    uint64_t i_startpos = vlc_stream_Tell( p_demux->s );
     int64_t i_granule;
     int64_t i_pagepos;
 
@@ -957,6 +851,12 @@ int Oggseek_BlindSeektoPosition( demux_t *p_demux, logical_stream_t *p_stream,
                                              i_size * f, i_size,
                                              p_stream,
                                              &i_granule );
+    if( i_granule == -1 )
+    {
+        if( vlc_stream_Seek( p_demux->s, i_startpos ) != VLC_SUCCESS )
+            msg_Err( p_demux, "Seek back failed. Not seekable ?" );
+        return VLC_EGENERIC;
+    }
 
     OggDebug( msg_Dbg( p_demux, "Seek start pos is %"PRId64" granule %"PRId64, i_size, i_granule ) );
 
@@ -968,24 +868,25 @@ int Oggseek_BlindSeektoPosition( demux_t *p_demux, logical_stream_t *p_stream,
          * final seek time */
         i_pagepos = OggBackwardSeekToFrame( p_demux,
                 __MAX ( i_size - MAX_PAGE_SIZE, p_stream->i_data_start ),
-                __MIN ( i_size + MAX_PAGE_SIZE, p_sys->i_total_length ),
+                __MIN ( i_size + MAX_PAGE_SIZE, p_sys->i_total_bytes ),
                 p_stream, i_granule );
     }
     else
     {
         /* Otherwise, we just sync to the next keyframe we meet */
         i_pagepos = OggForwardSeekToFrame( p_demux,
-                __MAX ( i_size - MAX_PAGE_SIZE, p_stream->i_data_start ),
+                __MAX ( i_size - MIN_PAGE_SIZE, p_stream->i_data_start ),
                 stream_Size( p_demux->s ),
                 p_stream, i_granule, false );
     }
 
     OggDebug( msg_Dbg( p_demux, "=================== Seeked To %"PRId64" granule %"PRId64, i_pagepos, i_granule ) );
-    return i_pagepos;
+    (void) i_pagepos;
+    return VLC_SUCCESS;
 }
 
 int Oggseek_SeektoAbsolutetime( demux_t *p_demux, logical_stream_t *p_stream,
-                                int64_t i_time )
+                                vlc_tick_t i_time )
 {
     demux_sys_t *p_sys  = p_demux->p_sys;
 
@@ -1005,15 +906,17 @@ int Oggseek_SeektoAbsolutetime( demux_t *p_demux, logical_stream_t *p_stream,
     }
     OggDebug( msg_Dbg( p_demux, "Search bounds set to %"PRId64" %"PRId64" using skeleton index", i_offset_lower, i_offset_upper ) );
 
-    OggNoDebug(
-        OggSeekIndexFind( p_stream, i_time, &i_offset_lower, &i_offset_upper )
-    );
+
+    vlc_tick_t i_lower_index;
+    if(!OggSeekIndexFind( p_stream, i_time, &i_offset_lower, &i_offset_upper, &i_lower_index ))
+        i_lower_index = 0;
 
     i_offset_lower = __MAX( i_offset_lower, p_stream->i_data_start );
-    i_offset_upper = __MIN( i_offset_upper, p_sys->i_total_length );
+    i_offset_upper = __MIN( i_offset_upper, p_sys->i_total_bytes );
 
+    int64_t i_sync_time;
     int64_t i_pagepos = OggBisectSearchByTime( p_demux, p_stream, i_time,
-                                       i_offset_lower, i_offset_upper);
+                                       i_offset_lower, i_offset_upper, &i_sync_time );
     if ( i_pagepos >= 0 )
     {
         /* be sure to clear any state or read+pagein() will fail on same # */
@@ -1021,11 +924,13 @@ int Oggseek_SeektoAbsolutetime( demux_t *p_demux, logical_stream_t *p_stream,
         p_sys->i_input_position = i_pagepos;
         seek_byte( p_demux, p_sys->i_input_position );
     }
+
     /* Insert keyframe position into index */
-    OggNoDebug(
-    if ( i_pagepos >= p_stream->i_data_start )
-        OggSeek_IndexAdd( p_stream, i_time, i_pagepos )
-    );
+    vlc_tick_t index_interval = p_sys->i_length
+              ? vlc_tick_from_sec( ceil( sqrt( SEC_FROM_VLC_TICK( p_sys->i_length ) ) / 2 ) )
+              : vlc_tick_from_sec( 5 );
+    if ( i_pagepos >= p_stream->i_data_start && ( i_sync_time - i_lower_index >= index_interval ) )
+        OggSeek_IndexAdd( p_stream, i_sync_time, i_pagepos );
 
     OggDebug( msg_Dbg( p_demux, "=================== Seeked To %"PRId64" time %"PRId64, i_pagepos, i_time ) );
     return i_pagepos;
@@ -1086,6 +991,8 @@ int64_t oggseek_read_page( demux_t *p_demux )
     ogg_sync_reset( &p_ogg->oy );
 
     buf = ogg_sync_buffer( &p_ogg->oy, i_page_size );
+    if( !buf )
+        return 0;
 
     memcpy( buf, header, PAGE_HEADER_BYTES + i_nsegs );
 

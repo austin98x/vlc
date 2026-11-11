@@ -29,7 +29,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#ifdef HAVE_POLL
+#ifdef HAVE_POLL_H
 # include <poll.h>
 #endif
 
@@ -56,15 +56,14 @@ static void Close(vlc_object_t *);
 vlc_module_begin()
     set_shortname(N_("NFS"))
     set_description(N_("NFS input"))
-    set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_ACCESS)
-    add_bool("nfs-auto-guid", true, AUTO_GUID_TEXT, AUTO_GUID_LONGTEXT, true)
-    set_capability("access", 2)
+    add_bool("nfs-auto-guid", true, AUTO_GUID_TEXT, AUTO_GUID_LONGTEXT)
+    set_capability("access", 0)
     add_shortcut("nfs")
     set_callbacks(Open, Close)
 vlc_module_end()
 
-struct access_sys_t
+typedef struct
 {
     struct rpc_context *    p_mount; /* used to to get exports mount point */
     struct nfs_context *    p_nfs;
@@ -95,7 +94,7 @@ struct access_sys_t
             bool b_done;
         } seek;
     } res;
-};
+} access_sys_t;
 
 static bool
 nfs_check_status(stream_t *p_access, int i_status, const char *psz_error,
@@ -189,7 +188,8 @@ nfs_read_cb(int i_status, struct nfs_context *p_nfs, void *p_data,
     else
     {
         p_sys->res.read.i_len = i_status;
-        memcpy(p_sys->res.read.p_buf, p_data, i_status);
+        if (p_sys->res.read.p_buf != NULL && p_data != NULL)
+            memcpy(p_sys->res.read.p_buf, p_data, i_status);
     }
 }
 
@@ -209,16 +209,22 @@ FileRead(stream_t *p_access, void *p_buf, size_t i_len)
         return 0;
 
     p_sys->res.read.i_len = 0;
+#ifdef LIBNFS_API_V2
+    p_sys->res.read.p_buf = NULL;
+    if (nfs_read_async(p_sys->p_nfs, p_sys->p_nfsfh, p_buf, i_len, nfs_read_cb,
+                       p_access) < 0)
+#else
     p_sys->res.read.p_buf = p_buf;
     if (nfs_read_async(p_sys->p_nfs, p_sys->p_nfsfh, i_len, nfs_read_cb,
                        p_access) < 0)
+#endif
     {
         msg_Err(p_access, "nfs_read_async failed");
-        return -1;
+        return 0;
     }
 
     if (vlc_nfs_mainloop(p_access, nfs_read_finished_cb) < 0)
-        return -1;
+        return 0;
 
     return p_sys->res.read.i_len;
 }
@@ -261,6 +267,8 @@ FileSeek(stream_t *p_access, uint64_t i_pos)
     if (vlc_nfs_mainloop(p_access, nfs_seek_finished_cb) < 0)
         return VLC_EGENERIC;
 
+    p_sys->b_eof = false;
+
     return VLC_SUCCESS;
 }
 
@@ -281,6 +289,7 @@ FileControl(stream_t *p_access, int i_query, va_list args)
 
         case STREAM_CAN_PAUSE:
         case STREAM_CAN_CONTROL_PACE:
+        case STREAM_CAN_DOWNLOAD:
             *va_arg(args, bool *) = true;
             break;
 
@@ -291,8 +300,8 @@ FileControl(stream_t *p_access, int i_query, va_list args)
         }
 
         case STREAM_GET_PTS_DELAY:
-            *va_arg(args, int64_t *) = var_InheritInteger(p_access,
-                                                          "network-caching");
+            *va_arg(args, vlc_tick_t *) = VLC_TICK_FROM_MS(
+                    var_InheritInteger(p_access, "network-caching") );
             break;
 
         case STREAM_SET_PAUSE_STATE:
@@ -305,7 +314,7 @@ FileControl(stream_t *p_access, int i_query, va_list args)
 }
 
 static char *
-NfsGetUrl(vlc_url_t *p_url, const char *psz_file)
+NfsGetUrl(const vlc_url_t *p_url, const char *psz_file)
 {
     /* nfs://<psz_host><psz_path><psz_file>?<psz_option> */
     char *psz_url;
@@ -361,8 +370,16 @@ DirRead(stream_t *p_access, input_item_node_t *p_node)
         default:
             i_type = ITEM_TYPE_UNKNOWN;
         }
+
+        input_item_t *p_item;
+
         i_ret = vlc_readdir_helper_additem(&rdh, psz_url, NULL, p_nfsdirent->name,
-                                           i_type, ITEM_NET);
+                                           i_type, ITEM_NET, &p_item);
+        if (i_ret == VLC_SUCCESS && p_item && p_nfsdirent->mtime.tv_sec >= 0)
+        {
+            input_item_AddStat(p_item, "mtime", p_nfsdirent->mtime.tv_sec);
+            input_item_AddStat(p_item, "size", p_nfsdirent->size);
+        }
         free(psz_url);
     }
 
@@ -392,7 +409,7 @@ MountRead(stream_t *p_access, input_item_node_t *p_node)
             break;
         }
         i_ret = vlc_readdir_helper_additem(&rdh, psz_url, NULL, psz_name,
-                                            ITEM_TYPE_DIRECTORY, ITEM_NET);
+                                            ITEM_TYPE_DIRECTORY, ITEM_NET, NULL);
         free(psz_url);
     }
 

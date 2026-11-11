@@ -2,7 +2,6 @@
  * filter.cpp : DirectShow access module for vlc
  *****************************************************************************
  * Copyright (C) 2002-2010 VLC authors and VideoLAN
- * $Id$
  *
  * Author: Gildas Bazin <gbazin@videolan.org>
  *
@@ -32,18 +31,16 @@
 #include <vlc_common.h>
 #include <vlc_fourcc.h>
 
-#ifndef _MSC_VER
-    /* Work-around a bug in w32api-2.5 */
-#   define QACONTAINERFLAGS QACONTAINERFLAGS_SOMETHINGELSE
-#endif
-
 #include "access.h"
 #include "filter.h"
-#include "vlc_dshow.h"
 
 #include <initguid.h>
 
+#include <wmcodecdsp.h>
+
 #include <new>
+
+namespace dshow {
 
 DEFINE_GUID(MEDIASUBTYPE_HDYC ,0x43594448 /* CYDH */ , 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
 DEFINE_GUID(MEDIASUBTYPE_DIVX ,0x58564944 /* XVID */ , 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
@@ -98,9 +95,9 @@ HRESULT WINAPI CopyMediaType( AM_MEDIA_TYPE *pmtTarget,
     return S_OK;
 }
 
-int GetFourCCFromMediaType( const AM_MEDIA_TYPE &media_type )
+vlc_fourcc_t GetFourCCFromMediaType( const AM_MEDIA_TYPE &media_type )
 {
-    int i_fourcc = 0;
+    vlc_fourcc_t i_fourcc = 0;
 
     if( media_type.majortype == MEDIATYPE_Video )
     {
@@ -115,15 +112,15 @@ int GetFourCCFromMediaType( const AM_MEDIA_TYPE &media_type )
             else if( media_type.subtype == MEDIASUBTYPE_RGB8 )
                i_fourcc = VLC_FOURCC( 'R', 'G', 'B', '8' );
             else if( media_type.subtype == MEDIASUBTYPE_RGB555 )
-               i_fourcc = VLC_CODEC_RGB15;
+               i_fourcc = VLC_CODEC_RGB555LE;
             else if( media_type.subtype == MEDIASUBTYPE_RGB565 )
-               i_fourcc = VLC_CODEC_RGB16;
+               i_fourcc = VLC_CODEC_RGB565LE;
             else if( media_type.subtype == MEDIASUBTYPE_RGB24 )
-               i_fourcc = VLC_CODEC_RGB24;
+               i_fourcc = VLC_CODEC_BGR24;
             else if( media_type.subtype == MEDIASUBTYPE_RGB32 )
-               i_fourcc = VLC_CODEC_RGB32;
+               i_fourcc = VLC_CODEC_BGRX;
             else if( media_type.subtype == MEDIASUBTYPE_ARGB32 )
-               i_fourcc = VLC_CODEC_RGBA;
+               i_fourcc = VLC_CODEC_BGRA;
 
             /* Planar YUV formats */
             else if( media_type.subtype == MEDIASUBTYPE_I420 )
@@ -136,6 +133,10 @@ int GetFourCCFromMediaType( const AM_MEDIA_TYPE &media_type )
                i_fourcc = VLC_CODEC_YV12;
             else if( media_type.subtype == MEDIASUBTYPE_YVU9 )
                i_fourcc = VLC_CODEC_I410;
+
+            /* Semi-planar YUV formats */
+            else if( media_type.subtype == MEDIASUBTYPE_NV12 )
+               i_fourcc = VLC_CODEC_NV12;
 
             /* Packed YUV formats */
             else if( media_type.subtype == MEDIASUBTYPE_YVYU )
@@ -177,6 +178,11 @@ int GetFourCCFromMediaType( const AM_MEDIA_TYPE &media_type )
             else if( media_type.subtype == MEDIASUBTYPE_MJPG )
                 i_fourcc = VLC_CODEC_MJPG;
 
+            else if( media_type.subtype == MEDIASUBTYPE_H264 ||
+                     media_type.subtype == MEDIASUBTYPE_h264 ||
+                     media_type.subtype == MEDIASUBTYPE_x264 ||
+                     media_type.subtype == MEDIASUBTYPE_X264 )
+                i_fourcc = VLC_CODEC_H264;
         }
     }
     else if( media_type.majortype == MEDIATYPE_Audio )
@@ -253,7 +259,7 @@ HRESULT CapturePin::CustomGetSamples( std::deque<VLCMediaSample> &external_queue
  * Returns a sample from its sample queue. Proper locking must be done prior
  * to this call. Current dshow code protects the access to any sample queue
  * (audio and video) with the p_sys->lock
- * @param vlc_sample [out] Address of a sample if sucessfull. Undefined
+ * @param vlc_sample [out] Address of a sample if successful. Undefined
  * otherwise.
  * @return S_OK if a sample was available, S_FALSE if no sample was
  * available
@@ -503,7 +509,7 @@ STDMETHODIMP CapturePin::QueryAccept( const AM_MEDIA_TYPE *pmt )
         return S_FALSE;
     }
 
-    int i_fourcc = GetFourCCFromMediaType(*pmt);
+    vlc_fourcc_t i_fourcc = GetFourCCFromMediaType(*pmt);
     if( !i_fourcc )
     {
         msg_Dbg( p_input, "CapturePin::QueryAccept "
@@ -638,8 +644,7 @@ STDMETHODIMP CapturePin::Receive( IMediaSample *pSample )
     msg_Dbg( p_input, "CapturePin::Receive" );
 #endif
 
-    mtime_t i_timestamp = mdate() * 10;
-    VLCMediaSample vlc_sample = {pSample, i_timestamp};
+    VLCMediaSample vlc_sample = {pSample, vlc_tick_now()};
 
     vlc_mutex_lock( &p_sys->lock );
     samples_queue.push_front( vlc_sample );
@@ -1166,3 +1171,5 @@ STDMETHODIMP CaptureEnumMediaTypes::Clone( IEnumMediaTypes **ppEnum )
 
     return NOERROR;
 };
+
+} // namespace

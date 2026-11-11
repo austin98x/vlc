@@ -2,7 +2,6 @@
  * art_manager.cpp
  *****************************************************************************
  * Copyright (C) 2010 the VideoLAN team
- * $Id$
  *
  * Author: Erwan Tulou      <erwan10@vidoelan.org>
  *
@@ -70,13 +69,13 @@ ArtManager::~ArtManager( )
     }
 
     std::list<ArtBitmap*>::const_iterator it;
-    for( it = m_listBitmap.begin(); it != m_listBitmap.end(); ++it )
+    for( it = m_listBitmap.cbegin(); it != m_listBitmap.cend(); ++it )
         delete *it;
     m_listBitmap.clear();
 }
 
 
-ArtBitmap* ArtManager::getArtBitmap( std::string uriName )
+ArtBitmap* ArtManager::getArtBitmap( const std::string &uriName )
 {
     if( !uriName.size() )
         return NULL;
@@ -86,7 +85,7 @@ ArtBitmap* ArtManager::getArtBitmap( std::string uriName )
 
     // check whether art is already loaded
     std::list<ArtBitmap*>::const_iterator it;
-    for( it = m_listBitmap.begin(); it != m_listBitmap.end(); ++it )
+    for( it = m_listBitmap.cbegin(); it != m_listBitmap.cend(); ++it )
     {
         if( (*it)->getUriName() == uriName )
             return *it;

@@ -3,9 +3,8 @@
  *****************************************************************************
  * Copyright (C) 2005 VLC authors and VideoLAN
  * Copyright (C) 2002-2007 Rémi Denis-Courmont
- * $Id$
  *
- * Author: Rémi Denis-Courmont <rem # videolan.org>
+ * Author: Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -63,18 +62,6 @@ int vlc_getnameinfo( const struct sockaddr *sa, int salen,
     return i_val;
 }
 
-
-/**
- * Resolves a host name to a list of socket addresses (like getaddrinfo()).
- *
- * @param node host name to resolve (encoded as UTF-8), or NULL
- * @param i_port port number for the socket addresses
- * @param p_hints parameters (see getaddrinfo() manual page)
- * @param res pointer set to the resulting chained list.
- * @return 0 on success, a getaddrinfo() error otherwise.
- * On failure, *res is undefined. On success, it must be freed with
- * freeaddrinfo().
- */
 int vlc_getaddrinfo (const char *node, unsigned port,
                      const struct addrinfo *hints, struct addrinfo **res)
 {
@@ -121,9 +108,8 @@ int vlc_getaddrinfo (const char *node, unsigned port,
 }
 
 #if defined (_WIN32) || defined (__OS2__) \
- || defined (__ANDROID__) || defined (__APPLE__) \
- || defined (__native_client__)
-#warning vlc_getaddr_info_i11e() not implemented!
+ || defined (__ANDROID__) || defined (__APPLE__)
+#warning vlc_getaddrinfo_i11e() not implemented!
 int vlc_getaddrinfo_i11e(const char *node, unsigned port,
                          const struct addrinfo *hints, struct addrinfo **res)
 {

@@ -2,7 +2,6 @@
  * input_slider.cpp : VolumeSlider and SeekSlider
  ****************************************************************************
  * Copyright (C) 2006-2017 the VideoLAN team
- * $Id$
  *
  * Authors: Pierre Lamot <pierre@videolabs.io>
  *
@@ -32,6 +31,8 @@ class ImageHelper
 public:
     /* render a Svg to a pixmap with current device pixel ratio */
     static QPixmap loadSvgToPixmap(const QString& path, qint32 i_width, qint32 i_height);
+
+    static class QImageIOHandler* createSvgImageIOHandler();
 };
 
 #endif // IMAGEHELPER_HPP

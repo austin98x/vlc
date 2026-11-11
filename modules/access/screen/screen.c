@@ -2,7 +2,6 @@
  * screen.c: Screen capture module.
  *****************************************************************************
  * Copyright (C) 2004-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Gildas Bazin <gbazin@videolan.org>
  *          Antoine Cellerier <dionoea at videolan dot org>
@@ -32,10 +31,12 @@
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
-#include <vlc_modules.h>                 /* module_need for "video blending" */
 #include <vlc_filter.h>
 #include <vlc_url.h>
 #include "screen.h"
+#ifdef SCREEN_MOUSE
+#   include <vlc_image.h>
+#endif
 
 /*****************************************************************************
  * Module descriptor
@@ -76,7 +77,7 @@
     "capture." )
 #endif
 
-#ifdef SCREEN_DISPLAY_ID
+#ifdef __APPLE__
 #define DISPLAY_ID_TEXT N_( "Display ID" )
 #define DISPLAY_ID_LONGTEXT N_( \
     "Display ID. If not specified, main display ID is used." )
@@ -97,35 +98,34 @@ static void Close( vlc_object_t * );
 vlc_module_begin ()
     set_description( N_("Screen Input") )
     set_shortname( N_("Screen" ))
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_ACCESS )
 
-    add_float( "screen-fps", SCREEN_FPS, FPS_TEXT, FPS_LONGTEXT, false )
+    add_float( "screen-fps", SCREEN_FPS, FPS_TEXT, FPS_LONGTEXT )
 
 #ifdef SCREEN_SUBSCREEN
-    add_integer( "screen-top", 0, TOP_TEXT, TOP_LONGTEXT, true )
-    add_integer( "screen-left", 0, LEFT_TEXT, LEFT_LONGTEXT, true )
-    add_integer( "screen-width", 0, WIDTH_TEXT, WIDTH_TEXT, true )
-    add_integer( "screen-height", 0, HEIGHT_TEXT, HEIGHT_TEXT, true )
+    add_integer( "screen-top", 0, TOP_TEXT, TOP_LONGTEXT )
+    add_integer( "screen-left", 0, LEFT_TEXT, LEFT_LONGTEXT )
+    add_integer( "screen-width", 0, WIDTH_TEXT, NULL )
+    add_integer( "screen-height", 0, HEIGHT_TEXT, NULL )
 
     add_bool( "screen-follow-mouse", false, FOLLOW_MOUSE_TEXT,
-              FOLLOW_MOUSE_LONGTEXT, false )
+              FOLLOW_MOUSE_LONGTEXT )
 #endif
 
 #ifdef SCREEN_MOUSE
-    add_loadfile( "screen-mouse-image", "", MOUSE_TEXT, MOUSE_LONGTEXT, true )
+    add_loadfile("screen-mouse-image", "", MOUSE_TEXT, MOUSE_LONGTEXT)
 #endif
 
 #ifdef _WIN32
-    add_integer( "screen-fragment-size", 0, FRAGS_TEXT, FRAGS_LONGTEXT, true )
+    add_integer( "screen-fragment-size", 0, FRAGS_TEXT, FRAGS_LONGTEXT )
 #endif
 
-#ifdef SCREEN_DISPLAY_ID
-    add_integer( "screen-display-id", 0, DISPLAY_ID_TEXT, DISPLAY_ID_LONGTEXT, true )
-    add_integer( "screen-index", 0, INDEX_TEXT, INDEX_LONGTEXT, true )
+#ifdef __APPLE__
+    add_integer( "screen-display-id", 0, DISPLAY_ID_TEXT, DISPLAY_ID_LONGTEXT )
+    add_integer( "screen-index", 0, INDEX_TEXT, INDEX_LONGTEXT )
 #endif
 
-    set_capability( "access_demux", 0 )
+    set_capability( "access", 0 )
     add_shortcut( "screen" )
     set_callbacks( Open, Close )
 vlc_module_end ()
@@ -144,6 +144,9 @@ static int Open( vlc_object_t *p_this )
     demux_t     *p_demux = (demux_t*)p_this;
     demux_sys_t *p_sys;
 
+    if (p_demux->out == NULL)
+        return VLC_EGENERIC;
+
     /* Fill p_demux field */
     p_demux->pf_demux = Demux;
     p_demux->pf_control = Control;
@@ -152,7 +155,7 @@ static int Open( vlc_object_t *p_this )
         return VLC_ENOMEM;
 
     p_sys->f_fps = var_CreateGetFloat( p_demux, "screen-fps" );
-    p_sys->i_incr = 1000000 / p_sys->f_fps;;
+    p_sys->i_incr = vlc_tick_rate_duration( p_sys->f_fps );
     p_sys->i_next_date = 0;
 
 #ifdef SCREEN_SUBSCREEN
@@ -160,11 +163,6 @@ static int Open( vlc_object_t *p_this )
     p_sys->i_left = var_CreateGetInteger( p_demux, "screen-left" );
     p_sys->i_width = var_CreateGetInteger( p_demux, "screen-width" );
     p_sys->i_height = var_CreateGetInteger( p_demux, "screen-height" );
-#endif
-
-#ifdef SCREEN_DISPLAY_ID
-    p_sys->i_display_id = var_CreateGetInteger( p_demux, "screen-display-id" );
-    p_sys->i_screen_index = var_CreateGetInteger( p_demux, "screen-index" );
 #endif
 
     if( screen_InitCapture( p_demux ) != VLC_SUCCESS )
@@ -175,7 +173,7 @@ static int Open( vlc_object_t *p_this )
 
     msg_Dbg( p_demux, "screen width: %i, height: %i, depth: %i",
              p_sys->fmt.video.i_width, p_sys->fmt.video.i_height,
-             p_sys->fmt.video.i_bits_per_pixel );
+             vlc_fourcc_GetChromaBPP(p_sys->fmt.video.i_chroma) );
 
 #ifdef SCREEN_SUBSCREEN
     if( p_sys->i_left >= p_sys->fmt.video.i_width
@@ -222,28 +220,27 @@ static int Open( vlc_object_t *p_this )
     if( mouseurl )
     {
         image_handler_t *p_image;
-        video_format_t fmt_in, fmt_out;
+        video_format_t fmt_out;
         msg_Dbg( p_demux, "Using %s for the mouse pointer image", mouseurl );
-        memset( &fmt_in, 0, sizeof( fmt_in ) );
-        memset( &fmt_out, 0, sizeof( fmt_out ) );
-        fmt_out.i_chroma = VLC_CODEC_RGBA;
+        video_format_Init( &fmt_out, VLC_CODEC_RGBA );
         p_image = image_HandlerCreate( p_demux );
         if( p_image )
         {
             p_sys->p_mouse =
-                image_ReadUrl( p_image, mouseurl, &fmt_in, &fmt_out );
+                image_ReadUrl( p_image, mouseurl, &fmt_out );
             image_HandlerDelete( p_image );
         }
         if( !p_sys->p_mouse )
             msg_Err( p_demux, "Failed to open mouse pointer image (%s)",
                      mouseurl );
         free( mouseurl );
+        video_format_Clean( &fmt_out );
     }
 #endif
 
     p_sys->es = es_out_Add( p_demux->out, &p_sys->fmt );
 
-    p_sys->i_start = mdate();
+    p_sys->i_start = vlc_tick_now();
 
     return VLC_SUCCESS;
 }
@@ -256,7 +253,8 @@ static void Close( vlc_object_t *p_this )
     demux_t     *p_demux = (demux_t*)p_this;
     demux_sys_t *p_sys = p_demux->p_sys;
 
-    screen_CloseCapture( p_demux );
+    if (p_sys->ops)
+        p_sys->ops->close( p_sys->p_data );
 #ifdef SCREEN_MOUSE
     if( p_sys->p_mouse )
         picture_Release( p_sys->p_mouse );
@@ -272,19 +270,24 @@ static int Demux( demux_t *p_demux )
     demux_sys_t *p_sys = p_demux->p_sys;
     block_t *p_block;
 
-    if( !p_sys->i_next_date ) p_sys->i_next_date = mdate();
+    if( !p_sys->i_next_date ) p_sys->i_next_date = vlc_tick_now();
 
     /* Frame skipping if necessary */
-    while( mdate() >= p_sys->i_next_date + p_sys->i_incr )
-        p_sys->i_next_date += p_sys->i_incr;
+    int64_t extra_frames;
+    extra_frames = (vlc_tick_now() - p_sys->i_next_date) / p_sys->i_incr;
+    p_sys->i_next_date += extra_frames * p_sys->i_incr;
 
-    mwait( p_sys->i_next_date );
-    p_block = screen_Capture( p_demux );
+    vlc_tick_wait( p_sys->i_next_date );
+    p_block = p_sys->ops->capture( p_demux );
     if( !p_block )
     {
         p_sys->i_next_date += p_sys->i_incr;
         return 1;
     }
+
+    // ensure the output DTS matches our ticks if the capture took too long
+    extra_frames = (vlc_tick_now() - p_sys->i_next_date) / p_sys->i_incr;
+    p_sys->i_next_date += extra_frames * p_sys->i_incr;
 
     p_block->i_dts = p_block->i_pts = p_sys->i_next_date;
 
@@ -302,7 +305,6 @@ static int Demux( demux_t *p_demux )
 static int Control( demux_t *p_demux, int i_query, va_list args )
 {
     bool *pb;
-    int64_t *pi64;
     demux_sys_t *p_sys = p_demux->p_sys;
 
     switch( i_query )
@@ -317,14 +319,12 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = INT64_C(1000)
-                  * var_InheritInteger( p_demux, "live-caching" );
+            *va_arg( args, vlc_tick_t * ) =
+                VLC_TICK_FROM_MS(var_InheritInteger( p_demux, "live-caching" ));
             return VLC_SUCCESS;
 
         case DEMUX_GET_TIME:
-            pi64 = va_arg( args, int64_t * );
-            *pi64 = mdate() - p_sys->i_start;
+            *va_arg( args, vlc_tick_t * ) = vlc_tick_now() - p_sys->i_start;
             return VLC_SUCCESS;
 
         /* TODO implement others */
@@ -345,67 +345,5 @@ void FollowMouse( demux_sys_t *p_sys, int i_x, int i_y )
     if( i_y < 0 ) i_y = 0;
     p_sys->i_top = __MIN( (unsigned int)i_y,
     p_sys->i_screen_height - p_sys->i_height );
-}
-#endif
-
-#ifdef SCREEN_MOUSE
-void RenderCursor( demux_t *p_demux, int i_x, int i_y,
-                   uint8_t *p_dst )
-{
-    demux_sys_t *p_sys = p_demux->p_sys;
-    if( !p_sys->dst.i_planes )
-        picture_Setup( &p_sys->dst, &p_sys->fmt.video );
-
-    if( !p_sys->dst.i_planes )
-        return;
-
-#ifdef _WIN32
-    /* Bitmaps here created by CreateDIBSection: stride rounded up to the nearest DWORD */
-    p_sys->dst.p[ 0 ].i_pitch = p_sys->dst.p[ 0 ].i_visible_pitch =
-        ( ( ( ( p_sys->fmt.video.i_width * p_sys->fmt.video.i_bits_per_pixel ) + 31 ) & ~31 ) >> 3 );
-#endif
-
-    if( !p_sys->p_blend )
-    {
-        p_sys->p_blend = vlc_object_create( p_demux, sizeof(filter_t) );
-        if( p_sys->p_blend )
-        {
-            es_format_Init( &p_sys->p_blend->fmt_in, VIDEO_ES,
-                            VLC_CODEC_RGBA );
-            p_sys->p_blend->fmt_in.video = p_sys->p_mouse->format;
-            p_sys->p_blend->fmt_out = p_sys->fmt;
-            p_sys->p_blend->p_module =
-                module_need( p_sys->p_blend, "video blending", NULL, false );
-            if( !p_sys->p_blend->p_module )
-            {
-                msg_Err( p_demux, "Could not load video blending module" );
-                vlc_object_release( p_sys->p_blend );
-                p_sys->p_blend = NULL;
-            }
-        }
-    }
-    if( p_sys->p_blend )
-    {
-        p_sys->dst.p->p_pixels = p_dst;
-        p_sys->p_blend->pf_video_blend( p_sys->p_blend,
-                                        &p_sys->dst,
-                                        p_sys->p_mouse,
-#ifdef SCREEN_SUBSCREEN
-                                        i_x-p_sys->i_left,
-#else
-                                        i_x,
-#endif
-#ifdef SCREEN_SUBSCREEN
-                                        i_y-p_sys->i_top,
-#else
-                                        i_y,
-#endif
-                                        255 );
-    }
-    else
-    {
-        picture_Release( p_sys->p_mouse );
-        p_sys->p_mouse = NULL;
-    }
 }
 #endif

@@ -2,7 +2,6 @@
  * x11_factory.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -38,7 +37,7 @@ class X11DragDrop;
 class X11TimerLoop;
 
 
-/// Class used to instanciate X11 specific objects
+/// Class used to instantiate X11 specific objects
 class X11Factory: public OSFactory
 {
 private:
@@ -129,7 +128,7 @@ public:
     virtual int getScreenHeight() const;
 
     /// Get Monitor Information
-    virtual void getMonitorInfo( const GenericWindow &rWindow,
+    virtual void getMonitorInfo( OSWindow *pWindow,
                                  int* x, int* y,
                                  int* width, int* height ) const;
     virtual void getMonitorInfo( int numScreen,

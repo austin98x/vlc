@@ -37,21 +37,19 @@ static void Close (vlc_object_t *);
 vlc_module_begin ()
     set_shortname ("sndio")
     set_description (N_("OpenBSD sndio audio output"))
-    set_category (CAT_AUDIO)
     set_subcategory (SUBCAT_AUDIO_AOUT)
     set_capability ("audio output", 120)
     set_callbacks (Open, Close)
 vlc_module_end ()
 
-static int TimeGet (audio_output_t *, mtime_t *);
-static void Play (audio_output_t *, block_t *);
-static void Flush (audio_output_t *, bool);
+static void Play(audio_output_t *, block_t *, vlc_tick_t);
+static void Flush (audio_output_t *);
 static int VolumeSet (audio_output_t *, float);
 static int MuteSet (audio_output_t *, bool);
 static void VolumeChanged (void *, unsigned);
 static void PositionChanged (void *, int);
 
-struct aout_sys_t
+typedef struct
 {
     struct sio_hdl *hdl;
     int started;
@@ -59,7 +57,7 @@ struct aout_sys_t
     unsigned rate;
     unsigned volume;
     bool mute;
-};
+} aout_sys_t;
 
 /** Initializes an sndio playback stream */
 static int Start (audio_output_t *aout, audio_sample_format_t *restrict fmt)
@@ -178,7 +176,6 @@ static int Start (audio_output_t *aout, audio_sample_format_t *restrict fmt)
     fmt->i_physical_channels = chans;
     aout_FormatPrepare (fmt);
 
-    aout->time_get = TimeGet;
     aout->play = Play;
     aout->pause = NULL;
     aout->flush = Flush;
@@ -208,6 +205,8 @@ static void Stop (audio_output_t *aout)
 {
     aout_sys_t *sys = aout->sys;
 
+    aout->volume_set = NULL;
+    aout->mute_set = NULL;
     sio_close (sys->hdl);
 }
 
@@ -220,26 +219,17 @@ static void PositionChanged (void *arg, int delta)
     sys->started = 1;
 }
 
-static int TimeGet (audio_output_t *aout, mtime_t *restrict delay)
-{
-    aout_sys_t *sys = aout->sys;
-
-    if (!sys->started)
-        return -1;
-    *delay = (mtime_t)sys->delay * CLOCK_FREQ / sys->rate;
-    return 0;
-}
-
-static void Play (audio_output_t *aout, block_t *block)
+static void Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
 {
     aout_sys_t *sys = aout->sys;
 
     sio_write (sys->hdl, block->p_buffer, block->i_buffer);
     sys->delay += block->i_nb_samples;
     block_Release (block);
+    (void) date;
 }
 
-static void Flush (audio_output_t *aout, bool wait)
+static void Flush (audio_output_t *aout)
 {
     aout_sys_t *sys = aout->sys;
 
@@ -247,18 +237,18 @@ static void Flush (audio_output_t *aout, bool wait)
     sys->started = 0;
     sys->delay = 0;
     sio_start (sys->hdl);
-    (void)wait;
 }
 
 static void VolumeChanged (void *arg, unsigned volume)
 {
     audio_output_t *aout = arg;
+    aout_sys_t *p_sys = aout->sys;
     float fvol = (float)volume / (float)SIO_MAXVOL;
 
     aout_VolumeReport (aout, fvol);
     aout_MuteReport (aout, volume == 0);
     if (volume) /* remember last non-zero volume to unmute later */
-        aout->sys->volume = volume;
+        p_sys->volume = volume;
 }
 
 static int VolumeSet (audio_output_t *aout, float fvol)

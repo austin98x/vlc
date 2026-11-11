@@ -2,7 +2,6 @@
  * x11_factory.cpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -26,7 +25,6 @@
 
 #include <errno.h>
 #include <unistd.h>
-#include <dirent.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/Xinerama.h>
 
@@ -42,6 +40,7 @@
 #include "../src/generic_window.hpp"
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_xlib.h>
 
 X11Factory::X11Factory( intf_thread_t *pIntf ): OSFactory( pIntf ),
@@ -86,13 +85,19 @@ bool X11Factory::init()
                                      ConnectionNumber( pDisplay ) );
 
     // Initialize the resource path
-    char *datadir = config_GetUserDir( VLC_DATA_DIR );
-    m_resourcePath.push_back( (std::string)datadir + "/skins2" );
-    free( datadir );
+    char *datadir = config_GetUserDir( VLC_USERDATA_DIR );
+    if (likely(datadir != nullptr))
+    {
+        m_resourcePath.push_back( (std::string)datadir + "/skins2" );
+        free( datadir );
+    }
     m_resourcePath.push_back( (std::string)"share/skins2" );
-    datadir = config_GetDataDir();
-    m_resourcePath.push_back( (std::string)datadir + "/skins2" );
-    free( datadir );
+    datadir = config_GetSysPath(VLC_PKG_DATA_DIR, "skins2");
+    if (likely(datadir != nullptr))
+    {
+        m_resourcePath.push_back( (std::string)datadir );
+        free( datadir );
+    }
 
     // Determine the monitor geometry
     getDefaultGeometry( &m_screenWidth, &m_screenHeight );
@@ -204,10 +209,11 @@ int X11Factory::getScreenHeight() const
 }
 
 
-void X11Factory::getMonitorInfo( const GenericWindow &rWindow,
+void X11Factory::getMonitorInfo( OSWindow *pWindow,
                                  int* p_x, int* p_y,
                                  int* p_width, int* p_height ) const
 {
+    X11Window *pWin = (X11Window*)pWindow;
     // initialize to default geometry
     *p_x = 0;
     *p_y = 0;
@@ -217,7 +223,7 @@ void X11Factory::getMonitorInfo( const GenericWindow &rWindow,
     // Use Xinerama to determine the monitor where the video
     // mostly resides (biggest surface)
     Display *pDisplay = m_pDisplay->getDisplay();
-    Window wnd = (Window)rWindow.getOSHandle();
+    Window wnd = pWin->getDrawable();
     Window root = DefaultRootWindow( pDisplay );
     Window child_wnd;
 
@@ -343,15 +349,18 @@ SkinsRect X11Factory::getWorkArea() const
                                 &ret, &i_format, &i_items, &i_bytesafter,
                                 (unsigned char **)&values ) == Success )
         {
-            x = values[0];
-            y = values[1];
-            w = values[2];
-            h = values[3];
-            XFree( values );
+            if( values )
+            {
+                x = values[0];
+                y = values[1];
+                w = values[2];
+                h = values[3];
+                XFree( values );
+            }
         }
     }
     msg_Dbg( getIntf(),"WorkArea: %ix%i at +%i+%i", w, h, x, y );
-    return SkinsRect( x, y, w, h );
+    return SkinsRect( x, y, x + w, y + h );
 }
 
 
@@ -370,16 +379,16 @@ void X11Factory::getMousePos( int &rXPos, int &rYPos ) const
 
 void X11Factory::rmDir( const std::string &rPath )
 {
-    struct dirent *file;
-    DIR *dir;
+    const char *file;
+    vlc_DIR *dir;
 
-    dir = opendir( rPath.c_str() );
+    dir = vlc_opendir( rPath.c_str() );
     if( !dir ) return;
 
     // Parse the directory and remove everything it contains
-    while( (file = readdir( dir )) )
+    while( (file = vlc_readdir( dir )) )
     {
-        std::string filename = file->d_name;
+        std::string filename = file;
 
         // Skip "." and ".."
         if( filename == "." || filename == ".." )
@@ -394,7 +403,7 @@ void X11Factory::rmDir( const std::string &rPath )
     }
 
     // Close the directory
-    closedir( dir );
+    vlc_closedir( dir );
 
     // And delete it
     rmdir( rPath.c_str() );
@@ -424,7 +433,7 @@ void X11Factory::initCursors( )
         { kResizeNESW, "bottom_left_corner" },
     };
     // retrieve cursors from default theme
-    for( unsigned i = 0; i < sizeof(cursors) / sizeof(cursors[0]); i++ )
+    for( unsigned i = 0; i < ARRAY_SIZE(cursors); i++ )
         mCursors[cursors[i].type] =
             XcursorLibraryLoadCursor( display, cursors[i].name );
 

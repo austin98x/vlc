@@ -20,6 +20,8 @@
 #ifndef VLC_TS_H
 #define VLC_TS_H
 
+#include <vlc_arrays.h>
+
 #ifdef HAVE_ARIBB24
     typedef struct arib_instance_t arib_instance_t;
 #endif
@@ -49,6 +51,7 @@ struct demux_sys_t
     stream_t   *stream;
     bool        b_canseek;
     bool        b_canfastseek;
+    bool        b_lowdelay;
     int         current_title;
     int         current_seekpoint;
     unsigned    updates;
@@ -68,13 +71,12 @@ struct demux_sys_t
 
     ts_standards_e standard;
 
+#ifdef HAVE_ARIBB24
     struct
     {
-#ifdef HAVE_ARIBB24
         arib_instance_t *p_instance;
-#endif
-        stream_t     *b25stream;
     } arib;
+#endif
 
     /* All pid */
     ts_pid_list_t pids;
@@ -84,11 +86,9 @@ struct demux_sys_t
 
     enum
     {
-        NO_ES, /* for preparse */
         DELAY_ES,
         CREATE_ES
     } es_creation;
-    #define PREPARSING p_sys->es_creation == NO_ES
 
     /* */
     bool        b_es_id_pid;
@@ -100,6 +100,8 @@ struct demux_sys_t
     bool        b_valid_scrambling;
 
     bool        b_trust_pcr;
+    bool        b_check_pcr_offset;
+    unsigned    i_generated_pcr_dpb_offset;
 
     /* */
     bool        b_access_control;
@@ -122,8 +124,9 @@ struct demux_sys_t
 
     struct
     {
-        mtime_t i_first_dts;     /* first dts encountered for the stream */
+        vlc_tick_t i_first_dts;     /* first dts encountered for the stream */
         int     i_timesourcepid; /* which pid we saved the dts from */
+        bool    b_pcrhasnopcrfield;
         enum { PAT_WAITING = 0, PAT_MISSING, PAT_FIXTRIED } status; /* set if we haven't seen PAT within MIN_PAT_INTERVAL */
     } patfix;
 
@@ -134,6 +137,7 @@ struct demux_sys_t
 
     /* */
     bool        b_start_record;
+    char        *record_dir_path;
 };
 
 void TsChangeStandard( demux_sys_t *, ts_standards_e );

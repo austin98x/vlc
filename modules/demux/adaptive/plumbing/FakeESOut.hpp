@@ -22,63 +22,144 @@
 
 #include <vlc_common.h>
 #include <list>
+#include "../tools/Macros.hpp"
+#include "../Time.hpp"
+#include "../ID.hpp"
+#include <vlc_threads.h>
 
 namespace adaptive
 {
     class ExtraFMTInfoInterface
     {
+        PREREQ_INTERFACE(ExtraFMTInfoInterface);
+
         public:
             virtual void fillExtraFMTInfo( es_format_t * ) const = 0;
     };
 
-    class CommandsQueue;
+    class AbstractCommandsQueue;
+    class CommandsFactory;
+    class AbstractFakeESOutID;
     class FakeESOutID;
 
-    class FakeESOut
+    class AbstractFakeEsOut
+    {
+        friend class EsOutCallbacks;
+        PREREQ_VIRTUAL(AbstractFakeEsOut);
+
+        public:
+            AbstractFakeEsOut();
+            virtual ~AbstractFakeEsOut();
+            operator es_out_t*();
+            virtual void milestoneReached() = 0;
+            /* Used by FakeES ID */
+            virtual void recycle( AbstractFakeESOutID * ) = 0;
+            virtual void createOrRecycleRealEsID( AbstractFakeESOutID * ) = 0;
+            virtual void setPriority(int) = 0;
+            virtual void sendData( AbstractFakeESOutID *, block_t * ) = 0;
+            virtual void sendMeta( int, const vlc_meta_t * ) = 0;
+
+        private:
+            void *esoutpriv;
+            virtual es_out_id_t *esOutAdd( const es_format_t * ) = 0;
+            virtual int esOutSend( es_out_id_t *, block_t * ) = 0;
+            virtual void esOutDel( es_out_id_t * ) = 0;
+            virtual int esOutControl( int, va_list ) = 0;
+            virtual void esOutDestroy() = 0;
+    };
+
+    class FakeESOut : public AbstractFakeEsOut
     {
         public:
-            FakeESOut( es_out_t *, CommandsQueue * );
-            ~FakeESOut();
-            es_out_t * getEsOut();
-            void setTimestampOffset( mtime_t );
-            void setExpectedTimestampOffset(mtime_t);
+            class LockedFakeEsOut
+            {
+                friend class FakeESOut;
+                public:
+                    ~LockedFakeEsOut();
+                    operator es_out_t*();
+                    FakeESOut & operator*();
+                    FakeESOut * operator->();
+                private:
+                    FakeESOut *p;
+                    LockedFakeEsOut(FakeESOut &q);
+            };
+            FakeESOut( es_out_t *, AbstractCommandsQueue *, CommandsFactory * );
+            virtual ~FakeESOut();
+            LockedFakeEsOut WithLock();
+            AbstractCommandsQueue * commandsQueue();
+            CommandsFactory *commandsFactory() const;
+            void setAssociatedTimestamp( vlc_tick_t );
+            void setAssociatedTimestamp( vlc_tick_t, vlc_tick_t );
+            void setExpectedTimestamp( vlc_tick_t );
+            void resetTimestamps();
             size_t esCount() const;
             bool hasSelectedEs() const;
-            bool decodersDrained();
+            bool hasSelectedEs(const AbstractFakeESOutID *) const;
             bool restarting() const;
             void setExtraInfoProvider( ExtraFMTInfoInterface * );
-            void checkTimestampsStart(mtime_t);
+            vlc_tick_t fixTimestamp(vlc_tick_t);
+            vlc_tick_t applyTimestampContinuity(vlc_tick_t);
+            void declareEs( const es_format_t * );
+
+            void milestoneReached() override;
 
             /* Used by FakeES ID */
-            void recycle( FakeESOutID *id );
-            void createOrRecycleRealEsID( FakeESOutID * );
+            void recycle( AbstractFakeESOutID *id ) override;
+            void createOrRecycleRealEsID( AbstractFakeESOutID * ) override;
+            void setPriority(int) override;
+            void sendData( AbstractFakeESOutID *, block_t * ) override;
+            void sendMeta( int, const vlc_meta_t * ) override;
 
             /**/
+            void scheduleNecessaryMilestone();
+            bool hasSegmentStartTimes() const;
+            void setSegmentStartTimes(const SegmentTimes &);
+            void setSegmentProgressTimes(const SegmentTimes &);
+            bool hasSynchronizationReference() const;
+            void setSynchronizationReference(const SynchronizationReference &);
+            void setSrcID( const SrcID & );
+            void setPCRTrusted( bool );
             void schedulePCRReset();
             void scheduleAllForDeletion(); /* Queue Del commands for non Del issued ones */
             void recycleAll(); /* Cancels all commands and send fakees for recycling */
             void gc();
 
-            /* static callbacks for demuxer */
-            static es_out_id_t *esOutAdd_Callback( es_out_t *, const es_format_t * );
-            static int esOutSend_Callback( es_out_t *, es_out_id_t *, block_t * );
-            static void esOutDel_Callback( es_out_t *, es_out_id_t * );
-            static int esOutControl_Callback( es_out_t *, int, va_list );
-            static void esOutDestroy_Callback( es_out_t * );
-
         private:
+            friend class LockedFakeESOut;
             vlc_mutex_t lock;
+            es_out_id_t *esOutAdd( const es_format_t * ) override;
+            int esOutSend( es_out_id_t *, block_t * ) override;
+            void esOutDel( es_out_id_t * ) override;
+            int esOutControl( int, va_list ) override;
+            void esOutDestroy() override;
             es_out_t *real_es_out;
             FakeESOutID * createNewID( const es_format_t * );
             ExtraFMTInfoInterface *extrainfo;
-            mtime_t getTimestampOffset() const;
-            CommandsQueue *commandsqueue;
-            es_out_t *fakeesout;
-            mtime_t timestamps_offset;
-            mtime_t timestamps_expected;
-            bool timestamps_check_done;
+            AbstractCommandsQueue *commandsqueue;
+            CommandsFactory *commandsfactory;
+            struct
+            {
+                vlc_tick_t timestamp;
+                bool b_timestamp_set;
+                bool b_offset_calculated;
+            } associated, expected;
+            vlc_tick_t timestamps_offset;
+            int priority;
+            bool b_in_commands_group;
+            enum class PcrStatus
+            {
+                WaitingFirst,
+                Evaluating,
+                Valid,
+                Broken,
+            } pcrstatus;
+            vlc_tick_t pcrcomparison;
             std::list<FakeESOutID *> fakeesidlist;
             std::list<FakeESOutID *> recycle_candidates;
+            std::list<FakeESOutID *> declared;
+            SegmentTimes startTimes;
+            SynchronizationReference synchronizationReference;
+            SrcID srcID = SrcID::dummy();
     };
 
 }

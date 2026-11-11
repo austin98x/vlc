@@ -31,26 +31,76 @@
 
 static block_t *Encode ( encoder_t *, subpicture_t * );
 
-int OpenEncoder( vlc_object_t *p_this )
+int webvtt_OpenEncoder( vlc_object_t *p_this )
 {
     encoder_t *p_enc = (encoder_t *)p_this;
 
     if( p_enc->fmt_out.i_codec != VLC_CODEC_WEBVTT )
         return VLC_EGENERIC;
 
-    p_enc->p_sys = NULL;
 
-    p_enc->pf_encode_sub = Encode;
-    p_enc->fmt_out.i_cat = SPU_ES;
+    static const struct vlc_encoder_operations ops =
+        { .encode_sub = Encode };
+    p_enc->ops = &ops;
+
     return VLC_SUCCESS;
 }
 
-
-void CloseEncoder( vlc_object_t *p_this )
+static void bo_add_escaped( bo_t *box, size_t len, const char *psz )
 {
-    (void)p_this;
+    if( likely(strcspn(psz, "&<>") >= len) )
+    {
+        bo_add_mem( box, len, psz );
+    }
+    else
+    {
+        for( size_t i=0; i<len; i++ )
+        {
+            switch(*psz)
+            {
+            case '&':
+                bo_add_mem( box, 6, "&#x26;" );
+                break;
+            case '<':
+                bo_add_mem( box, 6, "&#x3c;" );
+                break;
+            case '>': /* escapes forbidden --> sequence */
+                bo_add_mem( box, 6, "&#x3e;" );
+                break;
+            default:
+                bo_add_8( box, *psz );
+                break;
+            }
+            psz++;
+        }
+    }
 }
 
+static void WriteText( const char *psz, bo_t *box, char *c_last )
+{
+    /* We need to break any double newline sequence
+     * in or over segments */
+    while(*psz)
+    {
+        const char *p = strchr( psz, '\n' );
+        if( p )
+        {
+            bo_add_escaped( box, p - psz, psz );
+            if( (*c_last == '\n' || *c_last == '\0') && *psz == '\n' )
+                bo_add_mem( box, 8, "&#x2028;" ); /* Add space for empty line */
+            bo_add_8( box, '\n' );
+            *c_last = '\n';
+            psz = p + 1;
+        }
+        else
+        {
+            size_t len = strlen(psz);
+            bo_add_escaped( box, len, psz );
+            *c_last = (len > 0) ? psz[len - 1] : '\0';
+            break;
+        }
+    }
+}
 
 static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
 {
@@ -63,10 +113,10 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
     if( !bo_init( &box, 8 ) )
         return NULL;
 
-    for( subpicture_region_t *p_region = p_spu->p_region;
-                              p_region; p_region = p_region->p_next )
+    const subpicture_region_t *p_region;
+    vlc_spu_regions_foreach_const(p_region, &p_spu->regions)
     {
-        if( p_region->fmt.i_chroma != VLC_CODEC_TEXT ||
+        if(!subpicture_region_IsText( p_region )||
             p_region->p_text == NULL ||
             p_region->p_text->psz_text == NULL )
             continue;
@@ -81,14 +131,28 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
         bo_add_32be( &box, 0 );
         bo_add_fourcc( &box, "payl" );
 
+        char prevchar = '\0';
         /* This should already be UTF-8 encoded, so not much effort... */
         for( const text_segment_t *p_segment = p_region->p_text;
              p_segment; p_segment = p_segment->p_next )
         {
             if( p_segment->psz_text == NULL )
                 continue;
-            if( p_segment != p_region->p_text )
-                bo_add_8( &box, '\n' );
+
+            if( p_segment->p_ruby )
+            {
+                bo_add_mem( &box, 6, "<ruby>" );
+                for( const text_segment_ruby_t *p_ruby = p_segment->p_ruby;
+                                                p_ruby; p_ruby = p_ruby->p_next )
+                {
+                    WriteText( p_ruby->psz_base, &box, &prevchar );
+                    bo_add_mem( &box, 4, "<rt>" );
+                    WriteText( p_ruby->psz_rt, &box, &prevchar );
+                    bo_add_mem( &box, 5, "</rt>" );
+                }
+                bo_add_mem( &box, 7, "</ruby>" );
+                continue;
+            }
 
             const text_style_t *style = p_segment->style;
             if( style && style->i_features )
@@ -103,7 +167,9 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
                         bo_add_mem( &box, 3, "<i>" );
                 }
             }
-            bo_add_mem( &box, strlen(p_segment->psz_text), p_segment->psz_text );
+
+            WriteText( p_segment->psz_text, &box, &prevchar );
+
             if( style && style->i_features )
             {
                 if( style->i_features & STYLE_HAS_FLAGS )
@@ -122,7 +188,7 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
 
         /* Settings */
 
-        if( (p_region->i_text_align & (SUBPICTURE_ALIGN_LEFT|SUBPICTURE_ALIGN_RIGHT)) ||
+        if( (p_region->text_flags & (SUBPICTURE_ALIGN_LEFT|SUBPICTURE_ALIGN_RIGHT)) ||
                 (p_region->i_align & SUBPICTURE_ALIGN_TOP) )
         {
             size_t i_start = bo_size( &box );
@@ -130,9 +196,9 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
             bo_add_32be( &box, 0 );
             bo_add_fourcc( &box, "sttg" );
 
-            if( p_region->i_text_align & SUBPICTURE_ALIGN_LEFT )
+            if( p_region->text_flags & SUBPICTURE_ALIGN_LEFT )
                 bo_add_mem( &box, 10, "align:left" );
-            else if( p_region->i_text_align & SUBPICTURE_ALIGN_RIGHT )
+            else if( p_region->text_flags & SUBPICTURE_ALIGN_RIGHT )
                 bo_add_mem( &box, 11, "align:right" );
 
             if( p_region->i_align & SUBPICTURE_ALIGN_TOP )
@@ -143,7 +209,7 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
                 if( bo_size( &box ) != i_start + 8 )
                     bo_add_8( &box, ' ' );
                 char *psz;
-                int i_printed = us_asprintf( &psz, "line:%2.2f%%", offset );
+                int i_printed = vlc_asprintf_c( &psz, "line:%2.2f%%", offset );
                 if( i_printed >= 0 )
                 {
                     if( i_printed > 0 )
@@ -171,7 +237,7 @@ static block_t *Encode( encoder_t *p_enc, subpicture_t *p_spu )
     if( p_block )
     {
         p_block->i_pts = p_block->i_dts = p_spu->i_start;
-        if( p_spu->i_stop > p_spu->i_start )
+        if( p_spu->i_stop != VLC_TICK_INVALID && p_spu->i_stop > p_spu->i_start )
             p_block->i_length = p_spu->i_stop - p_spu->i_start;
     }
 

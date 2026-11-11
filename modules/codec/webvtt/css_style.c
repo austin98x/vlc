@@ -28,9 +28,12 @@
 #include "css_style.h"
 
 static void Color( vlc_css_term_t term,
-                   int *color, uint8_t *alpha,
+                   uint32_t *color, uint8_t *alpha,
                    uint16_t *feat, int cflag, int aflag )
 {
+    if( unlikely( term.psz == NULL ) )
+        return;
+
     if( term.type == TYPE_FUNCTION )
     {
         if( term.function ) /* func( expr ) */
@@ -38,9 +41,9 @@ static void Color( vlc_css_term_t term,
             if( ( !strcmp( term.psz, "rgb" ) && term.function->i_count == 3 ) ||
                 ( !strcmp( term.psz, "rgba" ) && term.function->i_count == 4 ) )
             {
-                *color = (((int)term.function->seq[0].term.val) << 16) |
-                         (((int)term.function->seq[1].term.val) << 8) |
-                          ((int)term.function->seq[2].term.val);
+                *color = (((uint32_t)term.function->seq[0].term.val) << 16) |
+                         (((uint32_t)term.function->seq[1].term.val) << 8) |
+                          ((uint32_t)term.function->seq[2].term.val);
                 *feat |= cflag;
                 if( term.psz[3] != 0 ) /* rgba */
                 {
@@ -103,7 +106,7 @@ void webvtt_FillStyleFromCssDeclaration( const vlc_css_declaration_t *p_decl, te
         return;
 
     /* Only support simple expressions for now */
-    if( p_decl->expr->i_count < 1 )
+    if( !p_decl->expr || p_decl->expr->i_count < 1 )
         return;
 
     vlc_css_term_t term0 = p_decl->expr->seq[0].term;
@@ -163,9 +166,41 @@ void webvtt_FillStyleFromCssDeclaration( const vlc_css_declaration_t *p_decl, te
     }
     else if( !strcasecmp( p_decl->psz_property, "font-family" ) )
     {
+        const vlc_css_term_t *term;
         if( term0.type >= TYPE_STRING )
         {
-            char *psz_font = NULL;
+            size_t i_total = 1 + (p_decl->expr->i_count - 1) * 2;
+            for( size_t i=0; i<p_decl->expr->i_count; i++ )
+            {
+                term = &p_decl->expr->seq[i].term;
+                if( term->type < TYPE_STRING )
+                    continue;
+                i_total += strlen( term->psz );
+                if( term->type == TYPE_STRING )
+                    i_total += 2;
+            }
+            char *psz = malloc( i_total );
+            if( psz )
+            {
+                *psz = 0;
+                for( size_t i=0; i<p_decl->expr->i_count; i++ )
+                {
+                    term = &p_decl->expr->seq[i].term;
+                    if( term->type < TYPE_STRING )
+                        continue;
+                    if( i > 0 )
+                        strcat( psz, ", " );
+                    i_total += strlen( term->psz );
+                    if( term->type == TYPE_STRING )
+                        strcat( psz, "\"" );
+                    strcat( psz, term->psz );
+                    if( term->type == TYPE_STRING )
+                        strcat( psz, "\"" );
+                }
+                free( p_style->psz_fontname );
+                p_style->psz_fontname = psz;
+            }
+            /*char *psz_font = NULL;
             const char *psz = strchr( term0.psz, ',' );
             if( psz )
                 psz_font = strndup( term0.psz, psz - term0.psz + 1 );
@@ -173,7 +208,7 @@ void webvtt_FillStyleFromCssDeclaration( const vlc_css_declaration_t *p_decl, te
                 psz_font = strdup( term0.psz );
             free( p_style->psz_fontname );
             p_style->psz_fontname = vlc_css_unquoted( psz_font );
-            free( psz_font );
+            free( psz_font );*/
         }
     }
     else if( !strcasecmp( p_decl->psz_property, "font-style" ) )

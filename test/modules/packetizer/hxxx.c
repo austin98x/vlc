@@ -62,6 +62,10 @@ static void test_iterators( const uint8_t *p_ab, size_t i_ab, /* AnnexB */
         int i_nal = 0;
         while(b1 && b2)
         {
+            /* hxxx_*_iterate_next can potentially not set these pointers. */
+            p_start_ab = NULL;
+            p_start_prefix = NULL;
+
             b1 = hxxx_annexb_iterate_next( &it_ab, &p_start_ab, &i_size_ab );
             b2 = hxxx_iterate_next( &it_prefix, &p_start_prefix, &i_size_prefix );
             printf("NAL %d ", i_nal++);
@@ -127,7 +131,7 @@ static void testannexbin( const uint8_t *p_data, size_t i_data,
     testfunction( test##number##_annexbdata, sizeof(test##number##_annexbdata), \
                   p_res, rgi_res )
 
-static void test_annexb()
+static void test_annexb( void )
 {
     const uint8_t *p_res[3];
     size_t rgi_res[3];
@@ -190,6 +194,12 @@ static void test_annexb()
     const uint8_t test7_avcdata2[]   = { 0, 0 };
     const uint8_t test7_avcdata4[]   = { 0, 0, 0, 0 };
 
+    /* padding/trailing zeroes stripping */
+    const uint8_t test8_annexbdata[] = { 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 0, 0, 0, 1, 0xff, 0 };
+    const uint8_t test8_avcdata1[]   = { 1, 0xff, 1, 0xff };
+    const uint8_t test8_avcdata2[]   = { 0, 1, 0xff, 0, 1, 0xff };
+    const uint8_t test8_avcdata4[]   = { 0, 0, 0, 1, 0xff, 0, 0, 0, 1, 0xff };
+
     runtest(4, "empty nal test", testannexbin);
     runtest(2, "single nal test", testannexbin);
     runtest(3, "single nal test, startcode 3", testannexbin);
@@ -204,8 +214,9 @@ static void test_annexb()
     runtest(5, "IT 4 bytes prefixed nal only (4 prefix optz)", test_iterators);
     runtest(6, "startcode repeat / empty nal", test_iterators);
     runtest(7, "IT empty nal", test_iterators);
+    runtest(8, "IT zeroes stripping", test_iterators);
 
-    printf("\nTEST 8 borkage test\n");\
+    printf("\nTEST 9 borkage test\n");\
     rgi_res[0] = 0;
     rgi_res[1] = rgi_res[2] = 1;
     p_res[0] = NULL;

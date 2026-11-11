@@ -2,7 +2,6 @@
  * media_discoverer.c: libvlc new API media discoverer functions
  *****************************************************************************
  * Copyright (C) 2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Pierre d'Herbemont <pdherbemont # videolan.org>
  *
@@ -28,10 +27,10 @@
 #include <assert.h>
 
 #include <vlc/libvlc.h>
+#include <vlc/libvlc_picture.h>
 #include <vlc/libvlc_media.h>
 #include <vlc/libvlc_media_list.h>
 #include <vlc/libvlc_media_discoverer.h>
-#include <vlc/libvlc_events.h>
 
 #include <vlc_services_discovery.h>
 
@@ -41,11 +40,11 @@
 
 struct libvlc_media_discoverer_t
 {
-    libvlc_event_manager_t   event_manager;
     libvlc_instance_t *      p_libvlc_instance;
     services_discovery_t *   p_sd;
     libvlc_media_list_t *    p_mlist;
-    vlc_dictionary_t         catname_to_submedialist;
+    const struct libvlc_media_discoverer_cbs *cbs;
+    void *                   cbs_opaque;
     char                     name[];
 };
 
@@ -59,51 +58,24 @@ struct libvlc_media_discoverer_t
 
 static void services_discovery_item_added( services_discovery_t *sd,
                                            input_item_t *parent,
-                                           input_item_t *p_item,
-                                           const char *psz_cat )
+                                           input_item_t *p_item )
 {
-    libvlc_media_t * p_md;
     libvlc_media_discoverer_t *p_mdis = sd->owner.sys;
     libvlc_media_list_t * p_mlist = p_mdis->p_mlist;
 
-    p_md = libvlc_media_new_from_input_item( p_mdis->p_libvlc_instance,
-                                             p_item );
+    libvlc_media_t *p_md = libvlc_media_new_from_input_item( p_item );
+    if (p_md == NULL)
+        return;
 
-    if( parent != NULL )
-    {
-        /* Flatten items list for now. TODO: tree support. */
-    }
-    else
-    /* If we have a category, that mean we have to group the items having
-     * that category in a media_list. */
-    if( psz_cat )
-    {
-        p_mlist = vlc_dictionary_value_for_key( &p_mdis->catname_to_submedialist, psz_cat );
-
-        if( p_mlist == kVLCDictionaryNotFound )
-        {
-            libvlc_media_t * p_catmd;
-            p_catmd = libvlc_media_new_as_node( p_mdis->p_libvlc_instance, psz_cat );
-            p_mlist = libvlc_media_subitems( p_catmd );
-            p_mlist->b_read_only = true;
-
-            /* Insert the newly created mlist in our dictionary */
-            vlc_dictionary_insert( &p_mdis->catname_to_submedialist, psz_cat, p_mlist );
-
-            /* Insert the md into the root list */
-            libvlc_media_list_lock( p_mdis->p_mlist );
-            libvlc_media_list_internal_add_media( p_mdis->p_mlist, p_catmd );
-            libvlc_media_list_unlock( p_mdis->p_mlist );
-
-            /* We don't release the mlist cause the dictionary
-             * doesn't retain the object. But we release the md. */
-            libvlc_media_release( p_catmd );
-        }
-    }
+    libvlc_media_t *parent_media = parent != NULL
+                                 ? input_item_GetLibvlcOwner( parent ) : NULL;
 
     libvlc_media_list_lock( p_mlist );
     libvlc_media_list_internal_add_media( p_mlist, p_md );
     libvlc_media_list_unlock( p_mlist );
+
+    if( p_mdis->cbs != NULL && p_mdis->cbs->on_media_added != NULL )
+        p_mdis->cbs->on_media_added( p_mdis->cbs_opaque, parent_media, p_md );
 
     libvlc_media_release( p_md );
 }
@@ -118,21 +90,25 @@ static void services_discovery_item_removed( services_discovery_t *sd,
     libvlc_media_t * p_md;
     libvlc_media_discoverer_t *p_mdis = sd->owner.sys;
 
-    int i, count = libvlc_media_list_count( p_mdis->p_mlist );
     libvlc_media_list_lock( p_mdis->p_mlist );
-    for( i = 0; i < count; i++ )
+    int count = libvlc_media_list_count( p_mdis->p_mlist );
+    for( int i = 0; i < count; i++ )
     {
         p_md = libvlc_media_list_item_at_index( p_mdis->p_mlist, i );
         assert(p_md != NULL);
-        if( p_md->p_input_item == p_item )
+        if( p_md == input_item_GetLibvlcOwner( p_item ) )
         {
             libvlc_media_list_internal_remove_index( p_mdis->p_mlist, i );
+            libvlc_media_list_unlock( p_mdis->p_mlist );
+
+            if( p_mdis->cbs != NULL && p_mdis->cbs->on_media_removed != NULL )
+                p_mdis->cbs->on_media_removed( p_mdis->cbs_opaque, p_md );
             libvlc_media_release( p_md );
-            break;
+            return;
         }
         libvlc_media_release( p_md );
     }
-    libvlc_media_list_unlock( p_mdis->p_mlist );
+    vlc_assert_unreachable();
 }
 
 /*
@@ -143,8 +119,13 @@ static void services_discovery_item_removed( services_discovery_t *sd,
  *       new (Public)
  **************************************************************************/
 libvlc_media_discoverer_t *
-libvlc_media_discoverer_new( libvlc_instance_t * p_inst, const char * psz_name )
+libvlc_media_discoverer_new( libvlc_instance_t * p_inst, const char * psz_name,
+                             const struct libvlc_media_discoverer_cbs *cbs,
+                             void *cbs_opaque )
 {
+    /* No different versions to handle for now */
+    assert(cbs == NULL || cbs->version <= 0);
+
     /* podcast SD is a hack and only works with custom playlist callbacks. */
     if( !strncasecmp( psz_name, "podcast", 7 ) )
         return NULL;
@@ -159,17 +140,21 @@ libvlc_media_discoverer_new( libvlc_instance_t * p_inst, const char * psz_name )
     }
 
     p_mdis->p_libvlc_instance = p_inst;
-    p_mdis->p_mlist = libvlc_media_list_new( p_inst );
+    p_mdis->p_mlist = libvlc_media_list_new();
     p_mdis->p_mlist->b_read_only = true;
     p_mdis->p_sd = NULL;
-
-    vlc_dictionary_init( &p_mdis->catname_to_submedialist, 0 );
-    libvlc_event_manager_init( &p_mdis->event_manager, p_mdis );
+    p_mdis->cbs = cbs;
+    p_mdis->cbs_opaque = cbs_opaque;
 
     libvlc_retain( p_inst );
     strcpy( p_mdis->name, psz_name );
     return p_mdis;
 }
+
+static const struct services_discovery_callbacks sd_cbs = {
+    .item_added = services_discovery_item_added,
+    .item_removed = services_discovery_item_removed,
+};
 
 /**************************************************************************
  *       start (Public)
@@ -178,13 +163,12 @@ LIBVLC_API int
 libvlc_media_discoverer_start( libvlc_media_discoverer_t * p_mdis )
 {
     struct services_discovery_owner_t owner = {
+        &sd_cbs,
         p_mdis,
-        services_discovery_item_added,
-        services_discovery_item_removed,
     };
 
     /* Here we go */
-    p_mdis->p_sd = vlc_sd_Create( (vlc_object_t *)p_mdis->p_libvlc_instance->p_libvlc_int,
+    p_mdis->p_sd = vlc_sd_Create( VLC_OBJECT(p_mdis->p_libvlc_instance->p_libvlc_int),
                                   p_mdis->name, &owner );
     if( p_mdis->p_sd == NULL )
     {
@@ -192,9 +176,6 @@ libvlc_media_discoverer_start( libvlc_media_discoverer_t * p_mdis )
         return -1;
     }
 
-    libvlc_event_t event;
-    event.type = libvlc_MediaDiscovererStarted;
-    libvlc_event_send( &p_mdis->event_manager, &event );
     return 0;
 }
 
@@ -204,105 +185,31 @@ libvlc_media_discoverer_start( libvlc_media_discoverer_t * p_mdis )
 LIBVLC_API void
 libvlc_media_discoverer_stop( libvlc_media_discoverer_t * p_mdis )
 {
-    libvlc_media_list_t * p_mlist = p_mdis->p_mlist;
-    libvlc_media_list_lock( p_mlist );
-    libvlc_media_list_internal_end_reached( p_mlist );
-    libvlc_media_list_unlock( p_mlist );
-
-    libvlc_event_t event;
-    event.type = libvlc_MediaDiscovererEnded;
-    libvlc_event_send( &p_mdis->event_manager, &event );
-
     vlc_sd_Destroy( p_mdis->p_sd );
     p_mdis->p_sd = NULL;
 }
 
 /**************************************************************************
- *       new_from_name (Public)
- *
- * \deprecated Use libvlc_media_discoverer_new and libvlc_media_discoverer_start
+ * destroy (Public)
  **************************************************************************/
-libvlc_media_discoverer_t *
-libvlc_media_discoverer_new_from_name( libvlc_instance_t * p_inst,
-                                       const char * psz_name )
-{
-    libvlc_media_discoverer_t *p_mdis = libvlc_media_discoverer_new( p_inst, psz_name );
-
-    if( !p_mdis )
-        return NULL;
-
-    if( libvlc_media_discoverer_start( p_mdis ) != 0)
-    {
-        libvlc_media_discoverer_release( p_mdis );
-        return NULL;
-    }
-
-    return p_mdis;
-}
-
-/**************************************************************************
- * release (Public)
- **************************************************************************/
-static void
-MediaListDictValueRelease( void* mlist, void* obj )
-{
-    libvlc_media_list_release( mlist );
-    (void)obj;
-}
 
 void
-libvlc_media_discoverer_release( libvlc_media_discoverer_t * p_mdis )
+libvlc_media_discoverer_destroy( libvlc_media_discoverer_t * p_mdis )
 {
     if( p_mdis->p_sd != NULL )
         libvlc_media_discoverer_stop( p_mdis );
 
     libvlc_media_list_release( p_mdis->p_mlist );
 
-    vlc_dictionary_clear( &p_mdis->catname_to_submedialist,
-        MediaListDictValueRelease, NULL );
-
-    libvlc_event_manager_destroy( &p_mdis->event_manager );
     libvlc_release( p_mdis->p_libvlc_instance );
 
     free( p_mdis );
 }
 
 /**************************************************************************
- * localized_name (Public)
- **************************************************************************/
-char *
-libvlc_media_discoverer_localized_name( libvlc_media_discoverer_t * p_mdis )
-{
-    if( p_mdis->p_sd == NULL || p_mdis->p_sd->description == NULL )
-        return NULL;
-    return strdup( p_mdis->p_sd->description );
-}
-
-/**************************************************************************
- * media_list (Public)
- **************************************************************************/
-libvlc_media_list_t *
-libvlc_media_discoverer_media_list( libvlc_media_discoverer_t * p_mdis )
-{
-    libvlc_media_list_retain( p_mdis->p_mlist );
-    return p_mdis->p_mlist;
-}
-
-/**************************************************************************
- * event_manager (Public)
- **************************************************************************/
-libvlc_event_manager_t *
-libvlc_media_discoverer_event_manager( libvlc_media_discoverer_t * p_mdis )
-{
-    return &p_mdis->event_manager;
-}
-
-
-/**************************************************************************
  * running (Public)
  **************************************************************************/
-int
-libvlc_media_discoverer_is_running( libvlc_media_discoverer_t * p_mdis )
+bool libvlc_media_discoverer_is_running(libvlc_media_discoverer_t * p_mdis)
 {
     return p_mdis->p_sd != NULL;
 }

@@ -20,6 +20,9 @@
 #ifndef FAKEESOUTID_HPP
 #define FAKEESOUTID_HPP
 
+#include "../ID.hpp"
+#include "../tools/Macros.hpp"
+
 #include <vlc_common.h>
 #include <vlc_es.h>
 
@@ -27,17 +30,40 @@ namespace adaptive
 {
     class FakeESOut;
 
-    class FakeESOutID
+    enum class EsType
     {
+        Video,
+        Audio,
+        Other,
+    };
+
+    class AbstractFakeESOutID
+    {
+        PREREQ_INTERFACE(AbstractFakeESOutID);
+
+        public:
+            virtual es_out_id_t * realESID() const = 0;
+            virtual void create() = 0;
+            virtual void release() = 0;
+            virtual void sendData(block_t *) = 0;
+            virtual EsType esType() const = 0;
+    };
+
+    class FakeESOutID : public AbstractFakeESOutID
+    {
+        PREREQ_VIRTUAL(FakeESOutID);
+
         public:
             FakeESOutID( FakeESOut *, const es_format_t * );
-            ~FakeESOutID();
+            FakeESOutID( FakeESOut *, const es_format_t *, const SrcID & );
+            virtual ~FakeESOutID();
             void setRealESID( es_out_id_t * );
-            es_out_id_t * realESID();
+            es_out_id_t * realESID() const override;
             const es_format_t *getFmt() const;
-            void create();
-            void release();
-            void notifyData();
+            void create() override;
+            void release() override;
+            void sendData(block_t *) override;
+            EsType esType() const override;
             bool isCompatible( const FakeESOutID * ) const;
             /* Ensure we won't issue delete command twice */
             void setScheduledForDeletion();
@@ -48,6 +74,7 @@ namespace adaptive
             es_out_id_t *p_real_es_id;
             es_format_t fmt;
             bool pending_delete;
+            SrcID srcid = SrcID::dummy();
     };
 }
 

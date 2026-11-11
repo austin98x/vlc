@@ -38,7 +38,6 @@ static void Close(vlc_object_t *);
 vlc_module_begin()
     set_shortname(N_("libsecret keystore"))
     set_description(N_("Secrets are stored via libsecret"))
-    set_category(CAT_ADVANCED)
     set_subcategory(SUBCAT_ADVANCED_MISC)
     set_capability("keystore", 100)
     set_callbacks(Open, Close)
@@ -74,7 +73,7 @@ static void cancellable_interrupted(void *p_data)
     g_cancellable_cancel(p_canc);
 }
 
-static GCancellable *cancellable_register()
+static GCancellable *cancellable_register(void)
 {
     GCancellable *p_canc = g_cancellable_new();
     if (!p_canc)
@@ -266,7 +265,7 @@ Remove(vlc_keystore *p_keystore, const char *const ppsz_values[KEY_MAX])
 
 struct secrets_watch_data
 {
-    vlc_sem_t sem;
+    GMainLoop *loop;
     bool b_running;
 };
 
@@ -277,7 +276,7 @@ dbus_appeared_cb(GDBusConnection *connection, const gchar *name,
     (void) connection; (void) name; (void)name_owner;
     struct secrets_watch_data *p_watch_data = user_data;
     p_watch_data->b_running = true;
-    vlc_sem_post(&p_watch_data->sem);
+    g_main_loop_quit(p_watch_data->loop);
 }
 
 static void
@@ -286,37 +285,85 @@ dbus_vanished_cb(GDBusConnection *connection, const gchar *name,
 {
     (void) connection; (void) name;
     struct secrets_watch_data *p_watch_data = user_data;
-    p_watch_data->b_running = false;
-    vlc_sem_post(&p_watch_data->sem);
+    g_main_loop_quit(p_watch_data->loop);
+}
+
+static void mainloop_interrupted(void *user_data)
+{
+    struct secrets_watch_data *p_watch_data = user_data;
+    g_main_loop_quit(p_watch_data->loop);
+}
+
+static int
+check_service_running(void)
+{
+    /* Cache the return of this function that may take up to 200ms. This atomic
+     * doesn't prevent a cache miss (unlikely). This function can be called
+     * safely from any threads. */
+    static atomic_int cache_running = 0;
+    int running = atomic_load_explicit(&cache_running, memory_order_relaxed);
+    if (running != 0)
+        return running == 1 ? VLC_SUCCESS : VLC_EGENERIC;
+
+    /* First, check if secrets service is running using g_bus_watch_name().
+     * Indeed, secret_service_get_sync will spawn a service if it's not
+     * running, even on non Gnome environments */
+
+    /* Use a private context: another thread may own the default one for the
+     * whole lifetime of the process (Qt's GLib dispatcher does). Push it as
+     * the thread-default one, that is where g_bus_watch_name() attaches. */
+    GMainContext *ctx = g_main_context_new();
+    if (unlikely(ctx == NULL))
+        return VLC_ENOMEM;
+
+    g_main_context_push_thread_default(ctx);
+
+    GMainLoop *loop = g_main_loop_new(ctx, FALSE);
+    if (unlikely(loop == NULL))
+    {
+        g_main_context_pop_thread_default(ctx);
+        g_main_context_unref(ctx);
+        return VLC_ENOMEM;
+    }
+
+    struct secrets_watch_data watch_data = {
+        .loop = loop,
+        .b_running = false,
+    };
+
+    guint i_id = g_bus_watch_name(G_BUS_TYPE_SESSION,
+                                  "org.freedesktop.secrets",
+                                  G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                  dbus_appeared_cb, dbus_vanished_cb,
+                                  &watch_data, NULL);
+
+    vlc_interrupt_register(mainloop_interrupted, &watch_data);
+
+    g_main_loop_run(loop);
+
+    vlc_interrupt_unregister();
+
+    g_bus_unwatch_name(i_id);
+
+    g_main_loop_unref(loop);
+
+    g_main_context_pop_thread_default(ctx);
+    g_main_context_unref(ctx);
+
+    atomic_store_explicit(&cache_running, watch_data.b_running ? 1 : -1,
+                          memory_order_relaxed);
+
+    return watch_data.b_running ? VLC_SUCCESS : VLC_EGENERIC;
 }
 
 static int
 Open(vlc_object_t *p_this)
 {
-    if (!p_this->obj.force)
+    if (!p_this->force)
     {
-        /* First, check if secrets service is running using g_bus_watch_name().
-         * Indeed, secret_service_get_sync will spawn a service if it's not
-         * running, even on non Gnome environments */
-        struct secrets_watch_data watch_data;
-        watch_data.b_running = false;
-        vlc_sem_init(&watch_data.sem, 0);
-
-        guint i_id = g_bus_watch_name(G_BUS_TYPE_SESSION,
-                                      "org.freedesktop.secrets",
-                                      G_BUS_NAME_WATCHER_FLAGS_NONE,
-                                      dbus_appeared_cb, dbus_vanished_cb,
-                                      &watch_data, NULL);
-
-        /* We are guaranteed that one of the callbacks will be invoked after
-         * calling g_bus_watch_name */
-        vlc_sem_wait_i11e(&watch_data.sem);
-
-        g_bus_unwatch_name(i_id);
-        vlc_sem_destroy(&watch_data.sem);
-
-        if (!watch_data.b_running)
-            return VLC_EGENERIC;
+        int ret = check_service_running();
+        if (ret != VLC_SUCCESS)
+            return ret;
     }
 
     GCancellable *p_canc = cancellable_register();

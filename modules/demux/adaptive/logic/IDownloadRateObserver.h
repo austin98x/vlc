@@ -25,7 +25,10 @@
 #ifndef IDOWNLOADRATEOBSERVER_H_
 #define IDOWNLOADRATEOBSERVER_H_
 
+#include "../tools/Macros.hpp"
+
 #include <vlc_common.h>
+#include <vlc_tick.h>
 
 namespace adaptive
 {
@@ -33,9 +36,11 @@ namespace adaptive
 
     class IDownloadRateObserver
     {
+        PREREQ_INTERFACE(IDownloadRateObserver);
+
         public:
-            virtual void updateDownloadRate(const ID &, size_t, mtime_t) = 0;
-            virtual ~IDownloadRateObserver(){}
+            virtual void updateDownloadRate(const ID &, size_t,
+                                            vlc_tick_t, vlc_tick_t) = 0;
     };
 }
 

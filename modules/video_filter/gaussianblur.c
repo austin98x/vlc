@@ -2,7 +2,6 @@
  * gaussianblur.c : gaussian blur video filter
  *****************************************************************************
  * Copyright (C) 2000-2007 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Antoine Cellerier <dionoea -at- videolan -dot- org>
  *
@@ -30,19 +29,19 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
-#include <vlc_memory.h>
 #include <vlc_filter.h>
 #include <vlc_picture.h>
-#include "filter_picture.h"
 
 #include <math.h>                                          /* exp(), sqrt() */
+#include <stdckdint.h>
 
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Create    ( vlc_object_t * );
-static void Destroy   ( vlc_object_t * );
+static int  Create    ( filter_t * );
 
 #define SIGMA_MIN (0.01)
 #define SIGMA_MAX (4096.0)
@@ -60,21 +59,18 @@ vlc_module_begin ()
     set_description( N_("Gaussian blur video filter") )
     set_shortname( N_( "Gaussian Blur" ))
     set_help(GAUSSIAN_HELP)
-    set_capability( "video filter", 0 )
-    set_category( CAT_VIDEO )
     set_subcategory( SUBCAT_VIDEO_VFILTER )
 
     add_float_with_range( FILTER_PREFIX "sigma", 2., SIGMA_MIN, SIGMA_MAX,
-                          SIGMA_TEXT, SIGMA_LONGTEXT,
-                          false )
+                          SIGMA_TEXT, SIGMA_LONGTEXT )
 
-    set_callbacks( Create, Destroy )
+    set_callback_video_filter( Create )
 vlc_module_end ()
 
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
-static picture_t *Filter( filter_t *, picture_t * );
+VIDEO_FILTER_WRAPPER_CLOSE(Filter, Destroy)
 
 static const char *const ppsz_filter_options[] = {
     "sigma", NULL
@@ -93,7 +89,7 @@ static const char *const ppsz_filter_options[] = {
 #   define type_t float
 #endif
 
-struct filter_sys_t
+typedef struct
 {
     double f_sigma;
     int i_dim;
@@ -101,13 +97,15 @@ struct filter_sys_t
     type_t *pt_distribution;
     type_t *pt_buffer;
     type_t *pt_scale;
-};
+} filter_sys_t;
 
-static void gaussianblur_InitDistribution( filter_sys_t *p_sys )
+static int gaussianblur_InitDistribution( filter_sys_t *p_sys )
 {
     double f_sigma = p_sys->f_sigma;
     int i_dim = (int)(3.*f_sigma);
-    type_t *pt_distribution = xmalloc( (2*i_dim+1) * sizeof( type_t ) );
+    type_t *pt_distribution = vlc_alloc( 2*i_dim+1, sizeof( type_t ) );
+    if( pt_distribution == NULL )
+        return VLC_ENOMEM;
 
     for( int x = -i_dim; x <= i_dim; x++ )
     {
@@ -123,18 +121,16 @@ static void gaussianblur_InitDistribution( filter_sys_t *p_sys )
     }
     p_sys->i_dim = i_dim;
     p_sys->pt_distribution = pt_distribution;
+
+    return VLC_SUCCESS;
 }
 
-static int Create( vlc_object_t *p_this )
+static int Create( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
-
     if(   p_filter->fmt_in.video.i_chroma != VLC_CODEC_I420
-       && p_filter->fmt_in.video.i_chroma != VLC_CODEC_J420
        && p_filter->fmt_in.video.i_chroma != VLC_CODEC_YV12
 
        && p_filter->fmt_in.video.i_chroma != VLC_CODEC_I422
-       && p_filter->fmt_in.video.i_chroma != VLC_CODEC_J422
       )
     {
         /* We only want planar YUV 4:2:0 or 4:2:2 */
@@ -143,82 +139,87 @@ static int Create( vlc_object_t *p_this )
         return VLC_EGENERIC;
     }
 
-    if( p_filter->fmt_in.video.i_chroma != p_filter->fmt_out.video.i_chroma )
+    if( !video_format_IsSameChroma( &p_filter->fmt_in.video,
+                                    &p_filter->fmt_out.video ) )
     {
         msg_Err( p_filter, "Input and output chromas don't match" );
         return VLC_EGENERIC;
     }
 
-    p_filter->p_sys = malloc( sizeof( filter_sys_t ) );
-    if( p_filter->p_sys == NULL )
+    filter_sys_t *p_sys = malloc( sizeof( filter_sys_t ) );
+    if( p_sys == NULL )
         return VLC_ENOMEM;
+    p_filter->p_sys = p_sys;
 
     config_ChainParse( p_filter, FILTER_PREFIX, ppsz_filter_options,
                        p_filter->p_cfg );
 
-    p_filter->pf_video_filter = Filter;
+    p_filter->ops = &Filter_ops;
 
-    p_filter->p_sys->f_sigma =
+    p_sys->f_sigma =
         var_CreateGetFloat( p_filter, FILTER_PREFIX "sigma" );
-    if( p_filter->p_sys->f_sigma <= 0. )
+    if( p_sys->f_sigma <= 0. )
     {
         msg_Err( p_filter, "sigma must be greater than zero" );
         return VLC_EGENERIC;
     }
-    gaussianblur_InitDistribution( p_filter->p_sys );
+    if( gaussianblur_InitDistribution( p_sys ) != VLC_SUCCESS )
+    {
+        free( p_sys );
+        return VLC_ENOMEM;
+    }
     msg_Dbg( p_filter, "gaussian distribution is %d pixels wide",
-             p_filter->p_sys->i_dim*2+1 );
+             p_sys->i_dim*2+1 );
 
-    p_filter->p_sys->pt_buffer = NULL;
-    p_filter->p_sys->pt_scale = NULL;
+    p_sys->pt_buffer = NULL;
+    p_sys->pt_scale = NULL;
 
     return VLC_SUCCESS;
 }
 
-static void Destroy( vlc_object_t *p_this )
+static void Destroy( filter_t *p_filter )
 {
-    filter_t *p_filter = (filter_t *)p_this;
+    filter_sys_t *p_sys = p_filter->p_sys;
 
-    free( p_filter->p_sys->pt_distribution );
-    free( p_filter->p_sys->pt_buffer );
-    free( p_filter->p_sys->pt_scale );
+    free( p_sys->pt_distribution );
+    free( p_sys->pt_buffer );
+    free( p_sys->pt_scale );
 
-    free( p_filter->p_sys );
+    free( p_sys );
 }
 
-static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
+static void Filter( filter_t *p_filter, picture_t *p_pic, picture_t *p_outpic )
 {
-    picture_t *p_outpic;
     filter_sys_t *p_sys = p_filter->p_sys;
     const int i_dim = p_sys->i_dim;
     type_t *pt_buffer;
     type_t *pt_scale;
     const type_t *pt_distribution = p_sys->pt_distribution;
 
-    if( !p_pic ) return NULL;
+    size_t i_y_plane_bytes;
+    if( ckd_mul( &i_y_plane_bytes, p_pic->p[Y_PLANE].i_visible_lines, p_pic->p[Y_PLANE].i_pitch ) ||
+        ckd_mul( &i_y_plane_bytes, i_y_plane_bytes, sizeof( type_t ) ) ||
+        i_y_plane_bytes == 0 )
+        return; // FIXME: nullify output ?
 
-    p_outpic = filter_NewPicture( p_filter );
-    if( !p_outpic )
-    {
-        picture_Release( p_pic );
-        return NULL;
-    }
     if( !p_sys->pt_buffer )
     {
-        p_sys->pt_buffer = realloc_or_free( p_sys->pt_buffer,
-                               p_pic->p[Y_PLANE].i_visible_lines *
-                               p_pic->p[Y_PLANE].i_pitch * sizeof( type_t ) );
+        p_sys->pt_buffer = malloc( i_y_plane_bytes );
+        if( !p_sys->pt_buffer )
+            return;
     }
 
     pt_buffer = p_sys->pt_buffer;
     if( !p_sys->pt_scale )
     {
+        p_sys->pt_scale = malloc( i_y_plane_bytes );
+        if( !p_sys->pt_scale )
+            return;
+        pt_scale = p_sys->pt_scale;
+
         const int i_visible_lines = p_pic->p[Y_PLANE].i_visible_lines;
         const int i_visible_pitch = p_pic->p[Y_PLANE].i_visible_pitch;
         const int i_pitch = p_pic->p[Y_PLANE].i_pitch;
-
-        p_sys->pt_scale = xmalloc( i_visible_lines * i_pitch * sizeof( type_t ) );
-        pt_scale = p_sys->pt_scale;
 
         for( int i_line = 0; i_line < i_visible_lines; i_line++ )
         {
@@ -231,7 +232,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
                      y++ )
                 {
                     for( int x = __MAX( -i_dim, -i_col );
-                         x <= __MIN( i_dim, i_visible_pitch - i_col + 1 );
+                         x <= __MIN( i_dim, i_visible_pitch - i_col - 1 );
                          x++ )
                     {
                         t_value += pt_distribution[y+i_dim] *
@@ -264,7 +265,7 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
                 type_t t_value = 0;
                 const int c = i_line*i_in_pitch+i_col;
                 for( int x = __MAX( -i_dim, -i_col*(x_factor+1) );
-                     x <= __MIN( i_dim, (i_visible_pitch - i_col)*(x_factor+1) + 1 );
+                     x <= __MIN( i_dim, (i_visible_pitch - i_col)*(x_factor+1) - 1 );
                      x++ )
                 {
                     t_value += pt_distribution[x+i_dim] *
@@ -292,6 +293,4 @@ static picture_t *Filter( filter_t *p_filter, picture_t *p_pic )
             }
         }
     }
-
-    return CopyInfoAndRelease( p_outpic, p_pic );
 }

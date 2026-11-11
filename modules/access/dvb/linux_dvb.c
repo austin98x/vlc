@@ -30,6 +30,7 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_access.h>
 #include <vlc_fs.h>
 
@@ -153,8 +154,7 @@ int FrontendOpen( vlc_object_t *p_access, dvb_sys_t *p_sys, const char *psz_acce
             psz_expected = "DVB-T";
         }
 
-        if( (!strncmp( psz_access, "usdigital", 9 ) ||
-             !strncmp( psz_access, "atsc", 4 ) ) &&
+        if( !strncmp( psz_access, "atsc", 4 ) &&
              (p_frontend->info.type != FE_ATSC) )
         {
             psz_expected = "ATSC";
@@ -184,8 +184,7 @@ int FrontendOpen( vlc_object_t *p_access, dvb_sys_t *p_sys, const char *psz_acce
         else if( !strncmp( psz_access, "terrestrial", 11 ) ||
                  !strncmp( psz_access, "dvb-t", 5 ) )
             p_frontend->info.type = FE_OFDM;
-        else if( !strncmp( psz_access, "usdigital", 9 ) ||
-                 !strncmp( psz_access, "atsc", 4 ) )
+        else if( !strncmp( psz_access, "atsc", 4 ) )
             p_frontend->info.type = FE_ATSC;
     }
 
@@ -381,9 +380,9 @@ static int ScanParametersDvbS( vlc_object_t *p_access, dvb_sys_t *p_sys, scan_pa
     char *psz_name = var_InheritString( p_access, "dvb-satellite" );
     if( psz_name )
     {
-        char *data_dir = config_GetDataDir();
+        char *data_dir = config_GetSysPath(VLC_SYSDATA_DIR, "dvb/dvb-s");
         if( !data_dir || -1 ==  asprintf( &p_scan->psz_scanlist_file,
-            "%s" DIR_SEP "dvb" DIR_SEP "dvb-s" DIR_SEP "%s", data_dir, psz_name ) )
+            "%s/%s", data_dir, psz_name ) )
         {
             p_scan->psz_scanlist_file = NULL;
         }
@@ -409,7 +408,7 @@ static int ScanParametersDvbC( vlc_object_t *p_access, dvb_sys_t *p_sys, scan_pa
 
     /* if frontend can do auto, don't scan them */
     p_scan->b_modulation_set = ( p_frontend->info.caps & FE_CAN_QAM_AUTO );
-    /* our scanning code flips modulation from 16..256 automaticly*/
+    /* our scanning code flips modulation from 16..256 automatically*/
 
     /* if user supplies symbolrate, don't scan those */
     p_scan->i_symbolrate = var_GetInteger( p_access, "dvb-srate" );
@@ -685,7 +684,7 @@ static int DoDiseqc( vlc_object_t *p_access, dvb_sys_t *p_sys )
     }
 
     /* Wait for at least 15 ms. */
-    msleep(15000);
+    vlc_tick_sleep(VLC_TICK_FROM_MS(15));
 
     i_val = var_GetInteger( p_access, "dvb-satno" );
     if( i_val > 0 && i_val < 5 )
@@ -713,7 +712,7 @@ static int DoDiseqc( vlc_object_t *p_access, dvb_sys_t *p_sys )
             return VLC_EGENERIC;
         }
 
-        msleep(15000 + cmd.wait * 1000);
+        vlc_tick_sleep(VLC_TICK_FROM_MS(15 + cmd.wait));
 
         /* A or B simple diseqc ("diseqc-compatible") */
         if( ioctl( p_sys->i_frontend_handle, FE_DISEQC_SEND_BURST,
@@ -724,7 +723,7 @@ static int DoDiseqc( vlc_object_t *p_access, dvb_sys_t *p_sys )
             return VLC_EGENERIC;
         }
 
-        msleep(15000);
+        vlc_tick_sleep(VLC_TICK_FROM_MS(15));
     }
 
     if( ioctl( p_sys->i_frontend_handle, FE_SET_TONE, fe_tone ) )
@@ -735,7 +734,7 @@ static int DoDiseqc( vlc_object_t *p_access, dvb_sys_t *p_sys )
         return VLC_EGENERIC;
     }
 
-    msleep(50000);
+    vlc_tick_sleep(VLC_TICK_FROM_MS(50));
     return 0;
 }
 

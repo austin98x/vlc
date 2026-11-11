@@ -2,7 +2,6 @@
  * window_manager.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -32,6 +31,7 @@
 #include <map>
 #include <set>
 #include <utility>
+#include <memory>
 
 
 class GenericFont;
@@ -168,6 +168,9 @@ public:
     bool isOpacityNeeded() const
     { return (m_opacityEnabled && (m_alpha != 255 || m_moveAlpha != 255 )); }
 
+    /// Once a window is hidden, check if there are any left
+    void onWindowHidden();
+
 private:
     /// Some useful typedefs for lazy people like me
     typedef std::set<TopWindow*> WinSet_t;
@@ -220,7 +223,7 @@ private:
     /// Rect of the last maximized window
     SkinsRect m_maximizeRect;
     /// Tooltip
-    Tooltip *m_pTooltip;
+    std::unique_ptr<Tooltip> m_pTooltip;
     /// Active popup, if any
     Popup *m_pPopup;
 

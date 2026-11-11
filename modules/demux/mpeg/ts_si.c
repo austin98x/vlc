@@ -37,6 +37,7 @@
 #include <dvbpsi/tot.h> /* TDT support */
 #include <dvbpsi/dr.h>
 #include <dvbpsi/psi.h>
+#include "../../mux/mpeg/dvbpsi_compat.h" /* dvbpsi_messages */
 
 #include "ts_si.h"
 #include "ts_arib.h"
@@ -54,6 +55,12 @@
 #include <time.h>
 #include <assert.h>
 #include <limits.h>
+
+struct ts_si_context_t
+{
+    dvbpsi_t *p_handle;
+    int       i_version;
+};
 
 #ifndef SI_DEBUG_EIT
  #define SI_DEBUG_TIMESHIFT(t)
@@ -74,8 +81,8 @@ static void SINewTableCallBack( dvbpsi_t *h, uint8_t i_table_id,
 void ts_si_Packet_Push( ts_pid_t *p_pid, const uint8_t *p_pktbuffer )
 {
     if( likely(p_pid->type == TYPE_SI) &&
-        dvbpsi_decoder_present( p_pid->u.p_si->handle ) )
-        dvbpsi_packet_push( p_pid->u.p_si->handle, (uint8_t *) p_pktbuffer );
+        dvbpsi_decoder_present( p_pid->u.p_si->p_ctx->p_handle ) )
+        dvbpsi_packet_push( p_pid->u.p_si->p_ctx->p_handle, (uint8_t *) p_pktbuffer );
 }
 
 static char *EITConvertToUTF8( demux_t *p_demux,
@@ -143,8 +150,9 @@ static char *EITConvertToUTF8( demux_t *p_demux,
     }\
     } while(0)\
 
-static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
+static void SDTCallBack( void *opaque, dvbpsi_sdt_t *p_sdt )
 {
+    demux_t              *p_demux = opaque;
     demux_sys_t          *p_sys = p_demux->p_sys;
     ts_pid_t             *sdt = GetPID(p_sys, TS_SI_SDT_PID);
     ts_pat_t             *p_pat = ts_pid_Get(&p_sys->pids, 0)->u.p_pat;
@@ -154,14 +162,14 @@ static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
 
     if( p_sys->es_creation != CREATE_ES ||
        !p_sdt->b_current_next ||
-        p_sdt->i_version == sdt->u.p_si->i_version )
+        p_sdt->i_version == sdt->u.p_si->p_ctx->i_version )
     {
         dvbpsi_sdt_delete( p_sdt );
         return;
     }
 
     /* First callback */
-    if( sdt->u.p_si->i_version == -1 )
+    if( sdt->u.p_si->p_ctx->i_version == -1 )
     {
         attach_SI_decoders( TS_SI_EIT_PID, "EIT", eitpid );
         attach_SI_decoders( TS_SI_TDT_PID, "TDT", tdtpid );
@@ -263,10 +271,13 @@ static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
                 msg_Dbg( p_demux, "    - type=%"PRIu8" provider=%s name=%s",
                          pD->i_service_type, str1, str2 );
 
-                vlc_meta_SetTitle( p_meta, str2 );
-                vlc_meta_SetPublisher( p_meta, str1 );
-                if( pD->i_service_type >= 0x01 && pD->i_service_type <= 0x10 )
-                    psz_type = ppsz_type[pD->i_service_type];
+                if( !str2 || strcmp( "Service01", str2 ) ) /* Skip bogus libav/ffmpeg SDT */
+                {
+                    vlc_meta_SetTitle( p_meta, str2 );
+                    vlc_meta_SetPublisher( p_meta, str1 );
+                    if( pD->i_service_type >= 0x01 && pD->i_service_type <= 0x10 )
+                        psz_type = ppsz_type[pD->i_service_type];
+                }
                 free( str1 );
                 free( str2 );
             }
@@ -298,7 +309,7 @@ static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
                                       TS_ARIB_LOGO_TYPE_HD_LARGE ) > -1 )
                         {
                             vlc_meta_SetArtURL( p_meta, psz_name );
-                            vlc_meta_AddExtra( p_meta, "ARTURL", psz_name );
+                            vlc_meta_SetExtra( p_meta, "ARTURL", psz_name );
                             free( psz_name );
                         }
                     }
@@ -321,16 +332,16 @@ static void SDTCallBack( demux_t *p_demux, dvbpsi_sdt_t *p_sdt )
         }
 
         if( psz_type )
-            vlc_meta_AddExtra( p_meta, "Type", psz_type );
+            vlc_meta_SetExtra( p_meta, "Type", psz_type );
         if( psz_status )
-            vlc_meta_AddExtra( p_meta, "Status", psz_status );
+            vlc_meta_SetExtra( p_meta, "Status", psz_status );
 
         es_out_Control( p_demux->out, ES_OUT_SET_GROUP_META,
                         p_srv->i_service_id, p_meta );
         vlc_meta_Delete( p_meta );
     }
 
-    sdt->u.p_si->i_version = p_sdt->i_version;
+    sdt->u.p_si->p_ctx->i_version = p_sdt->i_version;
     dvbpsi_sdt_delete( p_sdt );
 }
 
@@ -373,8 +384,9 @@ static int EITConvertDuration( uint32_t i_duration )
 }
 #undef CVT_FROM_BCD
 
-static void TDTCallBack( demux_t *p_demux, dvbpsi_tot_t *p_tdt )
+static void TDTCallBack( void *opaque, dvbpsi_tot_t *p_tdt )
 {
+    demux_t            *p_demux = opaque;
     demux_sys_t        *p_sys = p_demux->p_sys;
 
 
@@ -393,7 +405,7 @@ static void TDTCallBack( demux_t *p_demux, dvbpsi_tot_t *p_tdt )
     /* Because libdvbpsi is broken and deduplicating timestamp tables,
      * we need to reset it to get next timestamp callback */
     ts_pid_t *pid = ts_pid_Get( &p_sys->pids, TS_SI_TDT_PID );
-    dvbpsi_decoder_reset( pid->u.p_si->handle->p_decoder, true );
+    dvbpsi_decoder_reset( pid->u.p_si->p_ctx->p_handle->p_decoder, true );
     dvbpsi_tot_delete(p_tdt);
 
     es_out_Control( p_demux->out, ES_OUT_SET_EPG_TIME, (int64_t) p_sys->i_network_time );
@@ -455,7 +467,8 @@ static void EITExtractDrDescItems( demux_t *p_demux, const dvbpsi_extended_event
                 continue;
             }
 
-            msg_Dbg( p_demux, "       - desc='%s' item='%s'", psz_key, psz_itm );
+            msg_Dbg( p_demux, "       - desc='%s' item='%s'",
+                     psz_key ? psz_key : "(null)", psz_itm );
             if( b_appending )
             {
                 /* Continued items */
@@ -479,8 +492,9 @@ static void EITExtractDrDescItems( demux_t *p_demux, const dvbpsi_extended_event
     }
 }
 
-static void EITCallBack( demux_t *p_demux, dvbpsi_eit_t *p_eit )
+static void EITCallBack( void *opaque, dvbpsi_eit_t *p_eit )
 {
+    demux_t            *p_demux = opaque;
     demux_sys_t        *p_sys = p_demux->p_sys;
     const dvbpsi_eit_event_t *p_evt;
     uint64_t i_runevt = 0;
@@ -503,7 +517,7 @@ static void EITCallBack( demux_t *p_demux, dvbpsi_eit_t *p_eit )
              p_eit->i_segment_last_section_number, p_eit->i_last_table_id );
 
     /* Use table ID for segmenting our EPG tables updates. 1 table id has 256 sections which
-     * represents 8 segements of 32 sections each. Thus a max of 24 hours per table ID
+     * represents 8 segments of 32 sections each. Thus a max of 24 hours per table ID
      * (Should be even better with tableid+segmentid compound if dvbpsi would export segment id)
      * see TS 101 211, 4.1.4.2.1 */
     p_epg = vlc_epg_New( p_eit->i_table_id, p_eit->i_extension );
@@ -766,14 +780,13 @@ static void SINewTableCallBack( dvbpsi_t *h, uint8_t i_table_id,
     assert( h );
     ts_pid_t *p_pid = (ts_pid_t *) p_pid_cbdata;
     demux_t *p_demux = (demux_t *) h->p_sys;
-    demux_sys_t *p_sys = p_demux->p_sys;
 #if 0
     msg_Dbg( p_demux, "SINewTableCallback: table 0x%"PRIx8"(%"PRIu16") ext=0x%"PRIx16"(%"PRIu16")",
              i_table_id, i_table_id, i_extension, i_extension );
 #endif
     if( p_pid->i_pid == TS_SI_SDT_PID && i_table_id == 0x42 )
     {
-        if( !dvbpsi_sdt_attach( h, i_table_id, i_extension, (dvbpsi_sdt_callback)SDTCallBack, p_demux ) )
+        if( !dvbpsi_sdt_attach( h, i_table_id, i_extension, SDTCallBack, p_demux ) )
             msg_Err( p_demux, "SINewTableCallback: failed attaching SDTCallback" );
     }
     else if( p_pid->i_pid == TS_SI_EIT_PID &&
@@ -781,13 +794,13 @@ static void SINewTableCallBack( dvbpsi_t *h, uint8_t i_table_id,
                (i_table_id >= 0x50 && i_table_id <= 0x5f) ) ) /* Schedule */
     {
         if( !dvbpsi_eit_attach( h, i_table_id, i_extension,
-                                (dvbpsi_eit_callback)EITCallBack, p_demux ) )
+                                EITCallBack, p_demux ) )
             msg_Err( p_demux, "SINewTableCallback: failed attaching EITCallback" );
     }
     else if( p_pid->i_pid == TS_SI_TDT_PID &&
             (i_table_id == TS_SI_TDT_TABLE_ID || i_table_id == TS_SI_TOT_TABLE_ID) )
     {
-        if( !dvbpsi_tot_attach( h, i_table_id, i_extension, (dvbpsi_tot_callback)TDTCallBack, p_demux ) )
+        if( !dvbpsi_tot_attach( h, i_table_id, i_extension, TDTCallBack, p_demux ) )
             msg_Err( p_demux, "SINewTableCallback: failed attaching TDTCallback" );
     }
     else if( p_pid->i_pid == TS_ARIB_CDT_PID && i_table_id == TS_ARIB_CDT_TABLE_ID )
@@ -803,8 +816,33 @@ bool ts_attach_SI_Tables_Decoders( ts_pid_t *p_pid )
     if( p_pid->type != TYPE_SI )
         return false;
 
-    if( dvbpsi_decoder_present( p_pid->u.p_si->handle ) )
+    if( dvbpsi_decoder_present( p_pid->u.p_si->p_ctx->p_handle ) )
         return true;
 
-    return dvbpsi_AttachDemux( p_pid->u.p_si->handle, SINewTableCallBack, p_pid );
+    return dvbpsi_AttachDemux( p_pid->u.p_si->p_ctx->p_handle, SINewTableCallBack, p_pid );
+}
+
+void ts_si_context_Delete( ts_si_context_t *p_ctx )
+{
+    if( dvbpsi_decoder_present( p_ctx->p_handle ) )
+        dvbpsi_DetachDemux( p_ctx->p_handle );
+    dvbpsi_delete( p_ctx->p_handle );
+    free( p_ctx );
+}
+
+ts_si_context_t * ts_si_context_New( demux_t *p_demux )
+{
+    ts_si_context_t *p_ctx = malloc(sizeof(*p_ctx));
+    if(likely(p_ctx))
+    {
+        p_ctx->p_handle = dvbpsi_new( &dvbpsi_messages, DVBPSI_MSG_DEBUG );
+        if( !p_ctx->p_handle )
+        {
+            free( p_ctx );
+            return NULL;
+        }
+        p_ctx->p_handle->p_sys = (void *) p_demux;
+        p_ctx->i_version = -1;
+    }
+    return p_ctx;
 }

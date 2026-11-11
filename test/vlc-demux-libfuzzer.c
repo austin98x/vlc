@@ -37,18 +37,29 @@ int LLVMFuzzerInitialize(int *argc, char ***argv);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 static struct vlc_run_args args;
+static libvlc_instance_t *vlc;
 
 int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
-    (void) argc; (void) argv;
-
+    (void) argc;
     vlc_run_args_init(&args);
 
-    return 0;
+    if (args.name == NULL)
+    {
+        char *name = *argv[0];
+        static const char suffix[] = "-libfuzzer";
+        static const size_t suffix_len = sizeof(suffix) - 1;
+        char *target_start = strstr(name, suffix);
+        if (target_start != NULL && target_start[suffix_len] == '-')
+            args.name = &target_start[suffix_len + 1];
+    }
+    vlc = libvlc_create(&args);
+
+    return vlc ? 0 : -1;
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    vlc_demux_process_memory(&args, data, size);
+    libvlc_demux_process_memory(vlc, &args, data, size);
     return 0;
 }

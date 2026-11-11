@@ -29,36 +29,42 @@
 #include <string.h>
 
 #include <sys/types.h>
+#ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
+#endif
 #include <poll.h>
 
+#include "../../libvlc/test.h"
+
 #include <vlc_common.h>
+#include <vlc_poll.h>
 #include <vlc_modules.h>
 #include <vlc_tls.h>
 #include "../../../lib/libvlc_internal.h"
 
 #include <vlc/vlc.h>
 
-static vlc_tls_creds_t *server_creds;
-static vlc_tls_creds_t *client_creds;
+static vlc_tls_server_t *server_creds;
+static vlc_tls_client_t *client_creds;
 
 static void *tls_echo(void *data)
 {
     vlc_tls_t *tls = data;
-    struct pollfd ufd;
     ssize_t val;
     char buf[256];
 
-    ufd.fd = vlc_tls_GetFD(tls);
-
     while ((val = vlc_tls_SessionHandshake(server_creds, tls)) > 0)
     {
+        struct pollfd ufd;
+
         switch (val)
         {
             case 1:  ufd.events = POLLIN;  break;
             case 2:  ufd.events = POLLOUT; break;
             default: vlc_assert_unreachable();
         }
+
+        ufd.fd = vlc_tls_GetPollFD(tls, &ufd.events);
         poll(&ufd, 1, -1);
     }
 
@@ -94,7 +100,7 @@ static vlc_tls_t *securepair(vlc_thread_t *th,
     server = vlc_tls_ServerSessionCreate(server_creds, socks[0], salpnv);
     assert(server != NULL);
 
-    val = vlc_clone(th, tls_echo, server, VLC_THREAD_PRIORITY_LOW);
+    val = vlc_clone(th, tls_echo, server);
     assert(val == 0);
 
     client = vlc_tls_ClientSessionCreate(client_creds, socks[1],
@@ -109,7 +115,7 @@ static vlc_tls_t *securepair(vlc_thread_t *th,
     return client;
 }
 
-#define CERTDIR SRCDIR "/samples/certs"
+#define CERTDIR TOP_SRCDIR "/test/samples/certs"
 #define CERTFILE CERTDIR "/certkey.pem"
 
 static const char *const test_cert_argv[] = {
@@ -127,7 +133,7 @@ int main(void)
     char *alp;
     int val;
 
-    setenv("VLC_PLUGIN_PATH", "../modules", 1);
+    test_setup();
 
     /*** Tests with normal certs database - server cert not acceptable. ***/
     vlc = libvlc_new(0, NULL);
@@ -146,7 +152,7 @@ int main(void)
         libvlc_release(vlc);
         return 77;
     }
-    vlc_tls_Delete(server_creds);
+    vlc_tls_ServerDelete(server_creds);
 
     server_creds = vlc_tls_ServerCreate(obj, CERTFILE, CERTFILE);
     assert(server_creds != NULL);
@@ -159,8 +165,8 @@ int main(void)
     tls = securepair(&th, alpn, alpn, NULL);
     assert(tls == NULL);
 
-    vlc_tls_Delete(client_creds);
-    vlc_tls_Delete(server_creds);
+    vlc_tls_ClientDelete(client_creds);
+    vlc_tls_ServerDelete(server_creds);
     libvlc_release(vlc);
 
     /*** Tests with test certs database - server cert accepted. ***/
@@ -190,7 +196,7 @@ int main(void)
 
     iov.iov_base = buf;
     iov.iov_len = sizeof (buf);
-    val = tls->readv(tls, &iov, 1);
+    val = tls->ops->readv(tls, &iov, 1);
     assert(val == -1 && errno == EAGAIN);
 
     val = vlc_tls_Write(tls, "Hello ", 6);
@@ -228,7 +234,7 @@ int main(void)
             data[i] = rand_r(&seed);
         bytes += sizeof (data);
     }
-    while ((val = tls->writev(tls, &iov, 1)) == sizeof (data));
+    while ((val = tls->ops->writev(tls, &iov, 1)) == sizeof (data));
 
     bytes -= sizeof (data);
     if (val > 0)
@@ -287,8 +293,8 @@ int main(void)
     vlc_tls_Close(tls);
     vlc_join(th, NULL);
 
-    vlc_tls_Delete(client_creds);
-    vlc_tls_Delete(server_creds);
+    vlc_tls_ClientDelete(client_creds);
+    vlc_tls_ServerDelete(server_creds);
     libvlc_release(vlc);
 
     return 0;

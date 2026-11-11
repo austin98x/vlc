@@ -1,7 +1,7 @@
 # X protocol C language Bindings
 
-XCB_VERSION := 1.12
-XCB_URL := http://xcb.freedesktop.org/dist/libxcb-$(XCB_VERSION).tar.bz2
+XCB_VERSION := 1.17.0
+XCB_URL := $(XORG)/lib/libxcb-$(XCB_VERSION).tar.xz
 
 ifdef HAVE_LINUX
 ifndef HAVE_ANDROID
@@ -9,18 +9,19 @@ PKGS += xcb
 endif
 endif
 
-ifeq ($(call need_pkg,"xcb >= 1.6 xcb-shm xcb-composite xcb-xv >= 1.1.90.1"),)
+ifeq ($(call need_pkg,"xcb >= 1.8 xcb-shm xcb-composite xcb-xv >= 1.1.90.1"),)
 # xcb-randr >= 1.3 is not that useful
 PKGS_FOUND += xcb
 endif
 
-$(TARBALLS)/libxcb-$(XCB_VERSION).tar.bz2:
-	$(call download,$(XCB_URL))
+$(TARBALLS)/libxcb-$(XCB_VERSION).tar.xz:
+	$(call download_pkg,$(XCB_URL),xcb)
 
-.sum-xcb: libxcb-$(XCB_VERSION).tar.bz2
+.sum-xcb: libxcb-$(XCB_VERSION).tar.xz
 
-libxcb: libxcb-$(XCB_VERSION).tar.bz2 .sum-xcb
+libxcb: libxcb-$(XCB_VERSION).tar.xz .sum-xcb
 	$(UNPACK)
+	$(call update_autoconfig,build-aux)
 	$(call pkg_static,"xcb.pc.in")
 	$(MOVE)
 
@@ -47,12 +48,13 @@ XCBCONF := \
 	--disable-xtest \
 	--enable-xv \
 	--disable-xvmc \
-	--without-doxygen \
-	$(HOSTCONF)
+	--without-doxygen
 
-DEPS_xcb = xau $(DEPS_xau) xcb-proto $(DEPS_xcb-proto)
+DEPS_xcb = pthread-stubs xau $(DEPS_xau) xcb-proto $(DEPS_xcb-proto)
 
 .xcb: libxcb
-	cd $< && $(HOSTVARS) ./configure $(XCBCONF)
-	cd $< && $(MAKE) install
+	$(MAKEBUILDDIR)
+	$(MAKECONFIGURE) $(XCBCONF)
+	+$(MAKEBUILD)
+	+$(MAKEBUILD) install
 	touch $@

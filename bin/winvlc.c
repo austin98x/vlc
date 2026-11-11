@@ -36,13 +36,11 @@
 #include <windows.h>
 #include <shellapi.h>
 
-#ifndef _WIN32_IE
-#  define  _WIN32_IE 0x501
-#endif
 #include <fcntl.h>
 #include <io.h>
 #include <shlobj.h>
-#define HeapEnableTerminationOnCorruption (HEAP_INFORMATION_CLASS)1
+
+#include "../lib/libvlc_internal.h"
 
 #ifdef HAVE_BREAKPAD
 void CheckCrashDump( const wchar_t* crashdump_path );
@@ -61,43 +59,10 @@ static char *FromWide (const wchar_t *wide)
     return out;
 }
 
-#if (_WIN32_WINNT < _WIN32_WINNT_WIN8)
-static BOOL SetDefaultDllDirectories_(DWORD flags)
-{
-    HMODULE h = GetModuleHandle(TEXT("kernel32.dll"));
-    if (h == NULL)
-        return FALSE;
-
-    BOOL (WINAPI * SetDefaultDllDirectoriesReal)(DWORD);
-
-    SetDefaultDllDirectoriesReal = GetProcAddress(h,
-                                                  "SetDefaultDllDirectories");
-    if (SetDefaultDllDirectoriesReal == NULL)
-        return FALSE;
-
-    return SetDefaultDllDirectoriesReal(flags);
-}
-# define SetDefaultDllDirectories SetDefaultDllDirectories_
-
-#endif
-
 static void PrioritizeSystem32(void)
 {
-#ifndef HAVE_PROCESS_MITIGATION_IMAGE_LOAD_POLICY
-    typedef struct _PROCESS_MITIGATION_IMAGE_LOAD_POLICY {
-      union {
-        DWORD  Flags;
-        struct {
-          DWORD NoRemoteImages  :1;
-          DWORD NoLowMandatoryLabelImages  :1;
-          DWORD PreferSystem32Images  :1;
-          DWORD ReservedFlags  :29;
-        };
-      };
-    } PROCESS_MITIGATION_IMAGE_LOAD_POLICY;
-#endif
 #if _WIN32_WINNT < _WIN32_WINNT_WIN8
-    BOOL WINAPI (*SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
+    BOOL (WINAPI *SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
     HINSTANCE h_Kernel32 = GetModuleHandle(TEXT("kernel32.dll"));
     if ( !h_Kernel32 )
         return;
@@ -108,7 +73,14 @@ static void PrioritizeSystem32(void)
 #endif
     PROCESS_MITIGATION_IMAGE_LOAD_POLICY m = { .Flags = 0 };
     m.PreferSystem32Images = 1;
-    SetProcessMitigationPolicy( 10 /* ProcessImageLoadPolicy */, &m, sizeof( m ) );
+    SetProcessMitigationPolicy( ProcessImageLoadPolicy, &m, sizeof( m ) );
+}
+
+static void vlc_kill(void *data)
+{
+    HANDLE *semp = data;
+
+    ReleaseSemaphore(*semp, 1, NULL);
 }
 
 int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -137,19 +109,8 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     HeapSetInformation(NULL, HeapEnableTerminationOnCorruption, NULL, 0);
 
-    /* SetProcessDEPPolicy, SetDllDirectory, & Co. */
-    HINSTANCE h_Kernel32 = GetModuleHandle(TEXT("kernel32.dll"));
-    if (h_Kernel32 != NULL)
-    {
-        /* Enable DEP */
-# define PROCESS_DEP_ENABLE 1
-        BOOL (WINAPI * mySetProcessDEPPolicy)( DWORD dwFlags);
-        mySetProcessDEPPolicy = (BOOL (WINAPI *)(DWORD))
-                            GetProcAddress(h_Kernel32, "SetProcessDEPPolicy");
-        if(mySetProcessDEPPolicy)
-            mySetProcessDEPPolicy(PROCESS_DEP_ENABLE);
-
-    }
+    /* Enable DEP */
+    SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
 
     /* Do NOT load any library from cwd. */
     SetDllDirectory(TEXT(""));
@@ -172,10 +133,10 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
     char *argv[argc + 3];
     BOOL crash_handling = TRUE;
     int j = 0;
-    char *lang = NULL;
+    WCHAR *lang = NULL;
 
-    argv[j++] = FromWide( L"--media-library" );
-    argv[j++] = FromWide( L"--no-ignore-config" );
+    argv[j++] = strdup("--media-library");
+    argv[j++] = strdup("--no-ignore-config");
     for (int i = 1; i < argc; i++)
     {
         if(!wcscmp(wargv[i], L"--no-crashdump"))
@@ -186,7 +147,7 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (!wcsncmp(wargv[i], L"--language", 10) )
         {
             if (i < argc - 1 && wcsncmp( wargv[i + 1], L"--", 2 ))
-                lang = FromWide (wargv[++i]);
+                lang = _wcsdup (wargv[++i]);
             continue;
         }
 
@@ -197,19 +158,31 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
     argv[argc] = NULL;
     LocalFree (wargv);
 
+#ifdef HAVE_BREAKPAD
     void* eh = NULL;
     if(crash_handling)
     {
-#ifdef HAVE_BREAKPAD
-        static wchar_t path[MAX_PATH];
-        if( S_OK != SHGetFolderPathW( NULL, CSIDL_APPDATA | CSIDL_FLAG_CREATE,
-                    NULL, SHGFP_TYPE_CURRENT, path ) )
+        PWSTR copath;
+        if( S_OK != SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_CREATE, 0, &copath) )
             fprintf( stderr, "Can't open the vlc conf PATH\n" );
-        _snwprintf( path+wcslen( path ), MAX_PATH,  L"%s", L"\\vlc\\crashdump" );
-        CheckCrashDump( &path[0] );
-        eh = InstallCrashHandler( &path[0] );
-#endif
+        else
+        {
+            const size_t pathlen = wcslen( copath );
+            wchar_t *path = malloc( ( pathlen + wcslen(L"\\vlc\\crashdump") + 1 ) * sizeof(*path) );
+            if ( path != NULL)
+            {
+                memcpy( path, copath, pathlen * sizeof(*path) );
+                memcpy( &path[pathlen], L"\\vlc\\crashdump", (wcslen(L"\\vlc\\crashdump") + 1)  * sizeof(*path) );
+                CheckCrashDump( path );
+                eh = InstallCrashHandler( path );
+                free( path );
+            }
+            CoTaskMemFree( copath );
+        }
     }
+#else
+    (void)crash_handling;
+#endif
 
     _setmode( _fileno( stdin ), _O_BINARY ); /* Needed for pipes */
 
@@ -220,17 +193,17 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if( RegOpenKeyEx( HKEY_CURRENT_USER, TEXT("Software\\VideoLAN\\VLC\\"), 0, KEY_READ, &h_key )
                 == ERROR_SUCCESS )
         {
-            TCHAR szData[256];
+            WCHAR szData[256];
             DWORD len = 256;
             if( RegQueryValueEx( h_key, TEXT("Lang"), NULL, NULL, (LPBYTE) &szData, &len ) == ERROR_SUCCESS )
-                lang = FromWide( szData );
+                lang = _wcsdup( szData );
         }
     }
 
-    if (lang && strncmp( lang, "auto", 4 ) )
+    if (lang && wcsncmp( lang, L"auto", 4 ) )
     {
         char tmp[11];
-        snprintf(tmp, 11, "LANG=%s", lang);
+        snprintf(tmp, 11, "LANG=%ls", lang);
         putenv(tmp);
     }
     free(lang);
@@ -240,14 +213,18 @@ int WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
     vlc = libvlc_new (argc, (const char **)argv);
     if (vlc != NULL)
     {
+        HANDLE sem = CreateSemaphore(NULL, 0, 1, NULL);
+
+        libvlc_SetExitHandler(vlc->p_libvlc_int, vlc_kill, &sem);
         libvlc_set_app_id (vlc, "org.VideoLAN.VLC", PACKAGE_VERSION,
                            PACKAGE_NAME);
         libvlc_set_user_agent (vlc, "VLC media player", "VLC/"PACKAGE_VERSION);
-        libvlc_add_intf (vlc, "hotkeys,none");
-        libvlc_add_intf (vlc, "globalhotkeys,none");
-        libvlc_add_intf (vlc, NULL);
-        libvlc_playlist_play (vlc, -1, 0, NULL);
-        libvlc_wait (vlc);
+        libvlc_InternalAddIntf (vlc->p_libvlc_int, NULL);
+        libvlc_InternalPlay (vlc->p_libvlc_int);
+
+        WaitForSingleObject(sem, INFINITE);
+        CloseHandle(sem);
+
         libvlc_release (vlc);
     }
     else

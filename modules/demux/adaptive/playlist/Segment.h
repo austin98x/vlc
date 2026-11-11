@@ -30,64 +30,66 @@
 #include <vector>
 #include "ICanonicalUrl.hpp"
 #include "../http/Chunk.h"
-#include "../tools/Properties.hpp"
-#include "Time.hpp"
+#include "../encryption/CommonEncryption.hpp"
+#include "../Time.hpp"
 
 namespace adaptive
 {
-    namespace http
-    {
-        class AbstractConnectionManager;
-    }
+    class SharedResources;
 
     namespace playlist
     {
         class BaseRepresentation;
         class SubSegment;
+        class Segment;
         class SegmentChunk;
 
         using namespace http;
+        using namespace encryption;
 
         class ISegment : public ICanonicalUrl
         {
+            PREREQ_VIRTUAL(ISegment);
+
             public:
                 ISegment(const ICanonicalUrl *parent);
                 virtual ~ISegment();
+
                 /**
                  *  @return true if the segment should be dropped after being read.
                  *          That is basically true when using an Url, and false
                  *          when using an UrlTemplate
                  */
-                virtual SegmentChunk*                   toChunk         (size_t, BaseRepresentation *, AbstractConnectionManager *);
+                virtual SegmentChunk*                   toChunk         (SharedResources *, size_t, BaseRepresentation *);
+                virtual SegmentChunk*                   createChunk     (AbstractChunkSource *, BaseRepresentation *) = 0;
                 virtual void                            setByteRange    (size_t start, size_t end);
                 virtual void                            setSequenceNumber(uint64_t);
                 virtual uint64_t                        getSequenceNumber() const;
+                virtual void                            setDiscontinuitySequenceNumber(uint64_t);
+                virtual uint64_t                        getDiscontinuitySequenceNumber() const;
                 virtual bool                            isTemplate      () const;
                 virtual size_t                          getOffset       () const;
-                virtual std::vector<ISegment*>          subSegments     () = 0;
-                virtual void                            addSubSegment   (SubSegment *) = 0;
                 virtual void                            debug           (vlc_object_t *,int = 0) const;
                 virtual bool                            contains        (size_t byte) const;
-                virtual int                             compare         (ISegment *) const;
-                int                                     getClassId      () const;
-                Property<stime_t>       startTime;
-                Property<stime_t>       duration;
-                Property<unsigned>      chunksuse;
+                void                                    setEncryption   (CommonEncryption &);
+                void                                    setDisplayTime  (vlc_tick_t);
+                vlc_tick_t                              getDisplayTime  () const;
+                stime_t                 startTime;
+                stime_t                 duration;
                 bool                    discontinuity;
 
-                static const int CLASSID_ISEGMENT = 0;
-                /* callbacks */
-                virtual void                            onChunkDownload (block_t **, SegmentChunk *, BaseRepresentation *);
-
             protected:
+                virtual bool                            prepareChunk    (SharedResources *,
+                                                                         SegmentChunk *,
+                                                                         BaseRepresentation *);
+                CommonEncryption        encryption;
                 size_t                  startByte;
                 size_t                  endByte;
                 std::string             debugName;
-                int                     classId;
                 bool                    templated;
                 uint64_t                sequence;
-                static const int        SEQUENCE_INVALID;
-                static const int        SEQUENCE_FIRST;
+                uint64_t                discontinuitySequenceNumber;
+                vlc_tick_t              displayTime;
         };
 
         class Segment : public ISegment
@@ -95,41 +97,34 @@ namespace adaptive
             public:
                 Segment( ICanonicalUrl *parent );
                 ~Segment();
+                SegmentChunk* createChunk(AbstractChunkSource *, BaseRepresentation *) override;
                 virtual void setSourceUrl( const std::string &url );
-                virtual Url getUrlSegment() const; /* impl */
-                virtual std::vector<ISegment*> subSegments();
-                virtual void debug(vlc_object_t *,int = 0) const;
+                Url getUrlSegment() const override;
+                virtual const std::vector<Segment*> & subSegments() const;
+                void debug(vlc_object_t *,int = 0) const override;
                 virtual void addSubSegment(SubSegment *);
-                static const int CLASSID_SEGMENT = 1;
 
             protected:
-                std::vector<SubSegment *> subsegments;
+                std::vector<Segment *> subsegments;
                 Url sourceUrl;
-                int size;
         };
 
         class InitSegment : public Segment
         {
             public:
                 InitSegment( ICanonicalUrl *parent );
-                static const int CLASSID_INITSEGMENT = 2;
         };
 
         class IndexSegment : public Segment
         {
             public:
                 IndexSegment( ICanonicalUrl *parent );
-                static const int CLASSID_INDEXSEGMENT = 3;
         };
 
-        class SubSegment : public ISegment
+        class SubSegment : public Segment
         {
             public:
-                SubSegment(ISegment *, size_t start, size_t end);
-                virtual Url getUrlSegment() const; /* impl */
-                virtual std::vector<ISegment*> subSegments();
-                virtual void addSubSegment(SubSegment *);
-                static const int CLASSID_SUBSEGMENT = 4;
+                SubSegment(Segment *, size_t start, size_t end);
         };
     }
 }

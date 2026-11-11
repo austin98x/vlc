@@ -40,6 +40,7 @@
 
 /* VLC core API headers */
 #include <vlc_common.h>
+#include <vlc_arrays.h>
 #include <vlc_demux.h>
 #include <vlc_plugin.h>
 
@@ -51,6 +52,12 @@
 #include <string>
 #include <list>
 #include <vector>
+
+#ifdef _WIN32
+# define KM_WIN32
+#endif
+
+#include <KM_fileio.h>
 
 using namespace std;
 typedef enum {
@@ -81,6 +88,9 @@ struct info_reel
 struct dcp_t
 {
     string path;                    /* Path to DCP directory */
+#if ASDCPLIB_FACTORY
+    Kumu::FileReaderFactory factory;
+#endif
 
     vector<PKL *> pkls;
     AssetList *p_asset_list;

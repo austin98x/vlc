@@ -33,7 +33,7 @@
 #include <windows.h>
 #include <wchar.h>
 
-static char *GetWindowsError( void )
+char *vlc_dlerror(void)
 {
     wchar_t wmsg[256];
     int i = 0, i_error = GetLastError();
@@ -50,45 +50,43 @@ static char *GetWindowsError( void )
     return FromWide( wmsg );
 }
 
-int module_Load( vlc_object_t *p_this, const char *psz_file,
-                 module_handle_t *p_handle, bool lazy )
+void *vlc_dlopen(const char *psz_file, bool lazy)
 {
     wchar_t *wfile = ToWide (psz_file);
     if (wfile == NULL)
-        return -1;
+        return NULL;
 
-    module_handle_t handle = NULL;
-#if !VLC_WINSTORE_APP
+    HMODULE handle = NULL;
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
     DWORD mode;
     if (SetThreadErrorMode (SEM_FAILCRITICALERRORS, &mode) != 0)
     {
         handle = LoadLibraryExW(wfile, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         SetThreadErrorMode (mode, NULL);
     }
-#else
+#elif WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
     handle = LoadPackagedLibrary( wfile, 0 );
+#elif defined(WINAPI_FAMILY_GAMES) && (WINAPI_FAMILY == WINAPI_FAMILY_GAMES)
+    // SEM_FAILCRITICALERRORS is not available on Xbox, error messages are not
+    // possible. This is a sandboxed environment where the library dependencies
+    // need to be managed manually per platform.
+    handle = LoadLibraryExW(wfile, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
+#error Unknown Windows Platform!
 #endif
     free (wfile);
 
-    if( handle == NULL )
-    {
-        char *psz_err = GetWindowsError();
-        msg_Warn( p_this, "cannot load module `%s' (%s)", psz_file, psz_err );
-        free( psz_err );
-        return -1;
-    }
-
-    *p_handle = handle;
     (void) lazy;
+    return handle;
+}
+
+int vlc_dlclose(void *handle)
+{
+    FreeLibrary( handle );
     return 0;
 }
 
-void module_Unload( module_handle_t handle )
+void *vlc_dlsym(void *handle, const char *psz_function)
 {
-    FreeLibrary( handle );
-}
-
-void *module_Lookup( module_handle_t handle, const char *psz_function )
-{
-    return (void *)GetProcAddress( handle, (char *)psz_function );
+    return GetProcAddress(handle, psz_function);
 }

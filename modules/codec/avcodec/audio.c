@@ -2,7 +2,6 @@
  * audio.c: audio decoder using libavcodec library
  *****************************************************************************
  * Copyright (C) 1999-2003 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Gildas Bazin <gbazin@videolan.org>
@@ -37,9 +36,14 @@
 #include <vlc_avcodec.h>
 
 #include "avcodec.h"
+#include "../../demux/xiph.h"
+
+#include <stdbit.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/mem.h>
+
+#define API_CHANNEL_LAYOUT_STRUCT (LIBAVCODEC_VERSION_CHECK(59, 24, 100)) // AVCodecContext.ch_layout
 
 #include <libavutil/channel_layout.h>
 
@@ -47,7 +51,7 @@
 /*****************************************************************************
  * decoder_sys_t : decoder descriptor
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
     AVCodecContext *p_context;
     const AVCodec  *p_codec;
@@ -63,10 +67,11 @@ struct decoder_sys_t
 
     /* */
     bool    b_extract;
+    bool    discontinuity;
     int     pi_extraction[AOUT_CHAN_MAX];
     int     i_previous_channels;
     uint64_t i_previous_layout;
-};
+} decoder_sys_t;
 
 #define BLOCK_FLAG_PRIVATE_REALLOCATED (1 << BLOCK_FLAG_PRIVATE_SHIFT)
 
@@ -77,14 +82,14 @@ static void Flush( decoder_t * );
 
 static void InitDecoderConfig( decoder_t *p_dec, AVCodecContext *p_context )
 {
-    if( p_dec->fmt_in.i_extra > 0 )
+    if( p_dec->fmt_in->i_extra > 0 )
     {
-        const uint8_t * const p_src = p_dec->fmt_in.p_extra;
+        const uint8_t * const p_src = p_dec->fmt_in->p_extra;
 
         int i_offset = 0;
-        int i_size = p_dec->fmt_in.i_extra;
+        int i_size = p_dec->fmt_in->i_extra;
 
-        if( p_dec->fmt_in.i_codec == VLC_CODEC_ALAC )
+        if( p_dec->fmt_in->i_codec == VLC_CODEC_ALAC )
         {
             static const uint8_t p_pattern[] = { 0, 0, 0, 36, 'a', 'l', 'a', 'c' };
             /* Find alac atom XXX it is a bit ugly */
@@ -93,15 +98,29 @@ static void InitDecoderConfig( decoder_t *p_dec, AVCodecContext *p_context )
                 if( !memcmp( &p_src[i_offset], p_pattern, sizeof(p_pattern) ) )
                     break;
             }
-            i_size = __MIN( p_dec->fmt_in.i_extra - i_offset, 36 );
+            i_size = __MIN( p_dec->fmt_in->i_extra - i_offset, 36 );
             if( i_size < 36 )
                 i_size = 0;
+        }
+        else if( p_dec->fmt_in->i_codec == VLC_CODEC_OPUS &&
+                 i_size > 21 && !memcmp( &p_src[2], "OpusHead", 8 ) )
+        {
+            /* see opus.c decoder */
+            size_t hdr_size[XIPH_MAX_HEADER_COUNT];
+            const void *hdr[XIPH_MAX_HEADER_COUNT];
+            size_t i_count;
+            if( !xiph_SplitHeaders( hdr_size, hdr, &i_count,
+                                    i_size, p_src ) && i_count >= 1 )
+            {
+                i_offset = (const uint8_t *)hdr[0] - p_src;
+                i_size = hdr_size[0];
+            }
         }
 
         if( i_size > 0 )
         {
             p_context->extradata =
-                av_malloc( i_size + FF_INPUT_BUFFER_PADDING_SIZE );
+                av_malloc( i_size + AV_INPUT_BUFFER_PADDING_SIZE );
             if( p_context->extradata )
             {
                 uint8_t *p_dst = p_context->extradata;
@@ -109,7 +128,7 @@ static void InitDecoderConfig( decoder_t *p_dec, AVCodecContext *p_context )
                 p_context->extradata_size = i_size;
 
                 memcpy( &p_dst[0],            &p_src[i_offset], i_size );
-                memset( &p_dst[i_size], 0, FF_INPUT_BUFFER_PADDING_SIZE );
+                memset( &p_dst[i_size], 0, AV_INPUT_BUFFER_PADDING_SIZE );
             }
         }
     }
@@ -130,7 +149,7 @@ static int OpenAudioCodec( decoder_t *p_dec )
     {
         if( codec->id == AV_CODEC_ID_VORBIS ||
             ( codec->id == AV_CODEC_ID_AAC &&
-              !p_dec->fmt_in.b_packetized ) )
+              !p_dec->fmt_in->b_packetized ) )
         {
             msg_Warn( p_dec, "waiting for extra data for codec %s",
                       codec->name );
@@ -138,11 +157,15 @@ static int OpenAudioCodec( decoder_t *p_dec )
         }
     }
 
-    ctx->sample_rate = p_dec->fmt_in.audio.i_rate;
-    ctx->channels = p_dec->fmt_in.audio.i_channels;
-    ctx->block_align = p_dec->fmt_in.audio.i_blockalign;
-    ctx->bit_rate = p_dec->fmt_in.i_bitrate;
-    ctx->bits_per_coded_sample = p_dec->fmt_in.audio.i_bitspersample;
+    ctx->sample_rate = p_dec->fmt_in->audio.i_rate;
+#if API_CHANNEL_LAYOUT_STRUCT && LIBAVUTIL_VERSION_CHECK(57, 24, 100)
+    av_channel_layout_default( &ctx->ch_layout, p_dec->fmt_in->audio.i_channels );
+#else
+    ctx->channels = p_dec->fmt_in->audio.i_channels;
+#endif
+    ctx->block_align = p_dec->fmt_in->audio.i_blockalign;
+    ctx->bit_rate = p_dec->fmt_in->i_bitrate;
+    ctx->bits_per_coded_sample = p_dec->fmt_in->audio.i_bitspersample;
 
     if( codec->id == AV_CODEC_ID_ADPCM_G726 &&
         ctx->bit_rate > 0 &&
@@ -169,6 +192,11 @@ static void vlc_av_frame_Release(block_t *block)
     free(b);
 }
 
+static const struct vlc_block_callbacks vlc_av_frame_cbs =
+{
+    vlc_av_frame_Release,
+};
+
 static block_t *vlc_av_frame_Wrap(AVFrame *frame)
 {
     for (unsigned i = 1; i < AV_NUM_DATA_POINTERS; i++)
@@ -183,9 +211,9 @@ static block_t *vlc_av_frame_Wrap(AVFrame *frame)
 
     block_t *block = &b->self;
 
-    block_Init(block, frame->extended_data[0], frame->linesize[0]);
+    block_Init(block, &vlc_av_frame_cbs,
+               frame->extended_data[0], frame->linesize[0]);
     block->i_nb_samples = frame->nb_samples;
-    block->pf_release = vlc_av_frame_Release;
     b->frame = frame;
     return block;
 }
@@ -215,7 +243,7 @@ int InitAudioDec( vlc_object_t *obj )
 {
     decoder_t *p_dec = (decoder_t *)obj;
     const AVCodec *codec;
-    AVCodecContext *avctx = ffmpeg_AllocContext( p_dec, &codec );
+    AVCodecContext *avctx = ffmpeg_AllocContext( p_dec, &codec, false );
     if( avctx == NULL )
         return VLC_EGENERIC;
 
@@ -246,26 +274,20 @@ int InitAudioDec( vlc_object_t *obj )
     p_sys->b_extract = false;
     p_sys->i_previous_channels = 0;
     p_sys->i_previous_layout = 0;
+    p_sys->discontinuity = false;
 
     /* */
     /* Try to set as much information as possible but do not trust it */
     SetupOutputFormat( p_dec, false );
 
-    date_Set( &p_sys->end_date, VLC_TS_INVALID );
     if( !p_dec->fmt_out.audio.i_rate )
-        p_dec->fmt_out.audio.i_rate = p_dec->fmt_in.audio.i_rate;
+        p_dec->fmt_out.audio.i_rate = p_dec->fmt_in->audio.i_rate;
     if( p_dec->fmt_out.audio.i_rate )
         date_Init( &p_sys->end_date, p_dec->fmt_out.audio.i_rate, 1 );
-    p_dec->fmt_out.audio.i_chan_mode = p_dec->fmt_in.audio.i_chan_mode;
+    p_dec->fmt_out.audio.i_chan_mode = p_dec->fmt_in->audio.i_chan_mode;
 
     p_dec->pf_decode = DecodeAudio;
     p_dec->pf_flush  = Flush;
-
-    /* XXX: Writing input format makes little sense. */
-    if( avctx->profile != FF_PROFILE_UNKNOWN )
-        p_dec->fmt_in.i_profile = avctx->profile;
-    if( avctx->level != FF_LEVEL_UNKNOWN )
-        p_dec->fmt_in.i_level = avctx->level;
 
     return VLC_SUCCESS;
 }
@@ -280,11 +302,12 @@ static void Flush( decoder_t *p_dec )
 
     if( avcodec_is_open( ctx ) )
         avcodec_flush_buffers( ctx );
-    date_Set( &p_sys->end_date, VLC_TS_INVALID );
+    date_Set( &p_sys->end_date, VLC_TICK_INVALID );
 
     if( ctx->codec_id == AV_CODEC_ID_MP2 ||
         ctx->codec_id == AV_CODEC_ID_MP3 )
         p_sys->i_reject_count = 3;
+    p_sys->discontinuity = false;
 }
 
 /*****************************************************************************
@@ -298,11 +321,16 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
     block_t *p_block = NULL;
     bool b_error = false;
 
-    if( !ctx->extradata_size && p_dec->fmt_in.i_extra
+    if( !ctx->extradata_size && p_dec->fmt_in->i_extra
      && !avcodec_is_open( ctx ) )
     {
         InitDecoderConfig( p_dec, ctx );
-        OpenAudioCodec( p_dec );
+        if( OpenAudioCodec( p_dec ) < 0 )
+        {
+            if( pp_block != NULL && *pp_block != NULL )
+                block_Release( *pp_block );
+            return VLCDEC_ECRITICAL;
+        }
     }
 
     if( !avcodec_is_open( ctx ) )
@@ -332,11 +360,12 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
 
         if( p_block->i_flags & BLOCK_FLAG_DISCONTINUITY )
         {
-            date_Set( &p_sys->end_date, VLC_TS_INVALID );
+            date_Set( &p_sys->end_date, VLC_TICK_INVALID );
         }
 
         /* We've just started the stream, wait for the first PTS. */
-        if( !date_Get( &p_sys->end_date ) && p_block->i_pts <= VLC_TS_INVALID )
+        if( p_block->i_pts == VLC_TICK_INVALID &&
+            date_Get( &p_sys->end_date ) == VLC_TICK_INVALID )
             goto drop;
 
         if( p_block->i_buffer <= 0 )
@@ -344,11 +373,11 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
 
         if( (p_block->i_flags & BLOCK_FLAG_PRIVATE_REALLOCATED) == 0 )
         {
-            *pp_block = p_block = block_Realloc( p_block, 0, p_block->i_buffer + FF_INPUT_BUFFER_PADDING_SIZE );
+            *pp_block = p_block = block_Realloc( p_block, 0, p_block->i_buffer + AV_INPUT_BUFFER_PADDING_SIZE );
             if( !p_block )
                 goto end;
-            p_block->i_buffer -= FF_INPUT_BUFFER_PADDING_SIZE;
-            memset( &p_block->p_buffer[p_block->i_buffer], 0, FF_INPUT_BUFFER_PADDING_SIZE );
+            p_block->i_buffer -= AV_INPUT_BUFFER_PADDING_SIZE;
+            memset( &p_block->p_buffer[p_block->i_buffer], 0, AV_INPUT_BUFFER_PADDING_SIZE );
 
             p_block->i_flags |= BLOCK_FLAG_PRIVATE_REALLOCATED;
         }
@@ -358,16 +387,19 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
     if (unlikely(frame == NULL))
         goto end;
 
+    bool send_failed = false;
     for( int ret = 0; ret == 0; )
     {
         /* Feed in the loop as buffer could have been full on first iterations */
         if( p_block )
         {
-            AVPacket pkt;
-            av_init_packet( &pkt );
-            pkt.data = p_block->p_buffer;
-            pkt.size = p_block->i_buffer;
-            ret = avcodec_send_packet( ctx, &pkt );
+            AVPacket *pkt = av_packet_alloc();
+            if( !pkt )
+                goto end;
+            pkt->data = p_block->p_buffer;
+            pkt->size = p_block->i_buffer;
+            ret = avcodec_send_packet( ctx, pkt );
+            av_packet_free(&pkt);
             if( ret == 0 ) /* Block has been consumed */
             {
                 /* Only set new pts from input block if it has been used,
@@ -385,7 +417,18 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
                 if( ret == AVERROR(ENOMEM) || ret == AVERROR(EINVAL) )
                     goto end;
                 else
-                    goto drop;
+                {
+                    char errorstring[AV_ERROR_MAX_STRING_SIZE];
+                    if( !av_strerror( ret, errorstring, AV_ERROR_MAX_STRING_SIZE ) )
+                        msg_Err( p_dec, "%s", errorstring );
+
+                    /* Signal an error, but continue to receive all output
+                     * frames. A discontinuity will be triggered for the
+                     * output frame coming right after the dropped one. */
+                    send_failed = true;
+                    block_Release( p_block );
+                    *pp_block = p_block = NULL;
+                }
             }
         }
 
@@ -393,12 +436,17 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
         ret = avcodec_receive_frame( ctx, frame );
         if( ret == 0 )
         {
+#if LIBAVUTIL_VERSION_CHECK(57, 24, 100)
+            int channels = frame->ch_layout.nb_channels;
+#else
+            int channels = ctx->channels;
+#endif
             /* checks and init from first decoded frame */
-            if( ctx->channels <= 0 || ctx->channels > INPUT_CHAN_MAX
+            if( channels <= 0 || channels > INPUT_CHAN_MAX
              || ctx->sample_rate <= 0 )
             {
                 msg_Warn( p_dec, "invalid audio properties channels count %d, sample rate %d",
-                          ctx->channels, ctx->sample_rate );
+                          channels, ctx->sample_rate );
                 goto drop;
             }
             else if( p_dec->fmt_out.audio.i_rate != (unsigned int)ctx->sample_rate )
@@ -425,6 +473,11 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
                 p_converted->i_length = date_Increment( &p_sys->end_date,
                                                       p_converted->i_nb_samples ) - p_converted->i_pts;
 
+                if (p_sys->discontinuity)
+                {
+                    p_sys->discontinuity = false;
+                    p_converted->i_flags |= BLOCK_FLAG_DISCONTINUITY;
+                }
                 decoder_QueueAudio( p_dec, p_converted );
             }
 
@@ -442,11 +495,19 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
         }
     };
 
+    if (send_failed)
+    {
+        /* Signal a discontinuity for the next output frame. */
+        p_sys->discontinuity = true;
+    }
+
     return VLCDEC_SUCCESS;
 
 end:
     b_error = true;
 drop:
+    /* Signal a discontinuity for the next output frame. */
+    p_sys->discontinuity = true;
     if( pp_block )
     {
         assert( *pp_block == p_block );
@@ -482,15 +543,15 @@ static block_t * ConvertAVFrame( decoder_t *p_dec, AVFrame *frame )
     /* Interleave audio if required */
     if( av_sample_fmt_is_planar( ctx->sample_fmt ) )
     {
-        p_block = block_Alloc(frame->linesize[0] * ctx->channels);
+        p_block = block_Alloc(frame->linesize[0] * p_dec->fmt_out.audio.i_channels );
         if ( likely(p_block) )
         {
-            const void *planes[ctx->channels];
-            for (int i = 0; i < ctx->channels; i++)
+            const void *planes[p_dec->fmt_out.audio.i_channels];
+            for (int i = 0; i < p_dec->fmt_out.audio.i_channels; i++)
                 planes[i] = frame->extended_data[i];
 
             aout_Interleave(p_block->p_buffer, planes, frame->nb_samples,
-                            ctx->channels, p_dec->fmt_out.audio.i_format);
+                            p_dec->fmt_out.audio.i_channels, p_dec->fmt_out.audio.i_format);
             p_block->i_nb_samples = frame->nb_samples;
         }
         av_frame_free(&frame);
@@ -509,7 +570,7 @@ static block_t * ConvertAVFrame( decoder_t *p_dec, AVFrame *frame )
         {
             aout_ChannelExtract( p_buffer->p_buffer,
                                  p_dec->fmt_out.audio.i_channels,
-                                 p_block->p_buffer, ctx->channels,
+                                 p_block->p_buffer, p_dec->fmt_out.audio.i_channels,
                                  p_block->i_nb_samples, p_sys->pi_extraction,
                                  p_dec->fmt_out.audio.i_bitspersample );
             p_buffer->i_nb_samples = p_block->i_nb_samples;
@@ -539,7 +600,7 @@ vlc_fourcc_t GetVlcAudioFormat( int fmt )
         [AV_SAMPLE_FMT_FLTP]  = VLC_CODEC_FL32,
         [AV_SAMPLE_FMT_DBLP]  = VLC_CODEC_FL64,
     };
-    if( (sizeof(fcc) / sizeof(fcc[0])) > (unsigned)fmt )
+    if( ARRAY_SIZE(fcc) > (unsigned)fmt )
         return fcc[fmt];
     return VLC_CODEC_S16N;
 }
@@ -566,6 +627,7 @@ static const uint64_t pi_channels_map[][2] =
     { AV_CH_TOP_BACK_RIGHT,    0 },
     { AV_CH_STEREO_LEFT,       0 },
     { AV_CH_STEREO_RIGHT,      0 },
+    { 0, 0 },
 };
 
 static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
@@ -573,11 +635,21 @@ static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
     decoder_sys_t *p_sys = p_dec->p_sys;
 
     p_dec->fmt_out.i_codec = GetVlcAudioFormat( p_sys->p_context->sample_fmt );
-    p_dec->fmt_out.audio.channel_type = p_dec->fmt_in.audio.channel_type;
+    p_dec->fmt_out.audio.channel_type = p_dec->fmt_in->audio.channel_type;
     p_dec->fmt_out.audio.i_format = p_dec->fmt_out.i_codec;
     p_dec->fmt_out.audio.i_rate = p_sys->p_context->sample_rate;
 
     /* */
+#if API_CHANNEL_LAYOUT_STRUCT
+    if( p_sys->i_previous_channels == p_sys->p_context->ch_layout.nb_channels &&
+        p_sys->i_previous_layout == p_sys->p_context->ch_layout.u.mask )
+        return;
+    if( b_trust )
+    {
+        p_sys->i_previous_channels = p_sys->p_context->ch_layout.nb_channels;
+        p_sys->i_previous_layout = p_sys->p_context->ch_layout.u.mask;
+    }
+#else
     if( p_sys->i_previous_channels == p_sys->p_context->channels &&
         p_sys->i_previous_layout == p_sys->p_context->channel_layout )
         return;
@@ -586,25 +658,43 @@ static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
         p_sys->i_previous_channels = p_sys->p_context->channels;
         p_sys->i_previous_layout = p_sys->p_context->channel_layout;
     }
-
-    const unsigned i_order_max = sizeof(pi_channels_map)/sizeof(*pi_channels_map);
-    uint32_t pi_order_src[i_order_max];
+#endif
 
     int i_channels_src = 0;
-    int64_t channel_layout =
+#if API_CHANNEL_LAYOUT_STRUCT
+    uint64_t channel_layout_mask = p_sys->p_context->ch_layout.u.mask;
+    int channel_count = p_sys->p_context->ch_layout.nb_channels;
+#else
+    uint64_t channel_layout_mask =
         p_sys->p_context->channel_layout ? p_sys->p_context->channel_layout :
-        av_get_default_channel_layout( p_sys->p_context->channels );
+        (uint64_t)av_get_default_channel_layout( p_sys->p_context->channels );
+    int channel_count = p_sys->p_context->channels;
+#endif
 
-    if( channel_layout )
+    if( channel_layout_mask )
     {
-        for( unsigned i = 0; i < i_order_max
-         && i_channels_src < p_sys->p_context->channels; i++ )
+        uint32_t* pi_order_src = calloc(channel_count,sizeof(uint32_t));
+
+        if( unlikely(pi_order_src == NULL) )
         {
-            if( channel_layout & pi_channels_map[i][0] )
+            p_dec->fmt_out.audio.i_physical_channels = 0;
+            p_dec->fmt_out.audio.i_channels = channel_count;
+
+            aout_FormatPrepare(&p_dec->fmt_out.audio);
+            p_sys->b_extract = false;
+            return;
+        }
+
+        assert(stdc_count_ones(channel_layout_mask) == (unsigned)channel_count);
+
+        for( unsigned i = 0; pi_channels_map[i][0]
+         && i_channels_src < channel_count; i++ )
+        {
+            if( channel_layout_mask & pi_channels_map[i][0] )
                 pi_order_src[i_channels_src++] = pi_channels_map[i][1];
         }
 
-        if( i_channels_src != p_sys->p_context->channels && b_trust )
+        if( i_channels_src != channel_count && b_trust )
             msg_Err( p_dec, "Channel layout not understood" );
 
         /* Detect special dual mono case */
@@ -624,29 +714,21 @@ static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
         if( i_channels_dst != i_channels_src && b_trust )
             msg_Warn( p_dec, "%d channels are dropped", i_channels_src - i_channels_dst );
 
-        /* Restore the right order of Ambisonic order 1 channels encoded in AAC... */
+        /* No reordering for Ambisonic order 1 channels encoded in AAC... */
         if (p_dec->fmt_out.audio.channel_type == AUDIO_CHANNEL_TYPE_AMBISONICS
-            && p_dec->fmt_in.i_codec == VLC_CODEC_MP4A
+            && p_dec->fmt_in->i_codec == VLC_CODEC_MP4A
             && i_channels_src == 4)
-        {
-            p_sys->pi_extraction[0] = 2;
-            p_sys->pi_extraction[1] = 0;
-            p_sys->pi_extraction[2] = 1;
-            p_sys->pi_extraction[3] = 3;
-            i_layout_dst = AOUT_CHAN_CENTER | AOUT_CHAN_LEFT
-                    | AOUT_CHAN_RIGHT | AOUT_CHAN_REARCENTER;
-            p_sys->b_extract = true;
-        }
+            p_sys->b_extract = false;
 
         p_dec->fmt_out.audio.i_physical_channels = i_layout_dst;
+        free(pi_order_src);
     }
     else
     {
         msg_Warn( p_dec, "no channel layout found");
         p_dec->fmt_out.audio.i_physical_channels = 0;
-        p_dec->fmt_out.audio.i_channels = p_sys->p_context->channels;
+        p_dec->fmt_out.audio.i_channels = channel_count;
     }
 
     aout_FormatPrepare( &p_dec->fmt_out.audio );
 }
-

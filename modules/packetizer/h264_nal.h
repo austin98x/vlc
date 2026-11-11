@@ -22,6 +22,11 @@
 
 # include <vlc_common.h>
 # include <vlc_es.h>
+# include <vlc_bits.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define PROFILE_H264_BASELINE             66
 #define PROFILE_H264_MAIN                 77
@@ -44,6 +49,11 @@
 
 #define H264_SPS_ID_MAX (31)
 #define H264_PPS_ID_MAX (255)
+#define H264_SPSEXT_ID_MAX H264_SPS_ID_MAX
+#define H264_MAX_NUM_SPS (H264_SPS_ID_MAX + 1)
+#define H264_MAX_NUM_PPS (H264_PPS_ID_MAX + 1)
+#define H264_MAX_NUM_SPSEXT (H264_SPSEXT_ID_MAX + 1)
+
 
 enum h264_nal_unit_type_e
 {
@@ -74,14 +84,27 @@ enum h264_nal_unit_type_e
     H264_NAL_RESERVED_23 = 23,
 };
 
+static inline enum h264_nal_unit_type_e h264_getNALType(const uint8_t *p)
+{
+    return (enum h264_nal_unit_type_e) (*p & 0x1f);
+}
+
 typedef struct h264_sequence_parameter_set_t h264_sequence_parameter_set_t;
 typedef struct h264_picture_parameter_set_t h264_picture_parameter_set_t;
+typedef struct h264_sequence_parameter_set_extension_t h264_sequence_parameter_set_extension_t;
+
+bool h264_get_xps_id(const uint8_t *p_nalbuf, size_t i_nalbuf, uint8_t *pi_id);
 
 h264_sequence_parameter_set_t * h264_decode_sps( const uint8_t *, size_t, bool );
 h264_picture_parameter_set_t *  h264_decode_pps( const uint8_t *, size_t, bool );
+h264_sequence_parameter_set_extension_t * h264_decode_sps_extension( const uint8_t *, size_t, bool );
 
 void h264_release_sps( h264_sequence_parameter_set_t * );
 void h264_release_pps( h264_picture_parameter_set_t * );
+void h264_release_sps_extension( h264_sequence_parameter_set_extension_t * );
+
+uint8_t h264_get_sps_id( const h264_sequence_parameter_set_t * );
+uint8_t h264_get_pps_sps_id( const h264_picture_parameter_set_t * );
 
 struct h264_sequence_parameter_set_t
 {
@@ -114,8 +137,8 @@ struct h264_sequence_parameter_set_t
     int32_t offset_for_ref_frame[255];
     int i_log2_max_pic_order_cnt_lsb;
 
+    bool vui_parameters_present_flag;
     struct {
-        bool b_valid;
         int i_sar_num, i_sar_den;
         struct {
             bool b_full_range;
@@ -135,6 +158,7 @@ struct h264_sequence_parameter_set_t
         /* restrictions */
         uint8_t b_bitstream_restriction_flag;
         uint8_t i_max_num_reorder_frames;
+        uint8_t i_max_dec_frame_buffering;
     } vui;
 };
 
@@ -146,6 +170,12 @@ struct h264_picture_parameter_set_t
     uint8_t i_redundant_pic_present_flag;
     uint8_t weighted_pred_flag;
     uint8_t weighted_bipred_idc;
+    uint32_t num_ref_idx_l01_default_active_minus1[2];
+};
+
+struct h264_sequence_parameter_set_extension_t
+{
+    uint8_t i_sps_id;
 };
 
 /*
@@ -175,27 +205,56 @@ block_t *h264_NAL_to_avcC( uint8_t i_nal_length_size,
                            const uint8_t **pp_sps_buf,
                            const size_t *p_sps_size, uint8_t i_sps_count,
                            const uint8_t **pp_pps_buf,
-                           const size_t *p_pps_size, uint8_t i_pps_count );
+                           const size_t *p_pps_size, uint8_t i_pps_count,
+                           const uint8_t **pp_sps_ext_buf,
+                           const size_t *p_sps_ext_size, uint8_t i_sps_ext_count);
 
 /* Convert AVCDecoderConfigurationRecord SPS/PPS to Annex B format */
-uint8_t * h264_avcC_to_AnnexB_NAL( const uint8_t *p_buf, size_t i_buf,
-                                   size_t *pi_result, uint8_t *pi_nal_length_size );
+bool h264_avcC_to_AnnexB_NAL( const uint8_t *p_buf, size_t i_buf,
+                              uint8_t **pp_result, size_t *pi_result,
+                              uint8_t *pi_nal_length_size );
 
 bool h264_get_dpb_values( const h264_sequence_parameter_set_t *,
-                          uint8_t *pi_depth, unsigned *pi_delay );
+                          uint8_t *pi_max_num_reorder, uint8_t *pi_max_dec_buffering );
 
-bool h264_get_picture_size( const h264_sequence_parameter_set_t *, unsigned *p_w, unsigned *p_h,
+unsigned h264_get_max_frame_num( const h264_sequence_parameter_set_t * );
+bool h264_is_frames_only( const h264_sequence_parameter_set_t * );
+bool h264_using_adaptive_frames( const h264_sequence_parameter_set_t * );
+
+bool h264_get_sps_profile_tier_level( const h264_sequence_parameter_set_t *,
+                                     uint8_t *pi_profile, uint8_t *pi_level );
+bool h264_get_picture_size( const h264_sequence_parameter_set_t *,
+                            unsigned *p_ox, unsigned *p_oy,
+                            unsigned *p_w, unsigned *p_h,
                             unsigned *p_vw, unsigned *p_vh );
+bool h264_get_frame_rate( const h264_sequence_parameter_set_t *,
+                          unsigned *pi_num, unsigned *pi_den );
+bool h264_get_aspect_ratio( const h264_sequence_parameter_set_t *,
+                           unsigned *pi_num, unsigned *pi_den );
 bool h264_get_chroma_luma( const h264_sequence_parameter_set_t *, uint8_t *pi_chroma_format,
                            uint8_t *pi_depth_luma, uint8_t *pi_depth_chroma );
 bool h264_get_colorimetry( const h264_sequence_parameter_set_t *p_sps,
                            video_color_primaries_t *p_primaries,
                            video_transfer_func_t *p_transfer,
                            video_color_space_t *p_colorspace,
-                           bool *p_full_range );
+                           video_color_range_t *p_full_range );
 
 /* Get level and Profile from DecoderConfigurationRecord */
 bool h264_get_profile_level(const es_format_t *p_fmt, uint8_t *pi_profile,
                             uint8_t *pi_level, uint8_t *p_nal_length_size);
+
+typedef struct
+{
+    unsigned i_frames;
+} h264_sei_recovery_point_t;
+
+bool h264_decode_sei_recovery_point( bs_t *, h264_sei_recovery_point_t * );
+bool h264_decode_sei_pic_timing(  bs_t *, const h264_sequence_parameter_set_t *,
+                                  uint8_t *, uint8_t *  );
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* H264_NAL_H */

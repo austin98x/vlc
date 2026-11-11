@@ -24,38 +24,168 @@
 
 #include "StreamFormat.hpp"
 
+#include <vlc_common.h>
+
+extern "C"
+{
+    #include "../../meta_engine/ID3Tag.h"
+}
+
+#include <algorithm>
+
 using namespace adaptive;
 
-StreamFormat::operator unsigned() const
+StreamFormat::operator StreamFormat::Type() const
 {
-    return formatid;
+    return type;
 }
 
 std::string StreamFormat::str() const
 {
-    switch(formatid)
+    switch(type)
     {
-        case MPEG2TS:
+        case Type::MPEG2TS:
             return "TS";
-        case MP4:
+        case Type::MP4:
             return "MP4";
-        case WEBVTT:
+        case Type::WebVTT:
             return "WebVTT";
-        case TTML:
+        case Type::TTML:
             return "Timed Text";
-        case PACKEDAAC:
+        case Type::PackedAAC:
             return "Packed AAC";
-        case UNSUPPORTED:
+        case Type::PackedMP3:
+            return "Packed MP3";
+        case Type::PackedAC3:
+            return "Packed AC-3";
+        case Type::WebM:
+            return "WebM";
+        case Type::Ogg:
+            return "Ogg";
+        case Type::Unsupported:
             return "Unsupported";
         default:
-        case UNKNOWN:
+        case Type::Unknown:
             return "Unknown";
     }
 }
 
-StreamFormat::StreamFormat( unsigned formatid_ )
+StreamFormat::StreamFormat( Type type_ )
 {
-    formatid = formatid_;
+    type = type_;
+}
+
+StreamFormat::StreamFormat( const std::string &mimetype )
+{
+    std::string mime = mimetype;
+    std::transform(mime.begin(), mime.end(), mime.begin(), ::tolower);
+    std::string::size_type pos = mime.find("/");
+    type = Type::Unknown;
+    if(pos != std::string::npos)
+    {
+        std::string tail = mime.substr(pos + 1);
+        if(tail == "mp4")
+            type = StreamFormat::Type::MP4;
+        else if(tail == "aac")
+            type = StreamFormat::Type::PackedAAC;
+        else if(tail == "mpeg" || tail == "mp3")
+            type = StreamFormat::Type::PackedMP3;
+        else if(tail == "ac3")
+            type = StreamFormat::Type::PackedAC3;
+        else if (tail == "mp2t")
+            type = StreamFormat::Type::MPEG2TS;
+        else if (tail == "vtt")
+            type = StreamFormat::Type::WebVTT;
+        else if (tail == "ttml+xml")
+            type = StreamFormat::Type::TTML;
+        else if (tail == "webm")
+            type = StreamFormat::Type::WebM;
+    }
+}
+
+static int ID3Callback(uint32_t, const uint8_t *, size_t, void *)
+{
+    return VLC_EGENERIC;
+}
+
+static bool IsWebVTT(const char *p, size_t sz)
+{
+    /* match optional U+FEFF BOM */
+    const uint8_t webvtt[] = { 0xEF, 0xBB, 0xBF, 0x57, 0x45, 0x42, 0x56, 0x54, 0x54 };
+    for(int i=3; i>=0; i-=3)
+    {
+        if(sz > (size_t)(10 - i) &&
+           !memcmp(webvtt + i, p, 9 - i) &&
+           (p[9 - i] == '\n' || p[9 - i] == '\r' || p[9 - i] == ' ' || p[9 - i] == '\t'))
+            return true;
+    }
+    return false;
+}
+
+StreamFormat::StreamFormat(const void *data_, size_t sz)
+{
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(data_);
+    type = Type::Unknown;
+    const char moov[] = "ftypmoovmoofemsg";
+
+    /* Skip PNG junk */
+    if(sz >= 20 && !memcmp(data, "\x89PNG\x0D\x0A\x1A\x0A", 8))
+    {
+        data += 8;
+        sz -= 8;
+        while(sz >= 12)
+        {
+            uint32_t chunk = GetDWBE(data);
+            vlc_fourcc_t cktype = VLC_FOURCC(data[4], data[5], data[6], data[7]);
+            if(chunk > sz - 12)
+                break;
+            sz -= chunk + 12;
+            data += chunk + 12;
+            if(cktype == VLC_FOURCC('I','E','N','D'))
+                break;
+        }
+    }
+
+    /* Skipped ID3 if any */
+    while(ID3TAG_IsTag(data, sz, false))
+    {
+        size_t tagsize = ID3TAG_Parse(data, sz, ID3Callback, this);
+        if(tagsize >= sz || tagsize == 0)
+            return; /* not enough peek */
+        data += tagsize;
+        sz -= tagsize;
+    }
+
+    if(sz > 188 && data[0] == 0x47 && data[188] == 0x47)
+        type = StreamFormat::Type::MPEG2TS;
+    else if(sz > 8 && (!memcmp(&moov,    &data[4], 4) ||
+                       !memcmp(&moov[4], &data[4], 4) ||
+                       !memcmp(&moov[8], &data[4], 4) ||
+                       !memcmp(&moov[12], &data[4], 4)))
+        type = StreamFormat::Type::MP4;
+    else if(IsWebVTT((const char *)data, sz))
+        type = StreamFormat::Type::WebVTT;
+    else if(sz > 4 && !memcmp("\x1A\x45\xDF\xA3", data, 4))
+        type = StreamFormat::Type::WebM;
+    else if(sz > 4 && !memcmp("OggS", data, 4))
+        type = StreamFormat::Type::Ogg;
+    else /* Check Packet Audio formats */
+    {
+        /* It MUST have ID3 header, but HLS spec is an oxymoron */
+        if(sz > 3 && (!memcmp("\xFF\xF1", data, 2) ||
+                      !memcmp("\xFF\xF9", data, 2)))
+        {
+            type = StreamFormat::Type::PackedAAC;
+        }
+        else if(sz > 4 && data[0] == 0xFF && (data[1] & 0xE6) > 0xE0)
+        {
+            type = StreamFormat::Type::PackedMP3;
+        }
+        else if(sz > 4 && data[0] == 0x0b && data[1] == 0x77)
+        {
+            type = StreamFormat::Type::PackedAC3;
+        }
+    }
 }
 
 StreamFormat::~StreamFormat()
@@ -63,12 +193,22 @@ StreamFormat::~StreamFormat()
 
 }
 
+bool StreamFormat::operator ==(Type t) const
+{
+    return type == t;
+}
+
+bool StreamFormat::operator !=(Type t) const
+{
+    return type != t;
+}
+
 bool StreamFormat::operator ==(const StreamFormat &other) const
 {
-    return formatid == other.formatid;
+    return type == other.type;
 }
 
 bool StreamFormat::operator !=(const StreamFormat &other) const
 {
-    return formatid != other.formatid;
+    return type != other.type;
 }

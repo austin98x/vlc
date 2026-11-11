@@ -36,6 +36,8 @@
 # define ASF_DEBUG 1
 #endif
 
+#define ASF_MAX_DEPTH 32
+
 /* Helpers:
  * They ensure that invalid reads will not create problems.
  * They are expansion safe
@@ -106,11 +108,14 @@ static char *AsfObjectHelperReadString( const uint8_t *p_peek, size_t i_peek, ui
  *
  ****************************************************************************/
 static int ASF_ReadObject( stream_t *, asf_object_t *,  asf_object_t * );
+static int ASF_ReadObjectExpDepth( stream_t *, asf_object_t *,
+                                   asf_object_t *, unsigned );
+static void ASF_ParentObject( asf_object_t *p_father, asf_object_t *p_obj );
 
 /****************************************************************************
  *
  ****************************************************************************/
-static int ASF_ReadObjectCommon( stream_t *s, asf_object_t *p_obj )
+static int ASF_ReadObjectCommon( stream_t *s, asf_object_t *p_obj, unsigned i_level )
 {
     asf_object_common_t *p_common = &p_obj->common;
     const uint8_t *p_peek;
@@ -122,10 +127,11 @@ static int ASF_ReadObjectCommon( stream_t *s, asf_object_t *p_obj )
     p_common->i_object_size = GetQWLE( p_peek + 16 );
     p_common->i_object_pos  = vlc_stream_Tell( s );
     p_common->p_next = NULL;
+    p_common->i_level = i_level;
 
 #ifdef ASF_DEBUG
     msg_Dbg( s,
-             "found object guid: " GUID_FMT " size:%"PRId64" at %"PRId64,
+             "found object guid: " GUID_FMT " size:%"PRIu64" at %"PRIu64,
              GUID_PRINT( p_common->i_object_id ),
              p_common->i_object_size, p_common->i_object_pos );
 #endif
@@ -145,7 +151,7 @@ static int ASF_NextObject( stream_t *s, asf_object_t *p_obj, uint64_t i_boundary
 
     if( p_obj == NULL )
     {
-        if( ASF_ReadObjectCommon( s, &obj ) )
+        if( ASF_ReadObjectCommon( s, &obj, 0 ) )
             return VLC_EGENERIC;
 
         p_obj = &obj;
@@ -196,7 +202,7 @@ static int  ASF_ReadObject_Header( stream_t *s, asf_object_t *p_obj )
 
 #ifdef ASF_DEBUG
     msg_Dbg( s,
-             "read \"header object\" subobj:%d, reserved1:%d, reserved2:%d",
+             "read \"header object\" subobj:%u, reserved1:%u, reserved2:%u",
              p_hdr->i_sub_object_count,
              p_hdr->i_reserved1,
              p_hdr->i_reserved2 );
@@ -210,7 +216,7 @@ static int  ASF_ReadObject_Header( stream_t *s, asf_object_t *p_obj )
     {
         p_subobj = malloc( sizeof( asf_object_t ) );
 
-        if( !p_subobj || ASF_ReadObject( s, p_subobj, (asf_object_t*)p_hdr ) )
+        if( !p_subobj || ASF_ReadObject( s, p_subobj, p_obj ) )
         {
             free( p_subobj );
             break;
@@ -236,7 +242,7 @@ static int ASF_ReadObject_Data( stream_t *s, asf_object_t *p_obj )
 #ifdef ASF_DEBUG
     msg_Dbg( s,
              "read \"data object\" file_id:" GUID_FMT " total data packet:"
-             "%"PRId64" reserved:%d",
+             "%"PRIu64" reserved:%u",
              GUID_PRINT( p_data->i_file_id ),
              p_data->i_total_data_packets,
              p_data->i_reserved );
@@ -267,15 +273,21 @@ static int ASF_ReadObject_Index( stream_t *s, asf_object_t *p_obj )
 #ifdef ASF_DEBUG
     msg_Dbg( s,
             "read \"index object\" file_id:" GUID_FMT
-            " index_entry_time_interval:%"PRId64" max_packet_count:%d "
-            "index_entry_count:%ld",
+            " index_entry_time_interval:%"PRId64" max_packet_count:%u "
+            "index_entry_count:%u",
             GUID_PRINT( p_index->i_file_id ),
             p_index->i_index_entry_time_interval,
             p_index->i_max_packet_count,
-            (long int)p_index->i_index_entry_count );
+            p_index->i_index_entry_count );
 #endif
 
     /* Sanity checking */
+    if( !p_index->i_index_entry_time_interval )
+    {
+        /* We can't use this index if it has an invalid time interval */
+        p_index->i_index_entry_count = 0;
+        return VLC_ENOMEM;
+    }
     if( p_index->i_index_entry_count > (p_index->i_object_size - 56) / 6 )
         p_index->i_index_entry_count = (p_index->i_object_size - 56) / 6;
 
@@ -317,7 +329,10 @@ static int ASF_ReadObject_file_properties( stream_t *s, asf_object_t *p_obj )
     p_fp->i_data_packets_count = GetQWLE( p_peek + 56 );
     p_fp->i_play_duration = GetQWLE( p_peek + 64 );
     p_fp->i_send_duration = GetQWLE( p_peek + 72 );
-    p_fp->i_preroll = GetQWLE( p_peek + 80 );
+    uint64_t preroll = GetQWLE( p_peek + 80 );
+    if (unlikely(preroll > INT32_MAX)) // sanity check on "appropriate" value
+        return VLC_EINVAL;
+    p_fp->i_preroll = VLC_TICK_FROM_MS(preroll);
     p_fp->i_flags = GetDWLE( p_peek + 88 );
     p_fp->i_min_data_packet_size = __MAX( GetDWLE( p_peek + 92 ), (uint32_t) 1 );
     p_fp->i_max_data_packet_size = __MAX( GetDWLE( p_peek + 96 ), (uint32_t) 1 );
@@ -326,14 +341,14 @@ static int ASF_ReadObject_file_properties( stream_t *s, asf_object_t *p_obj )
 #ifdef ASF_DEBUG
     msg_Dbg( s,
             "read \"file properties object\" file_id:" GUID_FMT
-            " file_size:%"PRId64" creation_date:%"PRId64" data_packets_count:"
-            "%"PRId64" play_duration:%"PRId64" send_duration:%"PRId64" preroll:%"PRId64
-            " flags:%d min_data_packet_size:%d "
-            " max_data_packet_size:%d max_bitrate:%d",
+            " file_size:%"PRIu64" creation_date:%"PRIu64" data_packets_count:"
+            "%"PRIu64" play_duration:%"PRId64" send_duration:%"PRId64" preroll:%"PRIu64
+            " flags:%u min_data_packet_size:%d "
+            " max_data_packet_size:%u max_bitrate:%u",
             GUID_PRINT( p_fp->i_file_id ), p_fp->i_file_size,
             p_fp->i_creation_date, p_fp->i_data_packets_count,
             p_fp->i_play_duration, p_fp->i_send_duration,
-            p_fp->i_preroll, p_fp->i_flags,
+            preroll, p_fp->i_flags,
             p_fp->i_min_data_packet_size, p_fp->i_max_data_packet_size,
             p_fp->i_max_bitrate );
 #endif
@@ -524,7 +539,7 @@ static int ASF_ReadObject_header_extension( stream_t *s, asf_object_t *p_obj )
         asf_object_t *p_child = malloc( sizeof( asf_object_t ) );
 
         if( p_child == NULL
-         || ASF_ReadObject( s, p_child, (asf_object_t*)p_he ) )
+         || ASF_ReadObject( s, p_child, p_obj ) )
         {
             free( p_child );
             break;
@@ -618,7 +633,7 @@ static int ASF_ReadObject_stream_properties( stream_t *s, asf_object_t *p_obj )
             "read \"stream Properties object\" stream_type:" GUID_FMT
             " error_correction_type:" GUID_FMT " time_offset:%"PRIu64
             " type_specific_data_length:%"PRIu32" error_correction_data_length:%"PRIu32
-            " flags:0x%x stream_number:%d",
+            " flags:0x%x stream_number:%u",
             GUID_PRINT( p_sp->i_stream_type ),
             GUID_PRINT( p_sp->i_error_correction_type ),
             p_sp->i_time_offset,
@@ -671,7 +686,7 @@ static int ASF_ReadObject_codec_list( stream_t *s, asf_object_t *p_obj )
     uint32_t count = GetDWLE( p_peek + 40 );
 #ifdef ASF_DEBUG
     msg_Dbg( s, "read \"codec list object\" reserved_guid:" GUID_FMT
-             " codec_entries_count:%d", GUID_PRINT( p_cl->i_reserved ),
+             " codec_entries_count:%u", GUID_PRINT( p_cl->i_reserved ),
              count );
 #endif
 
@@ -735,11 +750,10 @@ error:
     return VLC_EGENERIC;
 }
 
-static inline char *get_wstring( const uint8_t *p_data, size_t i_size )
+static inline char *get_wstring( const uint8_t **pp_data, size_t i_size )
 {
-    char *psz_str = FromCharset( "UTF-16LE", p_data, i_size );
-    if( psz_str )
-        p_data += i_size;
+    char *psz_str = FromCharset( "UTF-16LE", *pp_data, i_size );
+    *pp_data += i_size;
     return psz_str;
 }
 
@@ -769,11 +783,11 @@ static int ASF_ReadObject_content_description(stream_t *s, asf_object_t *p_obj)
     if( !ASF_HAVE( i_title+i_artist+i_copyright+i_description+i_rating ) )
         return VLC_EGENERIC;
 
-    p_cd->psz_title = get_wstring( p_data, i_title );
-    p_cd->psz_artist = get_wstring( p_data, i_artist );
-    p_cd->psz_copyright = get_wstring( p_data, i_copyright );
-    p_cd->psz_description = get_wstring( p_data, i_description );
-    p_cd->psz_rating = get_wstring( p_data, i_rating );
+    p_cd->psz_title = get_wstring( &p_data, i_title );
+    p_cd->psz_artist = get_wstring( &p_data, i_artist );
+    p_cd->psz_copyright = get_wstring( &p_data, i_copyright );
+    p_cd->psz_description = get_wstring( &p_data, i_description );
+    p_cd->psz_rating = get_wstring( &p_data, i_rating );
 
 #ifdef ASF_DEBUG
     msg_Dbg( s,
@@ -951,9 +965,9 @@ static int ASF_ReadObject_extended_stream_properties( stream_t *s,
     p_data += 64;
 
     p_esp->pi_stream_name_language = calloc( p_esp->i_stream_name_count,
-                                             sizeof(uint16_t) );
+                                             sizeof(*p_esp->pi_stream_name_language) );
     p_esp->ppsz_stream_name = calloc( p_esp->i_stream_name_count,
-                                      sizeof(char*) );
+                                      sizeof(*p_esp->ppsz_stream_name) );
     if( !p_esp->pi_stream_name_language ||
         !p_esp->ppsz_stream_name )
     {
@@ -1006,14 +1020,15 @@ static int ASF_ReadObject_extended_stream_properties( stream_t *s,
         }
 
         asf_object_t *p_sp = malloc( sizeof( asf_object_t ) );
-        if( !p_sp || ASF_ReadObject( s, p_sp, NULL ) )
+        if( !p_sp || ASF_ReadObjectExpDepth( s, p_sp, NULL, p_obj->common.i_level + 1 ) )
         {
             free( p_sp );
         }
         else
         {
             /* This p_sp will be inserted by ReadRoot later */
-            p_esp->p_sp = (asf_object_stream_properties_t*)p_sp;
+            p_esp->p_sp = &p_sp->stream_properties;
+            ASF_ParentObject( p_obj, p_sp );
         }
     }
 
@@ -1065,17 +1080,17 @@ static int ASF_ReadObject_advanced_mutual_exclusion( stream_t *s,
 
     p_data = &p_peek[ASF_OBJECT_COMMON_SIZE];
 
-    if( !ASF_HAVE( 16 + 2 * sizeof(uint16_t) ) ) /* at least one entry */
+    if( !ASF_HAVE( 16 + 2 + 2 ) ) /* at least one entry */
         return VLC_EGENERIC;
 
-    if ( guidcmp( (const guid_t *) p_data, &asf_guid_mutex_language ) )
+    if ( guidcmp( (const vlc_guid_t *) p_data, &asf_guid_mutex_language ) )
         p_ae->exclusion_type = LANGUAGE;
-    else if ( guidcmp( (const guid_t *) p_data, &asf_guid_mutex_bitrate ) )
+    else if ( guidcmp( (const vlc_guid_t *) p_data, &asf_guid_mutex_bitrate ) )
         p_ae->exclusion_type = BITRATE;
     ASF_SKIP( 16 );
 
     p_ae->i_stream_number_count = ASF_READ2();
-    p_ae->pi_stream_number = calloc( p_ae->i_stream_number_count, sizeof(uint16_t) );
+    p_ae->pi_stream_number = calloc( p_ae->i_stream_number_count, sizeof(*p_ae->pi_stream_number) );
     if ( !p_ae->pi_stream_number )
     {
         p_ae->i_stream_number_count = 0;
@@ -1098,7 +1113,7 @@ static int ASF_ReadObject_advanced_mutual_exclusion( stream_t *s,
              ( p_ae->exclusion_type == BITRATE ) ? "Bitrate" : "Unknown"
     );
     for( i = 0; i < p_ae->i_stream_number_count; i++ )
-        msg_Dbg( s, "  - stream=%d", p_ae->pi_stream_number[i] );
+        msg_Dbg( s, "  - stream=%u", p_ae->pi_stream_number[i] );
 #endif
     return VLC_SUCCESS;
 }
@@ -1128,9 +1143,10 @@ static int ASF_ReadObject_stream_prioritization( stream_t *s,
 
     p_sp->i_priority_count = ASF_READ2();
 
-    p_sp->pi_priority_flag = calloc( p_sp->i_priority_count, sizeof(uint16_t) );
-    p_sp->pi_priority_stream_number =
-                             calloc( p_sp->i_priority_count, sizeof(uint16_t) );
+    p_sp->pi_priority_flag = calloc( p_sp->i_priority_count,
+                                     sizeof(*p_sp->pi_priority_flag) );
+    p_sp->pi_priority_stream_number = calloc( p_sp->i_priority_count,
+                                              sizeof(*p_sp->pi_priority_stream_number) );
 
     if( !p_sp->pi_priority_flag || !p_sp->pi_priority_stream_number )
     {
@@ -1179,17 +1195,17 @@ static int ASF_ReadObject_bitrate_mutual_exclusion( stream_t *s, asf_object_t *p
 
     p_data = &p_peek[ASF_OBJECT_COMMON_SIZE];
 
-    if( !ASF_HAVE( 16 + 2 * sizeof(uint16_t) ) ) /* at least one entry */
+    if( !ASF_HAVE( 16 + 2 + 2 ) ) /* at least one entry */
         return VLC_EGENERIC;
 
-    if ( guidcmp( (const guid_t *) p_data, &asf_guid_mutex_language ) )
+    if ( guidcmp( (const vlc_guid_t *) p_data, &asf_guid_mutex_language ) )
         p_ex->exclusion_type = LANGUAGE;
-    else if ( guidcmp( (const guid_t *) p_data, &asf_guid_mutex_bitrate ) )
+    else if ( guidcmp( (const vlc_guid_t *) p_data, &asf_guid_mutex_bitrate ) )
         p_ex->exclusion_type = BITRATE;
     ASF_SKIP( 16 );
 
     p_ex->i_stream_number_count = ASF_READ2();
-    p_ex->pi_stream_numbers = calloc( p_ex->i_stream_number_count, sizeof(uint16_t) );
+    p_ex->pi_stream_numbers = calloc( p_ex->i_stream_number_count, sizeof(*p_ex->pi_stream_numbers) );
     if ( ! p_ex->pi_stream_numbers )
     {
         p_ex->i_stream_number_count = 0;
@@ -1214,7 +1230,7 @@ static int ASF_ReadObject_bitrate_mutual_exclusion( stream_t *s, asf_object_t *p
              ( p_ex->exclusion_type == BITRATE ) ? "Bitrate" : "Unknown"
     );
     for( uint16_t i = 0; i < p_ex->i_stream_number_count; i++ )
-        msg_Dbg( s, "  - stream=%i", p_ex->pi_stream_numbers[i] );
+        msg_Dbg( s, "  - stream=%u", p_ex->pi_stream_numbers[i] );
 #endif
 
     return VLC_SUCCESS;
@@ -1275,7 +1291,8 @@ static int ASF_ReadObject_extended_content_description( stream_t *s,
         else if( i_type == ASF_METADATA_TYPE_BYTE )
         {
             /* Byte array */
-            static const char hex[16] = "0123456789ABCDEF";
+            static const char hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
+                                         '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
             p_ec->ppsz_value[i] = malloc( 2*i_size + 1 );
             if( p_ec->ppsz_value[i] )
@@ -1299,19 +1316,19 @@ static int ASF_ReadObject_extended_content_description( stream_t *s,
         else if( i_type == ASF_METADATA_TYPE_DWORD )
         {
             /* DWord */
-            if( asprintf( &p_ec->ppsz_value[i], "%d", ASF_READ4() ) == -1 )
+            if( asprintf( &p_ec->ppsz_value[i], "%u", ASF_READ4() ) == -1 )
                 p_ec->ppsz_value[i] = NULL;
         }
         else if( i_type == ASF_METADATA_TYPE_QWORD )
         {
             /* QWord */
-            if( asprintf( &p_ec->ppsz_value[i], "%"PRId64, ASF_READ8() ) == -1 )
+            if( asprintf( &p_ec->ppsz_value[i], "%"PRIu64, ASF_READ8() ) == -1 )
                 p_ec->ppsz_value[i] = NULL;
         }
         else if( i_type == ASF_METADATA_TYPE_WORD )
         {
             /* Word */
-            if( asprintf( &p_ec->ppsz_value[i], "%d", ASF_READ2() ) == -1 )
+            if( asprintf( &p_ec->ppsz_value[i], "%u", ASF_READ2() ) == -1 )
                 p_ec->ppsz_value[i] = NULL;
         }
         else
@@ -1359,6 +1376,9 @@ static int ASF_ReadObject_marker(stream_t *s, asf_object_t *p_obj)
 
     p_data = &p_peek[ASF_OBJECT_COMMON_SIZE];
 
+    if( !ASF_HAVE( 16+4+2+2 ) )
+        return VLC_EGENERIC;
+
     ASF_GetGUID( &p_mk->i_reserved1, p_data );
     ASF_SKIP( 16 );
     p_mk->i_count = ASF_READ4();
@@ -1370,7 +1390,10 @@ static int ASF_ReadObject_marker(stream_t *s, asf_object_t *p_obj)
         p_mk->marker = calloc( p_mk->i_count,
                               sizeof( asf_marker_t ) );
         if( !p_mk->marker )
+        {
+            free( p_mk->name );
             return VLC_ENOMEM;
+        }
 
         for( uint32_t i = 0; i < p_mk->i_count; i++ )
         {
@@ -1408,7 +1431,101 @@ static void ASF_FreeObject_marker( asf_object_t *p_obj)
     {
         FREENULL( p_mk->marker[i].p_marker_description  );
     }
+    FREENULL( p_mk->marker );
     FREENULL( p_mk->name );
+}
+
+static int ASF_ReadObject_timecode_index(stream_t *s, asf_object_t *p_obj)
+{
+    asf_object_timecode_index_t *p_tc_index = &p_obj->timecode_index;
+    const uint8_t      *p_peek;
+
+    /* minimum: 24 common + 24 specific header = 48 bytes */
+    if( p_tc_index->i_object_size < 48
+     || p_tc_index->i_object_size > INT32_MAX
+     || vlc_stream_Peek( s, &p_peek, p_tc_index->i_object_size )
+        < (int64_t)p_tc_index->i_object_size )
+        return VLC_SUCCESS;
+
+    /* specific header fields at offset 24 (after common GUID+size):
+     *   +0  DWORD index_entry_count (meaning unclear, not entry count)
+     *   +4  DWORD index_entry_time_interval
+     *   +8  DWORD max_packet_count
+     *   +12 WORD  index_specifiers_count
+     *   +14 ...   index specifiers (4 bytes each)
+     * entries start at offset 48 (24 common + 24 specific header)
+     * each entry: 4 bytes timecode_ms + 4 bytes packet_number = 8 bytes
+     */
+    p_tc_index->i_index_entry_time_interval = GetDWLE( p_peek + 28 );
+    p_tc_index->i_max_packet_count = GetDWLE( p_peek + 32 );
+    p_tc_index->i_index_entry_count = (p_tc_index->i_object_size - 48) / 8;
+    p_tc_index->timecode_entry = NULL;
+
+#ifdef ASF_DEBUG
+    msg_Dbg( s,
+            "read \"timecode index object\""
+            " index_entry_time_interval:%u max_packet_count:%u"
+            " index_entry_count:%u",
+            p_tc_index->i_index_entry_time_interval,
+            p_tc_index->i_max_packet_count,
+            p_tc_index->i_index_entry_count );
+#endif
+
+    if( !p_tc_index->i_index_entry_count )
+        return VLC_SUCCESS;
+
+    p_tc_index->timecode_entry = calloc( p_tc_index->i_index_entry_count,
+                                         sizeof(asf_timecode_entry_t) );
+    if( !p_tc_index->timecode_entry )
+    {
+        p_tc_index->i_index_entry_count = 0;
+        return VLC_ENOMEM;
+    }
+
+    const uint8_t *p_data = p_peek + 48;
+    for( uint32_t i = 0; i < p_tc_index->i_index_entry_count; i++, p_data += 8 )
+    {
+        /* on-disk layout: timecode_ms(4LE) then packet_number(4LE) */
+        p_tc_index->timecode_entry[i].i_timecode = GetDWLE( p_data );
+        p_tc_index->timecode_entry[i].i_packet_number = GetDWLE( p_data + 4 );
+    }
+
+    return VLC_SUCCESS;
+}
+
+static int ASF_ReadObject_timecode_index_parameters(stream_t *s, asf_object_t *p_obj)
+{
+    asf_object_timecode_index_parameters_t *p_tc_params = &p_obj->timecode_index_parameters;
+    const uint8_t      *p_peek;
+
+    if( p_tc_params->i_object_size < 40
+     || p_tc_params->i_object_size > INT32_MAX
+     || vlc_stream_Peek( s, &p_peek, p_tc_params->i_object_size )
+        < (int64_t)p_tc_params->i_object_size )
+        return VLC_SUCCESS;
+
+    p_tc_params->i_index_entry_time_interval = GetDWLE( p_peek + ASF_OBJECT_COMMON_SIZE );
+    p_tc_params->i_max_packet_count = GetDWLE( p_peek + ASF_OBJECT_COMMON_SIZE + 8 );
+    p_tc_params->i_index_entry_count = GetDWLE( p_peek + ASF_OBJECT_COMMON_SIZE + 12 );
+
+#ifdef ASF_DEBUG
+    msg_Dbg( s,
+            "read \"timecode index parameters object\" "
+            "index_entry_time_interval:%u max_packet_count:%u "
+            "index_entry_count:%u",
+            p_tc_params->i_index_entry_time_interval,
+            p_tc_params->i_max_packet_count,
+            p_tc_params->i_index_entry_count );
+#endif
+
+    return VLC_SUCCESS;
+}
+
+static void ASF_FreeObject_timecode_index( asf_object_t *p_obj )
+{
+    asf_object_timecode_index_t *p_tc_index = &p_obj->timecode_index;
+
+    FREENULL( p_tc_index->timecode_entry );
 }
 
 static int ASF_ReadObject_Raw(stream_t *s, asf_object_t *p_obj)
@@ -1421,7 +1538,7 @@ static int ASF_ReadObject_Raw(stream_t *s, asf_object_t *p_obj)
 /* */
 static const struct ASF_Object_Function_entry
 {
-    const guid_t  *p_id;
+    const vlc_guid_t  *p_id;
     int     i_type;
     int     (*ASF_ReadObject_function)( stream_t *, asf_object_t *p_obj );
     void    (*ASF_FreeObject_function)( asf_object_t *p_obj );
@@ -1444,7 +1561,7 @@ static const struct ASF_Object_Function_entry
       ASF_ReadObject_metadata, ASF_FreeObject_metadata},
     { &asf_object_codec_list_guid, ASF_OBJECT_CODEC_LIST,
       ASF_ReadObject_codec_list, ASF_FreeObject_codec_list },
-    { &asf_object_marker_guid, ASF_OBJECT_MARKER, 
+    { &asf_object_marker_guid, ASF_OBJECT_MARKER,
       ASF_ReadObject_marker, ASF_FreeObject_marker },
     { &asf_object_padding, ASF_OBJECT_PADDING, NULL, NULL },
     { &asf_object_compatibility_guid, ASF_OBJECT_OTHER, NULL, NULL },
@@ -1470,6 +1587,10 @@ static const struct ASF_Object_Function_entry
     { &asf_object_extended_content_description, ASF_OBJECT_OTHER,
       ASF_ReadObject_extended_content_description,
       ASF_FreeObject_extended_content_description },
+    { &asf_object_timecode_index_guid, ASF_OBJECT_TIMECODE_INDEX,
+      ASF_ReadObject_timecode_index, ASF_FreeObject_timecode_index },
+    { &asf_object_timecode_index_parameters_guid, ASF_OBJECT_TIMECODE_INDEX_PARAMETERS,
+      ASF_ReadObject_timecode_index_parameters, ASF_FreeObject_Null },
     { &asf_object_content_encryption_guid, ASF_OBJECT_OTHER,
       ASF_ReadObject_Raw, ASF_FreeObject_Null },
     { &asf_object_advanced_content_encryption_guid, ASF_OBJECT_OTHER,
@@ -1494,7 +1615,7 @@ static void ASF_ParentObject( asf_object_t *p_father, asf_object_t *p_obj )
     }
 }
 
-static const struct ASF_Object_Function_entry * ASF_GetObject_Function( const guid_t *id )
+static const struct ASF_Object_Function_entry * ASF_GetObject_Function( const vlc_guid_t *id )
 {
     for( size_t i = 0; i < ARRAY_SIZE(ASF_Object_Function); i++ )
     {
@@ -1507,16 +1628,27 @@ static const struct ASF_Object_Function_entry * ASF_GetObject_Function( const gu
 static int ASF_ReadObject( stream_t *s, asf_object_t *p_obj,
                            asf_object_t *p_father )
 {
+    unsigned i_depth = p_father ? p_father->common.i_level + 1: 0;
+
+    return ASF_ReadObjectExpDepth( s, p_obj, p_father, i_depth );
+}
+
+static int ASF_ReadObjectExpDepth( stream_t *s, asf_object_t *p_obj,
+                                   asf_object_t *p_father, unsigned i_depth )
+{
     int i_result = VLC_SUCCESS;
 
     if( !p_obj )
         return VLC_SUCCESS;
 
+    if( i_depth >= ASF_MAX_DEPTH )
+        return VLC_EGENERIC;
+
     memset( p_obj, 0, sizeof( *p_obj ) );
 
-    if( ASF_ReadObjectCommon( s, p_obj ) )
+    if( ASF_ReadObjectCommon( s, p_obj, i_depth ) )
     {
-        msg_Warn( s, "cannot read one asf object" );
+        msg_Warn( s, "cannot read one asf object at %"PRIu64, vlc_stream_Tell(s) );
         return VLC_EGENERIC;
     }
     p_obj->common.p_father = p_father;
@@ -1527,7 +1659,7 @@ static int ASF_ReadObject( stream_t *s, asf_object_t *p_obj,
 
     if( p_obj->common.i_object_size < ASF_OBJECT_COMMON_SIZE )
     {
-        msg_Warn( s, "found a corrupted asf object (size<24)" );
+        msg_Warn( s, "found a corrupted asf object (size<24) at %"PRIu64, vlc_stream_Tell(s) );
         return VLC_EGENERIC;
     }
 
@@ -1593,7 +1725,7 @@ static void ASF_FreeObject( stream_t *s, asf_object_t *p_obj )
  *****************************************************************************/
 static const struct
 {
-    const guid_t *p_id;
+    const vlc_guid_t *p_id;
     const char *psz_name;
 } ASF_ObjectDumpDebugInfo[] =
 {
@@ -1620,9 +1752,11 @@ static const struct
     { &asf_object_stream_prioritization, "Stream Prioritization" },
     { &asf_object_bitrate_mutual_exclusion_guid, "Bitrate Mutual Exclusion" },
     { &asf_object_extended_content_description, "Extended content description"},
+    { &asf_object_timecode_index_guid, "Timecode Index"},
+    { &asf_object_timecode_index_parameters_guid, "Timecode Index Parameters"},
     { &asf_object_content_encryption_guid, "Content Encryption"},
     { &asf_object_advanced_content_encryption_guid, "Advanced Content Encryption"},
-    { &asf_object_extended_content_encryption_guid, "Entended Content Encryption"},
+    { &asf_object_extended_content_encryption_guid, "Extended Content Encryption"},
     /* Non Readable from this point */
     { &nonasf_object_index_placeholder_guid, "Index Placeholder"},
     { &nonasf_object_compatibility, "Object Compatibility"},
@@ -1684,17 +1818,21 @@ static void ASF_ObjectDumpDebug( vlc_object_t *p_obj,
  *****************************************************************************/
 asf_object_root_t *ASF_ReadObjectRoot( stream_t *s, int b_seekable )
 {
-    asf_object_root_t *p_root = malloc( sizeof( asf_object_root_t ) );
+    static_assert(offsetof(asf_object_root_t, p_next) == offsetof(asf_object_common_t, p_next),
+                           "bogus asf_object_root_t offset");
+    asf_object_t *p_obj_root = malloc( sizeof( *p_obj_root ) );
+    asf_object_root_t *p_root = &p_obj_root->root;
     asf_object_t *p_obj;
     uint64_t i_boundary = 0;
 
-    if( !p_root )
+    if( !p_obj_root )
         return NULL;
 
     p_root->i_type = ASF_OBJECT_ROOT;
-    memcpy( &p_root->i_object_id, &vlc_object_root_guid, sizeof( guid_t ) );
+    memcpy( &p_root->i_object_id, &vlc_object_root_guid, sizeof( vlc_guid_t ) );
     p_root->i_object_pos = vlc_stream_Tell( s );
     p_root->i_object_size = 0;
+    p_root->i_level = 0;
     p_root->p_first = NULL;
     p_root->p_last  = NULL;
     p_root->p_next  = NULL;
@@ -1702,13 +1840,16 @@ asf_object_root_t *ASF_ReadObjectRoot( stream_t *s, int b_seekable )
     p_root->p_data  = NULL;
     p_root->p_fp    = NULL;
     p_root->p_index = NULL;
+    p_root->p_he    = NULL;
     p_root->p_metadata = NULL;
+    p_root->p_timecode_index = NULL;
+    p_root->p_timecode_index_parameters = NULL;
 
     for( ; ; )
     {
         p_obj = malloc( sizeof( asf_object_t ) );
 
-        if( !p_obj || ASF_ReadObject( s, p_obj, (asf_object_t*)p_root ) )
+        if( !p_obj || ASF_ReadObject( s, p_obj, p_obj_root ) )
         {
             free( p_obj );
             break;
@@ -1717,15 +1858,19 @@ asf_object_root_t *ASF_ReadObjectRoot( stream_t *s, int b_seekable )
         {
             case( ASF_OBJECT_HEADER ):
                 if ( p_root->p_index || p_root->p_data || p_root->p_hdr ) break;
-                p_root->p_hdr = (asf_object_header_t*)p_obj;
+                p_root->p_hdr = &p_obj->header;
                 break;
             case( ASF_OBJECT_DATA ):
                 if ( p_root->p_index || p_root->p_data ) break;
-                p_root->p_data = (asf_object_data_t*)p_obj;
+                p_root->p_data = &p_obj->data;
             break;
             case( ASF_OBJECT_INDEX ):
                 if ( p_root->p_index ) break;
-                p_root->p_index = (asf_object_index_t*)p_obj;
+                p_root->p_index = &p_obj->index;
+                break;
+            case( ASF_OBJECT_TIMECODE_INDEX ):
+                if ( p_root->p_timecode_index ) break;
+                p_root->p_timecode_index = &p_obj->timecode_index;
                 break;
             default:
                 msg_Warn( s, "unknown top-level object found: " GUID_FMT,
@@ -1767,35 +1912,17 @@ asf_object_root_t *ASF_ReadObjectRoot( stream_t *s, int b_seekable )
                                 &asf_object_header_extension_guid, 0 );
             if( p_hdr_ext )
             {
-                int i_ext_stream;
-
+                p_root->p_he = (asf_object_header_extension_t *)p_hdr_ext;
                 p_root->p_metadata =
                     ASF_FindObject( p_hdr_ext,
                                     &asf_object_metadata_guid, 0 );
-                /* Special case for broken designed file format :( */
-                i_ext_stream = ASF_CountObject( p_hdr_ext,
-                                    &asf_object_extended_stream_properties_guid );
-                for( int i = 0; i < i_ext_stream; i++ )
-                {
-                    asf_object_t *p_esp =
-                        ASF_FindObject( p_hdr_ext,
-                                   &asf_object_extended_stream_properties_guid, i );
-                    if( p_esp->ext_stream.p_sp )
-                    {
-                        asf_object_t *p_sp =
-                                         (asf_object_t*)p_esp->ext_stream.p_sp;
-
-                        /* Insert this p_sp */
-                        p_root->p_hdr->p_last->common.p_next = p_sp;
-                        p_root->p_hdr->p_last = p_sp;
-
-                        p_sp->common.p_father = (asf_object_t*)p_root->p_hdr;
-                    }
-                }
+                p_root->p_timecode_index_parameters =
+                    ASF_FindObject( p_hdr_ext,
+                                    &asf_object_timecode_index_parameters_guid, 0 );
             }
 
             ASF_ObjectDumpDebug( VLC_OBJECT(s),
-                                 (asf_object_common_t*)p_root, 0 );
+                                 &p_obj_root->common, 0 );
             return p_root;
         }
         msg_Warn( s, "cannot find file properties object" );
@@ -1821,7 +1948,7 @@ void ASF_FreeObjectRoot( stream_t *s, asf_object_root_t *p_root )
     free( p_root );
 }
 
-int ASF_CountObject( void *_p_obj, const guid_t *p_guid )
+int ASF_CountObject( void *_p_obj, const vlc_guid_t *p_guid )
 {
     int i_count;
     asf_object_t *p_child, *p_obj;
@@ -1842,7 +1969,7 @@ int ASF_CountObject( void *_p_obj, const guid_t *p_guid )
     return i_count;
 }
 
-void *ASF_FindObject( void *_p_obj, const guid_t *p_guid,
+void *ASF_FindObject( void *_p_obj, const vlc_guid_t *p_guid,
                         int i_number )
 {
     asf_object_t *p_child, *p_obj;

@@ -25,6 +25,8 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_arrays.h>
+#include <vlc_threads.h>
 #include <vlc_plugin.h>
 #include <vlc_stream.h>
 #include <vlc_strings.h>            /* b64_decode */
@@ -122,7 +124,7 @@ typedef struct hds_stream_s
 
 #define BITRATE_AS_BYTES_PER_SECOND 1024/8
 
-struct stream_sys_t
+typedef struct
 {
     char         *base_url;    /* URL common part for chunks */
     vlc_thread_t live_thread;
@@ -144,7 +146,7 @@ struct stream_sys_t
 
     bool         live;
     bool         closed;
-};
+} stream_sys_t;
 
 typedef struct _bootstrap_info {
     uint8_t* data;
@@ -203,11 +205,10 @@ static int  Open( vlc_object_t * );
 static void Close( vlc_object_t * );
 
 vlc_module_begin()
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_STREAM_FILTER )
     set_description( N_("HTTP Dynamic Streaming") )
     set_shortname( "Dynamic Streaming")
-    set_capability( "stream_filter", 30 )
+    set_capability( "stream_filter", 330 )
     set_callbacks( Open, Close )
 vlc_module_end()
 
@@ -288,7 +289,7 @@ static uint8_t* parse_asrt( vlc_object_t* p_this,
 
     if( 0 != memcmp( "asrt", data_p, 4 ) )
     {
-        msg_Err( p_this, "Cant find asrt in bootstrap" );
+        msg_Err( p_this, "Can't find asrt in bootstrap" );
         return NULL;
     }
     data_p += 4;
@@ -392,7 +393,7 @@ static uint8_t* parse_afrt( vlc_object_t* p_this,
 
     if( 0 != memcmp( data_p, "afrt", 4 ) )
     {
-        msg_Err( p_this, "Cant find afrt in bootstrap" );
+        msg_Err( p_this, "Can't find afrt in bootstrap" );
         return NULL;
     }
     data_p += 4;
@@ -445,7 +446,7 @@ static uint8_t* parse_afrt( vlc_object_t* p_this,
     }
 
     uint32_t fragment_run_entry_count = U32_AT( data_p );
-    data_p += sizeof(uint32_t);
+    data_p += 4;
 
     while(fragment_run_entry_count-- > 0)
     {
@@ -492,7 +493,7 @@ static uint8_t* parse_afrt( vlc_object_t* p_this,
     return data_p;
 }
 
-static inline chunk_t* chunk_new()
+static inline chunk_t* chunk_new(void)
 {
     chunk_t* chunk = calloc(1, sizeof(chunk_t));
     return chunk;
@@ -522,7 +523,7 @@ static void parse_BootstrapData( vlc_object_t* p_this,
 
     if( 0 != memcmp( data_p, "abst", 4 ) )
     {
-        msg_Warn( p_this, "Cant find abst in bootstrap" );
+        msg_Warn( p_this, "Can't find abst in bootstrap" );
         return;
     }
     data_p += 4;
@@ -762,7 +763,7 @@ static uint8_t* download_chunk( stream_t *s,
     const char* quality = "";
     char* server_base = sys->base_url;
     if( stream->server_entry_count > 0 &&
-        strlen(stream->server_entries[0]) > 0 )
+        stream->server_entries[0][0] != '\0' )
     {
         server_base = stream->server_entries[0];
     }
@@ -809,13 +810,12 @@ static uint8_t* download_chunk( stream_t *s,
     free( fragment_url );
 
     int64_t size = stream_Size( download_stream );
-    chunk->data_len = (uint32_t) size;
-
     if( size > MAX_REQUEST_SIZE )
     {
         msg_Err(s, "Strangely-large chunk of %"PRIi64" Bytes", size );
         return NULL;
     }
+    chunk->data_len = (uint32_t) size;
 
     uint8_t* data = malloc( size );
     if( ! data )
@@ -851,6 +851,8 @@ static uint8_t* download_chunk( stream_t *s,
 
 static void* download_thread( void* p )
 {
+    vlc_thread_set_name("vlc-hds-dl");
+
     vlc_object_t* p_this = (vlc_object_t*)p;
     stream_t* s = (stream_t*) p_this;
     stream_sys_t* sys = s->p_sys;
@@ -916,17 +918,16 @@ static void* download_thread( void* p )
 }
 
 static chunk_t* generate_new_chunk(
-    vlc_object_t* p_this,
+    stream_t* s,
     chunk_t* last_chunk,
     hds_stream_t* hds_stream )
 {
-    stream_t* s = (stream_t*) p_this;
     stream_sys_t *sys = s->p_sys;
     chunk_t *chunk = chunk_new();
     unsigned int frun_entry = 0;
 
     if( ! chunk ) {
-        msg_Err( p_this, "Couldn't allocate new chunk!" );
+        msg_Err( s, "Couldn't allocate new chunk!" );
         return NULL;
     }
 
@@ -962,7 +963,7 @@ static chunk_t* generate_new_chunk(
         {
             if( frun_entry == hds_stream->fragment_run_count - 1 )
             {
-                msg_Err( p_this, "Discontinuity but can't find next timestamp!");
+                msg_Err( s, "Discontinuity but can't find next timestamp!");
                 chunk_free( chunk );
                 return NULL;
             }
@@ -1004,7 +1005,7 @@ static chunk_t* generate_new_chunk(
 
     if( frun_entry == hds_stream->fragment_run_count )
     {
-        msg_Err( p_this, "Couldn'd find the fragment run!" );
+        msg_Err( s, "Couldn'd find the fragment run!" );
         chunk_free( chunk );
         return NULL;
     }
@@ -1027,7 +1028,7 @@ static chunk_t* generate_new_chunk(
         fragments_accum += (
             (hds_stream->segment_runs[srun_entry+1].first_segment -
              hds_stream->segment_runs[srun_entry].first_segment) *
-            hds_stream->segment_runs[srun_entry].fragments_per_segment );
+            (uint64_t)hds_stream->segment_runs[srun_entry].fragments_per_segment );
     }
 
     chunk->seg_num = segment;
@@ -1045,10 +1046,11 @@ static chunk_t* generate_new_chunk(
 }
 
 static void maintain_live_chunks(
-    vlc_object_t* p_this,
+    stream_t *s,
     hds_stream_t* hds_stream
     )
 {
+    vlc_mutex_lock( &hds_stream->dl_lock );
     if( ! hds_stream->chunks_head )
     {
         /* just start with the earliest in the abst
@@ -1056,7 +1058,7 @@ static void maintain_live_chunks(
          * but then we are right on the edge of buffering, esp for
          * small fragments */
         hds_stream->chunks_head = generate_new_chunk(
-            p_this, 0, hds_stream );
+            s, 0, hds_stream );
         hds_stream->chunks_livereadpos = hds_stream->chunks_head;
     }
 
@@ -1072,7 +1074,7 @@ static void maintain_live_chunks(
         }
         else
         {
-            chunk->next = generate_new_chunk( p_this, chunk, hds_stream );
+            chunk->next = generate_new_chunk( s, chunk, hds_stream );
             chunk = chunk->next;
             dl = true;
         }
@@ -1093,13 +1095,15 @@ static void maintain_live_chunks(
         hds_stream->chunks_livereadpos = hds_stream->chunks_head;
 
     hds_stream->chunks_head = chunk;
+    vlc_mutex_unlock( &hds_stream->dl_lock );
 }
 
 
 static void* live_thread( void* p )
 {
-    vlc_object_t* p_this = (vlc_object_t*)p;
-    stream_t* s = (stream_t*) p_this;
+    vlc_thread_set_name("vlc-hds-live");
+
+    stream_t *s = (stream_t*)p;
     stream_sys_t* sys = s->p_sys;
 
     if ( vlc_array_count( &sys->hds_streams ) == 0 )
@@ -1131,43 +1135,52 @@ static void* live_thread( void* p )
         }
     }
 
-    mtime_t last_dl_start_time;
+    vlc_tick_t last_dl_start_time;
 
     while( ! sys->closed )
     {
-        last_dl_start_time = mdate();
-        stream_t* download_stream = vlc_stream_NewURL( p_this, abst_url );
+        last_dl_start_time = vlc_tick_now();
+        stream_t* download_stream = vlc_stream_NewURL( s, abst_url );
         if( ! download_stream )
         {
-            msg_Err( p_this, "Failed to download abst %s", abst_url );
+            msg_Err( s, "Failed to download abst %s", abst_url );
         }
         else
         {
             int64_t size = stream_Size( download_stream );
-            uint8_t* data = malloc( size );
-            int read = vlc_stream_Read( download_stream, data,
-                                    size );
-            if( read < size )
+            if( size == 0 )
             {
-                msg_Err( p_this, "Requested %"PRIi64" bytes, "  \
-                         "but only got %d", size, read );
-
+                msg_Err( s, "Unknown stream size for %s", abst_url );
             }
             else
             {
-                vlc_mutex_lock( & hds_stream->abst_lock );
-                parse_BootstrapData( p_this, hds_stream,
-                                     data, data + read );
-                vlc_mutex_unlock( & hds_stream->abst_lock );
-                maintain_live_chunks( p_this, hds_stream );
-            }
+                uint8_t* data = malloc( size );
+                int read = vlc_stream_Read( download_stream, data,
+                                        size );
+                if( read < size )
+                {
+                    msg_Err( s, "Requested %"PRIi64" bytes, "  \
+                             "but only got %d", size, read );
 
-            free( data );
+                }
+                else
+                {
+                    vlc_mutex_lock( & hds_stream->abst_lock );
+                    parse_BootstrapData( VLC_OBJECT(s), hds_stream,
+                                         data, data + read );
+                    vlc_mutex_unlock( & hds_stream->abst_lock );
+                    maintain_live_chunks( s, hds_stream );
+                }
+
+                free( data );
+            }
 
             vlc_stream_Delete( download_stream );
         }
 
-        mwait( last_dl_start_time + ( ((int64_t)hds_stream->fragment_runs[hds_stream->fragment_run_count-1].fragment_duration) * 1000000LL) / ((int64_t)hds_stream->afrt_timescale) );
+        vlc_tick_wait( last_dl_start_time +
+                       vlc_tick_from_samples(hds_stream->fragment_runs[hds_stream->fragment_run_count-1].fragment_duration,
+                                             hds_stream->afrt_timescale) );
 
 
     }
@@ -1216,13 +1229,6 @@ static void cleanup_Manifest( manifest_t *m )
 
     if( m->vlc_reader )
         xml_ReaderDelete( m->vlc_reader );
-}
-
-static void cleanup_threading( hds_stream_t *stream )
-{
-    vlc_mutex_destroy( &stream->dl_lock );
-    vlc_cond_destroy( &stream->dl_cond );
-    vlc_mutex_destroy( &stream->abst_lock );
 }
 
 static void write_int_24( uint8_t *p, uint32_t val )
@@ -1327,19 +1333,32 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
         switch( type )
         {
         case XML_READER_STARTELEM:
-            if( current_element_idx == 0 && element_stack[current_element_idx] == 0 ) {
+            if( current_element_idx == 0 && element_stack[current_element_idx] == NULL ) {
                 if( !( element_stack[current_element_idx] = strdup( node ) ) )
+                {
+                    free(media_id);
                     return VLC_ENOMEM;
+                }
             } else {
+                if( current_element_idx == MAX_XML_DEPTH - 1u )
+                {
+                    msg_Err( s, "Too many XML elements, quitting" );
+                    free(media_id);
+                    return VLC_EGENERIC;
+                }
+
                 if ( !( element_stack[++current_element_idx] = strdup( node ) ) )
+                {
+                    free(media_id);
                     return VLC_ENOMEM;
+                }
             }
 
             break;
         case XML_READER_ENDELEM:
             if( current_element && ! strcmp( current_element, "bootstrapInfo") ) {
                 if( bootstrap_idx + 1 == MAX_BOOTSTRAP_INFO ) {
-                    msg_Warn( (vlc_object_t*) s, "Too many bootstraps, ignoring" );
+                    msg_Warn( s, "Too many bootstraps, ignoring" );
                 } else {
                     bootstrap_idx++;
                 }
@@ -1347,7 +1366,7 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
 
             free( current_element );
             current_element = NULL;
-            element_stack[current_element_idx--] = 0;
+            element_stack[current_element_idx--] = NULL;
             break;
         }
 
@@ -1361,7 +1380,8 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
         {
             if( media_idx == MAX_MEDIA_ELEMENTS )
             {
-                msg_Err( (vlc_object_t*) s, "Too many media elements, quitting" );
+                msg_Err( s, "Too many media elements, quitting" );
+                free(media_id);
                 return VLC_EGENERIC;
             }
 
@@ -1370,17 +1390,26 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                 if( !strcmp(attr_name, "streamId" ) )
                 {
                     if( !( medias[media_idx].stream_id = strdup( attr_value ) ) )
+                    {
+                        free(media_id);
                         return VLC_ENOMEM;
+                    }
                 }
                 else if( !strcmp(attr_name, "url" ) )
                 {
                     if( !( medias[media_idx].media_url = strdup( attr_value ) ) )
+                    {
+                        free(media_id);
                         return VLC_ENOMEM;
+                    }
                 }
                 else if( !strcmp(attr_name, "bootstrapInfoId" ) )
                 {
                     if( !( medias[media_idx].bootstrap_id = strdup( attr_value ) ) )
+                    {
+                        free(media_id);
                         return VLC_ENOMEM;
+                    }
                 }
                 else if( !strcmp(attr_name, "bitrate" ) )
                 {
@@ -1397,17 +1426,26 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                 if( !strcmp(attr_name, "url" ) )
                 {
                     if( !( bootstraps[bootstrap_idx].url = strdup( attr_value ) ) )
+                    {
+                        free(media_id);
                         return VLC_ENOMEM;
+                    }
                 }
                 else if( !strcmp(attr_name, "id" ) )
                 {
                     if( !( bootstraps[bootstrap_idx].id = strdup( attr_value ) ) )
-                       return VLC_ENOMEM;
+                    {
+                        free(media_id);
+                        return VLC_ENOMEM;
+                    }
                 }
                 else if( !strcmp(attr_name, "profile" ) )
                 {
                     if( !( bootstraps[bootstrap_idx].profile = strdup( attr_value ) ) )
+                    {
+                        free(media_id);
                         return VLC_ENOMEM;
+                    }
                 }
             }
         }
@@ -1425,7 +1463,7 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                     vlc_b64_decode_binary( (uint8_t**)&bootstraps[bootstrap_idx].data, start );
                 if( ! bootstraps[bootstrap_idx].data )
                 {
-                    msg_Err( (vlc_object_t*) s, "Couldn't decode bootstrap info" );
+                    msg_Err( s, "Couldn't decode bootstrap info" );
                 }
             }
             else if( ! strcmp( current_element, "duration" ) )
@@ -1457,14 +1495,17 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                         vlc_b64_decode_binary( (uint8_t**)&medias[mi].metadata, start );
 
                     if ( ! medias[mi].metadata )
+                    {
+                        free(media_id);
                         return VLC_ENOMEM;
+                    }
 
                     uint8_t *end_marker =
                         medias[mi].metadata + medias[mi].metadata_len - sizeof(amf_object_end);
                     if ( ( end_marker < medias[mi].metadata ) ||
                          memcmp(end_marker, amf_object_end, sizeof(amf_object_end)) != 0 )
                     {
-                        msg_Dbg( (vlc_object_t*)s, "Ignoring invalid metadata packet on stream %d", mi );
+                        msg_Dbg( s, "Ignoring invalid metadata packet on stream %d", mi );
                         FREENULL( medias[mi].metadata );
                         medias[mi].metadata_len = 0;
                     }
@@ -1507,7 +1548,6 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                     if( !(new_stream->url = strdup( medias[i].media_url ) ) )
                     {
                         free( media_id );
-                        cleanup_threading( new_stream );
                         free( new_stream );
                         return VLC_ENOMEM;
                     }
@@ -1520,7 +1560,6 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                     {
                         free( new_stream->url );
                         free( media_id );
-                        cleanup_threading( new_stream );
                         free( new_stream );
                         return VLC_ENOMEM;
                     }
@@ -1529,9 +1568,9 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                     new_stream->metadata_len = medias[i].metadata_len;
                 }
 
-                if( ! sys->live )
+                if( ! sys->live && bootstraps[j].data )
                 {
-                    parse_BootstrapData( (vlc_object_t*)s,
+                    parse_BootstrapData( VLC_OBJECT(s),
                                          new_stream,
                                          bootstraps[j].data,
                                          bootstraps[j].data + bootstraps[j].data_len );
@@ -1539,26 +1578,25 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
                     new_stream->download_leadtime = 15;
 
                     new_stream->chunks_head = generate_new_chunk(
-                        (vlc_object_t*) s, 0, new_stream );
+                        s, 0, new_stream );
                     chunk_t* chunk = new_stream->chunks_head;
                     uint64_t total_duration = chunk->duration;
                     while( chunk && total_duration/new_stream->afrt_timescale < new_stream->download_leadtime )
                     {
                         chunk->next = generate_new_chunk(
-                            (vlc_object_t*) s, chunk, new_stream );
+                            s, chunk, new_stream );
                         chunk = chunk->next;
                         if( chunk )
                             total_duration += chunk->duration;
                     }
                 }
-                else
+                else if( bootstraps[j].url )
                 {
                     if( !(new_stream->abst_url = strdup( bootstraps[j].url ) ) )
                     {
                         free( new_stream->metadata );
                         free( new_stream->url );
                         free( media_id );
-                        cleanup_threading( new_stream );
                         free( new_stream );
                         return VLC_ENOMEM;
                     }
@@ -1568,7 +1606,7 @@ static int parse_Manifest( stream_t *s, manifest_t *m )
 
                 vlc_array_append_or_abort( &sys->hds_streams, new_stream );
 
-                msg_Info( (vlc_object_t*)s, "New track with quality_segment(%s), bitrate(%u), timescale(%u), movie_id(%s), segment_run_count(%d), fragment_run_count(%u)",
+                msg_Info( s, "New track with quality_segment(%s), bitrate(%u), timescale(%u), movie_id(%s), segment_run_count(%d), fragment_run_count(%u)",
                           new_stream->quality_segment_modifier?new_stream->quality_segment_modifier:"", new_stream->bitrate, new_stream->timescale,
                           new_stream->movie_id, new_stream->segment_run_count, new_stream->fragment_run_count );
 
@@ -1588,8 +1626,6 @@ static void hds_free( hds_stream_t *p_stream )
     FREENULL( p_stream->quality_segment_modifier );
 
     FREENULL( p_stream->abst_url );
-
-    cleanup_threading( p_stream );
 
     FREENULL( p_stream->metadata );
     FREENULL( p_stream->url );
@@ -1666,7 +1702,7 @@ static int Open( vlc_object_t *p_this )
     s->pf_seek = NULL;
     s->pf_control = Control;
 
-    if( vlc_clone( &p_sys->dl_thread, download_thread, s, VLC_THREAD_PRIORITY_INPUT ) )
+    if( vlc_clone( &p_sys->dl_thread, download_thread, s ) )
     {
         goto error;
     }
@@ -1674,7 +1710,7 @@ static int Open( vlc_object_t *p_this )
     if( p_sys->live ) {
         msg_Info( p_this, "Live stream detected" );
 
-        if( vlc_clone( &p_sys->live_thread, live_thread, s, VLC_THREAD_PRIORITY_INPUT ) )
+        if( vlc_clone( &p_sys->live_thread, live_thread, s ) )
         {
             goto error;
         }
@@ -1697,9 +1733,11 @@ static void Close( vlc_object_t *p_this )
     hds_stream_t *stream = vlc_array_count(&p_sys->hds_streams) ?
         p_sys->hds_streams.pp_elems[0] : NULL;
 
+    vlc_mutex_lock( &stream->dl_lock );
     p_sys->closed = true;
     if (stream)
         vlc_cond_signal( & stream->dl_cond );
+    vlc_mutex_unlock( &stream->dl_lock );
 
     vlc_join( p_sys->dl_thread, NULL );
 
@@ -1734,11 +1772,10 @@ static int send_flv_header( hds_stream_t *stream, stream_sys_t* p_sys,
 }
 
 static unsigned read_chunk_data(
-    vlc_object_t* p_this,
+    stream_t* s,
     uint8_t* buffer, unsigned read_len,
     hds_stream_t* stream )
 {
-    stream_t* s = (stream_t*) p_this;
     stream_sys_t* sys = s->p_sys;
     chunk_t* chunk = stream->chunks_head;
     uint8_t* buffer_start = buffer;
@@ -1772,7 +1809,7 @@ static unsigned read_chunk_data(
             /* make sure there is at least one chunk in the queue */
             if( ! chunk->next && ! chunk->eof )
             {
-                chunk->next = generate_new_chunk( p_this, chunk,  stream );
+                chunk->next = generate_new_chunk( s, chunk,  stream );
                 dl = true;
             }
 
@@ -1797,6 +1834,7 @@ static unsigned read_chunk_data(
     /* new chunk generation is handled by a different thread in live case */
     if( ! sys->live )
     {
+        vlc_mutex_lock( &stream->dl_lock );
         chunk = stream->chunks_head;
         if( chunk )
         {
@@ -1805,7 +1843,7 @@ static unsigned read_chunk_data(
             {
                 if( ! chunk->next && ! chunk->eof )
                 {
-                    chunk->next = generate_new_chunk( p_this, chunk, stream );
+                    chunk->next = generate_new_chunk( s, chunk, stream );
                     dl = true;
                 }
 
@@ -1822,6 +1860,7 @@ static unsigned read_chunk_data(
 
         if( dl )
             vlc_cond_signal( & stream->dl_cond );
+        vlc_mutex_unlock( &stream->dl_lock );
     }
 
     return ( ((uint8_t*)buffer) - ((uint8_t*)buffer_start));
@@ -1847,7 +1886,7 @@ static ssize_t Read( stream_t *s, void *buffer, size_t i_read )
     if ( header_unfinished( p_sys ) )
         return send_flv_header( stream, p_sys, buffer, i_read );
 
-    return read_chunk_data( (vlc_object_t*)s, buffer, i_read, stream );
+    return read_chunk_data( s, buffer, i_read, stream );
 }
 
 static int Control( stream_t *s, int i_query, va_list args )
@@ -1865,8 +1904,8 @@ static int Control( stream_t *s, int i_query, va_list args )
             *(va_arg( args, bool * )) = true;
             break;
         case STREAM_GET_PTS_DELAY:
-            *va_arg (args, int64_t *) = INT64_C(1000) *
-                var_InheritInteger(s, "network-caching");
+            *va_arg (args, vlc_tick_t *) = VLC_TICK_FROM_MS(
+                var_InheritInteger(s, "network-caching") );
              break;
         case STREAM_GET_SIZE:
             *(va_arg (args, uint64_t *)) = get_stream_size(s);

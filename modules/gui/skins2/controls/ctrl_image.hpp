@@ -2,7 +2,6 @@
  * ctrl_image.hpp
  *****************************************************************************
  * Copyright (C) 2003 the VideoLAN team
- * $Id$
  *
  * Authors: Cyril Deguet     <asmax@via.ecp.fr>
  *          Olivier Teulière <ipkiss@via.ecp.fr>
@@ -51,19 +50,22 @@ public:
     CtrlImage( intf_thread_t *pIntf, GenericBitmap &rBitmap,
                CmdGeneric &rCommand, resize_t resizeMethod,
                const UString &rHelp, VarBool *pVisible, bool art );
-    virtual ~CtrlImage();
+    ~CtrlImage() override;
 
     /// Handle an event on the control
-    virtual void handleEvent( EvtGeneric &rEvent );
+    void handleEvent(EvtGeneric &rEvent) override;
 
     /// Check whether coordinates are inside the control
-    virtual bool mouseOver( int x, int y ) const;
+    bool mouseOver(int x, int y) const override;
 
     /// Draw the control on the given graphics
-    virtual void draw( OSGraphics &rImage, int xDest, int yDest, int w, int h );
+    void draw(OSGraphics &rImage, int xDest, int yDest, int w, int h) override;
 
     /// Get the type of control (custom RTTI)
-    virtual std::string getType() const { return "image"; }
+    std::string getType() const override { return "image"; }
+
+protected:
+    using CtrlGeneric::onUpdate;
 
 private:
     /// Bitmap
@@ -83,7 +85,7 @@ private:
     int m_y;
 
     /// Method called when the observed variable is modified
-    virtual void onUpdate( Subject<VarString> &rVariable, void* );
+    void onUpdate(Subject<VarString> &rVariable, void*) override;
 
 
 };

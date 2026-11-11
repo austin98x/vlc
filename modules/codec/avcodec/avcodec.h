@@ -2,7 +2,6 @@
  * avcodec.h: decoder and encoder using libavcodec
  *****************************************************************************
  * Copyright (C) 2001-2008 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *
@@ -25,17 +24,18 @@
 #include "avcommon.h"
 
 /* VLC <-> avcodec tables */
-bool GetFfmpegCodec( enum es_format_category_e cat, vlc_fourcc_t i_fourcc,
-                     unsigned *pi_ffmpeg_codec, const char **ppsz_name );
-vlc_fourcc_t GetVlcFourcc( unsigned i_ffmpeg_codec );
+bool GetFfmpegCodec( const es_format_t *,
+                     enum AVCodecID *pi_ffmpeg_codec, const char **ppsz_name );
+vlc_fourcc_t GetVlcFourcc( enum AVCodecID i_ffmpeg_codec );
 vlc_fourcc_t GetVlcAudioFormat( int i_sample_fmt );
 
 /* Video encoder module */
-int  OpenEncoder ( vlc_object_t * );
-void CloseEncoder( vlc_object_t * );
+int  InitVideoEnc ( vlc_object_t * );
+void EndVideoEnc( encoder_t * );
 
 /* Video Decoder */
 int InitVideoDec( vlc_object_t * );
+int InitVideoHwDec( vlc_object_t * );
 void EndVideoDec( vlc_object_t * );
 
 /* Audio Decoder */
@@ -47,7 +47,7 @@ int InitSubtitleDec( vlc_object_t * );
 void EndSubtitleDec( vlc_object_t * );
 
 /* Initialize decoder */
-AVCodecContext *ffmpeg_AllocContext( decoder_t *, const AVCodec ** );
+AVCodecContext *ffmpeg_AllocContext( decoder_t *, const AVCodec **, bool );
 int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
 
 /*****************************************************************************
@@ -59,35 +59,11 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
 #define CORRUPTED_TEXT N_("Show corrupted frames")
 #define CORRUPTED_LONGTEXT N_("Prefer visual artifacts instead of missing frames")
 
-#define ERROR_TEXT N_("Error resilience")
-#define ERROR_LONGTEXT N_( \
-    "libavcodec can do error resilience.\n" \
-    "However, with a buggy encoder (such as the ISO MPEG-4 encoder from M$) " \
-    "this can produce a lot of errors.\n" \
-    "Valid values range from 0 to 4 (0 disables all errors resilience).")
-
-#define BUGS_TEXT N_("Workaround bugs")
-#define BUGS_LONGTEXT N_( \
-    "Try to fix some bugs:\n" \
-    "1  autodetect\n" \
-    "2  old msmpeg4\n" \
-    "4  xvid interlaced\n" \
-    "8  ump4 \n" \
-    "16 no padding\n" \
-    "32 ac vlc\n" \
-    "64 Qpel chroma.\n" \
-    "This must be the sum of the values. For example, to fix \"ac vlc\" and " \
-    "\"ump4\", enter 40.")
-
 #define HURRYUP_TEXT N_("Hurry up")
 #define HURRYUP_LONGTEXT N_( \
     "The decoder can partially decode or skip frame(s) " \
     "when there is not enough time. It's useful with low CPU power " \
     "but it can produce distorted pictures.")
-
-#define FAST_TEXT N_("Allow speed tricks")
-#define FAST_LONGTEXT N_( \
-    "Allow non specification compliant speedup tricks. Faster but error-prone.")
 
 #define SKIP_FRAME_TEXT N_("Skip frame (default=0)")
 #define SKIP_FRAME_LONGTEXT N_( \
@@ -96,11 +72,10 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
 
 #define SKIP_IDCT_TEXT N_("Skip idct (default=0)")
 #define SKIP_IDCT_LONGTEXT N_( \
-    "Force skipping of idct to speed up decoding for frame types " \
-    "(-1=None, 0=Default, 1=B-frames, 2=P-frames, 3=B+P frames, 4=all frames)." )
+    "Force skipping of idct to speed up decoding for frame types." )
 
 #define DEBUG_TEXT N_( "Debug mask" )
-#define DEBUG_LONGTEXT N_( "Set FFmpeg debug mask" )
+#define DEBUG_LONGTEXT NULL
 
 #define CODEC_TEXT N_( "Codec name" )
 #define CODEC_LONGTEXT N_( "Internal libavcodec codec name" )
@@ -109,9 +84,6 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
 #define SKIPLOOPF_LONGTEXT N_( "Skipping the loop filter (aka deblocking) " \
     "usually has a detrimental effect on quality. However it provides a big " \
     "speedup for high definition streams." )
-
-#define HW_TEXT N_("Hardware decoding")
-#define HW_LONGTEXT N_("This allows hardware decoding when available.")
 
 #define THREADS_TEXT N_( "Threads" )
 #define THREADS_LONGTEXT N_( "Number of threads used for decoding, 0 meaning auto" )
@@ -141,8 +113,7 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
   "motion estimation algorithms. This requires more CPU." )
 
 #define ENC_PRE_ME_TEXT N_( "Pre-motion estimation" )
-#define ENC_PRE_ME_LONGTEXT N_( "Enable the pre-motion " \
-  "estimation algorithm.")
+#define ENC_PRE_ME_LONGTEXT NULL
 
 #define ENC_RC_BUF_TEXT N_( "Rate control buffer size" )
 #define ENC_RC_BUF_LONGTEXT N_( "Rate control " \
@@ -150,8 +121,6 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
   "control, but will cause a delay in the stream." )
 
 #define ENC_RC_BUF_AGGR_TEXT N_( "Rate control buffer aggressiveness" )
-#define ENC_RC_BUF_AGGR_LONGTEXT N_( "Rate control "\
-  "buffer aggressiveness." )
 
 #define ENC_IQUANT_FACTOR_TEXT N_( "I quantization factor" )
 #define ENC_IQUANT_FACTOR_LONGTEXT N_(  \
@@ -182,12 +151,8 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
   "threshold to ease the encoder's task." )
 
 #define ENC_QMIN_TEXT N_( "Minimum video quantizer scale" )
-#define ENC_QMIN_LONGTEXT N_( "Minimum video " \
-  "quantizer scale." )
 
 #define ENC_QMAX_TEXT N_( "Maximum video quantizer scale" )
-#define ENC_QMAX_LONGTEXT N_( "Maximum video " \
-  "quantizer scale." )
 
 #define ENC_TRELLIS_TEXT N_( "Trellis quantization" )
 #define ENC_TRELLIS_LONGTEXT N_( "Enable trellis " \
@@ -232,8 +197,3 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *, const AVCodec * );
    "for encoding the audio bitstream. It takes the following options: " \
    "main, low, ssr (not supported),ltp, hev1, hev2 (default: low). " \
    "hev1 and hev2 are currently supported only with libfdk-aac enabled libavcodec" )
-
-#ifndef AV_VERSION_INT
-#   define AV_VERSION_INT(a, b, c) ((a)<<16 | (b)<<8 | (c))
-#endif
-

@@ -2,7 +2,6 @@
  * item.h
  *****************************************************************************
  * Copyright (C) 2008 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -25,16 +24,28 @@
 #define LIBVLC_INPUT_ITEM_H 1
 
 #include "input_interface.h"
-#include <stdatomic.h>
+#include <vlc_atomic.h>
 
-void input_item_SetErrorWhenReading( input_item_t *p_i, bool b_error );
-void input_item_UpdateTracksInfo( input_item_t *item, const es_format_t *fmt );
-bool input_item_ShouldPreparseSubItems( input_item_t *p_i );
+void input_item_UpdateTracksInfo( input_item_t *item, const es_format_t *fmt,
+                                  const char *es_id, bool stable );
+/**
+ * Set the libvlc owner (libvlc_media_t *) with a release callback
+ *
+ * Can only be set after the item is just created.
+ */
+VLC_API void input_item_SetLibvlcOwner(input_item_t *, void *,
+                                       void (*release)(void *));
+/**
+ * Get the libvlc owner (libvlc_media_t *)
+ */
+VLC_API void *input_item_GetLibvlcOwner(input_item_t *);
 
 typedef struct input_item_owner
 {
     input_item_t item;
-    atomic_uint refs;
+    void *libvlc_owner;
+    void (*libvlc_owner_release)(void *libvlc_owner);
+    vlc_atomic_rc_t rc;
 } input_item_owner_t;
 
 # define item_owner(item) ((struct input_item_owner *)(item))

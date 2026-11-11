@@ -6,7 +6,7 @@
  * Copyright (C) 2011 KO Myung-Hun
  *
  * Authors: KO Myung-Hun <komh@chollian.net>
- *          Rémi Denis-Courmont <rem # videolan.org>
+ *          Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -30,7 +30,9 @@
 #include <vlc_common.h>
 #include <vlc_network.h>
 
+#ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
+#endif
 
 #define _NI_MASK (NI_NUMERICHOST|NI_NUMERICSERV|NI_NOFQDN|NI_NAMEREQD|\
                   NI_DGRAM)
@@ -158,18 +160,17 @@ makeaddrinfo (int af, int type, int proto,
 static struct addrinfo *
 makeipv4info (int type, int proto, u_long ip, u_short port, const char *name)
 {
-    struct sockaddr_in addr;
+    vlc_sockaddr addr = {0};
 
-    memset (&addr, 0, sizeof (addr));
-    addr.sin_family = AF_INET;
+    addr.sin.sin_family = AF_INET;
 # ifdef HAVE_SA_LEN
-    addr.sin_len = sizeof (addr);
+    addr.sin.sin_len = sizeof (addr.sin);
 # endif
-    addr.sin_port = port;
-    addr.sin_addr.s_addr = ip;
+    addr.sin.sin_port = port;
+    addr.sin.sin_addr.s_addr = ip;
 
     return makeaddrinfo (AF_INET, type, proto,
-                         (struct sockaddr*)&addr, sizeof (addr), name);
+                         &addr.sa, sizeof (addr.sin), name);
 }
 
 /*

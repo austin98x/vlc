@@ -2,7 +2,6 @@
  * blend2.cpp: Blend one picture with alpha onto another picture
  *****************************************************************************
  * Copyright (C) 2012 Laurent Aimar
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir _AT_ videolan _DOT_ org>
  *
@@ -37,13 +36,12 @@
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
-static int  Open (vlc_object_t *);
-static void Close(vlc_object_t *);
+static int  Open (filter_t *);
+static void Close(filter_t *);
 
 vlc_module_begin()
     set_description(N_("Video pictures blending"))
-    set_capability("video blending", 100)
-    set_callbacks(Open, Close)
+    set_callback_video_blending(Open, 100)
 vlc_module_end()
 
 static inline unsigned div255(unsigned v)
@@ -59,6 +57,8 @@ void merge(T *dst, unsigned src, unsigned f)
 {
     *dst = div255((255 - f) * (*dst) + src * f);
 }
+
+namespace {
 
 struct CPixel {
     unsigned i, j, k;
@@ -145,8 +145,8 @@ private:
     {
         if (plane == 1 || plane == 2)
             return (pixel*)&data[plane][(x + dx) / rx * sizeof(pixel)];
-        else
-            return (pixel*)&data[plane][(x + dx) /  1 * sizeof(pixel)];
+
+        return (pixel*)&data[plane][(x + dx) /  1 * sizeof(pixel)];
     }
     uint8_t *data[4];
 };
@@ -262,32 +262,17 @@ private:
     uint8_t *data;
 };
 
-template <unsigned bytes, bool has_alpha>
+template <unsigned bytes>
 class CPictureRGBX : public CPicture {
 public:
     CPictureRGBX(const CPicture &cfg) : CPicture(cfg)
     {
-        if (has_alpha) {
-            if (fmt->i_chroma == VLC_CODEC_BGRA) {
-                offset_r = 2;
-                offset_g = 1;
-                offset_b = 0;
-            } else {
-                offset_r = 0;
-                offset_g = 1;
-                offset_b = 2;
-            }
-            offset_a = 3;
-        } else {
-#ifdef WORDS_BIGENDIAN
-            offset_r = (8 * bytes - fmt->i_lrshift) / 8;
-            offset_g = (8 * bytes - fmt->i_lgshift) / 8;
-            offset_b = (8 * bytes - fmt->i_lbshift) / 8;
-#else
-            offset_r = fmt->i_lrshift / 8;
-            offset_g = fmt->i_lgshift / 8;
-            offset_b = fmt->i_lbshift / 8;
-#endif
+        if (GetPackedRgbIndexes(fmt->i_chroma, &offset_r, &offset_g, &offset_b, &offset_a) != VLC_SUCCESS) {
+            /* at least init to something on error to silence compiler warnings */
+            offset_r = 0;
+            offset_g = 1;
+            offset_b = 2;
+            offset_a = -1;
         }
         data = CPicture::getLine<1>(0);
     }
@@ -297,13 +282,13 @@ public:
         px->i = src[offset_r];
         px->j = src[offset_g];
         px->k = src[offset_b];
-        if (has_alpha)
+        if (offset_a != -1)
             px->a = src[offset_a];
     }
     void merge(unsigned dx, const CPixel &spx, unsigned a, bool)
     {
         uint8_t *dst = getPointer(dx);
-        if (has_alpha) {
+        if (offset_a != -1) {
             // Handle different cases of existing alpha in the
             // destination buffer. If the existing alpha is 0,
             // the RGB components should be copied as is and
@@ -337,25 +322,56 @@ private:
     {
         return &data[(x + dx) * bytes];
     }
-    unsigned offset_r;
-    unsigned offset_g;
-    unsigned offset_b;
-    unsigned offset_a;
+    int offset_r;
+    int offset_g;
+    int offset_b;
+    int offset_a;
     uint8_t *data;
 };
 
 class CPictureRGB16 : public CPicture {
+private:
+    uint32_t rmask, gmask, bmask;
+    unsigned rshift, gshift, bshift;
 public:
     CPictureRGB16(const CPicture &cfg) : CPicture(cfg)
     {
         data = CPicture::getLine<1>(0);
+        switch (fmt->i_chroma)
+        {
+        case VLC_CODEC_RGB565:
+            rmask = 0xf800;
+            gmask = 0x07e0;
+            bmask = 0x001f;
+            break;
+        case VLC_CODEC_BGR565:
+            bmask = 0xf800;
+            gmask = 0x07e0;
+            rmask = 0x001f;
+            break;
+        case VLC_CODEC_RGB555:
+            rmask = 0x7c00;
+            gmask = 0x03e0;
+            bmask = 0x001f;
+            break;
+        case VLC_CODEC_BGR555:
+            bmask = 0x7c00;
+            gmask = 0x03e0;
+            rmask = 0x001f;
+            break;
+        default:
+            vlc_assert_unreachable();
+        }
+        rshift = vlc_ctz(rmask);
+        gshift = vlc_ctz(gmask);
+        bshift = vlc_ctz(bmask);
     }
     void get(CPixel *px, unsigned dx, bool = true) const
     {
         const uint16_t data = *getPointer(dx);
-        px->i = (data & fmt->i_rmask) >> fmt->i_lrshift;
-        px->j = (data & fmt->i_gmask) >> fmt->i_lgshift;
-        px->k = (data & fmt->i_bmask) >> fmt->i_lbshift;
+        px->i = (data & rmask) >> rshift;
+        px->j = (data & gmask) >> gshift;
+        px->k = (data & bmask) >> bshift;
     }
     void merge(unsigned dx, const CPixel &spx, unsigned a, bool full)
     {
@@ -366,9 +382,9 @@ public:
         ::merge(&dpx.j, spx.j, a);
         ::merge(&dpx.k, spx.k, a);
 
-        *getPointer(dx) = (dpx.i << fmt->i_lrshift) |
-                          (dpx.j << fmt->i_lgshift) |
-                          (dpx.k << fmt->i_lbshift);
+        *getPointer(dx) = (dpx.i << rshift) |
+                          (dpx.j << gshift) |
+                          (dpx.k << bshift);
     }
     void nextLine()
     {
@@ -385,7 +401,6 @@ private:
 
 typedef CPictureYUVPlanar<uint8_t,  1,1, true,  false> CPictureYUVA;
 
-typedef CPictureYUVPlanar<uint8_t,  4,4, false, true>  CPictureYV9;
 typedef CPictureYUVPlanar<uint8_t,  4,4, false, false> CPictureI410_8;
 
 typedef CPictureYUVPlanar<uint8_t,  4,1, false, false> CPictureI411_8;
@@ -408,10 +423,10 @@ typedef CPictureYUVPacked<1, 0, 2> CPictureUYVY;
 typedef CPictureYUVPacked<0, 3, 1> CPictureYVYU;
 typedef CPictureYUVPacked<1, 2, 0> CPictureVYUY;
 
-typedef CPictureRGBX<4, true>  CPictureRGBA;
-typedef CPictureRGBX<4, true>  CPictureBGRA;
-typedef CPictureRGBX<4, false> CPictureRGB32;
-typedef CPictureRGBX<3, false> CPictureRGB24;
+typedef CPictureRGBX<4> CPictureRGBA;
+typedef CPictureRGBX<4> CPictureBGRA;
+typedef CPictureRGBX<4> CPictureRGB32;
+typedef CPictureRGBX<3> CPictureRGB24;
 
 struct convertNone {
     convertNone(const video_format_t *, const video_format_t *) {}
@@ -459,15 +474,46 @@ struct convertYuv8ToRgb {
 };
 
 struct convertRgbToRgbSmall {
-    convertRgbToRgbSmall(const video_format_t *dst, const video_format_t *) : fmt(*dst) {}
+    convertRgbToRgbSmall(const video_format_t *dst, const video_format_t *)
+    {
+        uint32_t rmask, gmask, bmask;
+        switch (dst->i_chroma)
+        {
+        case VLC_CODEC_RGB565:
+            rmask = 0xf800;
+            gmask = 0x07e0;
+            bmask = 0x001f;
+            break;
+        case VLC_CODEC_BGR565:
+            bmask = 0xf800;
+            gmask = 0x07e0;
+            rmask = 0x001f;
+            break;
+        case VLC_CODEC_RGB555:
+            rmask = 0x7c00;
+            gmask = 0x03e0;
+            bmask = 0x001f;
+            break;
+        case VLC_CODEC_BGR555:
+            bmask = 0x7c00;
+            gmask = 0x03e0;
+            rmask = 0x001f;
+            break;
+        default:
+            vlc_assert_unreachable();
+        }
+        rshift = 8 - vlc_popcount(rmask);
+        bshift = 8 - vlc_popcount(bmask);
+        gshift = 8 - vlc_popcount(gmask);
+    }
     void operator()(CPixel &p)
     {
-        p.i >>= fmt.i_rrshift;
-        p.j >>= fmt.i_rgshift;
-        p.k >>= fmt.i_rbshift;
+        p.i >>= rshift;
+        p.j >>= gshift;
+        p.k >>= bshift;
     }
 private:
-    const video_format_t &fmt;
+    unsigned rshift, gshift, bshift;
 };
 
 struct convertYuvpToAny {
@@ -519,6 +565,8 @@ private:
     G g;
 };
 
+} // namespace
+
 template <class TDst, class TSrc, class TConvert>
 void Blend(const CPicture &dst_data, const CPicture &src_data,
            unsigned width, unsigned height, int alpha)
@@ -529,7 +577,7 @@ void Blend(const CPicture &dst_data, const CPicture &src_data,
 
     for (unsigned y = 0; y < height; y++) {
         for (unsigned x = 0; x < width; x++) {
-            CPixel spx;
+            CPixel spx {};
 
             src.get(&spx, x);
             convert(spx);
@@ -551,6 +599,8 @@ void Blend(const CPicture &dst_data, const CPicture &src_data,
 typedef void (*blend_function_t)(const CPicture &dst_data, const CPicture &src_data,
                                  unsigned width, unsigned height, int alpha);
 
+namespace {
+
 static const struct {
     vlc_fourcc_t     dst;
     vlc_fourcc_t     src;
@@ -567,14 +617,21 @@ static const struct {
     { csp, VLC_CODEC_RGBA, Blend<picture, CPictureRGBA, compose<cvt, convertRgbToYuv8> > }, \
     { csp, VLC_CODEC_YUVP, Blend<picture, CPictureYUVP, compose<cvt, convertYuvpToYuva8> > }
 
-    RGB(VLC_CODEC_RGB15,    CPictureRGB16,    convertRgbToRgbSmall),
-    RGB(VLC_CODEC_RGB16,    CPictureRGB16,    convertRgbToRgbSmall),
+    RGB(VLC_CODEC_RGB555,   CPictureRGB16,    convertRgbToRgbSmall),
+    RGB(VLC_CODEC_BGR555,   CPictureRGB16,    convertRgbToRgbSmall),
+    RGB(VLC_CODEC_RGB565,   CPictureRGB16,    convertRgbToRgbSmall),
+    RGB(VLC_CODEC_BGR565,   CPictureRGB16,    convertRgbToRgbSmall),
     RGB(VLC_CODEC_RGB24,    CPictureRGB24,    convertNone),
-    RGB(VLC_CODEC_RGB32,    CPictureRGB32,    convertNone),
+    RGB(VLC_CODEC_BGR24,    CPictureRGB24,    convertNone),
     RGB(VLC_CODEC_RGBA,     CPictureRGBA,     convertNone),
+    RGB(VLC_CODEC_ARGB,     CPictureRGBA,     convertNone),
     RGB(VLC_CODEC_BGRA,     CPictureBGRA,     convertNone),
+    RGB(VLC_CODEC_ABGR,     CPictureBGRA,     convertNone),
+    RGB(VLC_CODEC_RGBX,     CPictureRGB32,    convertNone),
+    RGB(VLC_CODEC_XRGB,     CPictureRGB32,    convertNone),
+    RGB(VLC_CODEC_BGRX,     CPictureRGB32,    convertNone),
+    RGB(VLC_CODEC_XBGR,     CPictureRGB32,    convertNone),
 
-    YUV(VLC_CODEC_YV9,      CPictureYV9,      convertNone),
     YUV(VLC_CODEC_I410,     CPictureI410_8,   convertNone),
 
     YUV(VLC_CODEC_I411,     CPictureI411_8,   convertNone),
@@ -582,7 +639,6 @@ static const struct {
     YUV(VLC_CODEC_YV12,     CPictureYV12,     convertNone),
     YUV(VLC_CODEC_NV12,     CPictureNV12,     convertNone),
     YUV(VLC_CODEC_NV21,     CPictureNV21,     convertNone),
-    YUV(VLC_CODEC_J420,     CPictureI420_8,   convertNone),
     YUV(VLC_CODEC_I420,     CPictureI420_8,   convertNone),
 #ifdef WORDS_BIGENDIAN
     YUV(VLC_CODEC_I420_9B,  CPictureI420_16,  convert8To9Bits),
@@ -592,17 +648,17 @@ static const struct {
     YUV(VLC_CODEC_I420_10L, CPictureI420_16,  convert8To10Bits),
 #endif
 
-    YUV(VLC_CODEC_J422,     CPictureI422_8,   convertNone),
     YUV(VLC_CODEC_I422,     CPictureI422_8,   convertNone),
 #ifdef WORDS_BIGENDIAN
     YUV(VLC_CODEC_I422_9B,  CPictureI422_16,  convert8To9Bits),
     YUV(VLC_CODEC_I422_10B, CPictureI422_16,  convert8To10Bits),
+    YUV(VLC_CODEC_I422_16B, CPictureI422_16,  convert8To16Bits),
 #else
     YUV(VLC_CODEC_I422_9L,  CPictureI422_16,  convert8To9Bits),
     YUV(VLC_CODEC_I422_10L, CPictureI422_16,  convert8To10Bits),
+    YUV(VLC_CODEC_I422_16L, CPictureI422_16,  convert8To16Bits),
 #endif
 
-    YUV(VLC_CODEC_J444,     CPictureI444_8,   convertNone),
     YUV(VLC_CODEC_I444,     CPictureI444_8,   convertNone),
 #ifdef WORDS_BIGENDIAN
     YUV(VLC_CODEC_I444_9B,  CPictureI444_16,  convert8To9Bits),
@@ -630,14 +686,16 @@ struct filter_sys_t {
     blend_function_t blend;
 };
 
+} // namespace
+
 /**
  * It blends 2 picture together.
  */
-static void Blend(filter_t *filter,
+static void DoBlend(filter_t *filter,
                   picture_t *dst, const picture_t *src,
                   int x_offset, int y_offset, int alpha)
 {
-    filter_sys_t *sys = filter->p_sys;
+    filter_sys_t *sys = reinterpret_cast<filter_sys_t *>( filter->p_sys );
 
     if( x_offset < 0 || y_offset < 0 )
     {
@@ -652,9 +710,6 @@ static void Blend(filter_t *filter,
     if (width <= 0 || height <= 0 || alpha <= 0)
         return;
 
-    video_format_FixRgb(&filter->fmt_out.video);
-    video_format_FixRgb(&filter->fmt_in.video);
-
     sys->blend(CPicture(dst, &filter->fmt_out.video,
                         filter->fmt_out.video.i_x_offset + x_offset,
                         filter->fmt_out.video.i_y_offset + y_offset),
@@ -664,9 +719,17 @@ static void Blend(filter_t *filter,
                width, height, alpha);
 }
 
-static int Open(vlc_object_t *object)
+static const struct FilterOperationInitializer {
+    struct vlc_filter_operations ops {};
+    FilterOperationInitializer()
+    {
+        ops.blend_video = DoBlend;
+        ops.close       = Close;
+    }
+} filter_ops;
+
+static int Open(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)object;
     const vlc_fourcc_t src = filter->fmt_in.video.i_chroma;
     const vlc_fourcc_t dst = filter->fmt_out.video.i_chroma;
 
@@ -683,14 +746,13 @@ static int Open(vlc_object_t *object)
         return VLC_EGENERIC;
     }
 
-    filter->pf_video_blend = Blend;
+    filter->ops = &filter_ops.ops;
     filter->p_sys          = sys;
     return VLC_SUCCESS;
 }
 
-static void Close(vlc_object_t *object)
+static void Close(filter_t *filter)
 {
-    filter_t *filter = (filter_t *)object;
-    delete filter->p_sys;
+    filter_sys_t *p_sys = reinterpret_cast<filter_sys_t *>( filter->p_sys );
+    delete p_sys;
 }
-

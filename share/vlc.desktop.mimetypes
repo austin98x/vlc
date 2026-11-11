@@ -119,10 +119,6 @@ x-scheme-handler/icyx   # Icecast
 
 # Linux desktop environment hooks for ISOs etc.
 application/x-cd-image
-x-content/video-vcd
-x-content/video-svcd
-x-content/video-dvd
-x-content/audio-cdda
 x-content/audio-player
 
 # Playlists / text/xml list with URLs
@@ -177,6 +173,7 @@ audio/vnd.dolby.mlp     # IANA MLP/TrueHD
 audio/basic             # IANA mulaw
 audio/midi
 # Weird audio formats
+audio/atrac3
 audio/x-ape
 audio/x-gsm
 audio/x-musepack

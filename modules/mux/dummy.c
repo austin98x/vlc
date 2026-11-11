@@ -2,7 +2,6 @@
  * dummy.c: dummy muxer module for vlc
  *****************************************************************************
  * Copyright (C) 2001, 2002 VLC authors and VideoLAN
- * $Id$
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Eric Petit <titer@videolan.org>
@@ -44,7 +43,6 @@ static void Close  ( vlc_object_t * );
 vlc_module_begin ()
     set_description( N_("Dummy/Raw muxer") )
     set_capability( "sout mux", 5 )
-    set_category( CAT_SOUT )
     set_subcategory( SUBCAT_SOUT_MUX )
     add_shortcut( "dummy", "raw", "es" )
     set_callbacks( Open, Close )
@@ -58,12 +56,12 @@ static int AddStream( sout_mux_t *, sout_input_t * );
 static void DelStream( sout_mux_t *, sout_input_t * );
 static int Mux      ( sout_mux_t * );
 
-struct sout_mux_sys_t
+typedef struct
 {
     /* Some streams have special initialization data, we'll output this
      * data as an header in the stream. */
     bool b_header;
-};
+} sout_mux_sys_t;
 
 /*****************************************************************************
  * Open:
@@ -114,11 +112,6 @@ static int Control( sout_mux_t *p_mux, int i_query, va_list args )
             *pb_bool = true;
             return VLC_SUCCESS;
 
-        case MUX_GET_ADD_STREAM_WAIT:
-            pb_bool = va_arg( args, bool * );
-            *pb_bool = false;
-            return VLC_SUCCESS;
-
         case MUX_GET_MIME:   /* Unknown */
         default:
             return VLC_EGENERIC;
@@ -146,7 +139,6 @@ static int Mux( sout_mux_t *p_mux )
     for( i = 0; i < p_mux->i_nb_inputs; i++ )
     {
         block_fifo_t *p_fifo;
-        int i_count;
 
         if( p_sys->b_header && p_mux->pp_inputs[i]->p_fmt->i_extra )
         {
@@ -164,14 +156,17 @@ static int Mux( sout_mux_t *p_mux )
         }
 
         p_fifo = p_mux->pp_inputs[i]->p_fifo;
-        i_count = block_FifoCount( p_fifo );
-        while( i_count > 0 )
+        vlc_fifo_Lock( p_fifo );
+        block_t *p_data = vlc_fifo_DequeueAllUnlocked( p_fifo );
+        vlc_fifo_Unlock( p_fifo );
+        while( p_data != NULL )
         {
-            block_t *p_data = block_FifoGet( p_fifo );
+            block_t *p_next = p_data->p_next;
+            p_data->p_next = NULL;
 
             sout_AccessOutWrite( p_mux->p_access, p_data );
 
-            i_count--;
+            p_data = p_next;
         }
     }
     p_sys->b_header = false;

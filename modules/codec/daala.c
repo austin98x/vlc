@@ -29,15 +29,16 @@
 #endif
 
 #include <vlc_common.h>
+#include <vlc_configuration.h>
 #include <vlc_plugin.h>
 #include <vlc_codec.h>
-#include <vlc_input.h>
+#include <vlc_meta.h>
 #include "../demux/xiph.h"
 
-#include <daala/codec.h>
-#include <daala/daaladec.h>
+#include <codec.h>
+#include <daaladec.h>
 #ifdef ENABLE_SOUT
-#include <daala/daalaenc.h>
+#include <daalaenc.h>
 #endif
 
 #include <limits.h>
@@ -45,7 +46,7 @@
 /*****************************************************************************
  * decoder_sys_t : daala decoder descriptor
  *****************************************************************************/
-struct decoder_sys_t
+typedef struct
 {
     /* Module mode */
     bool b_packetizer;
@@ -70,8 +71,8 @@ struct decoder_sys_t
     /*
      * Common properties
      */
-    mtime_t i_pts;
-};
+    vlc_tick_t i_pts;
+} decoder_sys_t;
 
 /*****************************************************************************
  * Local prototypes
@@ -92,7 +93,7 @@ static void daala_CopyPicture( picture_t *, daala_image * );
 
 #ifdef ENABLE_SOUT
 static int  OpenEncoder( vlc_object_t *p_this );
-static void CloseEncoder( vlc_object_t *p_this );
+static void CloseEncoder( encoder_t *p_enc );
 static block_t *Encode( encoder_t *p_enc, picture_t *p_pict );
 
 static const char *const enc_chromafmt_list[] = {
@@ -114,7 +115,6 @@ static const char *const enc_chromafmt_list_text[] = {
   "Enforce a keyframe interval between 1 and 1000." )
 
 vlc_module_begin ()
-    set_category( CAT_INPUT )
     set_subcategory( SUBCAT_INPUT_VCODEC )
     set_shortname( "Daala" )
     set_description( N_("Daala video decoder") )
@@ -123,46 +123,45 @@ vlc_module_begin ()
     add_shortcut( "daala" )
     add_submodule ()
     set_description( N_("Daala video packetizer") )
-    set_capability( "packetizer", 100 )
+    set_capability( "video packetizer", 100 )
     set_callbacks( OpenPacketizer, CloseDecoder )
     add_shortcut( "daala" )
 
 #ifdef ENABLE_SOUT
     add_submodule ()
     set_description( N_("Daala video encoder") )
-    set_capability( "encoder", 150 )
-    set_callbacks( OpenEncoder, CloseEncoder )
+    set_capability( "video encoder", 150 )
+    set_callback( OpenEncoder )
     add_shortcut( "daala" )
 
 #   define ENC_CFG_PREFIX "sout-daala-"
     add_integer_with_range( ENC_CFG_PREFIX "quality", 10, 0, 511,
-                 ENC_QUALITY_TEXT, ENC_QUALITY_LONGTEXT, false )
+                 ENC_QUALITY_TEXT, ENC_QUALITY_LONGTEXT )
     add_integer_with_range( ENC_CFG_PREFIX "keyint", 256, 1, 1000,
-                 ENC_KEYINT_TEXT, ENC_KEYINT_LONGTEXT, false )
+                 ENC_KEYINT_TEXT, ENC_KEYINT_LONGTEXT )
 
 #   define ENC_CHROMAFMT_TEXT N_("Chroma format")
 #   define ENC_CHROMAFMT_LONGTEXT N_("Picking chroma format will force a " \
                                      "conversion of the video into that format")
 
     add_string( ENC_CFG_PREFIX "chroma-fmt", "420", ENC_CHROMAFMT_TEXT,
-                ENC_CHROMAFMT_LONGTEXT, false )
+                ENC_CHROMAFMT_LONGTEXT )
     change_string_list( enc_chromafmt_list, enc_chromafmt_list_text )
+#endif
 vlc_module_end ()
 
+#ifdef ENABLE_SOUT
 static const char *const ppsz_enc_options[] = {
     "quality", "keyint", "chroma-fmt", NULL
 };
 #endif
 
-/*****************************************************************************
- * OpenDecoder: probe the decoder and return score
- *****************************************************************************/
-static int OpenDecoder( vlc_object_t *p_this )
+static int OpenCommon( vlc_object_t *p_this, bool b_packetizer )
 {
     decoder_t *p_dec = (decoder_t*)p_this;
     decoder_sys_t *p_sys;
 
-    if( p_dec->fmt_in.i_codec != VLC_CODEC_DAALA )
+    if( p_dec->fmt_in->i_codec != VLC_CODEC_DAALA )
     {
         return VLC_EGENERIC;
     }
@@ -173,18 +172,22 @@ static int OpenDecoder( vlc_object_t *p_this )
         return VLC_ENOMEM;
 
     p_dec->p_sys = p_sys;
-    p_dec->p_sys->b_packetizer = false;
+    p_sys->b_packetizer = b_packetizer;
     p_sys->b_has_headers = false;
-    p_sys->i_pts = VLC_TS_INVALID;
+    p_sys->i_pts = VLC_TICK_INVALID;
     p_sys->b_decoded_first_keyframe = false;
     p_sys->dcx = NULL;
 
-    /* Set output properties */
-    p_dec->fmt_out.i_codec = VLC_CODEC_I420;
-
-    /* Set callbacks */
-    p_dec->pf_decode    = DecodeVideo;
-    p_dec->pf_packetize = Packetize;
+    if( b_packetizer )
+    {
+        p_dec->fmt_out.i_codec = VLC_CODEC_DAALA;
+        p_dec->pf_packetize = Packetize;
+    }
+    else
+    {
+        p_dec->fmt_out.i_codec = VLC_CODEC_I420;
+        p_dec->pf_decode = DecodeVideo;
+    }
 
     /* Init supporting Daala structures needed in header parsing */
     daala_comment_init( &p_sys->dc );
@@ -193,19 +196,17 @@ static int OpenDecoder( vlc_object_t *p_this )
     return VLC_SUCCESS;
 }
 
+/*****************************************************************************
+ * OpenDecoder: probe the decoder and return score
+ *****************************************************************************/
+static int OpenDecoder( vlc_object_t *p_this )
+{
+    return OpenCommon( p_this, false );
+}
+
 static int OpenPacketizer( vlc_object_t *p_this )
 {
-    decoder_t *p_dec = (decoder_t*)p_this;
-
-    int i_ret = OpenDecoder( p_this );
-
-    if( i_ret == VLC_SUCCESS )
-    {
-        p_dec->p_sys->b_packetizer = true;
-        p_dec->fmt_out.i_codec = VLC_CODEC_DAALA;
-    }
-
-    return i_ret;
+    return OpenCommon( p_this, true );
 }
 
 /****************************************************************************
@@ -280,10 +281,10 @@ static int ProcessHeaders( decoder_t *p_dec )
     daala_setup_info *ds = NULL; /* daala setup information */
 
     unsigned pi_size[XIPH_MAX_HEADER_COUNT];
-    void     *pp_data[XIPH_MAX_HEADER_COUNT];
+    const void *pp_data[XIPH_MAX_HEADER_COUNT];
     unsigned i_count;
     if( xiph_SplitHeaders( pi_size, pp_data, &i_count,
-                           p_dec->fmt_in.i_extra, p_dec->fmt_in.p_extra) )
+                           p_dec->fmt_in->i_extra, p_dec->fmt_in->p_extra) )
         return VLC_EGENERIC;
     if( i_count < 3 )
         return VLC_EGENERIC;
@@ -295,7 +296,7 @@ static int ProcessHeaders( decoder_t *p_dec )
     /* Take care of the initial info header */
     dpacket.b_o_s  = 1; /* yes this actually is a b_o_s packet :) */
     dpacket.bytes  = pi_size[0];
-    dpacket.packet = pp_data[0];
+    dpacket.packet = (void *)pp_data[0];
     if( daala_decode_header_in( &p_sys->di, &p_sys->dc, &ds, &dpacket ) < 0 )
     {
         msg_Err( p_dec, "this bitstream does not contain Daala video data" );
@@ -356,7 +357,7 @@ static int ProcessHeaders( decoder_t *p_dec )
     /* The next packet in order is the comments header */
     dpacket.b_o_s  = 0;
     dpacket.bytes  = pi_size[1];
-    dpacket.packet = pp_data[1];
+    dpacket.packet = (void *)pp_data[1];
 
     if( daala_decode_header_in( &p_sys->di, &p_sys->dc, &ds, &dpacket ) < 0 )
     {
@@ -372,7 +373,7 @@ static int ProcessHeaders( decoder_t *p_dec )
      * missing or corrupted header is fatal. */
     dpacket.b_o_s  = 0;
     dpacket.bytes  = pi_size[2];
-    dpacket.packet = pp_data[2];
+    dpacket.packet = (void *)pp_data[2];
     if( daala_decode_header_in( &p_sys->di, &p_sys->dc, &ds, &dpacket ) < 0 )
     {
         msg_Err( p_dec, "Daala setup header is corrupted" );
@@ -393,16 +394,16 @@ static int ProcessHeaders( decoder_t *p_dec )
     else
     {
         void* p_extra = realloc( p_dec->fmt_out.p_extra,
-                                 p_dec->fmt_in.i_extra );
+                                 p_dec->fmt_in->i_extra );
         if( unlikely( p_extra == NULL ) )
         {
             ret = VLC_ENOMEM;
             goto cleanup;
         }
         p_dec->fmt_out.p_extra = p_extra;
-        p_dec->fmt_out.i_extra = p_dec->fmt_in.i_extra;
+        p_dec->fmt_out.i_extra = p_dec->fmt_in->i_extra;
         memcpy( p_dec->fmt_out.p_extra,
-                p_dec->fmt_in.p_extra, p_dec->fmt_out.i_extra );
+                p_dec->fmt_in->p_extra, p_dec->fmt_out.i_extra );
     }
 
 cleanup:
@@ -431,7 +432,7 @@ static void *ProcessPacket( decoder_t *p_dec, daala_packet *p_dpacket,
     }
 
     /* Date management */
-    if( p_block->i_pts > VLC_TS_INVALID && p_block->i_pts != p_sys->i_pts )
+    if( p_block->i_pts != VLC_TICK_INVALID && p_block->i_pts != p_sys->i_pts )
     {
         p_sys->i_pts = p_block->i_pts;
     }
@@ -452,7 +453,7 @@ static void *ProcessPacket( decoder_t *p_dec, daala_packet *p_dpacket,
     }
 
     /* Date management */
-    p_sys->i_pts += ( CLOCK_FREQ * p_sys->di.timebase_denominator /
+    p_sys->i_pts += vlc_tick_from_samples( p_sys->di.timebase_denominator,
                       p_sys->di.timebase_numerator ); /* 1 frame per packet */
 
     return p_buf;
@@ -511,14 +512,15 @@ static void ParseDaalaComments( decoder_t *p_dec )
        the bitstream format itself treats them as 8-bit clean vectors,
        possibly containing null characters, and so the length array
        should be treated as their authoritative length. */
-    for ( int i = 0; i < p_dec->p_sys->dc.comments; i++ )
+    decoder_sys_t *p_sys = p_dec->p_sys;
+    for ( int i = 0; i < p_sys->dc.comments; i++ )
     {
-        int clen = p_dec->p_sys->dc.comment_lengths[i];
+        int clen = p_sys->dc.comment_lengths[i];
         if ( clen <= 0 || clen >= INT_MAX ) { continue; }
         psz_comment = malloc( clen + 1 );
         if( !psz_comment )
             break;
-        memcpy( (void*)psz_comment, (void*)p_dec->p_sys->dc.user_comments[i], clen + 1 );
+        memcpy( (void*)psz_comment, (void*)p_sys->dc.user_comments[i], clen + 1 );
         psz_comment[clen] = '\0';
 
         psz_name = psz_comment;
@@ -533,7 +535,7 @@ static void ParseDaalaComments( decoder_t *p_dec )
             /* TODO:  Since psz_value can contain NULLs see if there is an
              * instance where we need to preserve the full length of this string */
             if( p_dec->p_description )
-                vlc_meta_AddExtra( p_dec->p_description, psz_name, psz_value );
+                vlc_meta_SetExtra( p_dec->p_description, psz_name, psz_value );
         }
         free( psz_comment );
     }
@@ -560,31 +562,26 @@ static void CloseDecoder( vlc_object_t *p_this )
 static void daala_CopyPicture( picture_t *p_pic,
                                daala_image *ycbcr )
 {
-    const int i_planes = p_pic->i_planes < 3 ? p_pic->i_planes : 3;
+    const int i_planes = __MIN(p_pic->i_planes, 3);
     for( int i_plane = 0; i_plane < i_planes; i_plane++ )
     {
-        const int i_total_lines = __MIN(p_pic->p[i_plane].i_lines,
-                ycbcr->height >> ycbcr->planes[i_plane].ydec);
-        uint8_t *p_dst = p_pic->p[i_plane].p_pixels;
-        uint8_t *p_src = ycbcr->planes[i_plane].data;
-        const int i_dst_stride  = p_pic->p[i_plane].i_pitch;
-        const int i_src_stride  = ycbcr->planes[i_plane].ystride;
-        for( int i_line = 0; i_line < i_total_lines; i_line++ )
-        {
-            memcpy( p_dst, p_src, i_src_stride );
-            p_src += i_src_stride;
-            p_dst += i_dst_stride;
-        }
+        plane_t src;
+        src.i_lines = __MIN(p_pic->p[i_plane].i_lines, ycbcr->height >> ycbcr->planes[i_plane].ydec);
+        src.p_pixels = ycbcr->planes[i_plane].data;
+        src.i_pitch = ycbcr->planes[i_plane].ystride;
+        src.i_visible_pitch = src.i_pitch;
+        src.i_visible_lines = src.i_lines;
+        plane_CopyPixels( &p_pic->p[i_plane], &src );
     }
 }
 
 #ifdef ENABLE_SOUT
-struct encoder_sys_t
+typedef struct
 {
     daala_info      di;                     /* daala bitstream settings */
     daala_comment   dc;                     /* daala comment header */
     daala_enc_ctx   *dcx;                   /* daala context */
-};
+} encoder_sys_t;
 
 static int OpenEncoder( vlc_object_t *p_this )
 {
@@ -605,14 +602,12 @@ static int OpenEncoder( vlc_object_t *p_this )
         return VLC_ENOMEM;
     p_enc->p_sys = p_sys;
 
-    p_enc->pf_encode_video = Encode;
-    p_enc->fmt_in.i_codec = VLC_CODEC_I420;
     p_enc->fmt_out.i_codec = VLC_CODEC_DAALA;
 
     config_ChainParse( p_enc, ENC_CFG_PREFIX, ppsz_enc_options, p_enc->p_cfg );
 
     char *psz_tmp = var_GetString( p_enc, ENC_CFG_PREFIX "chroma-fmt" );
-    uint32_t i_codec;
+    vlc_fourcc_t i_codec;
     if( !psz_tmp ) {
         free(p_sys);
         return VLC_ENOMEM;
@@ -702,7 +697,7 @@ static int OpenEncoder( vlc_object_t *p_this )
     {
         if ( status < 0 )
         {
-            CloseEncoder( p_this );
+            CloseEncoder( p_enc );
             return VLC_EGENERIC;
         }
         if( xiph_AppendHeaders( &p_enc->fmt_out.i_extra,
@@ -713,6 +708,14 @@ static int OpenEncoder( vlc_object_t *p_this )
             p_enc->fmt_out.p_extra = NULL;
         }
     }
+
+    static const struct vlc_encoder_operations ops =
+    {
+        .close = CloseEncoder,
+        .encode_video = Encode,
+    };
+    p_enc->ops = &ops;
+
     return VLC_SUCCESS;
 }
 
@@ -765,6 +768,9 @@ static block_t *Encode( encoder_t *p_enc, picture_t *p_pict )
 
     /* Daala packet to block */
     p_block = block_Alloc( dpacket.bytes );
+    if( unlikely(p_block == NULL) )
+        return NULL;
+
     memcpy( p_block->p_buffer, dpacket.packet, dpacket.bytes );
     p_block->i_dts = p_block->i_pts = p_pict->date;
 
@@ -774,9 +780,8 @@ static block_t *Encode( encoder_t *p_enc, picture_t *p_pict )
     return p_block;
 }
 
-static void CloseEncoder( vlc_object_t *p_this )
+static void CloseEncoder( encoder_t *p_enc )
 {
-    encoder_t *p_enc = (encoder_t *)p_this;
     encoder_sys_t *p_sys = p_enc->p_sys;
 
     daala_info_clear(&p_sys->di);

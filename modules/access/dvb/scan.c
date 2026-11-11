@@ -88,7 +88,7 @@ struct scan_service_t
     char *psz_name;     /* channel name in utf8 */
     char *psz_provider; /* service provider */
     uint16_t i_channel; /* logical channel number */
-    bool b_crypted;     /* True if potentially crypted */
+    bool b_crypted;     /* True if potentially encrypted */
 
     char *psz_original_network_name;
 
@@ -421,7 +421,7 @@ scan_t *scan_New( vlc_object_t *p_obj, const scan_parameter_t *p_parameter,
     p_scan->b_multiplexes_from_nit = false;
     scan_parameter_Init( &p_scan->parameter );
     scan_parameter_Copy( p_parameter, &p_scan->parameter );
-    p_scan->i_time_start = mdate();
+    p_scan->i_time_start = vlc_tick_now();
     p_scan->p_scanlist = NULL;
     p_scan->i_scanlist = 0;
 
@@ -563,7 +563,7 @@ static int Scan_Next_DVBC( const scan_parameter_t *p_params, scan_enumeration_t 
         static const unsigned short symbolrates[] = {
             6900, 6875, 6950
             /* With DR_44 we can cover other symbolrates from NIT-info
-                    as all channel-seed files have atleast one channel that
+                    as all channel-seed files have at least one channel that
                     has one of these symbolrate
                   */
         };
@@ -654,7 +654,7 @@ static int Scan_Next_DVBT( const scan_parameter_t *p_params, scan_enumeration_t 
     const int i_offset_count = 5;
     const int i_mhz = 1000000;
 
-    /* We will probe the whole band divided in all bandwidth possibility trying 
+    /* We will probe the whole band divided in all bandwidth possibility trying
      * i_offset_count offset around the position
      */
     for( ;; p_spectrum->i_index++ )
@@ -790,7 +790,7 @@ static int Scan_GetNextTunerConfig( scan_t *p_scan, scan_tuner_config_t *p_cfg, 
         }
     }
 
-    return VLC_ENOITEM;
+    return VLC_ENOENT;
 }
 
 static int scan_Next( scan_t *p_scan, scan_tuner_config_t *p_cfg )
@@ -812,12 +812,13 @@ static int scan_Next( scan_t *p_scan, scan_tuner_config_t *p_cfg )
     //while( !scan_tuner_config_ParametersValidate( &p_scan->parameter, p_cfg ) );
 
     const size_t i_total_services = scan_CountServices( p_scan );
-    const mtime_t i_eta = f_position > 0.005 ? (mdate() - p_scan->i_time_start) * ( 1.0 / f_position - 1.0 ) : -1;
+    const vlc_tick_t i_eta = f_position > 0.005 ? (vlc_tick_now() - p_scan->i_time_start) * ( 1.0 / f_position - 1.0 ) : -1;
     char psz_eta[MSTRTIME_MAX_SIZE];
     const char *psz_fmt = _("%.1f MHz (%d services)\n~%s remaining");
+    vlc_tick_to_str( psz_eta, i_eta );
 
     if( i_eta >= 0 )
-        msg_Info( p_scan->p_obj, "Scan ETA %s | %f", secstotimestr( psz_eta, i_eta/1000000 ), f_position * 100 );
+        msg_Info( p_scan->p_obj, "Scan ETA %s | %f", psz_eta, f_position * 100 );
 
     if( p_scan->p_dialog_id == NULL )
     {
@@ -827,7 +828,7 @@ static int scan_Next( scan_t *p_scan, scan_tuner_config_t *p_cfg )
                                          _("Scanning DVB"), psz_fmt,
                                          (double)p_cfg->i_frequency / 1000000,
                                          i_total_services,
-                                         secstotimestr( psz_eta, i_eta/1000000 ) );
+                                         psz_eta);
     }
     else
     {
@@ -835,7 +836,7 @@ static int scan_Next( scan_t *p_scan, scan_tuner_config_t *p_cfg )
                                          f_position, psz_fmt,
                                          (double)p_cfg->i_frequency / 1000000,
                                          i_total_services,
-                                         secstotimestr( psz_eta, i_eta/1000000 ) );
+                                         psz_eta );
     }
 
     return VLC_SUCCESS;
@@ -852,7 +853,7 @@ int scan_Run( scan_t *p_scan )
 {
     scan_tuner_config_t cfg;
     if( scan_Next( p_scan, &cfg ) )
-        return VLC_ENOITEM;
+        return VLC_ENOENT;
 
     scan_session_t *session = scan_session_New( p_scan, &cfg );
     if( unlikely(session == NULL) )
@@ -871,12 +872,12 @@ int scan_Run( scan_t *p_scan )
 
     /* */
     uint8_t packet[TS_PACKET_SIZE * SCAN_READ_BUFFER_COUNT];
-    int64_t i_scan_start = mdate();
+    int64_t i_scan_start = vlc_tick_now();
 
     for( ;; )
     {
         unsigned i_timeout = scan_session_GetTablesTimeout( session );
-        mtime_t i_remaining = mdate() - i_scan_start;
+        vlc_tick_t i_remaining = vlc_tick_now() - i_scan_start;
         if( i_remaining > i_timeout )
             break;
 
@@ -990,8 +991,9 @@ static void ParsePAT( vlc_object_t *p_obj, scan_t *p_scan,
 }
 
 /* FIXME handle properly string (convert to utf8) */
-static void PATCallBack( scan_session_t *p_session, dvbpsi_pat_t *p_pat )
+static void PATCallBack( void *opaque, dvbpsi_pat_t *p_pat )
 {
+    scan_session_t *p_session = opaque;
     vlc_object_t *p_obj = p_session->p_obj;
 
     /* */
@@ -1081,8 +1083,9 @@ static void ParseSDT( vlc_object_t *p_obj, scan_t *p_scan, const dvbpsi_sdt_t *p
     }
 }
 
-static void SDTCallBack( scan_session_t *p_session, dvbpsi_sdt_t *p_sdt )
+static void SDTCallBack( void *opaque, dvbpsi_sdt_t *p_sdt )
 {
+    scan_session_t *p_session = opaque;
     vlc_object_t *p_obj = p_session->p_obj;
     dvbpsi_sdt_t **pp_stored_sdt = NULL;
     if( p_sdt->i_table_id == SDT_OTHER_TS_TABLE_ID )
@@ -1434,8 +1437,9 @@ static void ParseNIT( vlc_object_t *p_obj, scan_t *p_scan,
     }
 }
 
-static void NITCallBack( scan_session_t *p_session, dvbpsi_nit_t *p_nit )
+static void NITCallBack( void * opaque, dvbpsi_nit_t *p_nit )
 {
+    scan_session_t *p_session = opaque;
     vlc_object_t *p_obj = p_session->p_obj;
     dvbpsi_nit_t **pp_stored_nit = NULL;
 
@@ -1519,12 +1523,12 @@ static void PSINewTableCallBack( dvbpsi_t *h, uint8_t i_table_id, uint16_t i_ext
 
     if( i_table_id == SDT_CURRENT_TS_TABLE_ID || i_table_id == SDT_OTHER_TS_TABLE_ID )
     {
-        if( !dvbpsi_sdt_attach( h, i_table_id, i_extension, (dvbpsi_sdt_callback)SDTCallBack, p_session ) )
+        if( !dvbpsi_sdt_attach( h, i_table_id, i_extension, SDTCallBack, p_session ) )
             msg_Err( p_session->p_obj, "PSINewTableCallback: failed attaching SDTCallback" );
     }
     else if( i_table_id == NIT_CURRENT_NETWORK_TABLE_ID || i_table_id == NIT_OTHER_NETWORK_TABLE_ID )
     {
-        if( !dvbpsi_nit_attach( h, i_table_id, i_extension, (dvbpsi_nit_callback)NITCallBack, p_session ) )
+        if( !dvbpsi_nit_attach( h, i_table_id, i_extension, NITCallBack, p_session ) )
             msg_Err( p_session->p_obj, "PSINewTableCallback: failed attaching NITCallback" );
     }
 }
@@ -1550,7 +1554,7 @@ static scan_session_t *scan_session_New( scan_t *p_scan, const scan_tuner_config
     p_session->p_pathandle = NULL;
     p_session->p_sdthandle = NULL;
     p_session->p_nithandle = NULL;
-    return p_session;;
+    return p_session;
 }
 
 static void scan_session_Delete( scan_session_t *p_session )
@@ -1804,7 +1808,7 @@ static bool scan_session_Push( scan_session_t *p_scan, const uint8_t *p_packet )
                 return false;
 
             p_scan->p_pathandle->p_sys = (void *) p_scan->p_obj;
-            if( !dvbpsi_pat_attach( p_scan->p_pathandle, (dvbpsi_pat_callback)PATCallBack, p_scan ) )
+            if( !dvbpsi_pat_attach( p_scan->p_pathandle, PATCallBack, p_scan ) )
             {
                 dvbpsi_delete( p_scan->p_pathandle );
                 p_scan->p_pathandle = NULL;

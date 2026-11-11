@@ -2,7 +2,6 @@
  * algo_ivtc.c : IVTC (inverse telecine) algorithm for the VLC deinterlacer
  *****************************************************************************
  * Copyright (C) 2010-2011 the VideoLAN team
- * $Id$
  *
  * Author: Juha Jeronen <juha.jeronen@jyu.fi>
  *
@@ -23,10 +22,6 @@
 
 #ifdef HAVE_CONFIG_H
 #   include "config.h"
-#endif
-
-#ifdef CAN_COMPILE_MMXEXT
-#   include "mmx.h"
 #endif
 
 #include <stdint.h>
@@ -1097,13 +1092,12 @@ static void IVTCCadenceAnalyze( filter_t *p_filter )
         if( p_ivtc->b_sequence_valid )
         {
             /* Determine TFF/BFF. */
-            int i_vote_invalid = 0;
             int i_vote_tff     = 0;
             int i_vote_bff     = 0;
             for( int i = 0; i < IVTC_DETECTION_HISTORY_SIZE; ++i )
             {
                 if( pi_tfd[i] == TFD_INVALID )
-                    i_vote_invalid++;
+                    continue;
                 else if( pi_tfd[i] == TFD_TFF )
                     i_vote_tff++;
                 else if( pi_tfd[i] == TFD_BFF )
@@ -1216,7 +1210,7 @@ static bool IVTCOutputOrDropFrame( filter_t *p_filter, picture_t *p_dst )
 
     filter_sys_t *p_sys = p_filter->p_sys;
     ivtc_sys_t *p_ivtc  = &p_sys->ivtc;
-    mtime_t t_final = VLC_TS_INVALID; /* for custom timestamp mangling */
+    vlc_tick_t t_final = VLC_TICK_INVALID; /* for custom timestamp mangling */
 
     picture_t *p_curr = p_sys->context.pp_history[1];
     picture_t *p_next = p_sys->context.pp_history[2];
@@ -1412,7 +1406,7 @@ static bool IVTCOutputOrDropFrame( filter_t *p_filter, picture_t *p_dst )
         {
             /* Approximate field duration from the PTS difference. */
             /* FIXME: use field length as measured by Deinterlace()? */
-            mtime_t i_half_field_dur = ( (p_next->date - p_curr->date)/3 ) / 2;
+            vlc_tick_t i_half_field_dur = ( (p_next->date - p_curr->date)/3 ) / 2;
             t_final = p_curr->date + i_half_field_dur;
         }
         else /* Otherwise, use original PTS of the outgoing frame. */
@@ -1458,7 +1452,7 @@ static bool IVTCOutputOrDropFrame( filter_t *p_filter, picture_t *p_dst )
     /* Note that picture_Copy() copies the PTS, too. Apply timestamp mangling
        now, if any was needed.
     */
-    if( t_final > VLC_TS_INVALID )
+    if( t_final != VLC_TICK_INVALID )
         p_dst->date = t_final;
 
     return true;

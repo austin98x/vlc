@@ -41,7 +41,6 @@ VLC_SD_PROBE_HELPER("pulse", N_("Audio capture"), SD_CAT_DEVICES);
 vlc_module_begin ()
     set_shortname (N_("Audio capture"))
     set_description (N_("Audio capture (PulseAudio)"))
-    set_category (CAT_PLAYLIST)
     set_subcategory (SUBCAT_PLAYLIST_SD)
     set_capability ("services_discovery", 0)
     set_callbacks (Open, Close)
@@ -50,12 +49,13 @@ vlc_module_begin ()
     VLC_SD_PROBE_SUBMODULE
 vlc_module_end ()
 
-struct services_discovery_sys_t
+typedef struct
 {
     void                 *root;
+    void                 *root_card;
     pa_context           *context;
     pa_threaded_mainloop *mainloop;
-};
+} services_discovery_sys_t;
 
 static void SourceCallback(pa_context *, const pa_source_info *, int, void *);
 static void ContextCallback(pa_context *, pa_subscription_event_type_t,
@@ -82,6 +82,7 @@ static int Open (vlc_object_t *obj)
     sd->description = _("Audio capture");
     sys->context = ctx;
     sys->root = NULL;
+    sys->root_card = NULL;
 
     /* Subscribe for source events */
     const pa_subscription_mask_t mask = PA_SUBSCRIPTION_MASK_SOURCE;
@@ -116,6 +117,13 @@ struct device
     services_discovery_t *sd;
 };
 
+struct card
+{
+    input_item_t *item;
+    services_discovery_t *sd;
+    char name[];
+};
+
 static void DestroySource (void *data)
 {
     struct device *d = data;
@@ -123,6 +131,15 @@ static void DestroySource (void *data)
     services_discovery_RemoveItem (d->sd, d->item);
     input_item_Release (d->item);
     free (d);
+}
+
+static void DestroyCard(void *data)
+{
+    struct card *c = data;
+
+    services_discovery_RemoveItem(c->sd, c->item);
+    input_item_Release(c->item);
+    free(c);
 }
 
 /**
@@ -134,6 +151,54 @@ static int cmpsrc (const void *a, const void *b)
     uint32_t idxa = *pa, idxb = *pb;
 
     return (idxa != idxb) ? ((idxa < idxb) ? -1 : +1) : 0;
+}
+
+static int cmpcard (const void *a, const void *b)
+{
+    const struct card *ca = a, *cb = b;
+    return strcmp(ca->name, cb->name);
+}
+
+static input_item_t *AddCard (services_discovery_t *sd, const pa_source_info *info)
+{
+    services_discovery_sys_t *sys = sd->p_sys;
+
+    const char *card_name = pa_proplist_gets(info->proplist, "device.product.name");
+    if (card_name == NULL)
+        card_name = N_("Generic");
+
+    struct card *c = malloc(sizeof(*c) + strlen(card_name) + 1);
+    if (unlikely(c == NULL))
+        return NULL;
+    strcpy(c->name, card_name);
+
+    void **cp = tsearch(c, &sys->root_card, cmpcard);
+    if (cp == NULL) /* Out-of-memory */
+    {
+        free(c);
+        return NULL;
+    }
+    if (*cp != c)
+    {
+        free(c);
+        c = *cp;
+        assert(c->item != NULL);
+        return c->item;
+    }
+
+    c->item = input_item_NewExt("vlc://nop", c->name,
+                                INPUT_DURATION_INDEFINITE,
+                                ITEM_TYPE_NODE, ITEM_LOCAL);
+
+    if (unlikely(c->item == NULL))
+    {
+        tdelete(c, &sys->root_card, cmpcard);
+        return NULL;
+    }
+    services_discovery_AddItem(sd, c->item);
+    c->sd = sd;
+
+    return c->item;
 }
 
 /**
@@ -163,7 +228,7 @@ static int AddSource (services_discovery_t *sd, const pa_source_info *info)
     d->index = info->index;
     d->item = item;
 
-    struct device **dp = tsearch (d, &sys->root, cmpsrc);
+    void **dp = tsearch (d, &sys->root, cmpsrc);
     if (dp == NULL) /* Out-of-memory */
     {
         free (d);
@@ -180,9 +245,8 @@ static int AddSource (services_discovery_t *sd, const pa_source_info *info)
         return 0;
     }
 
-    const char *card = pa_proplist_gets(info->proplist, "device.product.name");
-    services_discovery_AddItemCat(sd, item,
-                                  (card != NULL) ? card : N_("Generic"));
+    input_item_t *card = AddCard(sd, info);
+    services_discovery_AddSubItem(sd, card, item);
     d->sd = sd;
     return 0;
 }
@@ -205,7 +269,7 @@ static void RemoveSource (services_discovery_t *sd, uint32_t idx)
 {
     services_discovery_sys_t *sys = sd->p_sys;
 
-    struct device **dp = tfind (&idx, &sys->root, cmpsrc);
+    void **dp = tfind (&idx, &sys->root, cmpsrc);
     if (dp == NULL)
         return;
 
@@ -244,5 +308,6 @@ static void Close (vlc_object_t *obj)
 
     vlc_pa_disconnect (obj, sys->context, sys->mainloop);
     tdestroy (sys->root, DestroySource);
+    tdestroy (sys->root_card, DestroyCard);
     free (sys);
 }
